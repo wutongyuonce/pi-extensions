@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Review Loop</title>
+  <script>
+    for (const css of ["__MONACO_STYLES_BASE64__", "__APP_STYLES_BASE64__"]) {
+      const style = document.createElement("style");
+      style.textContent = atob(css);
+      document.head.appendChild(style);
+    }
+  </script>
+</head>
+<body>
+  <div id="app">
+    <header class="topbar">
+      <div class="identity">
+        <span class="mark">R</span>
+        <div class="identity-copy">
+          <strong id="repo-name">Review Loop</strong>
+          <span id="repo-meta">Connecting…</span>
+        </div>
+      </div>
+      <div class="toolbar">
+        <div class="segment" aria-label="Diff baseline">
+          <button id="mode-checkpoint" class="active">Since review</button>
+          <button id="mode-head">vs HEAD</button>
+        </div>
+        <button id="submit-review" class="primary" disabled>Mark reviewed</button>
+      </div>
+    </header>
+
+    <div class="workspace">
+      <aside class="sidebar">
+        <div class="search-wrap">
+          <input id="search" type="search" placeholder="Filter files" spellcheck="false" autocomplete="off">
+          <kbd>⌘K</kbd>
+        </div>
+        <section class="recent-section">
+          <div class="section-heading"><span>Recently changed</span><span id="recent-count"></span></div>
+          <div id="recent-list" class="file-list"></div>
+        </section>
+        <section class="tree-section">
+          <div class="section-heading"><span>Files</span><span id="file-count"></span></div>
+          <div id="file-tree" class="tree"></div>
+        </section>
+      </aside>
+
+      <main class="main-pane">
+        <div class="filebar">
+          <div class="file-title">
+            <span id="file-status" class="status"></span>
+            <span id="file-path">No changes to review</span>
+          </div>
+          <div class="file-actions">
+            <span id="comment-hint" class="comment-hint">Click a line number to comment</span>
+            <button id="line-wrap" class="quiet" type="button" aria-pressed="false" title="Enable line wrap" disabled>Wrap lines</button>
+            <button id="file-comment" class="quiet" disabled>Add file note</button>
+          </div>
+        </div>
+        <div id="empty-state" class="empty-state">
+          <div class="empty-check">✓</div>
+          <h1>Up to date</h1>
+          <p>New agent changes will appear here.</p>
+        </div>
+        <div id="editor" class="editor hidden"></div>
+
+        <section id="feedback-panel" class="feedback-panel hidden">
+          <div class="feedback-header">
+            <strong id="feedback-title">Feedback</strong>
+            <button id="cancel-draft" class="icon-button" title="Close">×</button>
+          </div>
+          <div id="comment-list" class="comment-list"></div>
+          <div id="draft-row" class="draft-row hidden">
+            <div id="draft-location" class="draft-location"></div>
+            <textarea id="draft-input" rows="3" placeholder="Leave actionable feedback…"></textarea>
+            <div class="draft-actions">
+              <span>⌘↵ to add</span>
+              <button id="add-comment" class="primary small">Add comment</button>
+            </div>
+          </div>
+        </section>
+      </main>
+    </div>
+    <div id="toast" class="toast"></div>
+  </div>
+
+  <script>
+    window.__reviewWorkerSource = atob("__WORKER_SOURCE_BASE64__");
+    (0, eval)(atob("__APP_SOURCE_BASE64__"));
+  </script>
+</body>
+</html>

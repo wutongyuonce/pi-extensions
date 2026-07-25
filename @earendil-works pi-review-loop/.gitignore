@@ -1,0 +1,4 @@
+node_modules/
+.pi/hf-sessions/
+.DS_Store
+*.log

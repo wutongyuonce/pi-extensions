@@ -1,0 +1,14 @@
+<section class="module" id="module-3">
+  <div class="module-content"><div class="module-number">03</div><p class="eyebrow">状态机与并发背压</p><h2><code>AgentManager</code> 是项目的交通指挥塔</h2><p>每个任务先成为 <span class="term" data-definition="状态机是把对象允许经历的状态及转换明确写出来的模型。它能避免“既完成又运行”这类矛盾。">AgentRecord</span>；后台任务达到并发上限时进 FIFO 队列，前台任务绕过队列，因为父任务本来就在等待它。</p>
+    <div class="flow-animation" data-steps='[{"from":"caller","to":"manager","label":"spawn(): 创建 record"},{"from":"manager","to":"queue","label":"满额：status = queued"},{"from":"queue","to":"runner","label":"drainQueue(): 取出并启动"},{"from":"runner","to":"manager","label":"完成：更新状态、通知、继续 drain"}]'><div class="flow-actors"><div class="flow-actor" data-id="caller">调用者</div><div class="flow-actor" data-id="manager">Manager</div><div class="flow-actor" data-id="queue">队列</div><div class="flow-actor" data-id="runner">Runner</div></div><div class="flow-packet"></div><div class="flow-step-label" id="flow-label">点击“下一步”追踪一个后台任务</div><div class="flow-controls"><button class="btn flow-next-btn">下一步</button><button class="btn flow-reset-btn">重来</button><span class="flow-progress"></span></div></div>
+    <div class="code-translation"><div class="translation-code"><div class="translation-label">真实源码 · src/agent-manager.ts</div><pre><code>if (options.isBackground && !options.bypassQueue && this.runningBackground >= this.maxConcurrent) {
+  this.queue.push({ id, args });
+  return id;
+}
+
+this.startAgent(id, record, args);
+return id;</code></pre></div><div class="translation-english"><div class="translation-label">逐行定位</div><div class="translation-lines"><div class="tl"><b>三个条件</b>：只有普通后台任务才受限；定时任务可用 bypassQueue 保证触发时效。</div><div class="tl"><b>queue.push</b>：保存全部启动参数，而不是只保存 id；以后才能原样启动。</div><div class="tl"><b>return id</b>：调用者立刻获得可查询、停止、转向的稳定句柄。</div><div class="tl"><b>startAgent</b>：非排队路径立即启动，保持 spawn 的统一出口。</div></div></div></div>
+    <div class="callout callout-info"><div class="callout-icon">🧭</div><div class="callout-content"><strong class="callout-title">定位 bug 的第一问</strong><p>看到“任务不动了”，先看 record 的 <code>status</code> 和 <code>runningBackground</code>；再看 queue 是否被 drain。不要先怀疑模型。</p></div></div>
+    <div class="quiz-container" data-quiz="m3"><div class="quiz-question-block"><p class="quiz-question">定时任务不能因为人工后台任务很多而错过触发窗口。该如何表达这一产品规则？</p><div class="quiz-options"><button class="quiz-option" data-value="a"><span class="quiz-option-radio"></span>增加 UI 刷新频率</button><button class="quiz-option" data-value="b"><span class="quiz-option-radio"></span>在调度 spawn 时设置 bypassQueue</button><button class="quiz-option" data-value="c"><span class="quiz-option-radio"></span>把 maxConcurrent 改成无限大</button></div><div class="quiz-feedback"></div></div><button class="quiz-check-btn" data-answer="b" data-correct-text="对。规则落在队列判定处，既明确又可测试。" data-incorrect-text="题目关心的是调度语义，不是显示或全局绕过资源限制。">检查理解</button></div>
+  </div>
+</section>

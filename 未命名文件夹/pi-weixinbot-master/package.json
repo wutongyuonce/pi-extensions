@@ -1,0 +1,42 @@
+{
+  "name": "pi-weixinbot",
+  "version": "1.0.5",
+  "type": "module",
+  "description": "微信机器人 extension for pi，支持扫码登录和消息收发",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "weixin",
+    "微信",
+    "wechat",
+    "extension"
+  ],
+  "license": "MIT",
+  "scripts": {
+    "test": "echo \"No tests\""
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/huang-x-h/pi-weixinbot.git"
+  },
+  "homepage": "https://github.com/huang-x-h/pi-weixinbot#readme",
+  "bugs": {
+    "url": "https://github.com/huang-x-h/pi-weixinbot/issues"
+  },
+  "pi": {
+    "extensions": [
+      "./src/weixin.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-agent-core": "*",
+    "@mariozechner/pi-ai": "*",
+    "@mariozechner/pi-coding-agent": "*"
+  },
+  "dependencies": {
+    "qrcode-terminal": "^0.12.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.0.0"
+  }
+}

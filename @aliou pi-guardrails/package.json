@@ -1,0 +1,85 @@
+{
+  "name": "@aliou/pi-guardrails",
+  "version": "0.16.0",
+  "license": "MIT",
+  "type": "module",
+  "private": false,
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "pi",
+    "guardrails",
+    "security"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/aliou/pi-guardrails"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions/path-access/index.ts",
+      "./extensions/guardrails/index.ts",
+      "./extensions/permission-gate/index.ts",
+      "./extensions/herdr/index.ts"
+    ],
+    "video": "https://assets.aliou.me/github/aliou/pi-guardrails/demo.mp4",
+    "image": "https://assets.aliou.me/github/aliou/pi-guardrails/banner.png"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "src",
+    "extensions",
+    "README.md",
+    "schema.json",
+    "!src/**/*.test.ts",
+    "!extensions/**/*.test.ts"
+  ],
+  "dependencies": {
+    "@aliou/pi-utils-settings": "^0.17.0",
+    "@aliou/sh": "^0.1.0"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  },
+  "devDependencies": {
+    "@aliou/biome-plugins": "^0.8.1",
+    "@biomejs/biome": "^2.4.15",
+    "@changesets/cli": "^2.27.11",
+    "@earendil-works/pi-coding-agent": "0.79.6",
+    "@earendil-works/pi-tui": "0.79.6",
+    "@golevelup/ts-vitest": "^4.0.0",
+    "@sinclair/typebox": "^0.34.48",
+    "@types/node": "^25.0.10",
+    "husky": "^9.1.7",
+    "memfs": "^4.57.2",
+    "ts-json-schema-generator": "^2.9.0",
+    "typescript": "^5.9.3",
+    "vitest": "^4.1.4"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "gen:schema": "ts-json-schema-generator --path src/shared/config/types.ts --type GuardrailsConfig --no-type-check -o schema.json",
+    "check:schema": "ts-json-schema-generator --path src/shared/config/types.ts --type GuardrailsConfig --no-type-check -o /tmp/pi-guardrails-schema-check.json && diff -q schema.json /tmp/pi-guardrails-schema-check.json",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint": "biome check",
+    "format": "biome check --write",
+    "check:lockfile": "pnpm install --frozen-lockfile --ignore-scripts",
+    "prepare": "[ -d .git ] && husky || true",
+    "changeset": "changeset",
+    "version": "changeset version",
+    "release": "pnpm changeset publish"
+  },
+  "packageManager": "pnpm@10.26.1",
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    },
+    "@earendil-works/pi-tui": {
+      "optional": true
+    }
+  }
+}

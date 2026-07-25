@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.ruff_cache/
+.venv/
+venv/
+src/*.egg-info/
+*.egg
+dist/
+build/
+node_modules/
+coverage/
+*.tsbuildinfo

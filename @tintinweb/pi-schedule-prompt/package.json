@@ -1,0 +1,58 @@
+{
+  "name": "pi-schedule-prompt",
+  "version": "0.4.1",
+  "description": "Pi's Heartbeat - A pi extension for scheduling recurring and one-shot main agent or background prompts with cron-like functionality",
+  "author": "tintinweb",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/tintinweb/pi-schedule-prompt.git"
+  },
+  "homepage": "https://github.com/tintinweb/pi-schedule-prompt#readme",
+  "bugs": {
+    "url": "https://github.com/tintinweb/pi-schedule-prompt/issues"
+  },
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-extension",
+    "scheduler",
+    "prompt",
+    "automation",
+    "cron",
+    "heartbeat",
+    "defer",
+    "remind"
+  ],
+  "peerDependencies": {
+    "@earendil-works/pi-ai": ">=0.74.0",
+    "@earendil-works/pi-coding-agent": ">=0.74.0",
+    "@earendil-works/pi-tui": ">=0.74.0"
+  },
+  "dependencies": {
+    "croner": "^10.0.1",
+    "nanoid": "^5.0.0"
+  },
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit",
+    "lint": "biome check src/ test/",
+    "lint:fix": "biome check --fix src/ test/",
+    "prepublishOnly": "npm run lint && npm run typecheck && npm run test && npm run build"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.4.8",
+    "@types/node": "^25.6.0",
+    "typescript": "^6.0.3",
+    "vitest": "^4.0.18"
+  },
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ],
+    "video": "https://github.com/tintinweb/pi-schedule-prompt/raw/master/media/demo.mp4",
+    "image": "https://github.com/tintinweb/pi-schedule-prompt/raw/master/media/screenshot.png"
+  }
+}

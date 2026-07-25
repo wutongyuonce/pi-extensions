@@ -1,0 +1,79 @@
+* { box-sizing: border-box; margin: 0; }
+
+body {
+  font-family: system-ui, -apple-system, sans-serif;
+  background: #f8f9fa;
+  color: #1a1a1a;
+  padding: 24px;
+}
+
+h2 {
+  font-size: 1.25rem;
+  font-weight: 600;
+  margin-bottom: 16px;
+}
+
+canvas {
+  width: 100%;
+  background: white;
+  border-radius: 12px;
+  padding: 16px;
+  border: 1px solid #e2e5e9;
+}
+
+.message-form {
+  display: flex;
+  gap: 8px;
+  margin-top: 20px;
+}
+
+.message-form input {
+  flex: 1;
+  padding: 10px 14px;
+  border: 1px solid #d0d5dd;
+  border-radius: 8px;
+  font-size: 0.875rem;
+  outline: none;
+}
+
+.message-form input:focus {
+  border-color: #5b7d86;
+  box-shadow: 0 0 0 2px rgba(91, 125, 134, 0.15);
+}
+
+.message-form button {
+  padding: 10px 20px;
+  background: #3f6771;
+  color: white;
+  border: none;
+  border-radius: 8px;
+  font-size: 0.875rem;
+  font-weight: 500;
+  cursor: pointer;
+}
+
+.message-form button:hover {
+  background: #2d4f58;
+}
+
+.status {
+  margin-top: 8px;
+  font-size: 0.8rem;
+  color: #637680;
+  min-height: 1.2em;
+}
+
+.svg-container {
+  background: #0a0e1a;
+  border-radius: 12px;
+  padding: 16px;
+  border: 1px solid #1a1f35;
+  display: flex;
+  justify-content: center;
+}
+
+.svg-container svg {
+  width: 100%;
+  max-width: 800px;
+  height: auto;
+}

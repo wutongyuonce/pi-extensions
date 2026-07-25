@@ -1,0 +1,56 @@
+{
+  "name": "@tintinweb/pi-subagents",
+  "version": "0.14.3",
+  "description": "A pi extension extension that brings smart Claude Code-style autonomous sub-agents to pi.",
+  "author": "tintinweb",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/tintinweb/pi-subagents.git"
+  },
+  "homepage": "https://github.com/tintinweb/pi-subagents#readme",
+  "bugs": {
+    "url": "https://github.com/tintinweb/pi-subagents/issues"
+  },
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-extension",
+    "subagent",
+    "agent",
+    "autonomous"
+  ],
+  "peerDependencies": {
+    "@earendil-works/pi-ai": ">=0.80.0",
+    "@earendil-works/pi-coding-agent": ">=0.80.0",
+    "@earendil-works/pi-tui": ">=0.80.0"
+  },
+  "dependencies": {
+    "@sinclair/typebox": "^0.34.49",
+    "croner": "^10.0.1",
+    "nanoid": "^5.0.0"
+  },
+  "scripts": {
+    "build": "tsc",
+    "prepublishOnly": "npm run lint && npm run typecheck && npm run test && npm run build",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:e2e": "vitest run e2e --reporter=verbose",
+    "typecheck": "tsc --noEmit",
+    "lint": "biome check src/ test/",
+    "lint:fix": "biome check --fix src/ test/"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.4.14",
+    "@types/node": "^25.5.0",
+    "typescript": "^6.0.0",
+    "vitest": "^4.0.18"
+  },
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ],
+    "video": "https://github.com/tintinweb/pi-subagents/raw/master/media/demo.mp4",
+    "image": "https://github.com/tintinweb/pi-subagents/raw/master/media/screenshot.png"
+  }
+}

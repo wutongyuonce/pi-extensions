@@ -1,0 +1,148 @@
+type Digit = "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9";
+type FindingDigits = `${Digit}${Digit}${Digit}` | `${Digit}${Digit}${Digit}${Digit}`;
+export type RunId = string;
+export type FindingId = `F${FindingDigits}`;
+export type ScenarioStatus = "pass" | "finding" | "blocked";
+export type Severity = "critical" | "high" | "medium" | "low";
+export type Confidence = "high" | "medium" | "low";
+
+export interface EvidenceRef {
+  kind: "capture" | "command" | "file" | "note";
+  ref: string;
+  sha256?: string;
+}
+
+export interface AcceptanceRequirement {
+  /** Stable kebab-case identity, unique within the charter. */
+  id: string;
+  text: string;
+}
+
+export interface BuildQaHandoffRef {
+  path: string;
+  schemaVersion: 1;
+  sha256: string;
+}
+
+export interface Charter {
+  feature: string;
+  promise: string;
+  entryPoint: string;
+  environment: string;
+  acceptance: AcceptanceRequirement[];
+  safety: string[];
+  outOfScope: string[];
+  /** Provenance only; the human-confirmed charter remains authoritative. */
+  handoff: BuildQaHandoffRef | null;
+}
+
+interface EventBase<T extends string> {
+  v: 1;
+  type: T;
+  /** Assigned only by the canonical ledger writer. Omit from fragments. */
+  seq?: number;
+}
+
+export interface RunStarted extends EventBase<"run.started"> {
+  runId: RunId;
+  charter: Charter;
+  tooling: {
+    driver: "agent-tty";
+    harness: ".pi/skills/qa-loop/scripts/pi-tui-harness.sh";
+    viewports: ["120x36", "72x24"];
+    sessionDir: `/tmp/pi-tidy-qa${string}/sessions`;
+    agentTtyHome: `/tmp/pi-tidy-qa${string}/agent-tty`;
+    piVersion: string;
+    agentTtyVersion: "0.5.0";
+    nodeVersion: string;
+  } | {
+    /** Compatibility only for ledgers created before agent-tty became canonical. */
+    driver: "tmux";
+    harness: ".pi/skills/qa-loop/scripts/pi-tui-harness.sh";
+    viewports: ["120x36", "72x24"];
+    sessionDir: "/tmp/pi-tidy-qa/sessions";
+    piVersion: string;
+    tmuxVersion: string;
+  };
+}
+
+export interface RoundStarted extends EventBase<"round.started"> {
+  round: number;
+  objective: "initial" | "retest" | "post-fix";
+}
+
+export interface FindingRaised extends EventBase<"finding.raised"> {
+  round: number;
+  findingId: FindingId;
+  severity: Severity;
+  confidence: Confidence;
+  summary: string;
+  actual: string;
+  expected: string;
+  reproduction: string[];
+  evidence: EvidenceRef[];
+  recommendation: string;
+  acceptance: string;
+}
+
+export interface ScenarioChecked extends EventBase<"scenario.checked"> {
+  round: number;
+  scenarioId: string;
+  requirementIds: string[];
+  status: ScenarioStatus;
+  findingIds: FindingId[];
+  evidence: EvidenceRef[];
+  notes: string;
+}
+
+export interface HumanSelected extends EventBase<"human.selected"> {
+  round: number;
+  action: "fix" | "retest" | "close";
+  findingIds: FindingId[];
+}
+
+export interface FixApplied extends EventBase<"fix.applied"> {
+  round: number;
+  findingId: FindingId;
+  files: string[];
+  tests: string[];
+  summary: string;
+  residualRisk: string;
+}
+
+export interface VerificationRecorded extends EventBase<"verification.recorded"> {
+  round: number;
+  findingId: FindingId;
+  status: "passed" | "failed" | "blocked";
+  evidence: EvidenceRef[];
+  notes: string;
+}
+
+export interface RoundClosed extends EventBase<"round.closed"> {
+  round: number;
+  outcome: "findings" | "no-findings" | "blocked";
+}
+
+export interface FinalVerificationCheck {
+  command: string;
+  status: "passed" | "failed" | "blocked";
+  exitCode: number | null;
+  evidence: EvidenceRef[];
+}
+export interface RunClosed extends EventBase<"run.closed"> {
+  reason: "no-findings" | "human-signoff";
+  acceptedOpenFindingIds: FindingId[];
+  verificationChecks: FinalVerificationCheck[];
+  worktreeStatus: string[];
+}
+
+export type QaEvent =
+  | RunStarted
+  | RoundStarted
+  | FindingRaised
+  | ScenarioChecked
+  | HumanSelected
+  | FixApplied
+  | VerificationRecorded
+  | RoundClosed
+  | RunClosed;

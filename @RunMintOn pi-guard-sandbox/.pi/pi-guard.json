@@ -1,0 +1,51 @@
+{
+  "mode": "workspace-write",
+  "sensitiveReadDeny": [
+    "~/.ssh",
+    "~/.aws",
+    "~/.gnupg",
+    "~/.git-credentials",
+    "~/.env",
+    "~/.env.*",
+    "~/.npmrc",
+    "~/.pypirc",
+    "~/.netrc",
+    "/mnt/c/Users/*/.ssh"
+  ],
+  "protectedPaths": {
+    "block": [
+      ".git",
+      "node_modules"
+    ],
+    "approval": [
+      ".env",
+      ".env.*",
+      ".pi/pi-guard.json"
+    ]
+  },
+  "bashPolicy": {
+    "directBlock": [
+      "sudo",
+      "su",
+      "mount",
+      "umount",
+      "mkfs",
+      "dd",
+      "docker-host-root-bind",
+      "curl-pipe-sh",
+      "curl-pipe-bash",
+      "wget-pipe-sh",
+      "wget-pipe-bash"
+    ],
+    "requireApproval": [
+      "rm-rf",
+      "git-reset-hard",
+      "git-clean-fd",
+      "git-clean-xdf",
+      "chmod-r",
+      "chown-r",
+      "bash-c",
+      "sh-c"
+    ]
+  }
+}

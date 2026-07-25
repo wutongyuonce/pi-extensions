@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>pi-subagents：从扩展入口到子会话</title>
+
+  <!-- Google Fonts: Bricolage Grotesque · DM Sans · JetBrains Mono -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,400;12..96,600;12..96,700;12..96,800&family=DM+Sans:ital,opsz,wght@0,9..40,300;0,9..40,400;0,9..40,500;0,9..40,600;0,9..40,700;1,9..40,400;1,9..40,500&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+
+  <link rel="stylesheet" href="styles.css">
+
+  <!--
+    CUSTOMIZE PER COURSE — change only the three accent variables below.
+    Options:
+      vermillion  #D94F30 / #C4432A / #FDEEE9 / #E8836C  (default)
+      coral       #E06B56 / #C85A47 / #FDECEA / #E89585
+      teal        #2A7B9B / #1F6280 / #E4F2F7 / #5A9DB8
+      amber       #D4A843 / #BF9530 / #FDF5E0 / #E0C070
+      forest      #2D8B55 / #226B41 / #E8F5EE / #5AAD7A
+  -->
+  <style>
+    :root {
+      --color-accent:       #2A7B9B;
+      --color-accent-hover: #1F6280;
+      --color-accent-light: #E4F2F7;
+      --color-accent-muted: #5A9DB8;
+    }
+  </style>
+
+  <script src="main.js" defer></script>
+</head>
+<body>
+
+  <nav class="nav" id="nav">
+    <div class="progress-bar" id="progress-bar" role="progressbar" aria-valuenow="0" aria-valuemin="0" aria-valuemax="100"></div>
+    <div class="nav-inner">
+      <span class="nav-title">pi-subagents：从扩展入口到子会话</span>
+      <div class="nav-dots" id="nav-dots" role="tablist">
+        <!--
+          One <button> per module. Replace MODULE_N_NAME with the actual module title.
+
+          <button class="nav-dot" data-target="module-1" data-tooltip="MODULE_1_NAME" role="tab" aria-label="Module 1: MODULE_1_NAME"></button>
+          <button class="nav-dot" data-target="module-2" data-tooltip="MODULE_2_NAME" role="tab" aria-label="Module 2: MODULE_2_NAME"></button>
+          ...
+        -->
+        <button class="nav-dot" data-target="module-1" data-tooltip="先看全貌" role="tab" aria-label="模块 1：先看全貌"></button>
+        <button class="nav-dot" data-target="module-2" data-tooltip="配置变成执行计划" role="tab" aria-label="模块 2：配置变成执行计划"></button>
+        <button class="nav-dot" data-target="module-3" data-tooltip="生命周期与并发" role="tab" aria-label="模块 3：生命周期与并发"></button>
+        <button class="nav-dot" data-target="module-4" data-tooltip="会话、工具与上下文" role="tab" aria-label="模块 4：会话、工具与上下文"></button>
+        <button class="nav-dot" data-target="module-5" data-tooltip="可靠性边界" role="tab" aria-label="模块 5：可靠性边界"></button>
+        <button class="nav-dot" data-target="module-6" data-tooltip="从零开发路线" role="tab" aria-label="模块 6：从零开发路线"></button>
+      </div>
+    </div>
+  </nav>
+
+  <main id="main">
+    <!-- modules/*.html content is assembled here by build.sh -->
+<section class="module" id="module-1">
+  <div class="module-content">
+    <div class="module-number">01</div><p class="eyebrow">先从一次真实调用出发</p>
+    <h1>它把一个 <span class="term" data-definition="扩展是由宿主程序加载、在宿主提供的 API 上运行的小程序。这里的宿主是 pi。">pi 扩展</span> 变成了子代理调度器</h1>
+    <p class="lead">用户或父代理调用 <code>Agent()</code>；扩展挑选配置、创建独立会话、持续显示状态，最后将结果送回父会话。它的核心不是“再调用一个模型”，而是把完整的代理运行时复制出一个受控实例。</p>
+    <div class="arch-diagram">
+      <div class="arch-zone"><h4 class="arch-zone-label">pi 宿主</h4><div class="arch-component" data-desc="唯一入口：注册 Agent、查询结果、转向和 /agents 命令。"><div class="arch-icon">①</div><span>index.ts</span></div></div>
+      <div class="arch-zone"><h4 class="arch-zone-label">调度层</h4><div class="arch-component" data-desc="保存 AgentRecord，执行队列、并发、停止、恢复与清理。"><div class="arch-icon">②</div><span>AgentManager</span></div></div>
+      <div class="arch-zone"><h4 class="arch-zone-label">运行时</h4><div class="arch-component" data-desc="把配置翻译为 pi 的 AgentSession：提示词、模型、工具、扩展与事件订阅。"><div class="arch-icon">③</div><span>runAgent</span></div></div>
+      <div class="arch-description" id="arch-desc">点击任一方块，查看其不可替代的职责</div>
+    </div>
+    <div class="flow-steps"><div class="flow-step"><div class="flow-step-num">1</div><p>调用 Agent 工具</p></div><div class="flow-arrow">→</div><div class="flow-step"><div class="flow-step-num">2</div><p>解析调用参数</p></div><div class="flow-arrow">→</div><div class="flow-step"><div class="flow-step-num">3</div><p>管理器建档/排队</p></div><div class="flow-arrow">→</div><div class="flow-step"><div class="flow-step-num">4</div><p>独立会话运行</p></div></div>
+    <div class="callout callout-accent"><div class="callout-icon">💡</div><div class="callout-content"><strong class="callout-title">读这类项目的诀窍</strong><p>不要从 2,399 行的 <code>index.ts</code> 逐行硬读。先画出“谁创建谁、谁持有状态、谁发事件”的主线，再回到局部函数。</p></div></div>
+    <div class="code-translation"><div class="translation-code"><div class="translation-label">真实源码 · package.json</div><pre><code>"pi": {
+  "extensions": [
+    "./src/index.ts"
+  ]
+}</code></pre></div><div class="translation-english"><div class="translation-label">逐行定位</div><div class="translation-lines"><div class="tl"><b>pi</b>：给宿主 pi 的专用清单。</div><div class="tl"><b>extensions</b>：要在启动时加载的扩展列表。</div><div class="tl"><b>index.ts</b>：本项目真正的启动入口；其他 src 文件都只是被它组织起来的部件。</div></div></div></div>
+    <div class="quiz-container" data-quiz="m1"><div class="quiz-question-block"><p class="quiz-question">你要新增“暂停排队中的任务”。第一处应该调查哪一层？</p><div class="quiz-options"><button class="quiz-option" data-value="a"><span class="quiz-option-radio"></span>UI 组件</button><button class="quiz-option" data-value="b"><span class="quiz-option-radio"></span>AgentManager 的 queue 与状态转换</button><button class="quiz-option" data-value="c"><span class="quiz-option-radio"></span>README 截图</button></div><div class="quiz-feedback"></div></div><button class="quiz-check-btn" data-answer="b" data-correct-text="对。排队是调度层的事实来源；UI 只展示它。" data-incorrect-text="先找拥有 queue 的 AgentManager。界面不应成为调度真相。">检查理解</button></div>
+  </div>
+</section>
+<section class="module" id="module-2">
+  <div class="module-content"><div class="module-number">02</div><p class="eyebrow">把声明翻译成可执行的决定</p><h2>配置不是散落的 YAML；它先汇合为 <code>AgentConfig</code></h2><p>把它想成一张“演员通行证”：默认演员在 <code>default-agents.ts</code>，用户可用 Markdown 覆盖；注册表合并后，运行器只认同一种结构。</p>
+    <div class="file-tree"><div class="ft-folder open"><span class="ft-name">src/</span><span class="ft-desc">配置管道</span><div class="ft-children"><div class="ft-file"><span class="ft-name">default-agents.ts</span><span class="ft-desc">内置三种角色</span></div><div class="ft-file"><span class="ft-name">custom-agents.ts</span><span class="ft-desc">读取 frontmatter</span></div><div class="ft-file"><span class="ft-name">agent-types.ts</span><span class="ft-desc">覆盖、大小写解析、回退</span></div><div class="ft-file"><span class="ft-name">invocation-config.ts</span><span class="ft-desc">配置与本次调用的优先级</span></div></div></div></div>
+    <div class="chat-container" id="config-chat"><div class="chat-header">配置群聊：一次 <code>Agent({ subagent_type: "Explore" })</code></div><div class="chat-messages"><div class="chat-message actor-1"><div class="chat-avatar">调用</div><div class="chat-bubble">我只指定类型，其他参数该从哪来？</div></div><div class="chat-message actor-2"><div class="chat-avatar">注册表</div><div class="chat-bubble">先按大小写不敏感查 Explore；找不到才回退 general-purpose。</div></div><div class="chat-message actor-3"><div class="chat-avatar">调用解析</div><div class="chat-bubble">本次明确传入的 model / thinking 优先；未指定时才采用该类型配置。</div></div></div><button class="chat-play-btn">播放对话</button></div>
+    <div class="code-translation"><div class="translation-code"><div class="translation-label">真实源码 · src/agent-types.ts</div><pre><code>export function resolveType(name: string): string | undefined {
+  return resolveKey(name);
+}
+
+export function getAgentConfig(name: string): AgentConfig | undefined {
+  const key = resolveKey(name);
+  return key ? agents.get(key) : undefined;
+}</code></pre></div><div class="translation-english"><div class="translation-label">逐行定位</div><div class="translation-lines"><div class="tl"><b>resolveType</b>：只负责把用户写法规范为注册表键，保持单一职责。</div><div class="tl"><b>getAgentConfig</b>：在同一套大小写规则下取完整配置，避免调用方直接碰 Map。</div><div class="tl"><b>undefined</b>：故意表达“未找到”，把回退策略留给上游，而非在这里偷偷决定。</div></div></div></div>
+    <div class="pattern-cards"><div class="pattern-card"><div class="pattern-icon">🧬</div><h4>覆盖</h4><p>同名用户定义覆盖默认定义，便于本地定制而不改源码。</p></div><div class="pattern-card"><div class="pattern-icon">🔒</div><h4>锁定字段</h4><p>frontmatter 已指定的策略字段不会被每次工具调用意外反转。</p></div><div class="pattern-card"><div class="pattern-icon">🧯</div><h4>回退</h4><p>未知类型可安全地转为 general-purpose，并保留提示信息。</p></div></div>
+    <div class="quiz-container" data-quiz="m2"><div class="quiz-question-block"><p class="quiz-question">你想让“审计”代理永远只读。最稳妥的设计是什么？</p><div class="quiz-options"><button class="quiz-option" data-value="a"><span class="quiz-option-radio"></span>让调用者每次记得传只读工具</button><button class="quiz-option" data-value="b"><span class="quiz-option-radio"></span>在 audit.md 配置 builtinToolNames / tools 并由运行器统一执行</button><button class="quiz-option" data-value="c"><span class="quiz-option-radio"></span>在 UI 隐藏编辑按钮</button></div><div class="quiz-feedback"></div></div><button class="quiz-check-btn" data-answer="b" data-correct-text="对。策略要落在配置与运行器边界，不能依赖每个调用者记忆。" data-incorrect-text="UI 不是安全边界；把权限固定在 AgentConfig 的工具范围中。">检查理解</button></div>
+  </div>
+</section>
+<section class="module" id="module-3">
+  <div class="module-content"><div class="module-number">03</div><p class="eyebrow">状态机与并发背压</p><h2><code>AgentManager</code> 是项目的交通指挥塔</h2><p>每个任务先成为 <span class="term" data-definition="状态机是把对象允许经历的状态及转换明确写出来的模型。它能避免“既完成又运行”这类矛盾。">AgentRecord</span>；后台任务达到并发上限时进 FIFO 队列，前台任务绕过队列，因为父任务本来就在等待它。</p>
+    <div class="flow-animation" data-steps='[{"from":"caller","to":"manager","label":"spawn(): 创建 record"},{"from":"manager","to":"queue","label":"满额：status = queued"},{"from":"queue","to":"runner","label":"drainQueue(): 取出并启动"},{"from":"runner","to":"manager","label":"完成：更新状态、通知、继续 drain"}]'><div class="flow-actors"><div class="flow-actor" data-id="caller">调用者</div><div class="flow-actor" data-id="manager">Manager</div><div class="flow-actor" data-id="queue">队列</div><div class="flow-actor" data-id="runner">Runner</div></div><div class="flow-packet"></div><div class="flow-step-label" id="flow-label">点击“下一步”追踪一个后台任务</div><div class="flow-controls"><button class="btn flow-next-btn">下一步</button><button class="btn flow-reset-btn">重来</button><span class="flow-progress"></span></div></div>
+    <div class="code-translation"><div class="translation-code"><div class="translation-label">真实源码 · src/agent-manager.ts</div><pre><code>if (options.isBackground && !options.bypassQueue && this.runningBackground >= this.maxConcurrent) {
+  this.queue.push({ id, args });
+  return id;
+}
+
+this.startAgent(id, record, args);
+return id;</code></pre></div><div class="translation-english"><div class="translation-label">逐行定位</div><div class="translation-lines"><div class="tl"><b>三个条件</b>：只有普通后台任务才受限；定时任务可用 bypassQueue 保证触发时效。</div><div class="tl"><b>queue.push</b>：保存全部启动参数，而不是只保存 id；以后才能原样启动。</div><div class="tl"><b>return id</b>：调用者立刻获得可查询、停止、转向的稳定句柄。</div><div class="tl"><b>startAgent</b>：非排队路径立即启动，保持 spawn 的统一出口。</div></div></div></div>
+    <div class="callout callout-info"><div class="callout-icon">🧭</div><div class="callout-content"><strong class="callout-title">定位 bug 的第一问</strong><p>看到“任务不动了”，先看 record 的 <code>status</code> 和 <code>runningBackground</code>；再看 queue 是否被 drain。不要先怀疑模型。</p></div></div>
+    <div class="quiz-container" data-quiz="m3"><div class="quiz-question-block"><p class="quiz-question">定时任务不能因为人工后台任务很多而错过触发窗口。该如何表达这一产品规则？</p><div class="quiz-options"><button class="quiz-option" data-value="a"><span class="quiz-option-radio"></span>增加 UI 刷新频率</button><button class="quiz-option" data-value="b"><span class="quiz-option-radio"></span>在调度 spawn 时设置 bypassQueue</button><button class="quiz-option" data-value="c"><span class="quiz-option-radio"></span>把 maxConcurrent 改成无限大</button></div><div class="quiz-feedback"></div></div><button class="quiz-check-btn" data-answer="b" data-correct-text="对。规则落在队列判定处，既明确又可测试。" data-incorrect-text="题目关心的是调度语义，不是显示或全局绕过资源限制。">检查理解</button></div>
+  </div>
+</section>
+<section class="module" id="module-4">
+  <div class="module-content"><div class="module-number">04</div><p class="eyebrow">真正运行前发生了什么</p><h2><code>runAgent()</code> 把抽象配置装配成一个独立 <span class="term" data-definition="会话是模型对话、工具集合、工作目录和事件流的运行容器。独立会话意味着子代理不会直接复用父代理的对话状态。">AgentSession</span></h2><p>它是本项目最重要的装配函数：选择有效 cwd，加载 extension 与 skill，解析模型和思考级别，限制工具，然后订阅流式事件并发送 prompt。</p>
+    <div class="step-cards"><div class="step-card"><div class="step-num">1</div><div class="step-body"><strong>装配输入</strong><p>合并类型配置、调用选项、父上下文与环境信息。</p></div></div><div class="step-card"><div class="step-num">2</div><div class="step-body"><strong>建立资源加载器</strong><p>按 extensions / skills / prompt_mode 过滤资源；隔离模式可全部关闭。</p></div></div><div class="step-card"><div class="step-num">3</div><div class="step-body"><strong>建会话并绑定扩展</strong><p>先构造工具边界，再允许延迟注册的扩展工具进入可见范围。</p></div></div><div class="step-card"><div class="step-num">4</div><div class="step-body"><strong>订阅事件后 prompt</strong><p>收集文本、工具活动、token、压缩与 turn 上限，结束时必定解绑。</p></div></div></div>
+    <div class="code-translation"><div class="translation-code"><div class="translation-label">真实源码 · src/agent-runner.ts</div><pre><code>const { session } = await createAgentSession(sessionOpts);
+
+session.setSessionName(
+  options.agentId ? `${baseSessionName}#${options.agentId.slice(0, 8)}` : baseSessionName,
+);
+
+await session.bindExtensions({
+  onError: (err) => {
+    options.onToolActivity?.({ type: "end", toolName: `extension-error:${err.extensionPath}` });
+  },
+});</code></pre></div><div class="translation-english"><div class="translation-label">逐行定位</div><div class="translation-lines"><div class="tl"><b>createAgentSession</b>：把前面拼好的 options 交给 pi，得到独立运行容器。</div><div class="tl"><b>setSessionName</b>：用类型和短 id 命名，便于日志、会话列表和问题追踪。</div><div class="tl"><b>bindExtensions</b>：触发扩展的初始化；错误转换成工具活动，让 UI 与调用者看得见。</div></div></div></div>
+    <div class="pattern-cards"><div class="pattern-card"><div class="pattern-icon">🧰</div><h4>工具作用域</h4><p><code>tools</code> 决定允许哪些工具；<code>extensions</code> 决定哪些扩展会加载。两者刻意分离。</p></div><div class="pattern-card"><div class="pattern-icon">🧠</div><h4>上下文继承</h4><p>仅在请求时把父会话摘要前置到任务，不等于共享同一个会话对象。</p></div><div class="pattern-card"><div class="pattern-icon">📡</div><h4>事件订阅</h4><p>运行器把底层事件转成上层可消费的回调，管理器无需知道 pi 内部细节。</p></div></div>
+    <div class="quiz-container" data-quiz="m4"><div class="quiz-question-block"><p class="quiz-question">一个 MCP 工具在会话创建后才注册。为何不能只在开始时把工具名快照成 allowlist？</p><div class="quiz-options"><button class="quiz-option" data-value="a"><span class="quiz-option-radio"></span>因为 UI 需要更多颜色</button><button class="quiz-option" data-value="b"><span class="quiz-option-radio"></span>晚到工具会永久被拒绝，必须以持续生效的范围规则处理</button><button class="quiz-option" data-value="c"><span class="quiz-option-radio"></span>因为 TypeScript 不支持数组</button></div><div class="quiz-feedback"></div></div><button class="quiz-check-btn" data-answer="b" data-correct-text="对。注释明确指出扩展可以异步注册；范围规则必须覆盖“现在”和“以后”。" data-incorrect-text="问题是动态注册时机，不是界面或语言能力。">检查理解</button></div>
+  </div>
+</section>
+<section class="module" id="module-5">
+  <div class="module-content"><div class="module-number">05</div><p class="eyebrow">把失败变成可解释状态</p><h2>可靠性不是一个 try/catch，而是一组明确边界</h2><p>这个项目将风险分散在专门模块：工作树隔离、内存路径安全、调度持久化锁、输出转录、模型范围与生命周期错误归类。每个模块只保护一种资源或约束。</p>
+    <div class="icon-rows"><div class="icon-row"><div class="icon-circle">🌳</div><div><strong>worktree.ts</strong><p>用临时 git worktree 隔离变更；完成后清理，若有更改则保留分支。</p></div></div><div class="icon-row"><div class="icon-circle">🗂️</div><div><strong>memory.ts</strong><p>拒绝危险名称与符号链接，避免代理记忆文件逃逸到非预期路径。</p></div></div><div class="icon-row"><div class="icon-circle">🔐</div><div><strong>schedule-store.ts</strong><p>JSON 存储配 PID 锁，避免同一会话的多个进程互相覆盖任务。</p></div></div><div class="icon-row"><div class="icon-circle">📜</div><div><strong>output-file.ts</strong><p>把流式对话写为 JSONL 转录，且可由配置关闭。</p></div></div></div>
+    <div class="code-translation"><div class="translation-code"><div class="translation-label">真实源码 · src/memory.ts</div><pre><code>export function isUnsafeName(name: string): boolean {
+  return name.includes("/") || name.includes("\\") || name === "." || name === "..";
+}
+
+export function isSymlink(filePath: string): boolean {
+  try {
+    return lstatSync(filePath).isSymbolicLink();
+  } catch {
+    return false;
+  }
+}</code></pre></div><div class="translation-english"><div class="translation-label">逐行定位</div><div class="translation-lines"><div class="tl"><b>isUnsafeName</b>：把路径分隔符和 . / .. 当作不安全输入，阻止目录穿越。</div><div class="tl"><b>lstatSync</b>：检查“链接本身”，不会跟随链接；这正是识别符号链接所需的语义。</div><div class="tl"><b>catch → false</b>：不存在的文件不是链接；调用者可继续按普通缺失文件处理。</div></div></div></div>
+    <div class="callout callout-warning"><div class="callout-icon">⚠️</div><div class="callout-content"><strong class="callout-title">不要把“失败”压成一个状态</strong><p><code>aborted</code>、<code>stopped</code>、<code>error</code>、<code>steered</code> 的含义不同。保留差异，UI、通知与重试策略才不会说谎。</p></div></div>
+    <div class="quiz-container" data-quiz="m5"><div class="quiz-question-block"><p class="quiz-question">代理可写“记忆”文件。你发现 agentName 可以包含 <code>../</code>。最合适的修复位置是？</p><div class="quiz-options"><button class="quiz-option" data-value="a"><span class="quiz-option-radio"></span>只在 UI 输入框禁用一个字符</button><button class="quiz-option" data-value="b"><span class="quiz-option-radio"></span>在 memory 路径构造前统一验证名称</button><button class="quiz-option" data-value="c"><span class="quiz-option-radio"></span>在 README 警告用户</button></div><div class="quiz-feedback"></div></div><button class="quiz-check-btn" data-answer="b" data-correct-text="对。路径构造模块才是所有入口共享的安全边界。" data-incorrect-text="输入层可能被绕过；安全校验应离危险操作最近。">检查理解</button></div>
+  </div>
+</section>
+<section class="module" id="module-6">
+  <div class="module-content"><div class="module-number">06</div><p class="eyebrow">把读懂转化为能重建</p><h2>从零做一个最小子代理扩展：按边界生长，不按文件堆叠</h2><p>先做可观察的最小闭环，再加策略、隔离与 UI。每一步都应有相应测试：项目的 <code>test/</code> 正是把这些边界固定下来的可执行规格。</p>
+    <div class="step-cards"><div class="step-card"><div class="step-num">1</div><div class="step-body"><strong>定义运行记录</strong><p>设计 AgentRecord：id、prompt、status、结果、AbortController。先只支持一个前台任务。</p></div></div><div class="step-card"><div class="step-num">2</div><div class="step-body"><strong>封装 runAgent</strong><p>创建 AgentSession、发送 prompt、收集最终文本；不让 UI 直接接触会话。</p></div></div><div class="step-card"><div class="step-num">3</div><div class="step-body"><strong>引入 Manager</strong><p>把记录表、停止、恢复与完成回调集中；再加后台队列和并发计数。</p></div></div><div class="step-card"><div class="step-num">4</div><div class="step-body"><strong>配置化角色</strong><p>将模型、工具、系统提示词从代码移到 AgentConfig 与 Markdown frontmatter。</p></div></div><div class="step-card"><div class="step-num">5</div><div class="step-body"><strong>补齐边界</strong><p>处理工作树、内存、转录、调度、扩展动态工具与错误状态。</p></div></div><div class="step-card"><div class="step-num">6</div><div class="step-body"><strong>最后做 UI</strong><p>Widget/Fleet/Viewer 从 Manager 读取事实，绝不自己维护第二份任务状态。</p></div></div></div>
+    <div class="code-translation"><div class="translation-code"><div class="translation-label">真实源码 · src/usage.ts</div><pre><code>export function getLifetimeTotal(u?: LifetimeUsage): number {
+  if (!u) return 0;
+  return u.input + u.output + u.cacheWrite;
+}</code></pre></div><div class="translation-english"><div class="translation-label">逐行定位</div><div class="translation-lines"><div class="tl"><b>可选参数</b>：调用方未拿到统计时也能安全展示 0。</div><div class="tl"><b>单一口径</b>：token 总量只在这里定义；UI 不应各自相加，以免统计口径漂移。</div><div class="tl"><b>刻意排除 cacheRead</b>：注释说明这是产品语义选择，不是遗漏。</div></div></div></div>
+    <div class="pattern-cards"><div class="pattern-card"><div class="pattern-icon">🧪</div><h4>先测行为</h4><p>如队列满时记录为 queued、完成后自动 drain；测试名称本身就是需求目录。</p></div><div class="pattern-card"><div class="pattern-icon">🧱</div><h4>按边界拆模块</h4><p>运行、调度、存储、显示各有事实来源，避免“万能 index.ts”。</p></div><div class="pattern-card"><div class="pattern-icon">🔭</div><h4>让状态可见</h4><p>先暴露事件和记录，再设计漂亮界面；可观测性会反过来降低调试成本。</p></div></div>
+    <div class="quiz-container" data-quiz="m6"><div class="quiz-question-block"><p class="quiz-question">你正在从零开发，模型输出能回来但界面永远显示“运行中”。最有价值的下一步是？</p><div class="quiz-options"><button class="quiz-option" data-value="a"><span class="quiz-option-radio"></span>立刻重写整个 UI</button><button class="quiz-option" data-value="b"><span class="quiz-option-radio"></span>验证 runAgent 完成事件是否让 Manager 更新 record.status，并让 UI 只读取该记录</button><button class="quiz-option" data-value="c"><span class="quiz-option-radio"></span>提高模型 thinking</button></div><div class="quiz-feedback"></div></div><button class="quiz-check-btn" data-answer="b" data-correct-text="对。先沿主线验证事实源与事件桥接，再考虑显示层。" data-incorrect-text="这是状态传播问题；模型质量与 UI 重写都不是首要假设。">完成课程</button></div>
+  </div>
+</section>
+  </main>
+
+</body>
+</html>

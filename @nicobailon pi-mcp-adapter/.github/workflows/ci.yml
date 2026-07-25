@@ -1,0 +1,32 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+      - name: Build interactive visualizer example
+        run: |
+          npm install --prefix examples/interactive-visualizer --no-package-lock --no-audit --no-fund
+          npm run --prefix examples/interactive-visualizer build
+      - run: npx tsc --noEmit
+      - run: npm test
+      - run: npm run test:oauth
+      - run: npm run test:conformance
+      - run: npm pack --dry-run

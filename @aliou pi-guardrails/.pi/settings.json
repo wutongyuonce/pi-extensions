@@ -1,0 +1,6 @@
+{
+  "packages": [
+    "npm:@378labs/pi-oss",
+    "npm:@378-skills/vitest"
+  ]
+}

@@ -1,0 +1,175 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import * as helpers from "../src/web/ui/state.js";
+
+test("web state helpers summarize every visible batch state without color-only meaning", () => {
+	assert.equal(
+		helpers.summarizeBatch({ phase: "empty", items: [], totalSourceBytes: 0 }).label,
+		"No images staged",
+	);
+	assert.deepEqual(
+		helpers.summarizeBatch({
+			phase: "blocked",
+			items: [{ status: "ready" }, { status: "processing" }, { status: "error" }],
+			totalSourceBytes: 123,
+		}),
+		{
+			ready: 1,
+			uploading: 1,
+			error: 1,
+			total: 3,
+			bytes: 123,
+			label: "1/3 ready · 1 uploading · 1 need attention",
+		},
+	);
+	assert.equal(
+		helpers.summarizeBatch({ phase: "reserved", items: [{ status: "ready" }], totalSourceBytes: 1 })
+			.label,
+		"1 image queued with Pi",
+	);
+});
+
+test("web history helpers separate concise status from secondary retention limits", () => {
+	assert.deepEqual(
+		helpers.summarizeHistory({
+			items: [],
+			totalBytes: 0,
+			maxImages: 128,
+			maxBytes: 512 * 1024 * 1024,
+		}),
+		{
+			total: 0,
+			bytes: 0,
+			maxImages: 128,
+			maxBytes: 512 * 1024 * 1024,
+			label: "No images sent yet",
+			usage: "0/128 images · 0 B of 512 MB",
+		},
+	);
+	assert.deepEqual(
+		helpers.summarizeHistory({
+			items: [{}, {}],
+			totalBytes: 5 * 1024 * 1024,
+			maxImages: 128,
+			maxBytes: 512 * 1024 * 1024,
+		}),
+		{
+			total: 2,
+			bytes: 5 * 1024 * 1024,
+			maxImages: 128,
+			maxBytes: 512 * 1024 * 1024,
+			label: "2 images · 5.0 MB",
+			usage: "2/128 images · 5.0 MB of 512 MB",
+		},
+	);
+});
+
+test("draft presentation keeps empty copy concise and separates progress from guidance", () => {
+	const cases = [
+		{
+			batch: { phase: "empty", items: [], totalSourceBytes: 0 },
+			status: "",
+			guidance: "Choose images to add them to your next Pi message.",
+		},
+		{
+			batch: {
+				phase: "editing",
+				items: [{ status: "processing" }, { status: "processing" }],
+				totalSourceBytes: 2048,
+			},
+			status: "0/2 ready · 2 uploading · 2.0 KB",
+			guidance: "Wait for 2 images to finish processing before sending from Pi.",
+		},
+		{
+			batch: {
+				phase: "blocked",
+				items: [{ status: "ready" }, { status: "error" }],
+				totalSourceBytes: 1024,
+			},
+			status: "1/2 ready · 1 need attention · 1.0 KB",
+			guidance: "Fix or delete 1 image that needs attention before sending from Pi.",
+		},
+		{
+			batch: { phase: "ready", items: [{ status: "ready" }], totalSourceBytes: 512 },
+			status: "1/1 ready · 512 B",
+			guidance:
+				"Return to Pi and send a non-empty message. 1 ready image will be attached automatically.",
+		},
+		{
+			batch: {
+				phase: "reserved",
+				items: [{ status: "ready" }, { status: "ready" }],
+				totalSourceBytes: 4096,
+			},
+			status: "2 images queued with Pi · 4.0 KB",
+			guidance: "Queued with Pi. These images will be attached when Pi sends this message.",
+		},
+		{
+			batch: { phase: "closed", items: [{ status: "ready" }], totalSourceBytes: 512 },
+			status: "1/1 ready · 512 B",
+			guidance: "This Pi session is no longer accepting images.",
+		},
+	];
+
+	for (const { batch, status, guidance } of cases) {
+		assert.deepEqual(helpers.draftPresentation(batch), { status, guidance });
+		assert.equal(helpers.draftGuidance(batch), guidance);
+	}
+});
+
+test("only the shared metadata notice is removed from per-image notes", () => {
+	assert.deepEqual(
+		helpers.visibleItemNotes([
+			"Sensitive image metadata removed",
+			"Converted from TIFF to PNG",
+			"Resized from 4000×3000 to 2000×1500",
+		]),
+		["Converted from TIFF to PNG", "Resized from 4000×3000 to 2000×1500"],
+	);
+	assert.deepEqual(
+		helpers.visibleItemNotes([
+			"sensitive image metadata removed",
+			"Sensitive image metadata removed after conversion",
+		]),
+		["sensitive image metadata removed", "Sensitive image metadata removed after conversion"],
+	);
+	assert.deepEqual(helpers.visibleItemNotes(undefined), []);
+});
+
+test("web ordering helpers are immutable and bounded", () => {
+	const ids = ["one", "two", "three"];
+	assert.deepEqual(helpers.moveItem(ids, "two", -1), ["two", "one", "three"]);
+	assert.deepEqual(helpers.moveItem(ids, "one", -1), ids);
+	assert.deepEqual(helpers.moveItemBefore(ids, "three", "one"), ["three", "one", "two"]);
+	assert.deepEqual(ids, ["one", "two", "three"]);
+});
+
+test("web mutation attempts expose failures so local retry files can be retained", async () => {
+	const failure = new Error("stale revision");
+	assert.deepEqual(await helpers.attemptMutation(async () => Promise.reject(failure)), {
+		ok: false,
+		error: failure,
+	});
+	assert.deepEqual(await helpers.attemptMutation(async () => "updated"), {
+		ok: true,
+		value: "updated",
+	});
+});
+
+test("web helpers gate frozen state, reject stale events, and format bounded sizes", () => {
+	assert.equal(helpers.canMutate({ phase: "ready" }), true);
+	assert.equal(helpers.canMutate({ phase: "reserved" }), false);
+	assert.equal(helpers.canMutate({ phase: "closed" }), false);
+	const current = { batch: { revision: 4 }, marker: "current" };
+	assert.equal(
+		helpers.preferNewestState(current, { batch: { revision: 3 }, marker: "stale" }),
+		current,
+	);
+	assert.equal(
+		helpers.preferNewestState(current, { batch: { revision: 5 }, marker: "new" }).marker,
+		"new",
+	);
+	assert.equal(helpers.formatBytes(512), "512 B");
+	assert.equal(helpers.formatBytes(1536), "1.5 KB");
+	assert.equal(helpers.formatBytes(2 * 1024 * 1024), "2.0 MB");
+});

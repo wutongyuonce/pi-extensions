@@ -1,0 +1,10 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "outDir": ".test-dist",
+    "rootDir": ".",
+    "sourceMap": true
+  },
+  "include": ["index.ts", "config.ts", "render.ts", "tool-composition.ts", "pi-fff/**/*.ts", "test/**/*.test.ts"]
+}

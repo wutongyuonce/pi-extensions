@@ -1,0 +1,482 @@
+/**
+ * MCP OAuth Provider
+ * 
+ * Implementation of the MCP SDK's OAuthClientProvider interface.
+ * Handles OAuth client registration, token storage, and authorization redirection.
+ */
+
+import { UnauthorizedError } from "@modelcontextprotocol/client"
+import type {
+  AddClientAuthentication,
+  OAuthClientProvider,
+  OAuthClientMetadata,
+  OAuthDiscoveryState,
+  StoredOAuthClientInformation,
+  StoredOAuthTokens,
+} from "@modelcontextprotocol/client"
+import {
+  getAuthForUrl,
+  updateTokens,
+  updateClientInfo,
+  clearAllCredentials,
+  clearClientInfo,
+  clearCodeVerifier,
+  clearTokens,
+  type AuthStorageOptions,
+  type StoredTokens,
+  type StoredClientInfo,
+} from "./mcp-auth.ts"
+
+// Callback server configuration
+const DEFAULT_OAUTH_CALLBACK_PORT = 19876
+const DEFAULT_OAUTH_CALLBACK_PATH = "/callback"
+
+let configuredOAuthCallbackPort = DEFAULT_OAUTH_CALLBACK_PORT
+
+if (process.env.MCP_OAUTH_CALLBACK_PORT) {
+  const parsedPort = Number.parseInt(process.env.MCP_OAUTH_CALLBACK_PORT, 10)
+  if (Number.isInteger(parsedPort) && parsedPort > 0 && parsedPort <= 65535) {
+    configuredOAuthCallbackPort = parsedPort
+  }
+}
+
+let oauthCallbackPort = configuredOAuthCallbackPort
+let oauthCallbackPath = DEFAULT_OAUTH_CALLBACK_PATH
+
+export function getConfiguredOAuthCallbackPort(): number {
+  return configuredOAuthCallbackPort
+}
+
+export function getOAuthCallbackPort(): number {
+  return oauthCallbackPort
+}
+
+export function setOAuthCallbackPort(port: number): void {
+  oauthCallbackPort = port
+}
+
+export function getOAuthCallbackPath(): string {
+  return oauthCallbackPath
+}
+
+export function setOAuthCallbackPath(path: string): void {
+  oauthCallbackPath = path.startsWith("/") ? path : `/${path}`
+}
+
+/** Configuration options for OAuth */
+export interface McpOAuthConfig {
+  grantType?: "authorization_code" | "client_credentials"
+  clientId?: string
+  clientSecret?: string
+  scope?: string
+  redirectUri?: string
+  clientName?: string
+  clientUri?: string
+}
+
+/** Callbacks for OAuth flow interactions */
+export interface McpOAuthCallbacks {
+  onRedirect: (url: URL) => void | Promise<void>
+}
+
+/**
+ * OAuth provider implementation for MCP servers.
+ * Implements the OAuthClientProvider interface from the MCP SDK.
+ */
+export class McpOAuthProvider implements OAuthClientProvider {
+  private readonly redirectUrlSnapshot: string | undefined
+  private active = true
+  private flowClientInfo: StoredClientInfo | undefined
+  private flowCodeVerifier: string | undefined
+  private flowDiscoveryState: OAuthDiscoveryState | undefined
+  private flowState: string | undefined
+
+  constructor(
+    private serverName: string,
+    private serverUrl: string,
+    private config: McpOAuthConfig,
+    private callbacks: McpOAuthCallbacks,
+    private storageOptions: AuthStorageOptions = {},
+    private runtimeSignal?: AbortSignal,
+    initialState?: string,
+  ) {
+    this.flowState = initialState
+    this.redirectUrlSnapshot = config.grantType === "client_credentials"
+      ? undefined
+      : config.redirectUri ?? `http://localhost:${getOAuthCallbackPort()}${getOAuthCallbackPath()}`
+  }
+
+  private get usesClientCredentials(): boolean {
+    return this.config.grantType === "client_credentials"
+  }
+
+  deactivate(): void {
+    this.active = false
+  }
+
+  private throwIfInactive(): void {
+    if (!this.active) throw new Error("OAuth flow is no longer active")
+    this.runtimeSignal?.throwIfAborted()
+  }
+
+  /**
+   * The redirect URL for OAuth callbacks.
+   * This must match the redirect_uri in client metadata.
+   */
+  get redirectUrl(): string | undefined {
+    return this.redirectUrlSnapshot
+  }
+
+  /**
+   * Client metadata for dynamic registration.
+   * Describes this client to the OAuth authorization server.
+   */
+  get clientMetadata(): OAuthClientMetadata {
+    if (this.usesClientCredentials) {
+      return {
+        client_name: this.config.clientName ?? "Pi Coding Agent",
+        client_uri: this.config.clientUri ?? "https://github.com/nicobailon/pi-mcp-adapter",
+        redirect_uris: [],
+        grant_types: ["client_credentials"],
+        token_endpoint_auth_method: this.config.clientSecret ? "client_secret_post" : "none",
+      }
+    }
+
+    const redirectUrl = this.redirectUrl
+    if (!redirectUrl) {
+      throw new Error("redirectUrl is required for authorization_code flow")
+    }
+
+    return {
+      redirect_uris: [redirectUrl],
+      client_name: this.config.clientName ?? "Pi Coding Agent",
+      client_uri: this.config.clientUri ?? "https://github.com/nicobailon/pi-mcp-adapter",
+      grant_types: ["authorization_code", "refresh_token"],
+      response_types: ["code"],
+      token_endpoint_auth_method: this.config.clientSecret ? "client_secret_post" : "none",
+      ...(this.config.scope !== undefined ? { scope: this.config.scope } : {}),
+    }
+  }
+
+  /**
+   * Get client information (for pre-registered or dynamically registered clients).
+   * Returns undefined if no client info exists or if the server URL has changed.
+   */
+  async clientInformation(): Promise<StoredOAuthClientInformation | undefined> {
+    // Check config first (pre-registered client)
+    if (this.config.clientId) {
+      // Reuse a previously stamped issuer (SEP-2352) if the SDK re-saved
+      // this pre-registered client with one.
+      const stored = await getAuthForUrl(this.serverName, this.serverUrl, this.storageOptions)
+      const issuer = stored?.clientInfo?.clientId === this.config.clientId ? stored.clientInfo.issuer : undefined
+      return {
+        client_id: this.config.clientId,
+        client_secret: this.config.clientSecret,
+        ...(issuer !== undefined ? { issuer } : {}),
+      }
+    }
+
+    // Keep client registration associated with this in-flight flow even if
+    // another runtime writes the shared persistent entry for the same name.
+    const clientInfo = this.flowClientInfo ?? (await getAuthForUrl(this.serverName, this.serverUrl, this.storageOptions))?.clientInfo
+    if (clientInfo) {
+      // A stored SEP-2352 issuer stub for a config-pre-registered client
+      // (identified by the explicit marker, or by the legacy stub shape of
+      // {clientId, issuer} with no registration metadata) is only meaningful
+      // when the config supplies the matching client secret. Since we reach
+      // this branch only when config.clientId is absent, serving the stub
+      // would let a token refresh go out with a client_id but no secret,
+      // causing invalid_client and credential invalidation. Return undefined
+      // so callers treat this as "no client info".
+      const isConfigStub = clientInfo.configPreRegistered === true
+        || (clientInfo.clientSecret === undefined
+          && clientInfo.clientIdIssuedAt === undefined
+          && clientInfo.clientSecretExpiresAt === undefined
+          && clientInfo.redirectUris === undefined)
+      if (isConfigStub) {
+        return undefined
+      }
+      // Check if client secret has expired
+      if (clientInfo.clientSecretExpiresAt && clientInfo.clientSecretExpiresAt < Date.now() / 1000) {
+        return undefined
+      }
+      // Return all stored registration metadata so the SDK's SEP-2352 issuer
+      // stamp-and-resave (which round-trips clientInformation() back through
+      // saveClientInformation()) does not drop client_id_issued_at,
+      // client_secret_expires_at, or the registered redirect_uris.
+      return {
+        client_id: clientInfo.clientId,
+        client_secret: clientInfo.clientSecret,
+        ...(clientInfo.clientIdIssuedAt !== undefined
+          ? { client_id_issued_at: clientInfo.clientIdIssuedAt }
+          : {}),
+        ...(clientInfo.clientSecretExpiresAt !== undefined
+          ? { client_secret_expires_at: clientInfo.clientSecretExpiresAt }
+          : {}),
+        ...(clientInfo.redirectUris !== undefined
+          ? { redirect_uris: clientInfo.redirectUris }
+          : {}),
+        ...(clientInfo.issuer !== undefined ? { issuer: clientInfo.issuer } : {}),
+      }
+    }
+
+    // No client info or URL changed - will trigger dynamic registration
+    return undefined
+  }
+
+  /**
+   * Save client information from dynamic registration.
+   */
+  async saveClientInformation(info: StoredOAuthClientInformation): Promise<void> {
+    this.throwIfInactive()
+    // Pre-registered client from config: the SDK's SEP-2352 issuer stamp
+    // re-saves whatever clientInformation() returned. Persist only the
+    // issuer binding - never copy the config-supplied client secret into
+    // the on-disk auth store.
+    if (this.config.clientId && info.client_id === this.config.clientId) {
+      updateClientInfo(
+        this.serverName,
+        { clientId: info.client_id, issuer: info.issuer, configPreRegistered: true },
+        this.serverUrl,
+        this.storageOptions,
+      )
+      return
+    }
+
+    const redirectUris = ("redirect_uris" in info ? info.redirect_uris : undefined)
+      ?? (this.redirectUrl ? [this.redirectUrl] : undefined)
+    const clientInfo: StoredClientInfo = {
+      clientId: info.client_id,
+      clientSecret: info.client_secret,
+      clientIdIssuedAt: info.client_id_issued_at,
+      clientSecretExpiresAt: info.client_secret_expires_at,
+      redirectUris,
+      issuer: info.issuer,
+    }
+    this.flowClientInfo = clientInfo
+    updateClientInfo(this.serverName, clientInfo, this.serverUrl, this.storageOptions)
+  }
+
+  /**
+   * Get stored OAuth tokens.
+   * Returns undefined if no tokens exist or if the server URL has changed.
+   */
+  async tokens(): Promise<StoredOAuthTokens | undefined> {
+    // Use getAuthForUrl to validate tokens are for the current server URL
+    const entry = await getAuthForUrl(this.serverName, this.serverUrl, this.storageOptions)
+    if (!entry?.tokens) return undefined
+
+    return {
+      access_token: entry.tokens.accessToken,
+      token_type: "Bearer",
+      refresh_token: entry.tokens.refreshToken,
+      expires_in: entry.tokens.expiresAt
+        ? Math.max(0, Math.floor(entry.tokens.expiresAt - Date.now() / 1000))
+        : undefined,
+      scope: entry.tokens.scope,
+      ...(entry.tokens.issuer !== undefined ? { issuer: entry.tokens.issuer } : {}),
+    }
+  }
+
+  /**
+   * Save OAuth tokens.
+   */
+  async saveTokens(tokens: StoredOAuthTokens): Promise<void> {
+    const storedTokens: StoredTokens = {
+      accessToken: tokens.access_token,
+      refreshToken: tokens.refresh_token,
+      // Preserve expiry even when expires_in is 0 (e.g. the SDK re-saving an
+      // already-expired token) so expired tokens stay expired instead of
+      // being persisted as never-expiring.
+      expiresAt: tokens.expires_in !== undefined ? Date.now() / 1000 + tokens.expires_in : undefined,
+      scope: tokens.scope,
+      issuer: tokens.issuer,
+    }
+    this.throwIfInactive()
+    updateTokens(this.serverName, storedTokens, this.serverUrl, this.storageOptions)
+    // Discovery must survive the browser redirect so the callback can verify
+    // the authorization server that minted the code. Once token issuance
+    // succeeds, clear it so a later 401 re-reads PRM and can observe an
+    // authorization-server migration.
+    this.flowDiscoveryState = undefined
+  }
+
+  /**
+   * Redirect the user to the authorization URL.
+   * This opens the browser for the user to authenticate.
+   *
+   * Throws UnauthorizedError when called outside of a user-initiated flow
+   * (no oauthState saved by startAuth). That path is reached when the SDK
+   * falls through from a failed refresh into a fresh authorization_code
+   * flow, which library hosts cannot complete in-process.
+   */
+  async redirectToAuthorization(authorizationUrl: URL): Promise<void> {
+    if (this.usesClientCredentials) {
+      throw new Error("redirectToAuthorization is not used for client_credentials flow")
+    }
+    // No flow-local state means we're on the post-refresh authorize fallback.
+    this.throwIfInactive()
+    if (!this.flowState) {
+      throw new UnauthorizedError(
+        `Re-authentication required for MCP server: ${this.serverName}`,
+      )
+    }
+    // URL is passed to callback, not logged (may contain sensitive params)
+    await this.callbacks.onRedirect(authorizationUrl)
+  }
+
+  /**
+   * Save the PKCE code verifier.
+   */
+  async saveCodeVerifier(codeVerifier: string): Promise<void> {
+    this.throwIfInactive()
+    this.flowCodeVerifier = codeVerifier
+  }
+
+  /**
+   * Get the stored PKCE code verifier.
+   * @throws Error if no code verifier is stored
+   */
+  async codeVerifier(): Promise<string> {
+    if (this.usesClientCredentials) {
+      throw new Error("codeVerifier is not used for client_credentials flow")
+    }
+    this.throwIfInactive()
+    if (!this.flowCodeVerifier) {
+      throw new Error(`No code verifier saved for MCP server: ${this.serverName}`)
+    }
+    return this.flowCodeVerifier
+  }
+
+  /**
+   * Persist discovery with the same durability as the PKCE verifier. SDK v2
+   * reads this on the callback leg to prevent authorization-code mix-up.
+   */
+  async saveDiscoveryState(state: OAuthDiscoveryState): Promise<void> {
+    this.throwIfInactive()
+    this.flowDiscoveryState = structuredClone(state)
+  }
+
+  async discoveryState(): Promise<OAuthDiscoveryState | undefined> {
+    this.throwIfInactive()
+    return this.flowDiscoveryState ? structuredClone(this.flowDiscoveryState) : undefined
+  }
+
+  /**
+   * Save the OAuth state parameter for CSRF protection.
+   */
+  async saveState(state: string): Promise<void> {
+    this.throwIfInactive()
+    this.flowState = state
+  }
+
+  /**
+   * Get the stored OAuth state parameter.
+   * @throws UnauthorizedError if no flow is in progress (see redirectToAuthorization)
+   */
+  async state(): Promise<string> {
+    if (this.usesClientCredentials) {
+      throw new Error("state is not used for client_credentials flow")
+    }
+    this.throwIfInactive()
+    if (!this.flowState) {
+      throw new UnauthorizedError(
+        `Re-authentication required for MCP server: ${this.serverName}`,
+      )
+    }
+    return this.flowState
+  }
+
+  /**
+   * Invalidate credentials when authentication fails.
+   * Clears tokens, client info, or all credentials based on the type.
+   */
+  async invalidateCredentials(type: "all" | "client" | "tokens" | "verifier" | "discovery"): Promise<void> {
+    this.throwIfInactive()
+    switch (type) {
+      case "all":
+        this.flowClientInfo = undefined
+        this.flowCodeVerifier = undefined
+        this.flowDiscoveryState = undefined
+        this.flowState = undefined
+        clearAllCredentials(this.serverName, this.storageOptions)
+        break
+      case "client":
+        this.flowClientInfo = undefined
+        clearClientInfo(this.serverName, this.storageOptions)
+        break
+      case "tokens":
+        clearTokens(this.serverName, this.storageOptions)
+        break
+      case "verifier":
+        clearCodeVerifier(this.serverName, this.storageOptions)
+        break
+      case "discovery":
+        this.flowDiscoveryState = undefined
+        break
+    }
+  }
+
+  /**
+   * Adds configured authorization-code scope without replacing the SDK's
+   * default token endpoint authentication behavior.
+   */
+  addClientAuthentication: AddClientAuthentication = async (headers, params, _url, metadata) => {
+    this.throwIfInactive()
+    if (params.get("grant_type") === "authorization_code" && !params.has("scope") && this.config.scope) {
+      params.set("scope", this.config.scope)
+    }
+
+    const clientInfo = await this.clientInformation()
+    this.throwIfInactive()
+    if (!clientInfo) {
+      return
+    }
+
+    const supportedMethods = metadata?.token_endpoint_auth_methods_supported ?? []
+    const hasClientSecret = clientInfo.client_secret !== undefined
+    let authMethod: "client_secret_basic" | "client_secret_post" | "none"
+
+    if (supportedMethods.length === 0) {
+      authMethod = hasClientSecret ? "client_secret_post" : "none"
+    } else if (hasClientSecret && supportedMethods.includes("client_secret_basic")) {
+      authMethod = "client_secret_basic"
+    } else if (hasClientSecret && supportedMethods.includes("client_secret_post")) {
+      authMethod = "client_secret_post"
+    } else if (supportedMethods.includes("none")) {
+      authMethod = "none"
+    } else {
+      authMethod = hasClientSecret ? "client_secret_post" : "none"
+    }
+
+    if (authMethod === "client_secret_basic") {
+      if (!clientInfo.client_secret) {
+        throw new Error("client_secret_basic authentication requires a client_secret")
+      }
+      headers.set("Authorization", `Basic ${Buffer.from(`${clientInfo.client_id}:${clientInfo.client_secret}`).toString("base64")}`)
+      return
+    }
+
+    if (!params.has("client_id")) {
+      params.set("client_id", clientInfo.client_id)
+    }
+    if (authMethod === "client_secret_post" && clientInfo.client_secret && !params.has("client_secret")) {
+      params.set("client_secret", clientInfo.client_secret)
+    }
+  }
+
+  prepareTokenRequest(scope?: string): URLSearchParams | undefined {
+    if (!this.usesClientCredentials) {
+      return undefined
+    }
+
+    const params = new URLSearchParams({ grant_type: "client_credentials" })
+    const requestedScope = scope ?? this.config.scope
+    if (requestedScope) {
+      params.set("scope", requestedScope)
+    }
+    return params
+  }
+}
+
+export { DEFAULT_OAUTH_CALLBACK_PORT, DEFAULT_OAUTH_CALLBACK_PATH }

@@ -1,0 +1,53 @@
+# Repository Guidelines
+
+## Project Structure & Module Organization
+
+- `index.ts`: the entire pi extension (single-file, TypeScript loaded directly by `pi`)
+- `test/e2e.ts`: end-to-end tests that invoke `pi` as a subprocess
+- `README.md`: user-facing install/usage docs
+- `package.json`: metadata + **peer** dependencies (provided by the pi runtime)
+
+Runtime data lives outside the repo under `~/.pi/agent/memory/` (`MEMORY.md`, `SCRATCHPAD.md`, `daily/YYYY-MM-DD.md`).
+
+## Activity Tracking (Required)
+
+- Track all work sessions by writing a short entry to the pi-memory daily log using `memory_write` (target: `daily`).
+- Summaries should include what changed, files touched, and any notable decisions.
+- Use the scratchpad tool for follow-ups or TODOs discovered during work.
+
+## Build, Test, and Development Commands
+
+- `pi -p -e ./index.ts "remember: I prefer dark mode"`: manual local run (print mode)
+- `pi install .` (or from the parent folder: `pi install ./pi-memory`): install the extension into pi
+- `npm test`: run the fast unit suite (`bun test test/unit.test.ts`; no API key, no qmd)
+- `npm run test:e2e` (or `npx tsx test/e2e.ts`): run E2E tests (requires `pi` on PATH + a configured API key)
+- `npm run test:eval`: run the recall-effectiveness eval (requires `pi` + API key + qmd)
+- `npm run build`: typecheck with `tsc` (`--noEmit`)
+- `npm run lint`: lint with Biome
+- Optional (for `memory_search`, requires Bun): `command -v qmd >/dev/null 2>&1 || bun install -g https://github.com/tobi/qmd`
+- Optional search setup: `qmd collection add ~/.pi/agent/memory --name pi-memory && qmd embed`
+
+## Coding Style & Naming Conventions
+
+- Keep `index.ts` self-contained; avoid adding a build step unless absolutely necessary.
+- Match existing formatting: tabs for indentation, semicolons, and double quotes.
+- Naming: `camelCase` for functions, `PascalCase` for types, `SCREAMING_SNAKE_CASE` for constants; tool names remain `snake_case` (e.g. `memory_write`).
+
+## Testing Guidelines
+
+- Enforce TDD for every behavior change: follow `red -> green -> refactor`.
+- Start by establishing a verifiable baseline: run the relevant existing tests before edits, and record the exact command + outcome in the PR/commit notes.
+- Add or update a failing test first that reproduces the bug or captures the new requirement; implement code only after the test fails for the expected reason.
+- Keep tests green after implementation and after any refactor; do not merge with skipped failing tests.
+- Every bug fix must include a regression test that fails before the fix and passes after it.
+- Tests touch `~/.pi/agent/memory/`; ensure backups/restores remain intact and new tests don’t leak user data.
+- Prefer behavior-focused assertions (tool availability, file contents, cross-session recall). Keep timeouts generous for model latency.
+
+## Commit & Pull Request Guidelines
+
+- Use Conventional Commits (`feat:`, `fix:`, `docs:`, `chore:`) and keep messages imperative.
+- PRs: include a short summary, exact test command(s) run, and call out any changes to on-disk memory formats or `qmd` behavior.
+
+## Security & Configuration Tips
+
+- Never commit real memory files or secrets. Tests assume `pi` is configured via environment (e.g. `OPENAI_API_KEY`).

@@ -1,0 +1,48 @@
+name: Publish to npm
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    env:
+      NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          registry-url: "https://registry.npmjs.org"
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - run: npm ci
+      - name: Verify tag matches package.json version
+        shell: bash
+        run: |
+          case "$GITHUB_REF" in
+            refs/tags/v*) ;;
+            *)
+              echo "Publishing requires a v* tag ref; got $GITHUB_REF." >&2
+              echo "For manual runs, dispatch the workflow from the release tag." >&2
+              exit 1
+              ;;
+          esac
+          tag="${GITHUB_REF_NAME#v}"
+          pkg="$(node -p "require('./package.json').version")"
+          if [ "$tag" != "$pkg" ]; then
+            echo "Tag $GITHUB_REF_NAME does not match package.json version $pkg" >&2
+            exit 1
+          fi
+      - run: npm run lint
+      - run: npm run build
+      - run: npm test
+      - run: npm publish

@@ -1,0 +1,21 @@
+<section class="module" id="module-1">
+  <div class="module-content">
+    <div class="module-number">01</div><p class="eyebrow">先从一次真实调用出发</p>
+    <h1>它把一个 <span class="term" data-definition="扩展是由宿主程序加载、在宿主提供的 API 上运行的小程序。这里的宿主是 pi。">pi 扩展</span> 变成了子代理调度器</h1>
+    <p class="lead">用户或父代理调用 <code>Agent()</code>；扩展挑选配置、创建独立会话、持续显示状态，最后将结果送回父会话。它的核心不是“再调用一个模型”，而是把完整的代理运行时复制出一个受控实例。</p>
+    <div class="arch-diagram">
+      <div class="arch-zone"><h4 class="arch-zone-label">pi 宿主</h4><div class="arch-component" data-desc="唯一入口：注册 Agent、查询结果、转向和 /agents 命令。"><div class="arch-icon">①</div><span>index.ts</span></div></div>
+      <div class="arch-zone"><h4 class="arch-zone-label">调度层</h4><div class="arch-component" data-desc="保存 AgentRecord，执行队列、并发、停止、恢复与清理。"><div class="arch-icon">②</div><span>AgentManager</span></div></div>
+      <div class="arch-zone"><h4 class="arch-zone-label">运行时</h4><div class="arch-component" data-desc="把配置翻译为 pi 的 AgentSession：提示词、模型、工具、扩展与事件订阅。"><div class="arch-icon">③</div><span>runAgent</span></div></div>
+      <div class="arch-description" id="arch-desc">点击任一方块，查看其不可替代的职责</div>
+    </div>
+    <div class="flow-steps"><div class="flow-step"><div class="flow-step-num">1</div><p>调用 Agent 工具</p></div><div class="flow-arrow">→</div><div class="flow-step"><div class="flow-step-num">2</div><p>解析调用参数</p></div><div class="flow-arrow">→</div><div class="flow-step"><div class="flow-step-num">3</div><p>管理器建档/排队</p></div><div class="flow-arrow">→</div><div class="flow-step"><div class="flow-step-num">4</div><p>独立会话运行</p></div></div>
+    <div class="callout callout-accent"><div class="callout-icon">💡</div><div class="callout-content"><strong class="callout-title">读这类项目的诀窍</strong><p>不要从 2,399 行的 <code>index.ts</code> 逐行硬读。先画出“谁创建谁、谁持有状态、谁发事件”的主线，再回到局部函数。</p></div></div>
+    <div class="code-translation"><div class="translation-code"><div class="translation-label">真实源码 · package.json</div><pre><code>"pi": {
+  "extensions": [
+    "./src/index.ts"
+  ]
+}</code></pre></div><div class="translation-english"><div class="translation-label">逐行定位</div><div class="translation-lines"><div class="tl"><b>pi</b>：给宿主 pi 的专用清单。</div><div class="tl"><b>extensions</b>：要在启动时加载的扩展列表。</div><div class="tl"><b>index.ts</b>：本项目真正的启动入口；其他 src 文件都只是被它组织起来的部件。</div></div></div></div>
+    <div class="quiz-container" data-quiz="m1"><div class="quiz-question-block"><p class="quiz-question">你要新增“暂停排队中的任务”。第一处应该调查哪一层？</p><div class="quiz-options"><button class="quiz-option" data-value="a"><span class="quiz-option-radio"></span>UI 组件</button><button class="quiz-option" data-value="b"><span class="quiz-option-radio"></span>AgentManager 的 queue 与状态转换</button><button class="quiz-option" data-value="c"><span class="quiz-option-radio"></span>README 截图</button></div><div class="quiz-feedback"></div></div><button class="quiz-check-btn" data-answer="b" data-correct-text="对。排队是调度层的事实来源；UI 只展示它。" data-incorrect-text="先找拥有 queue 的 AgentManager。界面不应成为调度真相。">检查理解</button></div>
+  </div>
+</section>

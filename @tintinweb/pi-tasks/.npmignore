@@ -1,0 +1,28 @@
+# Development files
+tsconfig.json
+biome.json
+.vscode/
+.git/
+.gitignore
+
+# Documentation
+PLAN.md
+SUMMARY.md
+plan/
+media/
+
+# Build artifacts
+*.log
+npm-debug.log*
+.DS_Store
+
+# Tests (if any)
+test/
+tests/
+*.test.ts
+*.spec.ts
+
+.pi
+.claude
+.vscode
+.github

@@ -1,0 +1,18 @@
+<section class="module" id="module-4">
+  <div class="module-content"><div class="module-number">04</div><p class="eyebrow">真正运行前发生了什么</p><h2><code>runAgent()</code> 把抽象配置装配成一个独立 <span class="term" data-definition="会话是模型对话、工具集合、工作目录和事件流的运行容器。独立会话意味着子代理不会直接复用父代理的对话状态。">AgentSession</span></h2><p>它是本项目最重要的装配函数：选择有效 cwd，加载 extension 与 skill，解析模型和思考级别，限制工具，然后订阅流式事件并发送 prompt。</p>
+    <div class="step-cards"><div class="step-card"><div class="step-num">1</div><div class="step-body"><strong>装配输入</strong><p>合并类型配置、调用选项、父上下文与环境信息。</p></div></div><div class="step-card"><div class="step-num">2</div><div class="step-body"><strong>建立资源加载器</strong><p>按 extensions / skills / prompt_mode 过滤资源；隔离模式可全部关闭。</p></div></div><div class="step-card"><div class="step-num">3</div><div class="step-body"><strong>建会话并绑定扩展</strong><p>先构造工具边界，再允许延迟注册的扩展工具进入可见范围。</p></div></div><div class="step-card"><div class="step-num">4</div><div class="step-body"><strong>订阅事件后 prompt</strong><p>收集文本、工具活动、token、压缩与 turn 上限，结束时必定解绑。</p></div></div></div>
+    <div class="code-translation"><div class="translation-code"><div class="translation-label">真实源码 · src/agent-runner.ts</div><pre><code>const { session } = await createAgentSession(sessionOpts);
+
+session.setSessionName(
+  options.agentId ? `${baseSessionName}#${options.agentId.slice(0, 8)}` : baseSessionName,
+);
+
+await session.bindExtensions({
+  onError: (err) => {
+    options.onToolActivity?.({ type: "end", toolName: `extension-error:${err.extensionPath}` });
+  },
+});</code></pre></div><div class="translation-english"><div class="translation-label">逐行定位</div><div class="translation-lines"><div class="tl"><b>createAgentSession</b>：把前面拼好的 options 交给 pi，得到独立运行容器。</div><div class="tl"><b>setSessionName</b>：用类型和短 id 命名，便于日志、会话列表和问题追踪。</div><div class="tl"><b>bindExtensions</b>：触发扩展的初始化；错误转换成工具活动，让 UI 与调用者看得见。</div></div></div></div>
+    <div class="pattern-cards"><div class="pattern-card"><div class="pattern-icon">🧰</div><h4>工具作用域</h4><p><code>tools</code> 决定允许哪些工具；<code>extensions</code> 决定哪些扩展会加载。两者刻意分离。</p></div><div class="pattern-card"><div class="pattern-icon">🧠</div><h4>上下文继承</h4><p>仅在请求时把父会话摘要前置到任务，不等于共享同一个会话对象。</p></div><div class="pattern-card"><div class="pattern-icon">📡</div><h4>事件订阅</h4><p>运行器把底层事件转成上层可消费的回调，管理器无需知道 pi 内部细节。</p></div></div>
+    <div class="quiz-container" data-quiz="m4"><div class="quiz-question-block"><p class="quiz-question">一个 MCP 工具在会话创建后才注册。为何不能只在开始时把工具名快照成 allowlist？</p><div class="quiz-options"><button class="quiz-option" data-value="a"><span class="quiz-option-radio"></span>因为 UI 需要更多颜色</button><button class="quiz-option" data-value="b"><span class="quiz-option-radio"></span>晚到工具会永久被拒绝，必须以持续生效的范围规则处理</button><button class="quiz-option" data-value="c"><span class="quiz-option-radio"></span>因为 TypeScript 不支持数组</button></div><div class="quiz-feedback"></div></div><button class="quiz-check-btn" data-answer="b" data-correct-text="对。注释明确指出扩展可以异步注册；范围规则必须覆盖“现在”和“以后”。" data-incorrect-text="问题是动态注册时机，不是界面或语言能力。">检查理解</button></div>
+  </div>
+</section>

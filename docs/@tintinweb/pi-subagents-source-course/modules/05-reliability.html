@@ -1,0 +1,18 @@
+<section class="module" id="module-5">
+  <div class="module-content"><div class="module-number">05</div><p class="eyebrow">把失败变成可解释状态</p><h2>可靠性不是一个 try/catch，而是一组明确边界</h2><p>这个项目将风险分散在专门模块：工作树隔离、内存路径安全、调度持久化锁、输出转录、模型范围与生命周期错误归类。每个模块只保护一种资源或约束。</p>
+    <div class="icon-rows"><div class="icon-row"><div class="icon-circle">🌳</div><div><strong>worktree.ts</strong><p>用临时 git worktree 隔离变更；完成后清理，若有更改则保留分支。</p></div></div><div class="icon-row"><div class="icon-circle">🗂️</div><div><strong>memory.ts</strong><p>拒绝危险名称与符号链接，避免代理记忆文件逃逸到非预期路径。</p></div></div><div class="icon-row"><div class="icon-circle">🔐</div><div><strong>schedule-store.ts</strong><p>JSON 存储配 PID 锁，避免同一会话的多个进程互相覆盖任务。</p></div></div><div class="icon-row"><div class="icon-circle">📜</div><div><strong>output-file.ts</strong><p>把流式对话写为 JSONL 转录，且可由配置关闭。</p></div></div></div>
+    <div class="code-translation"><div class="translation-code"><div class="translation-label">真实源码 · src/memory.ts</div><pre><code>export function isUnsafeName(name: string): boolean {
+  return name.includes("/") || name.includes("\\") || name === "." || name === "..";
+}
+
+export function isSymlink(filePath: string): boolean {
+  try {
+    return lstatSync(filePath).isSymbolicLink();
+  } catch {
+    return false;
+  }
+}</code></pre></div><div class="translation-english"><div class="translation-label">逐行定位</div><div class="translation-lines"><div class="tl"><b>isUnsafeName</b>：把路径分隔符和 . / .. 当作不安全输入，阻止目录穿越。</div><div class="tl"><b>lstatSync</b>：检查“链接本身”，不会跟随链接；这正是识别符号链接所需的语义。</div><div class="tl"><b>catch → false</b>：不存在的文件不是链接；调用者可继续按普通缺失文件处理。</div></div></div></div>
+    <div class="callout callout-warning"><div class="callout-icon">⚠️</div><div class="callout-content"><strong class="callout-title">不要把“失败”压成一个状态</strong><p><code>aborted</code>、<code>stopped</code>、<code>error</code>、<code>steered</code> 的含义不同。保留差异，UI、通知与重试策略才不会说谎。</p></div></div>
+    <div class="quiz-container" data-quiz="m5"><div class="quiz-question-block"><p class="quiz-question">代理可写“记忆”文件。你发现 agentName 可以包含 <code>../</code>。最合适的修复位置是？</p><div class="quiz-options"><button class="quiz-option" data-value="a"><span class="quiz-option-radio"></span>只在 UI 输入框禁用一个字符</button><button class="quiz-option" data-value="b"><span class="quiz-option-radio"></span>在 memory 路径构造前统一验证名称</button><button class="quiz-option" data-value="c"><span class="quiz-option-radio"></span>在 README 警告用户</button></div><div class="quiz-feedback"></div></div><button class="quiz-check-btn" data-answer="b" data-correct-text="对。路径构造模块才是所有入口共享的安全边界。" data-incorrect-text="输入层可能被绕过；安全校验应离危险操作最近。">检查理解</button></div>
+  </div>
+</section>

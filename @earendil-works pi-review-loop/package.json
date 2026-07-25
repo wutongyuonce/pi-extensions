@@ -1,0 +1,45 @@
+{
+  "name": "pi-review-loop",
+  "version": "0.3.0",
+  "description": "A persistent incremental diff review loop for pi",
+  "type": "module",
+  "license": "MIT",
+  "repository": "github:earendil-works/pi-review-loop",
+  "files": [
+    "src",
+    "web/dist",
+    "types",
+    "README.md",
+    "LICENSE"
+  ],
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "scripts": {
+    "build:web": "node scripts/build-web.mjs",
+    "check": "tsc --noEmit",
+    "test": "node --import tsx --test test/*.test.ts",
+    "build": "npm run build:web && npm run check",
+    "prepublishOnly": "npm run build && npm test"
+  },
+  "dependencies": {
+    "chokidar": "^5.0.0",
+    "glimpseui": "^0.8.1"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@types/node": "^24.5.2",
+    "esbuild": "^0.28.1",
+    "monaco-editor": "^0.56.0",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.2"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
