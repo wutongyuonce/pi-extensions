@@ -1,0 +1,7 @@
+id: prefer-string-is-empty
+valid:
+  - 'if (value.isEmpty()) return;'
+  - 'if (value.length() == 1) return;'
+invalid:
+  - 'if (value.length() == 0) return;'
+  - 'if (value.equals("")) return;'

@@ -1,0 +1,11 @@
+if [ -n "$PI_LENS_SKIP_HOOKS" ]; then
+  echo "[pre-push] skipped (PI_LENS_SKIP_HOOKS is set)."
+  exit 0
+fi
+
+# Bounds how long a push waits on the shared machine-wide test-suite lock
+# (#1101, ~10 agents can share one dev machine). pre-push-targeted-tests.mjs
+# treats a lock timeout as "let the push proceed, CI is authoritative" —
+# never as a hard failure.
+export PI_LENS_TEST_LOCK_TIMEOUT_MS=120000
+node scripts/pre-push-targeted-tests.mjs

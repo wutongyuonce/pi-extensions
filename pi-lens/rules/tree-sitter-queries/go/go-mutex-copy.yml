@@ -1,0 +1,60 @@
+id: go-mutex-copy
+name: Mutex Copied by Value
+severity: warning
+category: concurrency
+defect_class: correctness
+inline_tier: blocking
+language: go
+
+message: "sync.Mutex parameter taken by value — the callee locks a copy; take *sync.Mutex instead"
+
+description: |
+  A sync.Mutex must never be copied after first use. Copying a mutex copies
+  its internal state, so both copies appear unlocked even if the original
+  was locked — leading to data races and deadlocks.
+
+  This fires on a parameter declared as a bare `sync.Mutex`/`sync.RWMutex`
+  value: the call copies the lock, so the callee locks its own copy. Copies
+  through a struct that embeds a mutex (a value receiver, or a struct-typed
+  parameter) are NOT detected — that needs the struct definition, which this
+  single-file query cannot resolve.
+
+  ✅ FIX: take the mutex as *sync.Mutex, or reach it through a pointer receiver.
+
+  ❌ NEVER:
+    func work(mu sync.Mutex) { mu.Lock() }  // locks a copy!
+
+  ✅ SAFE:
+    func work(mu *sync.Mutex) { mu.Lock() }
+
+query: |
+  (parameter_declaration
+    type: (qualified_type
+      package: (package_identifier) @PKG
+      name: (type_identifier) @FN)
+    (#eq? @PKG "sync")
+    (#match? @FN "^(Mutex|RWMutex)$")) @DECL
+
+metavars:
+  - PKG
+  - FN
+  - DECL
+
+has_fix: false
+
+tags:
+  - go
+  - concurrency
+  - mutex
+  - correctness
+
+examples:
+  bad: |
+    func doWork(mu sync.Mutex) {   // BAD - mu is a copy
+        mu.Lock()
+    }
+
+  good: |
+    func doWork(mu *sync.Mutex) {
+        mu.Lock()
+    }

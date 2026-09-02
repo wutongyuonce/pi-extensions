@@ -1,0 +1,745 @@
+name: Publish
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to publish, e.g. 0.11.1 or 0.12.0"
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      NPM_CONFIG_REGISTRY: https://registry.npmjs.org
+      NPM_CONFIG_TAG: latest
+    outputs:
+      package-sha: ${{ steps.package.outputs.package-sha }}
+      release-tree: ${{ steps.package.outputs.release-tree }}
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+        with:
+          node-version: 24
+          package-manager-cache: false
+
+      - name: Bootstrap private npm config
+        run: |
+          set -euo pipefail
+          umask 077
+          test -n "${RUNNER_TEMP:-}"
+          test -d "$RUNNER_TEMP"
+          test -n "${GITHUB_WORKSPACE:-}"
+          case "$RUNNER_TEMP" in
+            "$GITHUB_WORKSPACE"|"$GITHUB_WORKSPACE"/*|"$PWD"|"$PWD"/*)
+              echo "RUNNER_TEMP must be outside checkout and package roots" >&2
+              exit 1
+              ;;
+          esac
+          export NPM_CONFIG_USERCONFIG="$RUNNER_TEMP/pi-workflow-npmrc"
+          export NPM_CONFIG_GLOBALCONFIG="$RUNNER_TEMP/pi-workflow-global-npmrc"
+          export NPM_CONFIG_REGISTRY="https://registry.npmjs.org"
+          export NPM_CONFIG_TAG="latest"
+          printf '%s\n' 'registry=https://registry.npmjs.org/' 'tag=latest' > "$NPM_CONFIG_USERCONFIG"
+          printf '%s\n' 'registry=https://registry.npmjs.org/' > "$NPM_CONFIG_GLOBALCONFIG"
+          {
+            printf 'NPM_CONFIG_USERCONFIG=%s\n' "$NPM_CONFIG_USERCONFIG"
+            printf 'NPM_CONFIG_GLOBALCONFIG=%s\n' "$NPM_CONFIG_GLOBALCONFIG"
+            printf 'NPM_CONFIG_REGISTRY=%s\n' "$NPM_CONFIG_REGISTRY"
+            printf 'NPM_CONFIG_TAG=%s\n' "$NPM_CONFIG_TAG"
+          } >> "$GITHUB_ENV"
+
+      - name: Show Node/npm versions
+        run: |
+          set -euo pipefail
+          test ! -e .npmrc
+          node --version
+          npm --version
+
+      - name: Validate already-versioned release source
+        id: version
+        env:
+          TARGET_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if ! [[ "$TARGET_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "version must be an exact semver without a v prefix" >&2
+            exit 1
+          fi
+          test "$(git rev-parse HEAD)" = "${{ github.sha }}"
+          test "$(node -p "require('./package.json').name")" = "@agwab/pi-workflow"
+          test "$(node -p "require('./package.json').version")" = "$TARGET_VERSION"
+          test "$(node -p "require('./package-lock.json').version")" = "$TARGET_VERSION"
+          tag_ref="refs/tags/v$TARGET_VERSION"
+          tag_refs="$(git ls-remote origin "$tag_ref" "$tag_ref^{}")"
+          dereferenced_tag="$(printf '%s\n' "$tag_refs" | awk -v ref="$tag_ref" '
+            BEGIN { peeled_ref = ref "^{}" }
+            NF == 0 { next }
+            NF != 2 { invalid = 1; next }
+            $2 == peeled_ref { peeled_sha = $1; peeled_count++; next }
+            $2 == ref { direct_sha = $1; direct_count++; next }
+            { invalid = 1 }
+            END {
+              if (invalid || direct_count != 1 || peeled_count > 1 || (peeled_count == 1 && !peeled_sha)) exit 1
+              if (peeled_count == 1) print peeled_sha
+              else print direct_sha
+            }')"
+          test "$dereferenced_tag" = "${{ github.sha }}"
+          echo "version=$TARGET_VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Install locked dependencies without lifecycle scripts
+        run: npm ci --legacy-peer-deps --ignore-scripts --registry https://registry.npmjs.org
+
+      - name: Release validation in read-only privilege context
+        env:
+          PI_WORKFLOW_ALLOW_PUBLISHED_VERSION: "1"
+        run: npm run release:check
+
+      - name: Create exact package and source-tree metadata
+        id: package
+        env:
+          TARGET_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          test ! -e .npmrc
+          git diff --exit-code
+          git diff --cached --exit-code
+          test -z "$(git ls-files --others --exclude-standard)"
+          release_tree="$(git rev-parse HEAD^{tree})"
+
+          pack_json_file="$(mktemp)"
+          cleanup_pack_json() { rm -f "$pack_json_file"; }
+          trap cleanup_pack_json EXIT
+          npm pack --ignore-scripts --registry https://registry.npmjs.org --tag latest --json > "$pack_json_file"
+          package_file="$(node -e 'const fs=require("node:fs"); const [p]=JSON.parse(fs.readFileSync(process.argv[1], "utf8")); process.stdout.write(p.filename)' "$pack_json_file")"
+          expected_file="agwab-pi-workflow-$TARGET_VERSION.tgz"
+          test "$package_file" = "$expected_file"
+          test -f "$expected_file"
+          test "$(find . -maxdepth 1 -type f -name '*.tgz' -print | wc -l | tr -d ' ')" = "1"
+          package_sha="$(sha256sum "$expected_file" | awk '{print $1}')"
+          echo "package-sha=$package_sha" >> "$GITHUB_OUTPUT"
+          echo "release-tree=$release_tree" >> "$GITHUB_OUTPUT"
+
+          export PACKAGE_FILE="$expected_file"
+          export PACKAGE_SHA="$package_sha"
+          export PACKAGE_PATH="$PWD/$expected_file"
+          export BASE_SHA="${{ github.sha }}"
+          export RELEASE_TREE="$release_tree"
+          export SOURCE_REPOSITORY="$GITHUB_REPOSITORY"
+          node <<'NODE'
+          const fs = require('node:fs');
+          const crypto = require('node:crypto');
+          const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+          if (JSON.stringify(pkg.publishConfig) !== '{"access":"public"}') throw new Error('source publishConfig is not exact');
+          const packageIntegrity = `sha512-${crypto.createHash('sha512').update(fs.readFileSync(process.env.PACKAGE_PATH)).digest('base64')}`;
+          fs.writeFileSync('release-metadata.json', `${JSON.stringify({
+            schema: 'pi-workflow-release-metadata-v3',
+            name: '@agwab/pi-workflow',
+            version: process.env.TARGET_VERSION,
+            sourceRepository: process.env.SOURCE_REPOSITORY,
+            sourceCommit: process.env.BASE_SHA,
+            releaseCommit: process.env.BASE_SHA,
+            releaseTree: process.env.RELEASE_TREE,
+            packageFile: process.env.PACKAGE_FILE,
+            packageSha256: process.env.PACKAGE_SHA,
+            packageIntegrity,
+          }, null, 2)}\n`);
+          NODE
+
+          packed_config="$(tar -xOf "$expected_file" package/package.json | node --input-type=commonjs -e 'const fs=require("node:fs"); const p=JSON.parse(fs.readFileSync(0,"utf8")); process.stdout.write(JSON.stringify(p.publishConfig));')"
+          test "$packed_config" = '{"access":"public"}'
+          if tar -tzf "$expected_file" | grep -Eq '(^|/)\.npmrc$'; then
+            echo "package contains .npmrc" >&2
+            exit 1
+          fi
+
+      - name: Upload exact release artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-artifact
+          path: |
+            release-metadata.json
+            agwab-pi-workflow-${{ steps.version.outputs.version }}.tgz
+          if-no-files-found: error
+          retention-days: 7
+
+  source:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: none
+    outputs:
+      release-commit: ${{ steps.verify.outputs.release-commit }}
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify promoted release source identity
+        id: verify
+        env:
+          EXPECTED_RELEASE_TREE: ${{ needs.build.outputs.release-tree }}
+          TARGET_VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "${{ github.sha }}"
+          test "$(git rev-parse HEAD^{tree})" = "$EXPECTED_RELEASE_TREE"
+          test "$(git ls-remote origin refs/heads/main | awk '{print $1}')" = "${{ github.sha }}"
+          tag_ref="refs/tags/v$TARGET_VERSION"
+          tag_refs="$(git ls-remote origin "$tag_ref" "$tag_ref^{}")"
+          dereferenced_tag="$(printf '%s\n' "$tag_refs" | awk -v ref="$tag_ref" '
+            BEGIN { peeled_ref = ref "^{}" }
+            NF == 0 { next }
+            NF != 2 { invalid = 1; next }
+            $2 == peeled_ref { peeled_sha = $1; peeled_count++; next }
+            $2 == ref { direct_sha = $1; direct_count++; next }
+            { invalid = 1 }
+            END {
+              if (invalid || direct_count != 1 || peeled_count > 1 || (peeled_count == 1 && !peeled_sha)) exit 1
+              if (peeled_count == 1) print peeled_sha
+              else print direct_sha
+            }')"
+          test "$dereferenced_tag" = "${{ github.sha }}"
+          echo "release-commit=${{ github.sha }}" >> "$GITHUB_OUTPUT"
+
+  publish:
+    needs: [build, source]
+    runs-on: ubuntu-latest
+    environment: npm-publish
+    permissions:
+      actions: read
+      contents: read
+      id-token: write
+    env:
+      NPM_CONFIG_REGISTRY: https://registry.npmjs.org
+      NPM_CONFIG_TAG: latest
+    steps:
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+        with:
+          node-version: 24
+          package-manager-cache: false
+
+      - name: Bootstrap private npm config
+        run: |
+          set -euo pipefail
+          umask 077
+          test -n "${RUNNER_TEMP:-}"
+          test -d "$RUNNER_TEMP"
+          test -n "${GITHUB_WORKSPACE:-}"
+          case "$RUNNER_TEMP" in
+            "$GITHUB_WORKSPACE"|"$GITHUB_WORKSPACE"/*|"$PWD"|"$PWD"/*)
+              echo "RUNNER_TEMP must be outside checkout and package roots" >&2
+              exit 1
+              ;;
+          esac
+          export NPM_CONFIG_USERCONFIG="$RUNNER_TEMP/pi-workflow-npmrc"
+          export NPM_CONFIG_GLOBALCONFIG="$RUNNER_TEMP/pi-workflow-global-npmrc"
+          export NPM_CONFIG_REGISTRY="https://registry.npmjs.org"
+          export NPM_CONFIG_TAG="latest"
+          printf '%s\n' 'registry=https://registry.npmjs.org/' 'tag=latest' > "$NPM_CONFIG_USERCONFIG"
+          printf '%s\n' 'registry=https://registry.npmjs.org/' > "$NPM_CONFIG_GLOBALCONFIG"
+          {
+            printf 'NPM_CONFIG_USERCONFIG=%s\n' "$NPM_CONFIG_USERCONFIG"
+            printf 'NPM_CONFIG_GLOBALCONFIG=%s\n' "$NPM_CONFIG_GLOBALCONFIG"
+            printf 'NPM_CONFIG_REGISTRY=%s\n' "$NPM_CONFIG_REGISTRY"
+            printf 'NPM_CONFIG_TAG=%s\n' "$NPM_CONFIG_TAG"
+          } >> "$GITHUB_ENV"
+
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: release-artifact
+          path: release-artifact
+
+      - name: Publish exact promoted tarball and record registry envelopes
+        env:
+          BUILD_PACKAGE_SHA: ${{ needs.build.outputs.package-sha }}
+          RELEASE_COMMIT: ${{ needs.source.outputs.release-commit }}
+          TARGET_VERSION: ${{ needs.build.outputs.version }}
+          NPM_PACKAGE: "@agwab/pi-workflow"
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          umask 077
+          verify_release_tag() {
+            tag_name="v$TARGET_VERSION"
+            tag_ref="refs/tags/v$TARGET_VERSION"
+            ref_json="$(gh api --method GET "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag_name")"
+            tag_object_type="$(printf '%s' "$ref_json" | jq -r '.object.type')"
+            tag_object_sha="$(printf '%s' "$ref_json" | jq -r '.object.sha')"
+            test "$tag_object_sha" != "null"
+            test "$tag_object_sha" != ""
+            case "$tag_object_type" in
+              commit) dereferenced_tag="$tag_object_sha" ;;
+              tag) dereferenced_tag="$(gh api --method GET "repos/$GITHUB_REPOSITORY/git/tags/$tag_object_sha" --jq '.object.sha')" ;;
+              *) echo "unsupported GitHub tag object type: $tag_object_type" >&2; exit 1 ;;
+            esac
+            test "$dereferenced_tag" != ""
+            test "$dereferenced_tag" != "null"
+            test "$dereferenced_tag" = "$RELEASE_COMMIT"
+
+            rulesets_json="$(gh api --method GET --paginate --slurp "repos/$GITHUB_REPOSITORY/rulesets")"
+            active_ruleset_ids="$(RULESETS_JSON="$rulesets_json" node --input-type=module <<'NODE'
+          const raw = process.env.RULESETS_JSON;
+          let pages;
+          try { pages = JSON.parse(raw); } catch (error) { throw new Error(`rulesets response is not valid JSON: ${error.message}`); }
+          if (!Array.isArray(pages) || pages.length === 0 || pages.some((page) => !Array.isArray(page) || page.length === 0)) throw new Error('rulesets response must contain non-empty pages');
+          const summaries = pages.flat();
+          const ids = new Set();
+          for (const entry of summaries) {
+            if (!entry || typeof entry !== 'object' || Array.isArray(entry) || !Number.isSafeInteger(entry.id) || entry.id <= 0 || typeof entry.target !== 'string' || typeof entry.enforcement !== 'string') throw new Error('rulesets response contains a malformed summary');
+            if (ids.has(entry.id)) throw new Error(`rulesets response contains duplicate id ${entry.id}`);
+            ids.add(entry.id);
+          }
+          const activeTags = summaries.filter((entry) => entry.enforcement === 'active' && entry.target === 'tag');
+          if (activeTags.length === 0) throw new Error('no active tag ruleset was returned');
+          process.stdout.write(activeTags.map((entry) => String(entry.id)).join('\n'));
+          NODE
+          )"
+            matched_ruleset=0
+            while IFS= read -r ruleset_id; do
+              test "$ruleset_id" != ""
+              ruleset_json="$(gh api --method GET "repos/$GITHUB_REPOSITORY/rulesets/$ruleset_id")"
+              ruleset_match="$(RULESET_ID="$ruleset_id" RULESET_JSON="$ruleset_json" TAG_REF="$tag_ref" node --input-type=module <<'NODE'
+          const raw = process.env.RULESET_JSON;
+          const expectedId = Number(process.env.RULESET_ID);
+          const tagRef = process.env.TAG_REF;
+          let ruleset;
+          try { ruleset = JSON.parse(raw); } catch (error) { throw new Error(`ruleset detail is not valid JSON: ${error.message}`); }
+          if (!ruleset || typeof ruleset !== 'object' || Array.isArray(ruleset) || !Number.isSafeInteger(expectedId) || expectedId <= 0 || ruleset.id !== expectedId || ruleset.enforcement !== 'active' || ruleset.target !== 'tag') throw new Error('ruleset detail is not an exact active tag ruleset');
+          const refName = ruleset.conditions?.ref_name;
+          if (!refName || typeof refName !== 'object' || Array.isArray(refName) || !Array.isArray(refName.include) || !Array.isArray(refName.exclude) || refName.include.length === 0 || refName.include.some((pattern) => typeof pattern !== 'string' || pattern.length === 0) || refName.exclude.some((pattern) => typeof pattern !== 'string' || pattern.length === 0)) throw new Error('ruleset ref_name conditions are malformed');
+          if (!Array.isArray(ruleset.rules) || ruleset.rules.length === 0 || ruleset.rules.some((rule) => !rule || typeof rule !== 'object' || Array.isArray(rule) || typeof rule.type !== 'string' || rule.type.length === 0)) throw new Error('ruleset rules are malformed');
+          const escape = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+          const globRegex = (pattern) => {
+            let expression = '^';
+            for (let index = 0; index < pattern.length; index++) {
+              const character = pattern[index];
+              if (character === '*') {
+                if (pattern[index + 1] === '*') index++;
+                expression += pattern[index - 1] === '*' ? '.*' : '[^/]*';
+              } else if (character === '?') expression += '[^/]';
+              else expression += escape(character);
+            }
+            return new RegExp(`${expression}$`);
+          };
+          const included = refName.include.some((pattern) => globRegex(pattern).test(tagRef));
+          const excluded = refName.exclude.some((pattern) => globRegex(pattern).test(tagRef));
+          const ruleTypes = new Set(ruleset.rules.map((rule) => rule.type));
+          process.stdout.write(included && !excluded && ruleTypes.has('deletion') && ruleTypes.has('non_fast_forward') ? 'true' : 'false');
+          NODE
+              )"
+              if [ "$ruleset_match" = "true" ]; then
+                matched_ruleset=1
+              fi
+            done <<< "$active_ruleset_ids"
+            test "$matched_ruleset" = "1"
+          }
+          # registry visibility retry start
+          registry_error_is_permanent() {
+            grep -Eiq 'npm (ERR!|error) code (E401|E403|EINTEGRITY)|npm (ERR!|error) (401|403)([^0-9]|$)' "$1"
+          }
+          registry_error_is_retryable() {
+            grep -Eiq 'npm (ERR!|error) code (E404|E408|E425|E429|E5[0-9][0-9]|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|ENETUNREACH|EHOSTUNREACH|ENOTFOUND|EPIPE)|npm (ERR!|error) (404|408|425|429|5[0-9][0-9])([^0-9]|$)' "$1"
+          }
+          observe_registry_until_visible() {
+            metadata_output="$1"
+            tags_output="$2"
+            metadata_tmp="${metadata_output}.tmp"
+            tags_tmp="${tags_output}.tmp"
+            max_attempts=30
+            attempt=1
+            last_reason="registry state is not visible"
+            while [ "$attempt" -le "$max_attempts" ]; do
+              rm -f "$metadata_tmp" "$tags_tmp"
+              : > "$publication_error"
+              set +e
+              npm view "$NPM_PACKAGE@$TARGET_VERSION" name version dist --registry https://registry.npmjs.org --tag latest --json > "$metadata_tmp" 2> "$publication_error"
+              metadata_status=$?
+              set -e
+              if [ "$metadata_status" -ne 0 ]; then
+                if registry_error_is_permanent "$publication_error" || ! registry_error_is_retryable "$publication_error"; then
+                  cat "$publication_error" >&2
+                  return "$metadata_status"
+                fi
+                last_reason="package metadata is not visible"
+              else
+                if ! node -e 'const fs=require("node:fs"); const value=JSON.parse(fs.readFileSync(process.argv[1],"utf8")); const keys=Object.keys(value).sort(); if (JSON.stringify(keys)!=="[\"dist\",\"name\",\"version\"]" || value.name!==process.argv[2] || value.version!==process.argv[3] || !value.dist || typeof value.dist!=="object" || Array.isArray(value.dist)) throw new Error("registry package metadata identity is malformed");' "$metadata_tmp" "$NPM_PACKAGE" "$TARGET_VERSION"; then
+                  echo "registry returned a conflicting package identity" >&2
+                  return 1
+                fi
+                : > "$publication_error"
+                set +e
+                npm view "$NPM_PACKAGE" dist-tags --registry https://registry.npmjs.org --tag latest --json > "$tags_tmp" 2> "$publication_error"
+                tags_status=$?
+                set -e
+                if [ "$tags_status" -ne 0 ]; then
+                  if registry_error_is_permanent "$publication_error" || ! registry_error_is_retryable "$publication_error"; then
+                    cat "$publication_error" >&2
+                    return "$tags_status"
+                  fi
+                  last_reason="dist-tags are not visible"
+                else
+                  set +e
+                  node -e 'const fs=require("node:fs"); const value=JSON.parse(fs.readFileSync(process.argv[1],"utf8")); const keys=Object.keys(value); if (keys.length!==1 || keys[0]!=="latest" || typeof value.latest!=="string") throw new Error("registry dist-tags identity is malformed"); process.exit(value.latest===process.argv[2] ? 0 : 75);' "$tags_tmp" "$TARGET_VERSION"
+                  tags_state=$?
+                  set -e
+                  case "$tags_state" in
+                    0)
+                      mv "$metadata_tmp" "$metadata_output"
+                      mv "$tags_tmp" "$tags_output"
+                      return 0
+                      ;;
+                    75) last_reason="latest dist-tag has not converged" ;;
+                    *) echo "registry returned malformed dist-tags" >&2; return "$tags_state" ;;
+                  esac
+                fi
+              fi
+              if [ "$attempt" -eq "$max_attempts" ]; then
+                test ! -s "$publication_error" || cat "$publication_error" >&2
+                echo "$last_reason after $max_attempts attempts" >&2
+                return 1
+              fi
+              delay_seconds=$((attempt < 6 ? attempt * 2 : 10))
+              echo "$last_reason (attempt $attempt/$max_attempts); retrying in ${delay_seconds}s" >&2
+              sleep "$delay_seconds"
+              attempt=$((attempt + 1))
+            done
+          }
+          # registry visibility retry end
+          test ! -e .npmrc
+          expected_file="agwab-pi-workflow-$TARGET_VERSION.tgz"
+          package_path="$PWD/release-artifact/$expected_file"
+          test -f "$package_path"
+          test "$(find release-artifact -maxdepth 1 -type f -name '*.tgz' -print | wc -l | tr -d ' ')" = "1"
+          actual_sha="$(sha256sum "$package_path" | awk '{print $1}')"
+          test "$actual_sha" = "$BUILD_PACKAGE_SHA"
+          metadata=release-artifact/release-metadata.json
+          test "$(node -p "require('./$metadata').schema")" = "pi-workflow-release-metadata-v3"
+          test "$(node -p "require('./$metadata').name")" = "$NPM_PACKAGE"
+          test "$(node -p "require('./$metadata').version")" = "$TARGET_VERSION"
+          test "$(node -p "require('./$metadata').packageFile")" = "$expected_file"
+          test "$(node -p "require('./$metadata').packageSha256")" = "$BUILD_PACKAGE_SHA"
+
+          publication_before=publication-before.json
+          publication_error="$(mktemp)"
+          cleanup_publication() { rm -f "$publication_error" publication-after.json.tmp dist-tags.json.tmp; }
+          trap cleanup_publication EXIT
+          set +e
+          npm view "$NPM_PACKAGE@$TARGET_VERSION" name version dist --registry https://registry.npmjs.org --tag latest --json > "$publication_before" 2> "$publication_error"
+          view_status=$?
+          set -e
+          if [ "$view_status" -ne 0 ]; then
+            if ! grep -Eiq 'npm (ERR!|error) code E404' "$publication_error"; then
+              cat "$publication_error" >&2
+              exit "$view_status"
+            fi
+            printf '{"name":%s,"version":%s,"dist":null}\n' "$(node -p 'JSON.stringify(process.env.NPM_PACKAGE)')" "$(node -p 'JSON.stringify(process.env.TARGET_VERSION)')" > "$publication_before"
+            verify_release_tag
+            npm publish "$package_path" --access public --provenance --ignore-scripts --registry https://registry.npmjs.org --tag latest
+          fi
+          observe_registry_until_visible publication-after.json dist-tags.json
+
+      - name: Upload registry evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: publication-evidence
+          path: |
+            publication-before.json
+            publication-after.json
+            dist-tags.json
+          if-no-files-found: error
+          retention-days: 7
+
+  verification:
+    needs: [build, source, publish]
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      id-token: none
+    env:
+      EXPECTED_REPOSITORY: AgwaB/pi-workflow
+      EXPECTED_WORKFLOW_REF: refs/heads/main
+      EXPECTED_WORKFLOW_PATH: .github/workflows/publish.yml
+      NPM_CONFIG_REGISTRY: https://registry.npmjs.org
+      NPM_CONFIG_TAG: latest
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ needs.source.outputs.release-commit }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6
+        with:
+          node-version: 24
+          package-manager-cache: false
+
+      - name: Bootstrap private npm config
+        run: |
+          set -euo pipefail
+          umask 077
+          test -n "${RUNNER_TEMP:-}"
+          test -d "$RUNNER_TEMP"
+          test -n "${GITHUB_WORKSPACE:-}"
+          case "$RUNNER_TEMP" in
+            "$GITHUB_WORKSPACE"|"$GITHUB_WORKSPACE"/*|"$PWD"|"$PWD"/*)
+              echo "RUNNER_TEMP must be outside checkout and package roots" >&2
+              exit 1
+              ;;
+          esac
+          export NPM_CONFIG_USERCONFIG="$RUNNER_TEMP/pi-workflow-npmrc"
+          export NPM_CONFIG_GLOBALCONFIG="$RUNNER_TEMP/pi-workflow-global-npmrc"
+          export NPM_CONFIG_REGISTRY="https://registry.npmjs.org"
+          export NPM_CONFIG_TAG="latest"
+          printf '%s\n' 'registry=https://registry.npmjs.org/' 'tag=latest' > "$NPM_CONFIG_USERCONFIG"
+          printf '%s\n' 'registry=https://registry.npmjs.org/' > "$NPM_CONFIG_GLOBALCONFIG"
+          {
+            printf 'NPM_CONFIG_USERCONFIG=%s\n' "$NPM_CONFIG_USERCONFIG"
+            printf 'NPM_CONFIG_GLOBALCONFIG=%s\n' "$NPM_CONFIG_GLOBALCONFIG"
+            printf 'NPM_CONFIG_REGISTRY=%s\n' "$NPM_CONFIG_REGISTRY"
+            printf 'NPM_CONFIG_TAG=%s\n' "$NPM_CONFIG_TAG"
+          } >> "$GITHUB_ENV"
+
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: release-artifact
+          path: release-artifact
+
+      - uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: publication-evidence
+          path: publication-evidence
+
+      - name: Cryptographically gate and verify exact npm provenance
+        env:
+          BUILD_PACKAGE_SHA: ${{ needs.build.outputs.package-sha }}
+          RELEASE_COMMIT: ${{ needs.source.outputs.release-commit }}
+          TARGET_VERSION: ${{ needs.build.outputs.version }}
+          NPM_PACKAGE: "@agwab/pi-workflow"
+        run: |
+          set -euo pipefail
+          umask 077
+          test ! -e .npmrc
+          expected_file="agwab-pi-workflow-$TARGET_VERSION.tgz"
+          package_path="$PWD/release-artifact/$expected_file"
+          test -f "$package_path"
+          actual_sha="$(sha256sum "$package_path" | awk '{print $1}')"
+          test "$actual_sha" = "$BUILD_PACKAGE_SHA"
+          metadata=release-artifact/release-metadata.json
+          test "$(node -p "require('./$metadata').schema")" = "pi-workflow-release-metadata-v3"
+          test "$(node -p "require('./$metadata').name")" = "$NPM_PACKAGE"
+          test "$(node -p "require('./$metadata').version")" = "$TARGET_VERSION"
+          test "$(node -p "require('./$metadata').sourceRepository")" = "$EXPECTED_REPOSITORY"
+          test "$(node -p "require('./$metadata').sourceCommit")" = "$RELEASE_COMMIT"
+          test "$(node -p "require('./$metadata').releaseCommit")" = "$RELEASE_COMMIT"
+          test "$(node -p "require('./$metadata').packageFile")" = "$expected_file"
+
+          gate_dir="$(mktemp -d)"
+          audit_json="$PWD/npm-audit-signatures.json"
+          audit_tmp="$(mktemp)"
+          audit_error="$(mktemp)"
+          cleanup_gate() { rm -rf "$gate_dir" "$audit_json" "$audit_tmp" "$audit_error"; }
+          trap cleanup_gate EXIT
+          mkdir -p "$gate_dir/node_modules/@agwab"
+          tar -xzf "$package_path" -C "$gate_dir/node_modules/@agwab"
+          mv "$gate_dir/node_modules/@agwab/package" "$gate_dir/node_modules/@agwab/pi-workflow"
+          rm -rf "$gate_dir/node_modules/@agwab/pi-workflow/node_modules"
+          PACKAGE_INTEGRITY="$(node -e 'const fs=require("node:fs"),crypto=require("node:crypto"); process.stdout.write(`sha512-${crypto.createHash("sha512").update(fs.readFileSync(process.argv[1])).digest("base64")}`)' "$package_path")"
+          GATE_DIR="$gate_dir" PACKAGE_INTEGRITY="$PACKAGE_INTEGRITY" TARGET_VERSION="$TARGET_VERSION" node --input-type=module <<'NODE'
+          import { writeFileSync } from 'node:fs';
+          const dir = process.env.GATE_DIR;
+          const version = process.env.TARGET_VERSION;
+          const integrity = process.env.PACKAGE_INTEGRITY;
+          const lock = {
+            name: 'pi-workflow-provenance-gate', version: '1.0.0', lockfileVersion: 3, requires: true,
+            packages: {
+              '': { name: 'pi-workflow-provenance-gate', version: '1.0.0', dependencies: { '@agwab/pi-workflow': version } },
+              'node_modules/@agwab/pi-workflow': {
+                version, resolved: `https://registry.npmjs.org/@agwab/pi-workflow/-/pi-workflow-${version}.tgz`, integrity,
+              },
+            },
+          };
+          writeFileSync(`${dir}/package.json`, JSON.stringify({ name: lock.name, version: lock.version, dependencies: { '@agwab/pi-workflow': version } }));
+          writeFileSync(`${dir}/package-lock.json`, JSON.stringify(lock));
+          NODE
+          # provenance visibility retry start
+          audit_error_is_permanent() {
+            grep -Eiq 'npm (ERR!|error) code (E401|E403|EINTEGRITY)|npm (ERR!|error) (401|403)([^0-9]|$)|"(code|errno)"[[:space:]]*:[[:space:]]*"(E401|E403|EINTEGRITY)"|"(status|statusCode)"[[:space:]]*:[[:space:]]*(401|403)([^0-9]|$)' "$audit_tmp" "$audit_error"
+          }
+          audit_error_is_retryable() {
+            grep -Eiq 'npm (ERR!|error) code (E404|E408|E425|E429|E5[0-9][0-9]|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|ENETUNREACH|EHOSTUNREACH|ENOTFOUND|EPIPE)|npm (ERR!|error) (404|408|425|429|5[0-9][0-9])([^0-9]|$)|"(code|errno)"[[:space:]]*:[[:space:]]*"(E404|E408|E425|E429|E5[0-9][0-9]|ECONNRESET|ECONNREFUSED|ETIMEDOUT|EAI_AGAIN|ENETUNREACH|EHOSTUNREACH|ENOTFOUND|EPIPE)"|"(status|statusCode)"[[:space:]]*:[[:space:]]*(404|408|425|429|5[0-9][0-9])([^0-9]|$)' "$audit_tmp" "$audit_error"
+          }
+          audit_max_attempts=30
+          audit_attempt=1
+          while [ "$audit_attempt" -le "$audit_max_attempts" ]; do
+            : > "$audit_tmp"
+            : > "$audit_error"
+            set +e
+            (cd "$gate_dir" && npm audit signatures --json --include-attestations --package-lock-only --registry https://registry.npmjs.org --ignore-scripts > "$audit_tmp" 2> "$audit_error")
+            audit_status=$?
+            set -e
+            audit_state="$(node -e 'const fs=require("node:fs"); try { const value=JSON.parse(fs.readFileSync(process.argv[1],"utf8")); if (!value || typeof value!=="object" || Array.isArray(value) || !Array.isArray(value.invalid) || !Array.isArray(value.missing) || !Array.isArray(value.verified)) process.stdout.write("malformed"); else if (value.invalid.length>0) process.stdout.write("invalid"); else if (value.missing.length>0 || value.verified.length===0) process.stdout.write("pending"); else process.stdout.write("ready"); } catch { process.stdout.write("malformed"); }' "$audit_tmp")"
+            if [ "$audit_status" -eq 0 ] && [ "$audit_state" = "ready" ]; then
+              mv "$audit_tmp" "$audit_json"
+              break
+            fi
+            if [ "$audit_state" = "invalid" ]; then
+              cat "$audit_tmp" >&2
+              cat "$audit_error" >&2
+              echo "npm provenance verification returned invalid evidence" >&2
+              test "$audit_status" -ne 0 || audit_status=1
+              exit "$audit_status"
+            fi
+            if audit_error_is_permanent; then
+              cat "$audit_tmp" >&2
+              cat "$audit_error" >&2
+              echo "npm provenance verification returned a permanent error" >&2
+              test "$audit_status" -ne 0 || audit_status=1
+              exit "$audit_status"
+            fi
+            if [ "$audit_status" -eq 0 ] && [ "$audit_state" = "malformed" ]; then
+              cat "$audit_tmp" >&2
+              echo "npm provenance verification returned malformed success evidence" >&2
+              exit 1
+            fi
+            audit_retryable=0
+            if [ "$audit_state" = "pending" ] || audit_error_is_retryable; then
+              audit_retryable=1
+            fi
+            if [ "$audit_retryable" -ne 1 ]; then
+              cat "$audit_tmp" >&2
+              cat "$audit_error" >&2
+              echo "npm provenance verification returned a non-retryable result" >&2
+              test "$audit_status" -ne 0 || audit_status=1
+              exit "$audit_status"
+            fi
+            if [ "$audit_attempt" -eq "$audit_max_attempts" ]; then
+              cat "$audit_tmp" >&2
+              cat "$audit_error" >&2
+              echo "npm provenance was not visible after $audit_max_attempts attempts" >&2
+              test "$audit_status" -ne 0 || audit_status=1
+              exit "$audit_status"
+            fi
+            audit_delay_seconds=$((audit_attempt < 6 ? audit_attempt * 2 : 10))
+            echo "npm provenance is not yet visible (attempt $audit_attempt/$audit_max_attempts, state $audit_state); retrying in ${audit_delay_seconds}s" >&2
+            sleep "$audit_delay_seconds"
+            audit_attempt=$((audit_attempt + 1))
+          done
+          # provenance visibility retry end
+          EXPECTED_REPOSITORY="$EXPECTED_REPOSITORY" EXPECTED_WORKFLOW_REF="$EXPECTED_WORKFLOW_REF" EXPECTED_WORKFLOW_PATH="$EXPECTED_WORKFLOW_PATH" NPM_PACKAGE="$NPM_PACKAGE" TARGET_VERSION="$TARGET_VERSION" RELEASE_COMMIT="$RELEASE_COMMIT" node tools/release/verify-npm-publication.mjs "$package_path" publication-evidence/publication-before.json publication-evidence/publication-after.json publication-evidence/dist-tags.json "$audit_json"
+
+  release:
+    needs: [build, source, publish, verification]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: none
+    steps:
+      - name: Create GitHub release for the exact published commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_COMMIT: ${{ needs.source.outputs.release-commit }}
+          TARGET_VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          set -euo pipefail
+          verify_release_tag() {
+            tag_name="v$TARGET_VERSION"
+            tag_ref="refs/tags/v$TARGET_VERSION"
+            ref_json="$(gh api --method GET "repos/$GITHUB_REPOSITORY/git/ref/tags/$tag_name")"
+            tag_object_type="$(printf '%s' "$ref_json" | jq -r '.object.type')"
+            tag_object_sha="$(printf '%s' "$ref_json" | jq -r '.object.sha')"
+            test "$tag_object_sha" != "null"
+            test "$tag_object_sha" != ""
+            case "$tag_object_type" in
+              commit) dereferenced_tag="$tag_object_sha" ;;
+              tag) dereferenced_tag="$(gh api --method GET "repos/$GITHUB_REPOSITORY/git/tags/$tag_object_sha" --jq '.object.sha')" ;;
+              *) echo "unsupported GitHub tag object type: $tag_object_type" >&2; exit 1 ;;
+            esac
+            test "$dereferenced_tag" != ""
+            test "$dereferenced_tag" != "null"
+            test "$dereferenced_tag" = "$RELEASE_COMMIT"
+
+            rulesets_json="$(gh api --method GET --paginate --slurp "repos/$GITHUB_REPOSITORY/rulesets")"
+            active_ruleset_ids="$(RULESETS_JSON="$rulesets_json" node --input-type=module <<'NODE'
+          const raw = process.env.RULESETS_JSON;
+          let pages;
+          try { pages = JSON.parse(raw); } catch (error) { throw new Error(`rulesets response is not valid JSON: ${error.message}`); }
+          if (!Array.isArray(pages) || pages.length === 0 || pages.some((page) => !Array.isArray(page) || page.length === 0)) throw new Error('rulesets response must contain non-empty pages');
+          const summaries = pages.flat();
+          const ids = new Set();
+          for (const entry of summaries) {
+            if (!entry || typeof entry !== 'object' || Array.isArray(entry) || !Number.isSafeInteger(entry.id) || entry.id <= 0 || typeof entry.target !== 'string' || typeof entry.enforcement !== 'string') throw new Error('rulesets response contains a malformed summary');
+            if (ids.has(entry.id)) throw new Error(`rulesets response contains duplicate id ${entry.id}`);
+            ids.add(entry.id);
+          }
+          const activeTags = summaries.filter((entry) => entry.enforcement === 'active' && entry.target === 'tag');
+          if (activeTags.length === 0) throw new Error('no active tag ruleset was returned');
+          process.stdout.write(activeTags.map((entry) => String(entry.id)).join('\n'));
+          NODE
+          )"
+            matched_ruleset=0
+            while IFS= read -r ruleset_id; do
+              test "$ruleset_id" != ""
+              ruleset_json="$(gh api --method GET "repos/$GITHUB_REPOSITORY/rulesets/$ruleset_id")"
+              ruleset_match="$(RULESET_ID="$ruleset_id" RULESET_JSON="$ruleset_json" TAG_REF="$tag_ref" node --input-type=module <<'NODE'
+          const raw = process.env.RULESET_JSON;
+          const expectedId = Number(process.env.RULESET_ID);
+          const tagRef = process.env.TAG_REF;
+          let ruleset;
+          try { ruleset = JSON.parse(raw); } catch (error) { throw new Error(`ruleset detail is not valid JSON: ${error.message}`); }
+          if (!ruleset || typeof ruleset !== 'object' || Array.isArray(ruleset) || !Number.isSafeInteger(expectedId) || expectedId <= 0 || ruleset.id !== expectedId || ruleset.enforcement !== 'active' || ruleset.target !== 'tag') throw new Error('ruleset detail is not an exact active tag ruleset');
+          const refName = ruleset.conditions?.ref_name;
+          if (!refName || typeof refName !== 'object' || Array.isArray(refName) || !Array.isArray(refName.include) || !Array.isArray(refName.exclude) || refName.include.length === 0 || refName.include.some((pattern) => typeof pattern !== 'string' || pattern.length === 0) || refName.exclude.some((pattern) => typeof pattern !== 'string' || pattern.length === 0)) throw new Error('ruleset ref_name conditions are malformed');
+          if (!Array.isArray(ruleset.rules) || ruleset.rules.length === 0 || ruleset.rules.some((rule) => !rule || typeof rule !== 'object' || Array.isArray(rule) || typeof rule.type !== 'string' || rule.type.length === 0)) throw new Error('ruleset rules are malformed');
+          const escape = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+          const globRegex = (pattern) => {
+            let expression = '^';
+            for (let index = 0; index < pattern.length; index++) {
+              const character = pattern[index];
+              if (character === '*') {
+                if (pattern[index + 1] === '*') index++;
+                expression += pattern[index - 1] === '*' ? '.*' : '[^/]*';
+              } else if (character === '?') expression += '[^/]';
+              else expression += escape(character);
+            }
+            return new RegExp(`${expression}$`);
+          };
+          const included = refName.include.some((pattern) => globRegex(pattern).test(tagRef));
+          const excluded = refName.exclude.some((pattern) => globRegex(pattern).test(tagRef));
+          const ruleTypes = new Set(ruleset.rules.map((rule) => rule.type));
+          process.stdout.write(included && !excluded && ruleTypes.has('deletion') && ruleTypes.has('non_fast_forward') ? 'true' : 'false');
+          NODE
+              )"
+              if [ "$ruleset_match" = "true" ]; then
+                matched_ruleset=1
+              fi
+            done <<< "$active_ruleset_ids"
+            test "$matched_ruleset" = "1"
+          }
+
+          verify_release_tag
+          if gh release view "v$TARGET_VERSION" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            test "$(gh release view "v$TARGET_VERSION" --repo "$GITHUB_REPOSITORY" --json targetCommitish --jq .targetCommitish)" = "$RELEASE_COMMIT"
+          else
+            gh release create "v$TARGET_VERSION" --repo "$GITHUB_REPOSITORY" --target "$RELEASE_COMMIT" --title "v$TARGET_VERSION" --generate-notes
+          fi
+          verify_release_tag

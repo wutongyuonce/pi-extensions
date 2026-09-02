@@ -1,0 +1,11 @@
+id: no-unknown-laundering
+valid:
+  - 'const x: unknown = foo()'
+  - 'function f(x: unknown) {}'
+  - 'function isValidPayload(data: unknown): data is Foo { return true; }'
+  - 'function f(cause: unknown) {}'
+  - 'type X = { a: unknown }'
+  - 'type Y = Record<string, unknown>'
+invalid:
+  - 'type X = unknown'
+  - 'type LooseHandler = unknown'

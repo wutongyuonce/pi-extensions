@@ -1,0 +1,665 @@
+{
+  "type": "object",
+  "required": [
+    "schema",
+    "digest",
+    "partitions",
+    "supportNotes",
+    "reportContext",
+    "reportPacket",
+    "sourceStatusSummary",
+    "partitionSummary",
+    "normalizationNotes",
+    "reviewerLedger",
+    "dedupSummary",
+    "verifierCoverage"
+  ],
+  "properties": {
+    "schema": {
+      "type": "string",
+      "minLength": 1
+    },
+    "digest": {
+      "type": "string",
+      "minLength": 1
+    },
+    "partitions": {
+      "type": "object",
+      "required": [
+        "keep",
+        "weaken",
+        "drop",
+        "needsHuman"
+      ],
+      "properties": {
+        "keep": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "findingId",
+              "rootCauseId",
+              "title",
+              "severity",
+              "locations",
+              "evidenceQuotes"
+            ],
+            "properties": {
+              "findingId": { "type": "string", "minLength": 1 },
+              "rootCauseId": { "type": "string", "minLength": 1 },
+              "title": { "type": "string", "minLength": 1 },
+              "severity": { "type": "string", "minLength": 1 },
+              "locations": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                  "type": "object",
+                  "required": ["file"],
+                  "properties": {
+                    "file": { "type": "string", "minLength": 1 },
+                    "line": { "type": "number" },
+                    "lineEnd": { "type": "number" },
+                    "symbol": { "type": "string", "minLength": 1 }
+                  }
+                }
+              },
+              "evidenceQuotes": {
+                "type": "array",
+                "minItems": 1,
+                "items": { "type": "string", "minLength": 1 }
+              }
+            }
+          }
+        },
+        "weaken": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "findingId",
+              "rootCauseId",
+              "title",
+              "severity",
+              "locations",
+              "evidenceQuotes"
+            ],
+            "properties": {
+              "findingId": { "type": "string", "minLength": 1 },
+              "rootCauseId": { "type": "string", "minLength": 1 },
+              "title": { "type": "string", "minLength": 1 },
+              "severity": { "type": "string", "minLength": 1 },
+              "locations": {
+                "type": "array",
+                "minItems": 1,
+                "items": {
+                  "type": "object",
+                  "required": ["file"],
+                  "properties": {
+                    "file": { "type": "string", "minLength": 1 },
+                    "line": { "type": "number" },
+                    "lineEnd": { "type": "number" },
+                    "symbol": { "type": "string", "minLength": 1 }
+                  }
+                }
+              },
+              "evidenceQuotes": {
+                "type": "array",
+                "minItems": 1,
+                "items": { "type": "string", "minLength": 1 }
+              }
+            }
+          }
+        },
+        "drop": {
+          "type": "array",
+          "items": { "type": "object" }
+        },
+        "needsHuman": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "findingId",
+              "rootCauseId",
+              "title",
+              "severity",
+              "locations",
+              "evidenceQuotes"
+            ],
+            "properties": {
+              "findingId": { "type": "string", "minLength": 1 },
+              "rootCauseId": { "type": "string", "minLength": 1 },
+              "title": { "type": "string", "minLength": 1 },
+              "classification": { "type": "string", "enum": ["behavioral", "support-only"] },
+              "supportClassification": { "type": "string", "enum": ["behavioral", "support-only"] },
+              "supportingFindingId": { "type": "string", "minLength": 1 },
+              "severity": { "type": "string", "minLength": 1 },
+              "locations": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "required": ["file"],
+                  "properties": {
+                    "file": { "type": "string", "minLength": 1 },
+                    "line": { "type": "number" },
+                    "lineEnd": { "type": "number" },
+                    "symbol": { "type": "string", "minLength": 1 }
+                  }
+                }
+              },
+              "evidenceQuotes": {
+                "type": "array",
+                "items": { "type": "string", "minLength": 1 }
+              },
+              "recommendedAction": { "type": "string" },
+              "note": { "type": "string" },
+              "counterEvidence": { "type": "array" }
+            }
+          }
+        }
+      }
+    },
+    "supportNotes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["findingId", "originalFindingId", "rootCauseId", "title", "locations", "evidenceQuotes", "source", "sourceLineage", "reviewerIdentity", "verifierOwner", "mergedLineage", "supportingFindingId"],
+        "properties": {
+          "title": { "type": "string", "minLength": 1 },
+          "classification": { "type": "string", "enum": ["behavioral", "support-only"] },
+          "supportClassification": { "type": "string", "enum": ["behavioral", "support-only"] },
+          "severity": { "type": "string" },
+          "reason": { "type": "string" },
+          "supportingFindingOf": { "type": "string" },
+          "findingId": { "type": "string", "minLength": 1 },
+          "originalFindingId": { "type": "string", "minLength": 1 },
+          "rootCauseId": { "type": "string", "minLength": 1 },
+          "source": { "type": "string", "minLength": 1 },
+          "sourceLineage": { "type": "array", "minItems": 1, "items": { "type": "string", "minLength": 1 } },
+          "reviewerIdentity": {
+            "type": "object",
+            "required": ["source", "specId", "taskId", "itemIdentity", "placeholderSpecId"],
+            "properties": {
+              "source": { "type": "string", "minLength": 1 },
+              "specId": { "type": "string", "minLength": 1 },
+              "taskId": { "type": "string", "minLength": 1 },
+              "itemIdentity": { "type": "string", "minLength": 1 },
+              "placeholderSpecId": { "type": "string", "minLength": 1 }
+            }
+          },
+          "verifierOwner": {
+            "type": "object",
+            "required": ["source", "specId", "taskId", "itemIdentity", "placeholderSpecId"],
+            "properties": {
+              "source": { "type": "string", "minLength": 1 },
+              "specId": { "type": "string", "minLength": 1 },
+              "taskId": { "type": "string", "minLength": 1 },
+              "itemIdentity": { "type": "string", "minLength": 1 },
+              "placeholderSpecId": { "type": "string", "minLength": 1 }
+            }
+          },
+          "mergedLineage": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["findingId", "originalFindingId", "rootCauseId"],
+              "properties": {
+                "findingId": { "type": "string", "minLength": 1 },
+                "originalFindingId": { "type": "string", "minLength": 1 },
+                "rootCauseId": { "type": "string", "minLength": 1 },
+                "source": { "type": "string" },
+                "sourceLineage": { "type": "array", "items": { "type": "string" } },
+                "reviewerIdentity": { "type": "object" },
+                "verifierOwner": { "type": "object" }
+              }
+            }
+          },
+          "mergedFindings": { "type": "array", "items": { "type": "object" } },
+          "supportingFindingId": { "type": "string", "minLength": 1 },
+          "locations": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "object",
+              "required": ["file"],
+              "properties": {
+                "file": { "type": "string", "minLength": 1 },
+                "line": { "type": "number" },
+                "lineEnd": { "type": "number" },
+                "symbol": { "type": "string", "minLength": 1 }
+              }
+            }
+          },
+          "evidenceQuotes": {
+            "type": "array",
+            "minItems": 1,
+            "items": { "type": "string", "minLength": 1 }
+          },
+          "recommendedAction": { "type": "string" }
+        }
+      }
+    },
+    "reportContext": {
+      "type": "object",
+      "required": [
+        "keep",
+        "weaken",
+        "drop",
+        "needsHuman",
+        "supportNoteSummaries",
+        "partialFailures"
+      ],
+      "properties": {
+        "keep": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["findingId", "rootCauseId", "title", "severity"],
+            "properties": {
+              "findingId": { "type": "string", "minLength": 1 },
+              "rootCauseId": { "type": "string", "minLength": 1 },
+              "title": { "type": "string", "minLength": 1 },
+              "severity": { "type": "string", "minLength": 1 },
+              "recommendedAction": { "type": "string" },
+              "mergedFindingIds": {
+                "type": "array",
+                "items": { "type": "string", "minLength": 1 }
+              }
+            }
+          }
+        },
+        "weaken": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["findingId", "rootCauseId", "title", "severity"],
+            "properties": {
+              "findingId": { "type": "string", "minLength": 1 },
+              "rootCauseId": { "type": "string", "minLength": 1 },
+              "title": { "type": "string", "minLength": 1 },
+              "severity": { "type": "string", "minLength": 1 },
+              "recommendedAction": { "type": "string" },
+              "mergedFindingIds": {
+                "type": "array",
+                "items": { "type": "string", "minLength": 1 }
+              }
+            }
+          }
+        },
+        "drop": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["findingId", "rootCauseId", "title", "severity"],
+            "properties": {
+              "findingId": { "type": "string", "minLength": 1 },
+              "rootCauseId": { "type": "string", "minLength": 1 },
+              "title": { "type": "string", "minLength": 1 },
+              "severity": { "type": "string", "minLength": 1 },
+              "recommendedAction": { "type": "string" },
+              "mergedFindingIds": { "type": "array", "items": { "type": "string", "minLength": 1 } }
+            }
+          }
+        },
+        "needsHuman": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["findingId", "rootCauseId", "title", "severity"],
+            "properties": {
+              "findingId": { "type": "string", "minLength": 1 },
+              "rootCauseId": { "type": "string", "minLength": 1 },
+              "title": { "type": "string", "minLength": 1 },
+              "severity": { "type": "string", "minLength": 1 },
+              "recommendedAction": { "type": "string" },
+              "mergedFindingIds": {
+                "type": "array",
+                "items": { "type": "string", "minLength": 1 }
+              }
+            }
+          }
+        },
+        "supportNoteSummaries": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["title"],
+            "properties": {
+              "title": { "type": "string", "minLength": 1 },
+              "severity": { "type": "string" },
+              "reason": { "type": "string" },
+              "supportingFindingOf": { "type": "string" }
+            }
+          }
+        },
+        "partialFailures": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["status"],
+            "properties": {
+              "source": { "type": "string" },
+              "displayName": { "type": "string" },
+              "taskId": { "type": "string" },
+              "specId": { "type": "string" },
+              "stageId": { "type": "string" },
+              "status": { "type": "string", "minLength": 1 },
+              "statusDetail": { "type": "string" },
+              "lastMessage": { "type": "string" },
+              "errorType": { "type": "string" }
+            }
+          }
+        }
+      }
+    },
+    "reportPacket": {
+      "type": "object",
+      "required": [
+        "schema",
+        "digest",
+        "maxChars",
+        "actualChars",
+        "partitionSummary",
+        "sourceStatusSummary",
+        "reportContext",
+        "normalizationNotes",
+        "overflowCounts"
+      ],
+      "properties": {
+        "schema": {
+          "type": "string",
+          "const": "deep-review-report-packet-v1"
+        },
+        "digest": {
+          "type": "string",
+          "minLength": 64,
+          "maxLength": 64
+        },
+        "maxChars": {
+          "type": "number",
+          "const": 15000
+        },
+        "actualChars": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 15000
+        },
+        "partitionSummary": {
+          "type": "object",
+          "required": [
+            "keep",
+            "weaken",
+            "drop",
+            "needsHuman",
+            "supportNotes",
+            "mergedFindings",
+            "verdictsReceived",
+            "batchIntegrityIssues",
+            "verdictIntegrityIssues",
+            "reviewerCoverageIssues",
+            "reviewerFindings",
+            "missingVerdicts",
+            "partialFailures"
+          ],
+          "properties": {
+            "keep": { "type": "number", "minimum": 0, "maximum": 9007199254740991 },
+            "weaken": { "type": "number", "minimum": 0, "maximum": 9007199254740991 },
+            "drop": { "type": "number", "minimum": 0, "maximum": 9007199254740991 },
+            "needsHuman": { "type": "number", "minimum": 0, "maximum": 9007199254740991 },
+            "supportNotes": { "type": "number", "minimum": 0, "maximum": 9007199254740991 },
+            "mergedFindings": { "type": "number", "minimum": 0, "maximum": 9007199254740991 },
+            "verdictsReceived": { "type": "number", "minimum": 0, "maximum": 9007199254740991 },
+            "batchIntegrityIssues": { "type": "number", "minimum": 0, "maximum": 9007199254740991 },
+            "verdictIntegrityIssues": { "type": "number", "minimum": 0, "maximum": 9007199254740991 },
+            "reviewerCoverageIssues": { "type": "number", "minimum": 0, "maximum": 9007199254740991 },
+            "reviewerFindings": { "type": "number", "minimum": 0, "maximum": 9007199254740991 },
+            "missingVerdicts": { "type": "number", "minimum": 0, "maximum": 9007199254740991 },
+            "partialFailures": { "type": "number", "minimum": 0, "maximum": 9007199254740991 }
+          },
+          "additionalProperties": false
+        },
+        "sourceStatusSummary": {
+          "type": "object",
+          "required": [
+            "total",
+            "completed",
+            "nonCompleted",
+            "partialFailureCount",
+            "partialFailures"
+          ],
+          "properties": {
+            "total": { "type": "number", "minimum": 0, "maximum": 9007199254740991 },
+            "completed": { "type": "number", "minimum": 0, "maximum": 9007199254740991 },
+            "nonCompleted": { "type": "number", "minimum": 0, "maximum": 9007199254740991 },
+            "partialFailureCount": { "type": "number", "minimum": 0, "maximum": 9007199254740991 },
+            "partialFailures": {
+              "type": "array",
+              "maxItems": 4,
+              "items": {
+                "type": "object",
+                "required": ["source", "status"],
+                "properties": {
+                  "source": { "type": "string", "minLength": 1, "maxLength": 128 },
+                  "status": { "type": "string", "minLength": 1, "maxLength": 32 },
+                  "statusDetail": { "type": "string", "minLength": 1, "maxLength": 160 }
+                },
+                "additionalProperties": false
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        "reportContext": {
+          "type": "object",
+          "required": ["keep", "weaken", "drop", "needsHuman", "supportNoteSummaries"],
+          "properties": {
+            "keep": {
+              "type": "array",
+              "maxItems": 4,
+              "items": {
+                "type": "object",
+                "required": ["findingId", "title", "severity"],
+                "properties": {
+                  "findingId": { "type": "string", "minLength": 1, "maxLength": 64 },
+                  "title": { "type": "string", "minLength": 1, "maxLength": 220 },
+                  "severity": { "type": "string", "minLength": 1, "maxLength": 32 },
+                  "recommendedAction": { "type": "string", "minLength": 1, "maxLength": 220 }
+                },
+                "additionalProperties": false
+              }
+            },
+            "weaken": {
+              "type": "array",
+              "maxItems": 4,
+              "items": {
+                "type": "object",
+                "required": ["findingId", "title", "severity"],
+                "properties": {
+                  "findingId": { "type": "string", "minLength": 1, "maxLength": 64 },
+                  "title": { "type": "string", "minLength": 1, "maxLength": 220 },
+                  "severity": { "type": "string", "minLength": 1, "maxLength": 32 },
+                  "recommendedAction": { "type": "string", "minLength": 1, "maxLength": 220 }
+                },
+                "additionalProperties": false
+              }
+            },
+            "drop": {
+              "type": "array",
+              "maxItems": 4,
+              "items": {
+                "type": "object",
+                "required": ["findingId", "title", "severity"],
+                "properties": {
+                  "findingId": { "type": "string", "minLength": 1, "maxLength": 64 },
+                  "title": { "type": "string", "minLength": 1, "maxLength": 220 },
+                  "severity": { "type": "string", "minLength": 1, "maxLength": 32 },
+                  "recommendedAction": { "type": "string", "minLength": 1, "maxLength": 220 }
+                },
+                "additionalProperties": false
+              }
+            },
+            "needsHuman": {
+              "type": "array",
+              "maxItems": 4,
+              "items": {
+                "type": "object",
+                "required": ["findingId", "title", "severity"],
+                "properties": {
+                  "findingId": { "type": "string", "minLength": 1, "maxLength": 64 },
+                  "title": { "type": "string", "minLength": 1, "maxLength": 220 },
+                  "severity": { "type": "string", "minLength": 1, "maxLength": 32 },
+                  "recommendedAction": { "type": "string", "minLength": 1, "maxLength": 220 }
+                },
+                "additionalProperties": false
+              }
+            },
+            "supportNoteSummaries": {
+              "type": "array",
+              "maxItems": 4,
+              "items": {
+                "type": "object",
+                "required": ["title"],
+                "properties": {
+                  "title": { "type": "string", "minLength": 1, "maxLength": 160 },
+                  "severity": { "type": "string", "minLength": 1, "maxLength": 32 },
+                  "reason": { "type": "string", "minLength": 1, "maxLength": 140 },
+                  "supportingFindingOf": { "type": "string", "minLength": 1, "maxLength": 96 }
+                },
+                "additionalProperties": false
+              }
+            }
+          },
+          "additionalProperties": false
+        },
+        "normalizationNotes": {
+          "type": "array",
+          "maxItems": 4,
+          "items": { "type": "string", "minLength": 1, "maxLength": 200 }
+        },
+        "overflowCounts": {
+          "type": "object",
+          "required": [
+            "keep",
+            "weaken",
+            "drop",
+            "needsHuman",
+            "supportNotes",
+            "partialFailures",
+            "normalizationNotes",
+            "truncatedStrings",
+            "omittedStringChars"
+          ],
+          "properties": {
+            "keep": { "type": "number", "minimum": 0, "maximum": 9007199254740991 },
+            "weaken": { "type": "number", "minimum": 0, "maximum": 9007199254740991 },
+            "drop": { "type": "number", "minimum": 0, "maximum": 9007199254740991 },
+            "needsHuman": { "type": "number", "minimum": 0, "maximum": 9007199254740991 },
+            "supportNotes": { "type": "number", "minimum": 0, "maximum": 9007199254740991 },
+            "partialFailures": { "type": "number", "minimum": 0, "maximum": 9007199254740991 },
+            "normalizationNotes": { "type": "number", "minimum": 0, "maximum": 9007199254740991 },
+            "truncatedStrings": { "type": "number", "minimum": 0, "maximum": 9007199254740991 },
+            "omittedStringChars": { "type": "number", "minimum": 0, "maximum": 9007199254740991 }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "sourceStatusSummary": {
+      "type": "object",
+      "required": ["total", "completed", "nonCompleted", "partialFailures"],
+      "properties": {
+        "total": { "type": "number", "minimum": 0 },
+        "completed": { "type": "number", "minimum": 0 },
+        "nonCompleted": { "type": "number", "minimum": 0 },
+        "partialFailures": { "type": "array" }
+      }
+    },
+    "partitionSummary": {
+      "type": "object",
+      "required": [
+        "keep",
+        "weaken",
+        "drop",
+        "needsHuman",
+        "supportNotes",
+        "mergedFindings",
+        "verdictsReceived",
+        "verdictIntegrityIssues",
+        "reviewerCoverageIssues",
+        "reviewerFindings",
+        "missingVerdicts",
+        "partialFailures"
+      ],
+      "properties": {
+        "keep": { "type": "number", "minimum": 0 },
+        "weaken": { "type": "number", "minimum": 0 },
+        "drop": { "type": "number", "minimum": 0 },
+        "needsHuman": { "type": "number", "minimum": 0 },
+        "supportNotes": { "type": "number", "minimum": 0 },
+        "mergedFindings": { "type": "number", "minimum": 0 },
+        "verdictsReceived": { "type": "number", "minimum": 0 },
+        "verdictIntegrityIssues": { "type": "number", "minimum": 0 },
+        "reviewerCoverageIssues": { "type": "number", "minimum": 0 },
+        "reviewerFindings": { "type": "number", "minimum": 0 },
+        "missingVerdicts": { "type": "number", "minimum": 0 },
+        "partialFailures": { "type": "number", "minimum": 0 }
+      }
+    },
+    "normalizationNotes": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "reviewerLedger": {
+      "type": "object",
+      "required": ["complete", "plannedLensIds", "materializedReviewerIds", "attestedLensIds", "ownerMap", "rawFindingIds", "dedupFindingIds", "dispositionFindingIds", "supportFindingIds", "lineageFindingIds", "sourceStatuses"],
+      "properties": {
+        "complete": { "type": "boolean" },
+        "plannedLensIds": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "materializedReviewerIds": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "attestedLensIds": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "ownerMap": { "type": "array", "items": { "type": "object", "required": ["source", "specId", "taskId", "itemIdentity", "placeholderSpecId"], "properties": { "source": { "type": "string", "minLength": 1 }, "specId": { "type": "string", "minLength": 1 }, "taskId": { "type": "string", "minLength": 1 }, "itemIdentity": { "type": "string", "minLength": 1 }, "placeholderSpecId": { "type": "string", "minLength": 1 } } } },
+        "rawFindingIds": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "dedupFindingIds": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "dispositionFindingIds": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "supportFindingIds": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "lineageFindingIds": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "sourceStatuses": { "type": "array", "items": { "type": "object" } }
+      },
+      "additionalProperties": true
+    },
+    "dedupSummary": {
+      "type": "object",
+      "required": ["complete", "rawCount", "uniqueCount", "duplicateCount", "rawFindingIds", "dedupFindingIds", "dispositionFindingIds", "supportFindingIds", "lineageFindingIds", "duplicates"],
+      "properties": {
+        "complete": { "type": "boolean" },
+        "rawCount": { "type": "number", "minimum": 0 },
+        "uniqueCount": { "type": "number", "minimum": 0 },
+        "duplicateCount": { "type": "number", "minimum": 0 },
+        "rawFindingIds": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "dedupFindingIds": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "dispositionFindingIds": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "supportFindingIds": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "lineageFindingIds": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "duplicates": { "type": "array", "items": { "type": "object" } }
+      },
+      "additionalProperties": true
+    },
+    "verifierCoverage": {
+      "type": "object",
+      "required": ["complete", "verdictsReceived", "expectedFindingIds", "verdictFindingIds", "rows", "sourceStatuses", "digest", "ownerIssues"],
+      "properties": {
+        "complete": { "type": "boolean" },
+        "verdictsReceived": { "type": "number", "minimum": 0 },
+        "expectedFindingIds": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "verdictFindingIds": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "rows": { "type": "array", "items": { "type": "object", "required": ["sourceId", "findingId", "valid", "owner"], "properties": { "sourceId": { "type": "string", "minLength": 1 }, "findingId": { "type": "string" }, "valid": { "type": "boolean" }, "owner": { "type": "object", "required": ["source", "specId", "taskId", "itemIdentity", "placeholderSpecId"], "properties": { "source": { "type": "string" }, "specId": { "type": "string" }, "taskId": { "type": "string" }, "itemIdentity": { "type": "string" }, "placeholderSpecId": { "type": "string" } } } } } },
+        "sourceStatuses": { "type": "array", "items": { "type": "object" } },
+        "digest": { "type": "string", "minLength": 1 },
+        "ownerIssues": { "type": "array", "items": { "type": "object" } }
+      },
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": true
+}

@@ -1,0 +1,12 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-web
+spec:
+  template:
+    spec:
+      containers:
+        - name: web
+          # `registry` is absent from values.yaml, so rendering fails with a nil
+          # pointer here. `helm lint` passes on this chart.
+          image: "{{ .Values.image.registry.host }}/{{ .Values.image.repository }}"

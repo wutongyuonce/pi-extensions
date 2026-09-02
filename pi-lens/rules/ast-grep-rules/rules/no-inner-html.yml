@@ -1,0 +1,38 @@
+id: no-inner-html
+language: TypeScript
+message: "Avoid innerHTML/outerHTML — use textContent or a sanitizer to prevent XSS"
+severity: error
+note: |
+  innerHTML and outerHTML can introduce XSS vulnerabilities when used with
+  user-supplied data. Use textContent for plain text or a library like DOMPurify
+  for sanitized HTML.
+
+  The assignment forms (`$EL.innerHTML = $VAL` / `$EL.outerHTML = $VAL`)
+  are NOT flagged when `$VAL` is a plain string literal or a template
+  literal with no `${...}` substitution — clearing a node
+  (`el.innerHTML = ''`) or setting static markup
+  (`el.innerHTML = "<hr>"`) can't carry injected content, since the
+  right-hand side is fixed at author time. Before this constraint every
+  literal assignment matched too, which is why 8/8 sampled hits in the
+  audit corpus were this exact "clear/reset" idiom (#1806). A dynamic
+  value (an identifier, a call, or a template literal with a
+  substitution) is still flagged — that's the actual injection surface.
+  `insertAdjacentHTML(...)` keeps its original unconditional match: its
+  argument shape (`position, html`) doesn't fit the same RHS-literal
+  check cleanly, and the issue that drove this fix was specifically the
+  assignment forms.
+rule:
+  any:
+    - pattern: $EL.innerHTML = $VAL
+    - pattern: $EL.outerHTML = $VAL
+    - pattern: $EL.insertAdjacentHTML($$$)
+constraints:
+  VAL:
+    not:
+      any:
+        - kind: string
+        - all:
+            - kind: template_string
+            - not:
+                has:
+                  kind: template_substitution

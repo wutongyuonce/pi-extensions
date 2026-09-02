@@ -1,0 +1,33 @@
+{
+	"$schema": "./node_modules/oxfmt/configuration_schema.json",
+	"useTabs": true,
+	"tabWidth": 2,
+	"printWidth": 80,
+	"sortPackageJson": false,
+	"ignorePatterns": [
+		"tests/fixtures/**",
+		"cases/**",
+		"vendor/**",
+		"**/*.captured.*",
+		".all-contributorsrc",
+		".yamllint",
+		"scripts/download-grammars.js",
+		"**/*.json",
+		"**/*.jsonc",
+		"**/*.json5",
+		"**/*.md",
+		"**/*.mdx",
+		"**/*.yaml",
+		"**/*.yml",
+		"**/*.toml",
+		"**/*.css",
+		"**/*.scss",
+		"**/*.less",
+		"**/*.html",
+		"**/*.htm",
+		"**/*.vue",
+		"**/*.svelte",
+		"**/*.graphql",
+		"**/*.gql"
+	]
+}

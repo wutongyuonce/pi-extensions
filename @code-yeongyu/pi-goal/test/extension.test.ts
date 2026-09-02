@@ -1,0 +1,907 @@
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+
+import type { AgentToolResult, ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { goalFilePath, readGoal } from "../src/goal/store.js";
+import type { GoalStoreRef } from "../src/goal/types.js";
+import piGoalExtension from "../src/index.js";
+
+type ToolResult = AgentToolResult<unknown>;
+
+type GoalContext = {
+	hasUI: boolean;
+	signal?: AbortSignal;
+	ui: MockUi;
+	cwd: string;
+	sessionManager: {
+		getSessionFile(): string;
+		getSessionDir(): string;
+		getSessionId(): string;
+	};
+	isIdle(): boolean;
+	hasPendingMessages(): boolean;
+};
+
+type RegisteredTool = {
+	name: string;
+	description: string;
+	parameters: unknown;
+	execute(
+		toolCallId: string,
+		params: Record<string, unknown>,
+		signal: AbortSignal | undefined,
+		onUpdate: undefined,
+		ctx: GoalContext,
+	): Promise<ToolResult>;
+};
+
+type RegisteredCommand = {
+	handler(args: string, ctx: GoalContext): Promise<void>;
+};
+
+type EventPayload = {
+	type: string;
+	reason?: string;
+	message?: unknown;
+	messages?: unknown[];
+};
+
+type EventHandler = (event: EventPayload, ctx: GoalContext) => unknown | Promise<unknown>;
+
+type NotifyType = "info" | "warning" | "error";
+type SelectCall = { title: string; options: string[] };
+type ConfirmCall = { title: string; message: string };
+type NotifyCall = { message: string; type: NotifyType | undefined };
+type MockUi = {
+	selectCalls: SelectCall[];
+	confirmCalls: ConfirmCall[];
+	notifyCalls: NotifyCall[];
+	select(title: string, options: string[]): Promise<string | undefined>;
+	confirm(title: string, message: string): Promise<boolean>;
+	notify(message: string, type?: NotifyType): void;
+	setStatus(key: string, text: string | undefined): void;
+};
+type SentMessage = {
+	message: { customType: string; content: string; display: boolean };
+	options: Record<string, unknown>;
+};
+
+const tempDirs: string[] = [];
+
+describe("pi-goal extension tool contract", () => {
+	it("exposes budget-free v2 goal tool schemas and limit-aware guidance", () => {
+		const harness = createHarness();
+		const createGoal = toolContract(harness.tool("create_goal"));
+		const updateGoal = toolContract(harness.tool("update_goal"));
+
+		expect(toolContract(harness.tool("get_goal"))).toEqual({
+			name: "get_goal",
+			description: "Get the current goal for this thread, including status, token and elapsed-time usage.",
+			parameters: {
+				type: "object",
+				properties: {},
+				additionalProperties: false,
+			},
+		});
+		expect(createGoal).toMatchObject({
+			name: "create_goal",
+			description: expect.stringContaining("4,000"),
+			parameters: {
+				type: "object",
+				required: ["objective"],
+				properties: {
+					objective: {
+						type: "string",
+						description: expect.stringContaining("4,000"),
+					},
+				},
+				additionalProperties: false,
+			},
+		});
+		expect(createGoal.description).toMatch(/file/i);
+		expect(JSON.stringify(createGoal.parameters)).toMatch(/file/i);
+		expect(createGoal.description).toMatch(/complete/i);
+		expect(updateGoal).toMatchObject({
+			name: "update_goal",
+			parameters: {
+				type: "object",
+				required: ["status"],
+				properties: {
+					status: {
+						anyOf: [
+							{ type: "string", const: "complete" },
+							{ type: "string", const: "blocked" },
+						],
+					},
+					reason: { type: "string" },
+				},
+				additionalProperties: false,
+			},
+		});
+		expect(updateGoal.description).toMatch(/3 consecutive goal turns/i);
+		expect(updateGoal.description).toMatch(/fresh blocked audit after resume/i);
+		expect(updateGoal.description).toMatch(/hard, slow, or uncertain/i);
+	});
+
+	it("never mentions token budgets in any tool definition", () => {
+		const harness = createHarness();
+
+		for (const name of ["create_goal", "update_goal", "get_goal"]) {
+			expect(JSON.stringify(harness.tool(name)).toLowerCase()).not.toContain("budget");
+		}
+	});
+});
+
+describe("pi-goal extension tool behavior", () => {
+	afterEach(async () => {
+		vi.useRealTimers();
+		await Promise.all(tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
+	});
+
+	it("creates, reads, and completes a goal through the tools and file store", async () => {
+		const harness = createHarness();
+		const ctx = await createContext("thread-tool-lifecycle");
+		const ref = refForContext(ctx);
+
+		await harness.tool("create_goal").execute("c1", { objective: "Ship goal extension" }, undefined, undefined, ctx);
+		const persisted = await readGoal(ref);
+		expect(persisted?.objective).toBe("Ship goal extension");
+		expect(persisted?.status).toBe("active");
+		expect(persisted).not.toHaveProperty("tokenBudget");
+
+		const got = await harness.tool("get_goal").execute("g1", {}, undefined, undefined, ctx);
+		expect(JSON.parse(toolResultText(got))).toMatchObject({
+			goal: { objective: "Ship goal extension", status: "active" },
+		});
+		expect(toolResultText(got).toLowerCase()).not.toContain("budget");
+
+		await harness.tool("update_goal").execute("u1", { status: "complete" }, undefined, undefined, ctx);
+		expect((await readGoal(ref))?.status).toBe("complete");
+	});
+
+	it("requires a non-empty reason to block and rejects a reason when completing", async () => {
+		const harness = createHarness();
+		const ctx = await createContext("thread-blocked-guard");
+		await harness.tool("create_goal").execute("c1", { objective: "Wait for a decision" }, undefined, undefined, ctx);
+
+		await expect(
+			harness.tool("update_goal").execute("u1", { status: "blocked" }, undefined, undefined, ctx),
+		).rejects.toThrow("reason is required");
+		await expect(
+			harness
+				.tool("update_goal")
+				.execute("u2", { status: "complete", reason: "not allowed" }, undefined, undefined, ctx),
+		).rejects.toThrow("reason must not be provided");
+	});
+
+	it("creates an oversized goal with a full-text spill and truncation notice", async () => {
+		const harness = createHarness();
+		const ctx = await createContext("thread/oversized objective");
+		const ref = refForContext(ctx);
+		const objective = "x".repeat(4_200);
+
+		const result = await harness.tool("create_goal").execute("c1", { objective }, undefined, undefined, ctx);
+
+		expect(toolResultText(result)).toContain("Objective was truncated; full objective saved to");
+		expect((await readGoal(ref))?.objective).toContain("[truncated; full objective:");
+		expect(await readFile(join(ref.baseDir, `${encodeURIComponent(ref.threadId)}.objective-full.txt`), "utf8")).toBe(
+			objective,
+		);
+	});
+
+	it("creates a new goal over a complete goal, archives it, and rejects unfinished goals", async () => {
+		const harness = createHarness();
+		const completeCtx = await createContext("thread/complete-create");
+		const completeRef = refForContext(completeCtx);
+
+		await harness.tool("create_goal").execute("c1", { objective: "First" }, undefined, undefined, completeCtx);
+		await harness.tool("update_goal").execute("u1", { status: "complete" }, undefined, undefined, completeCtx);
+		const replacement = await harness
+			.tool("create_goal")
+			.execute("c2", { objective: "Second" }, undefined, undefined, completeCtx);
+
+		expect(JSON.parse(toolResultText(replacement))).toMatchObject({
+			goal: { objective: "Second", status: "active" },
+		});
+		const history = await readFile(
+			join(completeRef.baseDir, `${encodeURIComponent(completeRef.threadId)}.history.jsonl`),
+			"utf8",
+		);
+		expect(history.trim().split("\n")).toHaveLength(1);
+		expect(JSON.parse(history)).toMatchObject({ objective: "First", status: "complete" });
+
+		for (const status of ["active", "paused"] as const) {
+			const ctx = await createContext(`thread-${status}-duplicate`);
+			await harness.tool("create_goal").execute("c1", { objective: "First" }, undefined, undefined, ctx);
+			if (status === "paused") await harness.command("goal").handler("pause", ctx);
+			await expect(
+				harness.tool("create_goal").execute("c2", { objective: "Second" }, undefined, undefined, ctx),
+			).rejects.toThrow("unfinished goal");
+		}
+	});
+});
+
+describe("pi-goal extension accounting", () => {
+	afterEach(async () => {
+		vi.useRealTimers();
+		await Promise.all(tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
+	});
+
+	it("starts elapsed-time accounting when a goal is created during an active agent turn", async () => {
+		vi.useFakeTimers();
+		vi.setSystemTime(0);
+		const harness = createHarness();
+		const ctx = await createContext("thread-create-during-turn");
+
+		await harness.emit("agent_start", { type: "agent_start" }, ctx);
+		vi.advanceTimersByTime(30_000);
+		await harness
+			.tool("create_goal")
+			.execute("create-goal", { objective: "created after the turn started" }, undefined, undefined, ctx);
+		vi.advanceTimersByTime(10_000);
+
+		await harness.emit("agent_end", { type: "agent_end", messages: [] }, ctx);
+
+		const goal = await readGoal(refForContext(ctx));
+		expect(goal?.timeUsedSeconds).toBe(10);
+	});
+
+	it("checkpoints streamed usage for update_goal and does not double count it at agent end", async () => {
+		const harness = createHarness();
+		const ctx = await createContext("thread-streamed-complete");
+		const message = assistantUsageMessage(100, 50);
+		await harness.tool("create_goal").execute("c1", { objective: "Ship it" }, undefined, undefined, ctx);
+		await harness.emit("agent_start", { type: "agent_start" }, ctx);
+		await harness.emit("message_end", { type: "message_end", message }, ctx);
+
+		const completed = await harness
+			.tool("update_goal")
+			.execute("u1", { status: "complete" }, undefined, undefined, ctx);
+		expect(JSON.parse(toolResultText(completed))).toMatchObject({ goal: { tokensUsed: 150 } });
+		await harness.emit("agent_end", { type: "agent_end", messages: [message] }, ctx);
+
+		expect((await readGoal(refForContext(ctx)))?.tokensUsed).toBe(150);
+	});
+
+	it("checkpoints streamed usage for get_goal and at session shutdown", async () => {
+		const harness = createHarness();
+		const ctx = await createContext("thread-streamed-get");
+		const message = assistantUsageMessage(100, 50);
+		await harness.tool("create_goal").execute("c1", { objective: "Ship it" }, undefined, undefined, ctx);
+		await harness.emit("agent_start", { type: "agent_start" }, ctx);
+		await harness.emit("message_end", { type: "message_end", message }, ctx);
+
+		const snapshot = await harness.tool("get_goal").execute("g1", {}, undefined, undefined, ctx);
+		expect(JSON.parse(toolResultText(snapshot))).toMatchObject({ goal: { tokensUsed: 150 } });
+		await harness.emit("session_shutdown", { type: "session_shutdown" }, ctx);
+
+		expect((await readGoal(refForContext(ctx)))?.tokensUsed).toBe(150);
+	});
+
+	it("does not charge usage streamed before a goal is created mid-turn", async () => {
+		const harness = createHarness();
+		const ctx = await createContext("thread-streamed-late-goal");
+		const before = assistantUsageMessage(1000, 500);
+		const after = assistantUsageMessage(10, 5);
+		await harness.emit("agent_start", { type: "agent_start" }, ctx);
+		await harness.emit("message_end", { type: "message_end", message: before }, ctx);
+		await harness.tool("create_goal").execute("c1", { objective: "Late goal" }, undefined, undefined, ctx);
+		await harness.emit("message_end", { type: "message_end", message: after }, ctx);
+		await harness.emit("agent_end", { type: "agent_end", messages: [before, after] }, ctx);
+
+		expect((await readGoal(refForContext(ctx)))?.tokensUsed).toBe(15);
+	});
+
+	it("accounts resumed active goal time from session start without counting offline time", async () => {
+		vi.useFakeTimers();
+		vi.setSystemTime(0);
+		const harness = createHarness();
+		const ctx = await createContext("thread-resume-active-accounting");
+
+		// given
+		await harness.emit("agent_start", { type: "agent_start" }, ctx);
+		await harness.tool("create_goal").execute("create-goal", { objective: "Resume work" }, undefined, undefined, ctx);
+		vi.advanceTimersByTime(20_000);
+		await harness.emit("agent_end", { type: "agent_end", messages: [] }, ctx);
+		await harness.emit("session_shutdown", { type: "session_shutdown" }, ctx);
+		vi.advanceTimersByTime(80_000);
+
+		// when
+		await harness.emit("session_start", { type: "session_start", reason: "resume" }, ctx);
+		vi.advanceTimersByTime(7_000);
+		await harness.emit("agent_start", { type: "agent_start" }, ctx);
+		vi.advanceTimersByTime(11_000);
+		await harness.emit("agent_end", { type: "agent_end", messages: [] }, ctx);
+
+		// then
+		const goal = await readGoal(refForContext(ctx));
+		expect(goal?.timeUsedSeconds).toBe(38);
+	});
+
+	it("finalizes elapsed time and usage when update_goal completes an active turn", async () => {
+		vi.useFakeTimers();
+		vi.setSystemTime(0);
+		const harness = createHarness();
+		const ctx = await createContext("thread-complete-during-turn");
+
+		await harness
+			.tool("create_goal")
+			.execute("create-goal", { objective: "finish in this turn" }, undefined, undefined, ctx);
+		await harness.emit("agent_start", { type: "agent_start" }, ctx);
+		vi.advanceTimersByTime(65_000);
+
+		const completion = await harness
+			.tool("update_goal")
+			.execute("complete-goal", { status: "complete" }, undefined, undefined, ctx);
+
+		const completedGoal = await readGoal(refForContext(ctx));
+		expect(completedGoal?.status).toBe("complete");
+		expect(completedGoal?.timeUsedSeconds).toBe(65);
+		expect(toolResultText(completion)).toContain('"timeUsedSeconds": 65');
+
+		vi.advanceTimersByTime(5_000);
+		await harness.emit(
+			"agent_end",
+			{
+				type: "agent_end",
+				messages: [
+					{
+						role: "assistant",
+						usage: { input: 100, output: 20, cacheRead: 60, cacheWrite: 0, totalTokens: 120 },
+					},
+				],
+			},
+			ctx,
+		);
+
+		const finalizedGoal = await readGoal(refForContext(ctx));
+		expect(finalizedGoal?.tokensUsed).toBe(120);
+		expect(finalizedGoal?.timeUsedSeconds).toBe(70);
+	});
+
+	it("accounts a blocked active turn before suppressing its continuation", async () => {
+		vi.useFakeTimers();
+		vi.setSystemTime(0);
+		const harness = createHarness();
+		const ctx = await createContext("thread-blocked-during-turn");
+
+		await harness.tool("create_goal").execute("c1", { objective: "Wait for a decision" }, undefined, undefined, ctx);
+		await harness.emit("agent_start", { type: "agent_start" }, ctx);
+		vi.advanceTimersByTime(65_000);
+		const blocked = await harness
+			.tool("update_goal")
+			.execute("u1", { status: "blocked", reason: "Waiting on a product decision" }, undefined, undefined, ctx);
+
+		expect(JSON.parse(toolResultText(blocked))).toMatchObject({
+			goal: { status: "blocked", blockedReason: "Waiting on a product decision", timeUsedSeconds: 65 },
+		});
+		vi.advanceTimersByTime(5_000);
+		await harness.emit(
+			"agent_end",
+			{
+				type: "agent_end",
+				messages: [
+					{
+						role: "assistant",
+						usage: { input: 100, output: 20, cacheRead: 60, cacheWrite: 0, totalTokens: 120 },
+					},
+				],
+			},
+			ctx,
+		);
+
+		const persisted = await readGoal(refForContext(ctx));
+		expect(persisted).toMatchObject({ status: "blocked", tokensUsed: 120, timeUsedSeconds: 70 });
+		expect(harness.sentMessages).toHaveLength(0);
+	});
+
+	it("accounts an aborted active turn before blocking it and suppressing continuation", async () => {
+		vi.useFakeTimers();
+		vi.setSystemTime(0);
+		const harness = createHarness();
+		const ctx = await createContext("thread-user-abort");
+		const abortController = new AbortController();
+		ctx.signal = abortController.signal;
+		await harness.tool("create_goal").execute("c1", { objective: "Finish the work" }, undefined, undefined, ctx);
+
+		await harness.emit("before_agent_start", { type: "before_agent_start" }, ctx);
+		await harness.emit("agent_start", { type: "agent_start" }, ctx);
+		vi.advanceTimersByTime(65_000);
+		abortController.abort();
+		await harness.emit(
+			"agent_end",
+			{
+				type: "agent_end",
+				messages: [
+					{
+						role: "assistant",
+						usage: { input: 100, output: 20, cacheRead: 60, cacheWrite: 0, totalTokens: 120 },
+					},
+				],
+			},
+			ctx,
+		);
+
+		expect(await readGoal(refForContext(ctx))).toMatchObject({
+			status: "blocked",
+			blockedReason: "user interrupted the turn",
+			tokensUsed: 120,
+			timeUsedSeconds: 65,
+		});
+		expect(harness.sentMessages).toHaveLength(0);
+	});
+
+	it("resumes a blocked goal only for the agent start following a real user prompt", async () => {
+		vi.useFakeTimers();
+		vi.setSystemTime(0);
+		const harness = createHarness();
+		const ctx = await createContext("thread-user-resume");
+		await harness.tool("create_goal").execute("c1", { objective: "Finish the work" }, undefined, undefined, ctx);
+		await harness
+			.tool("update_goal")
+			.execute("u1", { status: "blocked", reason: "Waiting on user input" }, undefined, undefined, ctx);
+
+		await harness.emit("agent_start", { type: "agent_start" }, ctx);
+		expect((await readGoal(refForContext(ctx)))?.status).toBe("blocked");
+
+		await harness.emit("before_agent_start", { type: "before_agent_start" }, ctx);
+		await harness.emit("agent_start", { type: "agent_start" }, ctx);
+		vi.advanceTimersByTime(10_000);
+		await harness.emit("agent_end", { type: "agent_end", messages: [] }, ctx);
+
+		const resumed = await readGoal(refForContext(ctx));
+		expect(resumed).toMatchObject({ status: "active", timeUsedSeconds: 10 });
+		expect(resumed).not.toHaveProperty("blockedReason");
+		expect(resumed).not.toHaveProperty("blockedAt");
+	});
+
+	it("resumes a blocked goal at before_agent_start even when admission rejects the run (no stale flag)", async () => {
+		vi.useFakeTimers();
+		vi.setSystemTime(0);
+		const harness = createHarness();
+		const ctx = await createContext("thread-user-flag-leak");
+		await harness.tool("create_goal").execute("c1", { objective: "Finish the work" }, undefined, undefined, ctx);
+		await harness
+			.tool("update_goal")
+			.execute("u1", { status: "blocked", reason: "Waiting on user input" }, undefined, undefined, ctx);
+
+		// Real user prompt fires before_agent_start, but the host's final provider admission
+		// rejects the run, so NO agent_start follows (no turn performed, no accounting begun).
+		// The resume must be bound to the user's before_agent_start, NOT deferred to a sticky
+		// flag that a later continuation-style agent_start could consume.
+		await harness.emit("before_agent_start", { type: "before_agent_start" }, ctx);
+
+		const afterRejectedPrompt = await readGoal(refForContext(ctx));
+		expect(afterRejectedPrompt).toMatchObject({ status: "active", timeUsedSeconds: 0 });
+		expect(afterRejectedPrompt).not.toHaveProperty("blockedReason");
+		expect(afterRejectedPrompt).not.toHaveProperty("blockedAt");
+
+		// A later continuation-style turn starts the agent WITHOUT a preceding before_agent_start.
+		// It must NOT perform a fresh resume transition; it only accounts its own turn against
+		// the already-active goal.
+		await harness.emit("agent_start", { type: "agent_start" }, ctx);
+		vi.advanceTimersByTime(5_000);
+		await harness.emit("agent_end", { type: "agent_end", messages: [] }, ctx);
+
+		const afterContinuation = await readGoal(refForContext(ctx));
+		expect(afterContinuation).toMatchObject({ status: "active", timeUsedSeconds: 5 });
+		expect(afterContinuation).not.toHaveProperty("blockedReason");
+	});
+
+	it("does not resume a blocked goal on a continuation-style agent_start with no preceding before_agent_start", async () => {
+		vi.useFakeTimers();
+		vi.setSystemTime(0);
+		const harness = createHarness();
+		const ctx = await createContext("thread-continuation-no-resume");
+		await harness.tool("create_goal").execute("c1", { objective: "Finish the work" }, undefined, undefined, ctx);
+		await harness
+			.tool("update_goal")
+			.execute("u1", { status: "blocked", reason: "Waiting on user input" }, undefined, undefined, ctx);
+
+		// A continuation-style turn (e.g. another extension's queued followUp) starts the agent
+		// without a real user prompt. agent_start must not resume a blocked goal on its own.
+		await harness.emit("agent_start", { type: "agent_start" }, ctx);
+		vi.advanceTimersByTime(5_000);
+		await harness.emit("agent_end", { type: "agent_end", messages: [] }, ctx);
+
+		const goal = await readGoal(refForContext(ctx));
+		expect(goal).toMatchObject({ status: "blocked", timeUsedSeconds: 0 });
+		expect(goal).toHaveProperty("blockedReason", "Waiting on user input");
+	});
+
+	it("does not check pending messages after a goal completes", async () => {
+		const harness = createHarness();
+		const ctx = await createContext("thread-complete-with-stale-pending");
+
+		await harness
+			.tool("create_goal")
+			.execute("create-goal", { objective: "finish without continuation checks" }, undefined, undefined, ctx);
+		await harness.emit("agent_start", { type: "agent_start" }, ctx);
+		await harness.tool("update_goal").execute("complete-goal", { status: "complete" }, undefined, undefined, ctx);
+		ctx.hasPendingMessages = () => {
+			throw new Error("stale pending messages");
+		};
+
+		await expect(harness.emit("agent_end", { type: "agent_end", messages: [] }, ctx)).resolves.toBeUndefined();
+	});
+
+	it("does not fail completed accounting when the UI ctx is stale", async () => {
+		const harness = createHarness();
+		const ctx = await createContext("thread-complete-with-stale-ui");
+
+		await harness
+			.tool("create_goal")
+			.execute("create-goal", { objective: "finish with stale ui" }, undefined, undefined, ctx);
+		await harness.emit("agent_start", { type: "agent_start" }, ctx);
+		await harness.tool("update_goal").execute("complete-goal", { status: "complete" }, undefined, undefined, ctx);
+		Object.defineProperty(ctx, "hasUI", {
+			get() {
+				throw new Error("This extension ctx is stale after session replacement or reload.");
+			},
+		});
+
+		await expect(
+			harness.emit(
+				"agent_end",
+				{
+					type: "agent_end",
+					messages: [
+						{
+							role: "assistant",
+							usage: { input: 100, output: 20, cacheRead: 60, cacheWrite: 0, totalTokens: 120 },
+						},
+					],
+				},
+				ctx,
+			),
+		).resolves.toBeUndefined();
+
+		const goal = await readGoal(refForContext(ctx));
+		expect(goal?.tokensUsed).toBe(120);
+	});
+
+	it("does not reread goal state during shutdown when no accounting is active", async () => {
+		const harness = createHarness();
+		const ctx = await createContext("thread-shutdown-no-accounting");
+		const filePath = goalFilePath(refForContext(ctx));
+		await mkdir(dirname(filePath), { recursive: true });
+		await writeFile(filePath, "", "utf8");
+
+		await expect(harness.emit("session_shutdown", { type: "session_shutdown" }, ctx)).resolves.toBeUndefined();
+	});
+
+	it("does not touch stale shutdown ctx when no accounting is active", async () => {
+		const harness = createHarness();
+		const ctx = await createContext("thread-shutdown-stale-ctx");
+		Object.defineProperty(ctx, "hasUI", {
+			get() {
+				throw new Error("stale ctx");
+			},
+		});
+
+		await expect(harness.emit("session_shutdown", { type: "session_shutdown" }, ctx)).resolves.toBeUndefined();
+	});
+
+	it("queues a budget-free hidden continuation prompt after agent_end while a goal is active", async () => {
+		const harness = createHarness();
+		const ctx = await createContext("thread-continuation");
+
+		await harness.tool("create_goal").execute("c1", { objective: "Keep going" }, undefined, undefined, ctx);
+		await harness.emit("agent_start", { type: "agent_start" }, ctx);
+		await harness.emit("agent_end", { type: "agent_end", messages: [] }, ctx);
+
+		expect(harness.sentMessages).toHaveLength(1);
+		expect(harness.sentMessages[0]?.message.customType).toBe("pi-goal-continuation");
+		expect(harness.sentMessages[0]?.message.display).toBe(false);
+		expect(harness.sentMessages[0]?.message.content.toLowerCase()).not.toContain("token budget");
+	});
+});
+
+describe("pi-goal extension command UI parity", () => {
+	afterEach(async () => {
+		vi.useRealTimers();
+		await Promise.all(tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
+	});
+
+	it("shows Codex-style usage text for a bare /goal without a goal", async () => {
+		const harness = createHarness();
+		const ui = createMockUi();
+		const ctx = await createContext("thread-show-no-goal", { hasUI: true, ui });
+
+		await harness.command("goal").handler("", ctx);
+
+		expect(ui.notifyCalls).toContainEqual({
+			message: "Usage: /goal <objective>\nNo goal is currently set.",
+			type: "warning",
+		});
+	});
+
+	it("shows Codex-style clear feedback when no goal exists", async () => {
+		const harness = createHarness();
+		const ui = createMockUi();
+		const ctx = await createContext("thread-clear-no-goal", { hasUI: true, ui });
+
+		await harness.command("goal").handler("clear", ctx);
+
+		expect(ui.notifyCalls).toContainEqual({
+			message: "No goal to clear\nThis thread does not currently have a goal.",
+			type: "warning",
+		});
+	});
+
+	it("asks with Codex-style choices before replacing an existing goal", async () => {
+		const harness = createHarness();
+		const ui = createMockUi({ selectResponses: ["Cancel"] });
+		const ctx = await createContext("thread-replace-cancel", { hasUI: true, ui });
+		await harness.tool("create_goal").execute("create-goal", { objective: "Original" }, undefined, undefined, ctx);
+
+		await harness.command("goal").handler("Replacement", ctx);
+
+		expect(ui.selectCalls).toContainEqual({
+			title: "Replace goal?\nNew objective: Replacement",
+			options: ["Replace current goal", "Cancel"],
+		});
+		expect(ui.confirmCalls).toHaveLength(0);
+		expect(await readGoal(refForContext(ctx))).toMatchObject({ objective: "Original" });
+	});
+
+	it("replaces an existing goal only after the replace choice is selected", async () => {
+		const harness = createHarness();
+		const ui = createMockUi({ selectResponses: ["Replace current goal"] });
+		const ctx = await createContext("thread-replace-confirm", { hasUI: true, ui });
+		await harness.tool("create_goal").execute("create-goal", { objective: "Original" }, undefined, undefined, ctx);
+
+		await harness.command("goal").handler("Replacement", ctx);
+
+		expect(await readGoal(refForContext(ctx))).toMatchObject({
+			objective: "Replacement",
+			status: "active",
+			tokensUsed: 0,
+			timeUsedSeconds: 0,
+		});
+		expect(ui.notifyCalls.at(-1)).toMatchObject({
+			message: expect.stringContaining("Goal active\nObjective: Replacement"),
+			type: "info",
+		});
+	});
+
+	it("prompts to resume a paused goal when a session is resumed", async () => {
+		const harness = createHarness();
+		const ui = createMockUi({ selectResponses: ["Resume goal"] });
+		const ctx = await createContext("thread-resume-paused", { hasUI: true, ui });
+		await harness.tool("create_goal").execute("create-goal", { objective: "Paused work" }, undefined, undefined, ctx);
+		await harness.command("goal").handler("pause", ctx);
+
+		await harness.emit("session_start", { type: "session_start", reason: "resume" }, ctx);
+
+		expect(ui.selectCalls).toContainEqual({
+			title: "Resume paused goal?\nGoal: Paused work",
+			options: ["Resume goal", "Leave paused"],
+		});
+		expect(await readGoal(refForContext(ctx))).toMatchObject({ objective: "Paused work", status: "active" });
+		expect(harness.sentMessages).toHaveLength(1);
+		expect(harness.sentMessages[0]?.message.customType).toBe("pi-goal-continuation");
+	});
+
+	it("does not prompt to resume a paused goal on non-resume session starts", async () => {
+		const harness = createHarness();
+		const ui = createMockUi({ selectResponses: ["Resume goal"] });
+		const ctx = await createContext("thread-startup-paused", { hasUI: true, ui });
+		await harness.tool("create_goal").execute("create-goal", { objective: "Paused work" }, undefined, undefined, ctx);
+		await harness.command("goal").handler("pause", ctx);
+
+		await harness.emit("session_start", { type: "session_start", reason: "startup" }, ctx);
+
+		expect(ui.selectCalls).toHaveLength(0);
+		expect(await readGoal(refForContext(ctx))).toMatchObject({ objective: "Paused work", status: "paused" });
+		expect(harness.sentMessages).toHaveLength(0);
+	});
+
+	it("leaves a paused resumed-session goal paused when that choice is selected", async () => {
+		const harness = createHarness();
+		const ui = createMockUi({ selectResponses: ["Leave paused"] });
+		const ctx = await createContext("thread-leave-paused", { hasUI: true, ui });
+		await harness.tool("create_goal").execute("create-goal", { objective: "Paused work" }, undefined, undefined, ctx);
+		await harness.command("goal").handler("pause", ctx);
+
+		await harness.emit("session_start", { type: "session_start", reason: "resume" }, ctx);
+
+		expect(await readGoal(refForContext(ctx))).toMatchObject({ objective: "Paused work", status: "paused" });
+		expect(harness.sentMessages).toHaveLength(0);
+	});
+});
+
+function createHarness(): {
+	tool(name: string): RegisteredTool;
+	command(name: string): RegisteredCommand;
+	emit(event: string, payload: EventPayload, ctx: GoalContext): Promise<void>;
+	sentMessages: SentMessage[];
+} {
+	const tools = new Map<string, RegisteredTool>();
+	const commands = new Map<string, RegisteredCommand>();
+	const handlers = new Map<string, EventHandler[]>();
+	const sentMessages: SentMessage[] = [];
+
+	piGoalExtension(createExtensionApi(tools, commands, handlers, sentMessages));
+
+	return {
+		tool(name) {
+			const tool = tools.get(name);
+			if (tool === undefined) throw new Error(`tool not registered: ${name}`);
+			return tool;
+		},
+		command(name) {
+			const command = commands.get(name);
+			if (command === undefined) throw new Error(`command not registered: ${name}`);
+			return command;
+		},
+		async emit(event, payload, ctx) {
+			for (const handler of handlers.get(event) ?? []) {
+				await handler(payload, ctx);
+			}
+		},
+		sentMessages,
+	};
+}
+
+function createExtensionApi(
+	tools: Map<string, RegisteredTool>,
+	commands: Map<string, RegisteredCommand>,
+	handlers: Map<string, EventHandler[]>,
+	sentMessages: SentMessage[],
+): ExtensionAPI {
+	return {
+		on(event, handler) {
+			const eventHandlers = handlers.get(event) ?? [];
+			eventHandlers.push((payload, ctx) => handler(payload as never, ctx as never));
+			handlers.set(event, eventHandlers);
+		},
+		registerTool(tool) {
+			tools.set(tool.name, {
+				name: tool.name,
+				description: tool.description,
+				parameters: tool.parameters,
+				execute(toolCallId, params, signal, onUpdate, ctx) {
+					return tool.execute(toolCallId, params as never, signal, onUpdate, ctx as never);
+				},
+			});
+		},
+		registerCommand(name, options) {
+			commands.set(name, {
+				handler(args, ctx) {
+					return options.handler(args, ctx as never);
+				},
+			});
+		},
+		registerShortcut() {},
+		registerFlag() {},
+		getFlag() {
+			return undefined;
+		},
+		registerMessageRenderer() {},
+		registerEntryRenderer() {},
+		sendMessage(message, options) {
+			sentMessages.push({
+				message: {
+					customType: message.customType,
+					content: String(message.content),
+					display: message.display,
+				},
+				options: options ?? {},
+			});
+		},
+		sendUserMessage() {},
+		appendEntry() {},
+		setSessionName() {},
+		getSessionName() {
+			return undefined;
+		},
+		setLabel() {},
+		async exec() {
+			return { stdout: "", stderr: "", code: 0, killed: false };
+		},
+		getActiveTools() {
+			return [];
+		},
+		getAllTools() {
+			return [];
+		},
+		setActiveTools() {},
+		getCommands() {
+			return [];
+		},
+		async setModel() {
+			return false;
+		},
+		getThinkingLevel() {
+			return "medium";
+		},
+		setThinkingLevel() {},
+		registerProvider() {},
+		unregisterProvider() {},
+		events: {
+			emit() {},
+			on() {
+				return () => {};
+			},
+		},
+	};
+}
+
+type ContextOptions = {
+	hasUI?: boolean;
+	ui?: MockUi;
+	isIdle?: boolean;
+	hasPendingMessages?: boolean;
+};
+
+async function createContext(threadId: string, options: ContextOptions = {}): Promise<GoalContext> {
+	const sessionDir = await mkdtemp(join(tmpdir(), "pi-goal-extension-"));
+	tempDirs.push(sessionDir);
+	return {
+		hasUI: options.hasUI ?? false,
+		ui: options.ui ?? createMockUi(),
+		cwd: sessionDir,
+		sessionManager: {
+			getSessionFile: () => join(sessionDir, "session.json"),
+			getSessionDir: () => sessionDir,
+			getSessionId: () => threadId,
+		},
+		isIdle: () => options.isIdle ?? true,
+		hasPendingMessages: () => options.hasPendingMessages ?? false,
+	};
+}
+
+function createMockUi(
+	options: { selectResponses?: (string | undefined)[]; confirmResponses?: boolean[] } = {},
+): MockUi {
+	const selectResponses = [...(options.selectResponses ?? [])];
+	const confirmResponses = [...(options.confirmResponses ?? [])];
+	return {
+		selectCalls: [],
+		confirmCalls: [],
+		notifyCalls: [],
+		async select(title, choices) {
+			this.selectCalls.push({ title, options: choices });
+			return selectResponses.shift();
+		},
+		async confirm(title, message) {
+			this.confirmCalls.push({ title, message });
+			return confirmResponses.shift() ?? false;
+		},
+		notify(message, type) {
+			this.notifyCalls.push({ message, type });
+		},
+		setStatus() {},
+	};
+}
+
+function refForContext(ctx: GoalContext): GoalStoreRef {
+	return {
+		baseDir: join(ctx.sessionManager.getSessionDir(), "extensions", "pi-goal"),
+		threadId: ctx.sessionManager.getSessionId(),
+	};
+}
+
+function assistantUsageMessage(input: number, output: number): unknown {
+	return {
+		role: "assistant",
+		usage: { input, output, cacheRead: 0, cacheWrite: 0, totalTokens: input + output },
+	};
+}
+
+function toolResultText(result: ToolResult): string {
+	const firstContent = result.content[0];
+	if (firstContent?.type !== "text") throw new Error("tool result had no text content");
+	return firstContent.text;
+}
+
+function toolContract(tool: RegisteredTool): Pick<RegisteredTool, "name" | "description" | "parameters"> {
+	return {
+		name: tool.name,
+		description: tool.description,
+		parameters: tool.parameters,
+	};
+}

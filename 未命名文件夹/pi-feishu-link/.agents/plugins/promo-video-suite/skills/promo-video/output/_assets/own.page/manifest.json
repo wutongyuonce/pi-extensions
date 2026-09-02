@@ -1,0 +1,7 @@
+{
+  "domain": "own.page",
+  "source": "teacher",
+  "createdAt": "2026-08-08T06:36:31.388Z",
+  "assets": [],
+  "note": "No crawl-website.ts available — assets must be provided manually or via Playwright MCP"
+}

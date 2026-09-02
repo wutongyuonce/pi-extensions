@@ -1,0 +1,17 @@
+extends: existence
+message: "More than one em dash in this paragraph. Split into shorter sentences instead of chaining em-dash clauses."
+link: "https://developers.google.com/style/dashes"
+level: suggestion
+scope: paragraph
+nonword: true
+# Approximation, not exact prose densitometry: matches when a paragraph
+# contains two em dashes with text between them. It can miss a paragraph
+# whose third-plus em dash pairs with neither flagged one, and it fires once
+# per qualifying pair rather than reporting a true per-paragraph count. Good
+# enough as an advisory nudge against em-dash chains; not a hard gate.
+# `scope: paragraph` also means this never sees a blockquote's paragraphs
+# (Vale's paragraph selector doesn't descend into `>` blocks), so a
+# two-em-dash paragraph quoted inside a blockquote is silently skipped
+# (#1933 review F6).
+tokens:
+  - '—[\s\S]*—'

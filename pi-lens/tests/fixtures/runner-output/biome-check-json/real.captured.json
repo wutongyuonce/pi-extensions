@@ -1,0 +1,21 @@
+{
+	"provenance": {
+		"runner": "biome-check-json",
+		"tool": "biome",
+		"version": "2.4.12",
+		"command": "biome lint --reporter=json --no-errors-on-unmatched bad.js",
+		"argv": [
+			"lint",
+			"--reporter=json",
+			"--no-errors-on-unmatched",
+			"bad.js"
+		],
+		"workspace": "tests/fixtures/tool-smoke/javascript",
+		"platform": "win32-x64",
+		"capturedAt": "2026-08-21"
+	},
+	"file": "bad.js",
+	"exitCode": 0,
+	"stdout": "{\"summary\":{\"changed\":0,\"unchanged\":1,\"matches\":0,\"duration\":5582400,\"errors\":0,\"warnings\":1,\"infos\":0,\"skipped\":0,\"suggestedFixesSkipped\":0,\"diagnosticsNotPrinted\":0,\"scannerDuration\":507500},\"diagnostics\":[{\"severity\":\"warning\",\"message\":\"This variable unused is unused.\",\"category\":\"lint/correctness/noUnusedVariables\",\"location\":{\"path\":\"bad.js\",\"start\":{\"line\":2,\"column\":7},\"end\":{\"line\":2,\"column\":13}},\"advices\":[]}],\"command\":\"lint\"}\n",
+	"stderr": "The --json option is unstable/experimental and its output might change between patches/minor releases.\n"
+}

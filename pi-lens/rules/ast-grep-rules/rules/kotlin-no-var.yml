@@ -1,0 +1,35 @@
+# Kotlin No var
+# Detects a `var` property or local declaration (as opposed to `val`).
+# Ported from vinhnx/VTCode rules/kotlin/no-var.yml (#2198, refs #2195).
+id: kotlin-no-var
+language: kotlin
+severity: warning
+message: "Prefer val over var; mutability should be explicit and scoped"
+note: |
+  Kotlin favors immutability by default. A `var` where a `val` would do
+  widens the set of places a value can change, which makes reasoning about
+  the surrounding code harder as it grows.
+  Detection-only: some `var`s are load-bearing (loop counters, accumulators,
+  lifecycle-managed fields), and rewriting to `val` requires knowing every
+  call site's mutation intent, which this rule cannot verify.
+  A `lateinit var` also matches `kotlin-no-lateinit`, so it reports twice.
+  That's intentional, not a bug to dedupe: the two findings name different
+  problems (mutability here, deferred-initialization risk there) and either
+  one could be fixed independently of the other.
+rule:
+  kind: property_declaration
+  has:
+    kind: binding_pattern_kind
+    regex: "^var$"
+files:
+  - "**/*.kt"
+tags:
+  - kotlin
+  - idiom
+  - immutability
+examples:
+  bad: |
+    var total = 0
+    total = total + price
+  good: |
+    val total = prices.sum()

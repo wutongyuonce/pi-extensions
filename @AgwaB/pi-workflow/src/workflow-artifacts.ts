@@ -1,0 +1,781 @@
+import type { WorkflowRunRecord, WorkflowTaskRunRecord } from "./types.js";
+
+type StatusCounts = Partial<Record<WorkflowTaskRunRecord["status"], number>>;
+
+type OutputRepairCounts = WorkflowTelemetrySummary["outputRepairCounts"];
+
+interface WorkflowTelemetryAccumulator {
+	outputRetries: number;
+	launchRetries: number;
+	resumeEvents: number;
+	resumedTasks: number;
+	contextLimitFailures: number;
+	retryReasons: WorkflowTelemetrySummary["retryReasons"];
+	resumeStatusCounts: StatusCounts;
+	outputRepairCounts: OutputRepairCounts;
+}
+
+export interface WorkflowTelemetrySummary {
+	taskCount: number;
+	wallClockMs: number | null;
+	statusCounts: StatusCounts;
+	completion: {
+		health: "clean" | "repaired" | "incomplete";
+		clean: boolean;
+		repaired: boolean;
+		repairEvents: number;
+		contextLimitFailures: number;
+	};
+	retryCounts: { output: number; launch: number };
+	retryReasons: {
+		output: Record<string, number>;
+		launch: Record<string, number>;
+	};
+	resumeCounts: { events: number; tasks: number };
+	resumeStatusCounts: StatusCounts;
+	outputRepairCounts: {
+		sameSession: number;
+		newSession: number;
+		unknown: number;
+	};
+	outputBytes: number;
+	stages: Record<
+		string,
+		{
+			taskCount: number;
+			statusCounts: StatusCounts;
+			durationMs: number;
+			outputBytes: number;
+		}
+	>;
+}
+
+export function summarizeWorkflowTelemetry(
+	run: Pick<WorkflowRunRecord, "createdAt" | "updatedAt"> & {
+		tasks?: Array<Partial<WorkflowTaskRunRecord>>;
+	},
+	options: { outputBytesByTaskId?: Record<string, number> } = {},
+): WorkflowTelemetrySummary {
+	const tasks = run.tasks ?? [];
+	const statusCounts: StatusCounts = {};
+	const stages: WorkflowTelemetrySummary["stages"] = {};
+	let outputBytes = 0;
+	const accumulator = createWorkflowTelemetryAccumulator();
+
+	for (const task of tasks) {
+		const status = task.status;
+		if (status) statusCounts[status] = (statusCounts[status] ?? 0) + 1;
+		accumulateTaskReliability(task, accumulator);
+
+		const outputKey = task.files?.output ?? task.taskId ?? task.specId ?? "";
+		const taskOutputBytes = options.outputBytesByTaskId?.[outputKey] ?? 0;
+		outputBytes += taskOutputBytes;
+
+		const stageId = task.stageId ?? "(none)";
+		const stage = (stages[stageId] ??= {
+			taskCount: 0,
+			statusCounts: {},
+			durationMs: 0,
+			outputBytes: 0,
+		});
+		stage.taskCount += 1;
+		if (status)
+			stage.statusCounts[status] = (stage.statusCounts[status] ?? 0) + 1;
+		stage.durationMs += taskDurationMs(task);
+		stage.outputBytes += taskOutputBytes;
+	}
+
+	const repairEvents =
+		accumulator.outputRetries +
+		accumulator.launchRetries +
+		accumulator.resumeEvents;
+	const health = completionHealth(tasks, repairEvents, accumulator);
+
+	return {
+		taskCount: tasks.length,
+		wallClockMs: durationBetween(run.createdAt, run.updatedAt),
+		statusCounts,
+		completion: {
+			health,
+			clean: health === "clean",
+			repaired: health === "repaired",
+			repairEvents,
+			contextLimitFailures: accumulator.contextLimitFailures,
+		},
+		retryCounts: {
+			output: accumulator.outputRetries,
+			launch: accumulator.launchRetries,
+		},
+		retryReasons: accumulator.retryReasons,
+		resumeCounts: {
+			events: accumulator.resumeEvents,
+			tasks: accumulator.resumedTasks,
+		},
+		resumeStatusCounts: accumulator.resumeStatusCounts,
+		outputRepairCounts: accumulator.outputRepairCounts,
+		outputBytes,
+		stages,
+	};
+}
+
+function createWorkflowTelemetryAccumulator(): WorkflowTelemetryAccumulator {
+	return {
+		outputRetries: 0,
+		launchRetries: 0,
+		resumeEvents: 0,
+		resumedTasks: 0,
+		contextLimitFailures: 0,
+		retryReasons: { output: {}, launch: {} },
+		resumeStatusCounts: {},
+		outputRepairCounts: { sameSession: 0, newSession: 0, unknown: 0 },
+	};
+}
+
+function accumulateTaskReliability(
+	task: Partial<WorkflowTaskRunRecord>,
+	accumulator: WorkflowTelemetryAccumulator,
+): void {
+	if (taskHasContextLimitFailure(task)) accumulator.contextLimitFailures += 1;
+	const currentOutputAttempts = positiveCount(task.outputRetry?.attempts);
+	accumulator.outputRetries += currentOutputAttempts;
+	if (currentOutputAttempts > 0) {
+		countReason(accumulator.retryReasons.output, task.outputRetry?.reason);
+		countRepairMode(
+			accumulator.outputRepairCounts,
+			task.outputRetry?.repairMode,
+		);
+	}
+
+	const currentLaunchAttempts = positiveCount(task.launchRetry?.attempts);
+	accumulator.launchRetries += currentLaunchAttempts;
+	if (currentLaunchAttempts > 0)
+		countReason(accumulator.retryReasons.launch, task.launchRetry?.reason);
+
+	const resumeEvents = Array.isArray(task.resumeEvents)
+		? task.resumeEvents
+		: [];
+	if (resumeEvents.length === 0) return;
+	accumulator.resumedTasks += 1;
+	accumulator.resumeEvents += resumeEvents.length;
+	for (const event of resumeEvents) accumulateResumeEvent(event, accumulator);
+}
+
+function completionHealth(
+	tasks: Array<Partial<WorkflowTaskRunRecord>>,
+	repairEvents: number,
+	accumulator: WorkflowTelemetryAccumulator,
+): WorkflowTelemetrySummary["completion"]["health"] {
+	const allCompleted =
+		tasks.length > 0 && tasks.every((task) => task.status === "completed");
+	if (!allCompleted) return "incomplete";
+	return repairEvents === 0 && accumulator.contextLimitFailures === 0
+		? "clean"
+		: "repaired";
+}
+
+function accumulateResumeEvent(
+	event: NonNullable<WorkflowTaskRunRecord["resumeEvents"]>[number],
+	accumulator: WorkflowTelemetryAccumulator,
+): void {
+	accumulator.resumeStatusCounts[event.fromStatus] =
+		(accumulator.resumeStatusCounts[event.fromStatus] ?? 0) + 1;
+	if (resumeEventHasContextLimitFailure(event))
+		accumulator.contextLimitFailures += 1;
+	const previousOutputAttempts = positiveCount(event.outputRetryAttempts);
+	accumulator.outputRetries += previousOutputAttempts;
+	if (previousOutputAttempts > 0) {
+		countReason(accumulator.retryReasons.output, event.outputRetryReason);
+		countRepairMode(
+			accumulator.outputRepairCounts,
+			event.outputRetryRepairMode,
+		);
+	}
+	const previousLaunchAttempts = positiveCount(event.launchRetryAttempts);
+	accumulator.launchRetries += previousLaunchAttempts;
+	if (previousLaunchAttempts > 0)
+		countReason(accumulator.retryReasons.launch, event.launchRetryReason);
+}
+
+function positiveCount(value: number | undefined): number {
+	if (value === undefined || !Number.isFinite(value)) return 0;
+	return Math.max(0, Math.floor(value));
+}
+
+function countReason(
+	counts: Record<string, number>,
+	reason: string | undefined,
+): void {
+	const key = reason && reason.trim().length > 0 ? reason : "unknown";
+	counts[key] = (counts[key] ?? 0) + 1;
+}
+
+function countRepairMode(
+	counts: OutputRepairCounts,
+	mode: "same_session" | "new_session" | undefined,
+): void {
+	if (mode === "same_session") counts.sameSession += 1;
+	else if (mode === "new_session") counts.newSession += 1;
+	else counts.unknown += 1;
+}
+
+function taskHasContextLimitFailure(
+	task: Partial<WorkflowTaskRunRecord>,
+): boolean {
+	return [
+		task.statusDetail,
+		task.lastMessage,
+		task.outputRetry?.reason,
+		task.outputRetry?.message,
+		task.launchRetry?.reason,
+		task.launchRetry?.message,
+	].some(isContextLimitText);
+}
+
+function resumeEventHasContextLimitFailure(
+	event: NonNullable<WorkflowTaskRunRecord["resumeEvents"]>[number],
+): boolean {
+	return [
+		event.fromStatusDetail,
+		event.lastMessage,
+		event.outputRetryReason,
+		event.launchRetryReason,
+	].some(isContextLimitText);
+}
+
+function isContextLimitText(value: string | undefined): boolean {
+	const text = value?.toLowerCase() ?? "";
+	return (
+		text.includes("context_or_request_too_large") ||
+		/context (window|length)|maximum context|request too large|token limit/.test(
+			text,
+		)
+	);
+}
+
+export interface SourceContextPacket {
+	tasks: SourceContextTask[];
+	byStage: Record<
+		string,
+		{
+			taskCount: number;
+			statusCounts: StatusCounts;
+		}
+	>;
+}
+
+export interface SourceContextTask {
+	taskId?: string;
+	specId?: string;
+	stageId: string;
+	status?: WorkflowTaskRunRecord["status"];
+	structuredOutput?: unknown;
+	outputPreview?: string;
+	projectionWarnings?: Array<{
+		path: string;
+		reason: "missing";
+	}>;
+	omittedOutput?: {
+		reason: "packet_budget_exhausted";
+		originalChars?: number;
+	};
+}
+
+export interface SourceContextPacketOptions {
+	structuredOutputsByTaskId?: Record<string, unknown>;
+	rawOutputsByTaskId?: Record<string, string>;
+	maxPreviewChars?: number;
+	maxStructuredChars?: number;
+	maxStructuredCharsByStage?: Record<string, number>;
+	structuredOutputPathsByStage?: Record<string, string[]>;
+	maxPacketChars?: number;
+}
+
+export function buildSourceContextPacket(
+	run: { tasks?: Array<Partial<WorkflowTaskRunRecord>> },
+	options: SourceContextPacketOptions = {},
+): SourceContextPacket {
+	const maxPreviewChars = Math.max(
+		0,
+		Math.floor(options.maxPreviewChars ?? 1200),
+	);
+	const maxStructuredChars = normalizeOptionalCharCap(
+		options.maxStructuredChars,
+	);
+	const maxStructuredCharsByStage = Object.fromEntries(
+		Object.entries(options.maxStructuredCharsByStage ?? {}).map(
+			([stage, cap]) => [stage, Math.max(0, Math.floor(cap))],
+		),
+	);
+	const maxPacketChars = normalizeOptionalCharCap(options.maxPacketChars);
+	const packet: SourceContextPacket = { tasks: [], byStage: {} };
+
+	// Build the accounting metadata first.  It is part of the serialized packet
+	// and must not be treated as free space for task payloads.
+	for (const task of run.tasks ?? []) {
+		const stageId = task.stageId ?? "(none)";
+		const stage = (packet.byStage[stageId] ??= {
+			taskCount: 0,
+			statusCounts: {},
+		});
+		stage.taskCount += 1;
+		if (task.status)
+			stage.statusCounts[task.status] =
+				(stage.statusCounts[task.status] ?? 0) + 1;
+	}
+	if (maxPacketChars !== undefined && JSON.stringify(packet).length > maxPacketChars)
+		packet.byStage = {};
+
+	const sourceTasks = run.tasks ?? [];
+	for (const [taskIndex, task] of sourceTasks.entries()) {
+		const taskId = task.taskId;
+		const stageId = task.stageId ?? "(none)";
+		const structuredOutput = taskId
+			? options.structuredOutputsByTaskId?.[taskId]
+			: undefined;
+		const projection = projectStructuredOutput(
+			structuredOutput,
+			options.structuredOutputPathsByStage?.[stageId],
+		);
+		const rawOutput = taskId ? options.rawOutputsByTaskId?.[taskId] : undefined;
+		const stageStructuredChars =
+			maxStructuredCharsByStage[stageId] ?? maxStructuredChars;
+		const entry: SourceContextTask = {
+			taskId,
+			specId: task.specId,
+			stageId,
+			status: task.status,
+			structuredOutput: capStructuredOutput(
+				projection.value,
+				stageStructuredChars,
+			),
+			outputPreview:
+				structuredOutput === undefined && rawOutput !== undefined
+					? preview(rawOutput, maxPreviewChars)
+					: undefined,
+			projectionWarnings:
+				projection.missingPaths.length > 0
+					? projection.missingPaths.map((path) => ({
+							path,
+							reason: "missing",
+						}))
+					: undefined,
+		};
+		const reservedTasks = sourceTasks.slice(taskIndex + 1).map((future) => ({
+			stageId: future.stageId ?? "(none)",
+			omittedOutput: { reason: "packet_budget_exhausted" as const },
+		}));
+		let fitted = fitSourceContextTaskToBudget(
+			packet,
+			entry,
+			maxPacketChars,
+			reservedTasks,
+		);
+		if (!fitted && maxPacketChars !== undefined &&
+			Object.keys(packet.byStage).length > 0) {
+			// Under an extremely tight cap, retaining both the stage summary and
+			// useful task entries is impossible. Drop the optional summary and
+			// repack against the same serialized limit; its bytes were still
+			// accounted for while attempting the preferred representation.
+			packet.byStage = {};
+			fitted = fitSourceContextTaskToBudget(
+				packet,
+				entry,
+				maxPacketChars,
+				reservedTasks,
+			);
+		}
+		// If even the bounded metadata marker cannot fit, omit the task. The
+		// final serialized packet remains within the global limit.
+		if (fitted) packet.tasks.push(fitted);
+	}
+
+	return packet;
+}
+
+export interface StructuredContract {
+	requiredPaths?: string[];
+	arrays?: Array<{ path: string; minItems?: number; maxItems?: number }>;
+	maxStringChars?: Array<{ path: string; maxChars: number }>;
+}
+
+export interface StructuredContractIssue {
+	path: string;
+	message: string;
+}
+
+export function validateStructuredContract(
+	value: unknown,
+	contract: StructuredContract,
+): { valid: boolean; issues: StructuredContractIssue[] } {
+	const issues: StructuredContractIssue[] = [];
+
+	for (const path of contract.requiredPaths ?? []) {
+		const resolved = resolvePath(value, path);
+		if (
+			!resolved.exists ||
+			resolved.value === undefined ||
+			resolved.value === null
+		)
+			issues.push({ path, message: "required path is missing" });
+	}
+
+	for (const rule of contract.arrays ?? []) {
+		const resolved = resolvePath(value, rule.path);
+		if (!resolved.exists || !Array.isArray(resolved.value)) {
+			issues.push({ path: rule.path, message: "expected array" });
+			continue;
+		}
+		if (rule.minItems !== undefined && resolved.value.length < rule.minItems) {
+			issues.push({
+				path: rule.path,
+				message: `expected at least ${rule.minItems} items`,
+			});
+		}
+		if (rule.maxItems !== undefined && resolved.value.length > rule.maxItems) {
+			issues.push({
+				path: rule.path,
+				message: `expected at most ${rule.maxItems} items`,
+			});
+		}
+	}
+
+	for (const rule of contract.maxStringChars ?? []) {
+		const resolved = resolvePath(value, rule.path);
+		if (!resolved.exists) continue;
+		if (typeof resolved.value !== "string") {
+			issues.push({ path: rule.path, message: "expected string" });
+			continue;
+		}
+		if (resolved.value.length > rule.maxChars) {
+			issues.push({
+				path: rule.path,
+				message: `expected string length <= ${rule.maxChars}`,
+			});
+		}
+	}
+
+	return { valid: issues.length === 0, issues };
+}
+
+function taskDurationMs(task: Partial<WorkflowTaskRunRecord>): number {
+	const duration = durationBetween(task.startedAt, task.completedAt);
+	return duration ?? 0;
+}
+
+function durationBetween(
+	start: string | undefined,
+	end: string | undefined,
+): number | null {
+	if (!start || !end) return null;
+	const startMs = Date.parse(start);
+	const endMs = Date.parse(end);
+	if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs < startMs)
+		return null;
+	return endMs - startMs;
+}
+
+function normalizeOptionalCharCap(
+	value: number | undefined,
+): number | undefined {
+	return value === undefined ? undefined : Math.max(0, Math.floor(value));
+}
+
+function fitSourceContextTaskToBudget(
+	packet: SourceContextPacket,
+	entry: SourceContextTask,
+	maxPacketChars: number | undefined,
+	reservedTasks: SourceContextTask[] = [],
+): SourceContextTask | undefined {
+	if (maxPacketChars === undefined ||
+		serializedPacketLength(packet, entry, reservedTasks) <= maxPacketChars)
+		return entry;
+
+	if (entry.structuredOutput !== undefined) {
+		const serialized = JSON.stringify(entry.structuredOutput);
+		const candidate = (length: number): SourceContextTask => ({
+			taskId: entry.taskId,
+			specId: entry.specId,
+			stageId: entry.stageId,
+			status: entry.status,
+			structuredOutput: {
+				truncated: true,
+				originalChars: serialized.length,
+				preview: preview(serialized, length),
+			},
+			projectionWarnings: entry.projectionWarnings,
+		});
+		const fitted = largestFittingSourceContextTask(
+			packet, maxPacketChars, candidate, serialized.length, reservedTasks,
+		);
+		if (fitted) return fitted;
+		if (reservedTasks.length > 0) {
+			const compactCandidate = (length: number): SourceContextTask => ({
+				stageId: entry.stageId,
+				structuredOutput: {
+					truncated: true,
+					preview: preview(serialized, length),
+				},
+			});
+			const compact = largestFittingSourceContextTask(
+				packet, maxPacketChars, compactCandidate, serialized.length, reservedTasks,
+			);
+			if (compact) return compact;
+		}
+	}
+
+	if (entry.outputPreview !== undefined) {
+		const candidate = (length: number): SourceContextTask => ({
+			taskId: entry.taskId,
+			specId: entry.specId,
+			stageId: entry.stageId,
+			status: entry.status,
+			outputPreview: preview(entry.outputPreview!, length),
+			projectionWarnings: entry.projectionWarnings,
+		});
+		const fitted = largestFittingSourceContextTask(
+			packet, maxPacketChars, candidate, entry.outputPreview.length, reservedTasks,
+		);
+		if (fitted) return fitted;
+		if (reservedTasks.length > 0) {
+			const compactCandidate = (length: number): SourceContextTask => ({
+				stageId: entry.stageId,
+				outputPreview: preview(entry.outputPreview!, length),
+			});
+			const compact = largestFittingSourceContextTask(
+				packet, maxPacketChars, compactCandidate, entry.outputPreview.length, reservedTasks,
+			);
+			if (compact) return compact;
+		}
+	}
+
+	const originalOutputChars = outputChars(entry);
+	const metadataOnly: SourceContextTask = {
+		taskId: entry.taskId,
+		specId: entry.specId,
+		stageId: entry.stageId,
+		status: entry.status,
+		projectionWarnings: entry.projectionWarnings,
+		omittedOutput: {
+			reason: "packet_budget_exhausted",
+			...(originalOutputChars === undefined ? {} : { originalChars: originalOutputChars }),
+		},
+	};
+	if (serializedPacketLength(packet, metadataOnly, reservedTasks) <= maxPacketChars)
+		return metadataOnly;
+	const compactMetadata: SourceContextTask = {
+		stageId: entry.stageId,
+		omittedOutput: { reason: "packet_budget_exhausted" },
+	};
+	return serializedPacketLength(packet, compactMetadata, reservedTasks) <= maxPacketChars
+		? compactMetadata
+		: undefined;
+}
+
+function largestFittingSourceContextTask(
+	packet: SourceContextPacket,
+	maxPacketChars: number,
+	candidate: (length: number) => SourceContextTask,
+	maxLength: number,
+	reservedTasks: SourceContextTask[] = [],
+): SourceContextTask | undefined {
+	let low = 0;
+	let high = Math.max(0, maxLength);
+	let best: SourceContextTask | undefined;
+	while (low <= high) {
+		const middle = Math.floor((low + high) / 2);
+		const value = candidate(middle);
+		if (serializedPacketLength(packet, value, reservedTasks) <= maxPacketChars) {
+			best = value;
+			low = middle + 1;
+		} else {
+			high = middle - 1;
+		}
+	}
+	return best;
+}
+
+function serializedPacketLength(
+	packet: SourceContextPacket,
+	candidate: SourceContextTask,
+	reservedTasks: SourceContextTask[] = [],
+): number {
+	return JSON.stringify({
+		...packet,
+		tasks: [...packet.tasks, candidate, ...reservedTasks],
+	}).length;
+}
+
+function outputChars(entry: SourceContextTask): number | undefined {
+	if (entry.structuredOutput !== undefined)
+		return JSON.stringify(entry.structuredOutput).length;
+	if (entry.outputPreview !== undefined) return entry.outputPreview.length;
+	return undefined;
+}
+
+function projectStructuredOutput(
+	value: unknown,
+	paths: string[] | undefined,
+): { value: unknown; missingPaths: string[] } {
+	if (value === undefined || !paths || paths.length === 0)
+		return { value, missingPaths: [] };
+	const projected: Record<string, unknown> = {};
+	const missingPaths: string[] = [];
+	for (const path of paths) {
+		const tokens = parsePath(path);
+		if (!tokens) {
+			missingPaths.push(path);
+			continue;
+		}
+		const resolved = resolvePathTokens(value, tokens);
+		if (!resolved.exists) {
+			missingPaths.push(path);
+			continue;
+		}
+		setProjectedPath(projected, tokens, resolved.value);
+	}
+	return {
+		value: Object.keys(projected).length > 0 ? projected : undefined,
+		missingPaths,
+	};
+}
+
+function setProjectedPath(
+	target: Record<string, unknown>,
+	tokens: Array<string | number>,
+	value: unknown,
+): void {
+	let current: Record<string, unknown> = target;
+	for (let index = 0; index < tokens.length; index += 1) {
+		const token = tokens[index];
+		if (typeof token === "number" || !isSafePathToken(token)) return;
+		if (index === tokens.length - 1) {
+			current[token] = value;
+			return;
+		}
+		const nextToken = tokens[index + 1];
+		if (typeof nextToken === "number") return;
+		const next = Object.hasOwn(current, token) ? current[token] : undefined;
+		if (!isProjectionTargetContainer(next)) current[token] = {};
+		current = current[token] as Record<string, unknown>;
+	}
+}
+
+function isProjectionTargetContainer(
+	value: unknown,
+): value is Record<string, unknown> {
+	return (
+		!!value &&
+		typeof value === "object" &&
+		!Array.isArray(value) &&
+		value !== Object.prototype
+	);
+}
+
+function capStructuredOutput(
+	value: unknown,
+	maxChars: number | undefined,
+): unknown {
+	if (value === undefined || maxChars === undefined) return value;
+	const serialized = JSON.stringify(value);
+	if (serialized.length <= maxChars) return value;
+	return {
+		truncated: true,
+		originalChars: serialized.length,
+		preview: preview(serialized, maxChars),
+	};
+}
+
+function preview(text: string, maxChars: number): string {
+	if (text.length <= maxChars) return text;
+	return `${text.slice(0, maxChars)}…`;
+}
+
+function resolvePath(
+	value: unknown,
+	path: string,
+): { exists: boolean; value?: unknown } {
+	const tokens = parsePath(path);
+	if (!tokens) return { exists: false };
+	return resolvePathTokens(value, tokens);
+}
+
+function resolvePathTokens(
+	value: unknown,
+	tokens: Array<string | number>,
+): { exists: boolean; value?: unknown } {
+	let current: unknown = value;
+	for (const token of tokens) {
+		if (typeof token === "number") {
+			if (
+				!Array.isArray(current) ||
+				token < 0 ||
+				token >= current.length ||
+				!Object.hasOwn(current, token)
+			)
+				return { exists: false };
+			current = current[token];
+			continue;
+		}
+		if (
+			!isSafePathToken(token) ||
+			!current ||
+			typeof current !== "object" ||
+			!Object.hasOwn(current, token)
+		)
+			return { exists: false };
+		current = (current as Record<string, unknown>)[token];
+	}
+	return { exists: true, value: current };
+}
+
+function parsePath(path: string): Array<string | number> | undefined {
+	if (path === "$") return [];
+	if (!path.startsWith("$")) return undefined;
+	const tokens: Array<string | number> = [];
+	let index = 1;
+	while (index < path.length) {
+		const char = path[index];
+		if (char === ".") {
+			index += 1;
+			const keyStart = index;
+			if (!isPathKeyStart(path[index])) return undefined;
+			index += 1;
+			while (index < path.length && isPathKeyPart(path[index]!)) {
+				index += 1;
+			}
+			const key = path.slice(keyStart, index);
+			if (!isSafePathToken(key)) return undefined;
+			tokens.push(key);
+			continue;
+		}
+		if (char === "[") {
+			const end = path.indexOf("]", index + 1);
+			if (end === -1) return undefined;
+			const selector = path.slice(index + 1, end);
+			if (!/^\d+$/u.test(selector)) return undefined;
+			const token = Number(selector);
+			if (!Number.isSafeInteger(token)) return undefined;
+			tokens.push(token);
+			index = end + 1;
+			continue;
+		}
+		return undefined;
+	}
+	return tokens;
+}
+
+function isPathKeyStart(value: string | undefined): boolean {
+	return value !== undefined && /[A-Za-z_]/u.test(value);
+}
+
+function isPathKeyPart(value: string): boolean {
+	return /[A-Za-z0-9_-]/u.test(value);
+}
+
+function isSafePathToken(token: string): boolean {
+	return (
+		token !== "__proto__" &&
+		token !== "prototype" &&
+		token !== "constructor"
+	);
+}

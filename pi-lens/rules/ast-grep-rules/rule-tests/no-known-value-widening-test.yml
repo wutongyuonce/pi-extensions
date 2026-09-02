@@ -1,0 +1,9 @@
+id: no-known-value-widening
+valid:
+  - "const x = { a: 1 };"
+  - "const x: Record<string, number> = other;"
+  - "const x = other as Record<string, number>;"
+  - "const x: Record<string, number> = getDefaults();"
+invalid:
+  - "const x: Record<string, number> = { a: 1 };"
+  - 'const x: Record<string, string> = { a: "b", c: "d" };'

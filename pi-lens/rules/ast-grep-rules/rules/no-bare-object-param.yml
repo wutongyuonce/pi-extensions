@@ -1,0 +1,60 @@
+id: no-bare-object-param
+language: TypeScript
+severity: error
+metadata:
+  category: pi-lens-self-scan
+message: "Parameter typed bare 'object' — guarantees nothing about shape, use Record<string, unknown> or a real interface"
+note: |
+  `object` only tells the compiler "not a primitive" — it doesn't
+  guarantee any property exists, so every consumer still has to cast
+  or reach for `as` before doing anything useful. Use
+  `Record<string, unknown>` for an open bag of properties, or a real
+  interface/type when the shape is known.
+
+  Scope: direct annotations only — a parameter (required or optional)
+  whose type annotation is exactly the bare `object` keyword, matched
+  structurally at the `predefined_type` leaf so it fires the same way
+  whether the parameter sits in a function declaration, an arrow
+  function, a class method, an interface method signature, or a
+  function-type alias (all four share the same
+  `required_parameter`/`optional_parameter` -> `type_annotation` ->
+  `predefined_type` shape in tree-sitter-typescript). Anti-slop's
+  transitive-alias-resolution half (flag a parameter typed with an
+  alias that itself resolves to bare `object`) is intentionally
+  dropped — that needs same-file symbol lookup ast-grep doesn't do.
+  A union member (`object | null`) or an array element (`object[]`)
+  is NOT flagged: the type_annotation's only content must be the bare
+  keyword, so wrapping it in anything else takes it out of scope
+  rather than risk a wider, noisier match than the direct case calls
+  for. Capitalized `Object` is a different node kind (`type_identifier`,
+  not `predefined_type`) and was never in scope.
+
+  No JS variant: JavaScript has no type annotations, so this pattern
+  has nothing to match there (same call as no-unknown-laundering.yml).
+
+  FP-scan (napi engine, every .ts/.tsx file under clients/ and tests/,
+  998 files): exactly one hit, `clients/host-ports.ts:8` —
+  `export type HostLogSink = (entry: object) => void;`. That's a
+  function-type alias, confirming the rule does cover function-type
+  parameters, not just declarations/methods. Fixed in the same PR by
+  narrowing to `Record<string, unknown>`: `HostLogSink` feeds
+  `NdjsonLogger.log(obj: unknown)` through the host's log sink, and
+  every real log record is a structured key/value bag, not an opaque
+  non-primitive — `Record<string, unknown>` says that honestly without
+  over-committing to a fixed shape. Zero hits remained after the fix,
+  so severity stays at `warning` rather than `hint`.
+
+  2026-08-19 (refs #1718): promoted `warning` -> `error` as part of the
+  anti-slop pattern adoption. Re-ran the FP scan on the current tree
+  (clients/ + tests/, same napi engine): still 0 hits. A zero-violation
+  rule costs nothing to run at `error`, and it stays free only if
+  promoted before someone writes the first one.
+rule:
+  kind: predefined_type
+  regex: "^object$"
+  inside:
+    kind: type_annotation
+    inside:
+      any:
+        - kind: required_parameter
+        - kind: optional_parameter

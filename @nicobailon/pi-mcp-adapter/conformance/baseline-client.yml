@@ -1,0 +1,26 @@
+# Known gaps in pi-mcp-adapter's MCP client conformance coverage.
+# Remove an entry as soon as its scenario passes. The conformance CLI treats a
+# passing baseline entry as stale and fails the run.
+client:
+  # The adapter dynamically registers instead of publishing an HTTPS Client ID
+  # Metadata Document. The scenario otherwise passes and reports one SHOULD-level warning.
+  - auth/basic-cimd
+
+  # The SDK receives the widened scope from the 403 challenge, but its in-call
+  # step-up cannot open Pi's user-gated OAuth flow. A manual restart loses the
+  # challenge scope and requests only the original PRM scope.
+  - auth/scope-step-up
+
+  # The 2025-03-26 fallback scenario serves authorization metadata whose issuer
+  # differs from the identifier used to fetch it. Stable SDK v2 rejects that
+  # mismatch per RFC 8414 §3.3; the adapter intentionally keeps the strict
+  # mix-up protection instead of enabling the SDK's security-weakening opt-out.
+  - auth/2025-03-26-oauth-metadata-backcompat
+
+  # The adapter supports client_secret_basic client credentials, but its config
+  # has no private-key JWT credentials or assertion signing hook.
+  - auth/client-credentials-jwt
+
+  # SEP-990 needs an IdP token exchange followed by a JWT bearer grant. The
+  # adapter currently implements authorization_code and client_credentials only.
+  - auth/cross-app-access-complete-flow

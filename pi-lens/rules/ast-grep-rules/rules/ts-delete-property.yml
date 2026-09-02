@@ -1,0 +1,10 @@
+id: ts-delete-property
+language: typescript
+severity: warning
+message: delete obj.prop - consider setting to undefined or restructuring instead
+metadata:
+  weight: 3
+  category: slop
+rule:
+  kind: unary_expression
+  pattern: "delete $OBJ.$PROP"

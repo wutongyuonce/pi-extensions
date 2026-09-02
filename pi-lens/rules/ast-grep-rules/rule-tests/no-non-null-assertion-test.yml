@@ -1,0 +1,226 @@
+id: no-non-null-assertion
+valid:
+  - 'const x = foo'
+  - 'const x = foo?.bar'
+  - 'const x: number = foo()'
+  # #1777: get-after-has, same map, same key — suppressed.
+  - |
+    function f(m: Map<string, number>, k: string) {
+      if (m.has(k)) {
+        return m.get(k)!;
+      }
+    }
+  # #1777: pop-after-length, same array, in a while loop.
+  - |
+    function f(stack: number[]) {
+      while (stack.length > 0) {
+        const x = stack.pop()!;
+      }
+    }
+  # #1777: shift-after-length, same array, in an if branch.
+  - |
+    function f(queue: number[]) {
+      if (queue.length > 0) {
+        return queue.shift()!;
+      }
+    }
+  # #1818 round 2: ternary-narrow. The consequence branch is only reached
+  # when the condition's own property access is truthy; the nested closure
+  # loses TS's narrowing across the function boundary, hence the `!`.
+  - |
+    function f(index: { forward?: Map<string, number> }, files: string[]) {
+      return index.forward
+        ? files.map((file) => index.forward!.get(file))
+        : undefined;
+    }
+  # #1818 round 2: property re-asserted after a `.filter()` on the same
+  # property, immediately followed by `.map()` in the same chain.
+  - |
+    function f(reads: Array<{ enclosingSymbol?: { name: string } }>) {
+      return reads
+        .filter((r) => r.enclosingSymbol)
+        .map((r) => ({ name: r.enclosingSymbol!.name }));
+    }
+invalid:
+  - 'const x = foo!'
+  - 'foo!.bar()'
+  - 'const x = (foo!)!.bar'
+  - 'foo!!'
+  # #1777 mutation guard: a get()! with NO has() check anywhere in the
+  # function must still flag — deleting the exclusion's pattern match
+  # (not just its metavariable binding) reds this.
+  - |
+    function f(m: Map<string, number>, k: string) {
+      return m.get(k)!;
+    }
+  # #1777 mutation guard: the has() check is for a DIFFERENT key —
+  # same-key binding discipline is the guard, not mere presence of
+  # any .has() call on the map.
+  - |
+    function f(m: Map<string, number>, k: string, other: string) {
+      if (m.has(other)) {
+        return m.get(k)!;
+      }
+    }
+  # #1777 mutation guard: the has() check is on a DIFFERENT map —
+  # same-receiver binding discipline is the guard.
+  - |
+    function f(m: Map<string, number>, other: Map<string, number>, k: string) {
+      if (other.has(k)) {
+        return m.get(k)!;
+      }
+    }
+  # #1777 mutation guard: pop()! with NO length check anywhere in the
+  # function must still flag.
+  - |
+    function f(arr: number[]) {
+      return arr.pop()!;
+    }
+  # #1777 mutation guard: the length check is on a DIFFERENT array —
+  # same-array binding discipline is the guard.
+  - |
+    function f(arr: number[], other: number[]) {
+      if (other.length > 0) {
+        return arr.pop()!;
+      }
+    }
+  # #1777: a length check elsewhere in the SAME function that does not
+  # dominate this particular pop() (documented approximation — the
+  # rule only requires presence in the enclosing function, not proven
+  # dominance) still suppresses; this fixture exists to make that
+  # scoping visible rather than silently assumed. Left as `invalid`
+  # because this specific shape (length check AFTER the pop, in an
+  # unrelated later branch) is outside the two named idiom shapes: the
+  # pop here is not itself inside the while/for/if that carries the
+  # length check.
+  - |
+    function f(arr: number[]) {
+      const x = arr.pop()!;
+      if (arr.length > 0) {
+        return x;
+      }
+    }
+  # #1777 F1 regression test: a `.has()` guard in an OUTER function must
+  # NOT suppress a `!` inside an INNER closure — the `stopBy` boundary
+  # has to stop the ancestor walk at the nearest enclosing function.
+  # Review round 1 proved the pre-fix rule got this wrong (a guard in
+  # the outer scope suppressed the closure's finding).
+  - |
+    function outer(m: Map<string, number>, k: string) {
+      if (m.has(k)) {
+        // guard lives here, in the OUTER function
+      }
+      return function inner() {
+        return m.get(k)!;
+      };
+    }
+  # #1777 F1 regression test, arrow-closure variant: same outer/inner
+  # split, `.length` guard in the outer function only.
+  - |
+    function outer(arr: number[]) {
+      if (arr.length > 0) {
+        // guard lives here, in the OUTER function
+      }
+      return () => arr.pop()!;
+    }
+  # #1777 F2 regression test: `if (!m.has(k))` guards the branch where
+  # the key is proven ABSENT, so `m.get(k)!` inside that branch is a
+  # real bug, not a narrowed-after-check idiom. ast-grep can't read
+  # branch polarity, so the fix is a blunt one — ANY negated `.has()`
+  # is refused as a guard — but it MUST catch this exact shape, the one
+  # review round 1 named as "the rule's most likely real bug shape."
+  - |
+    function f(m: Map<string, number>, k: string) {
+      if (!m.has(k)) {
+        return m.get(k)!;
+      }
+    }
+  # #1777 F2 accepted regression: this is a genuinely SAFE early-return
+  # guard clause — by the time `m.get(k)!` runs, `!m.has(k)` has already
+  # returned. It was correctly suppressed before the F2 fix. It is NOT
+  # anymore, and that is accepted, not a bug: ast-grep matches this
+  # `if (!m.has(k)) return;` identically to the real-bug shape directly
+  # above (same syntax, opposite control flow), and there is no cheaper
+  # structural signal available to tell them apart. This fixture exists
+  # so the known blind spot has a name and a test, and can't be
+  # mistaken for coverage this rule doesn't have.
+  - |
+    function f(m: Map<string, number>, k: string) {
+      if (!m.has(k)) return;
+      return m.get(k)!;
+    }
+  # #1818 mutation guard: ternary-narrow, but the assertion sits in the
+  # ALTERNATIVE branch (the condition's property is falsy there) — a real
+  # bug, must still flag.
+  - |
+    function f(index: { forward?: Map<string, number> }, files: string[]) {
+      return index.forward
+        ? undefined
+        : files.map((file) => index.forward!.get(file));
+    }
+  # #1818 mutation guard: ternary-narrow, but the assertion targets a
+  # DIFFERENT object than the condition checked — same-binding discipline
+  # is the guard, not mere presence of a truthy-ternary anywhere outside.
+  - |
+    function f(
+      index: { forward?: Map<string, number> },
+      other: { forward?: Map<string, number> },
+      files: string[],
+    ) {
+      return index.forward
+        ? files.map((file) => other.forward!.get(file))
+        : undefined;
+    }
+  # #1818 mutation guard: filter+map, but the filter checks a DIFFERENT
+  # property than the one asserted in map — must still flag.
+  - |
+    function f(reads: Array<{ enclosingSymbol?: { name: string }; other?: unknown }>) {
+      return reads
+        .filter((r) => r.other)
+        .map((r) => ({ name: r.enclosingSymbol!.name }));
+    }
+  # #1818 mutation guard: no preceding filter at all — must still flag.
+  - |
+    function f(reads: Array<{ enclosingSymbol?: { name: string } }>) {
+      return reads.map((r) => ({ name: r.enclosingSymbol!.name }));
+    }
+  # #1818 review round 1, N1: the SAME assertion repeated in BOTH the
+  # consequence AND alternative branches. The consequence instance is
+  # genuinely safe and suppressed; the alternative instance is a real
+  # bug (the condition's property is falsy on that branch) and must
+  # still flag. An `has: field: consequence` EXISTENCE check on the
+  # ternary cannot tell these two instances apart (the consequence
+  # branch's matching text satisfies the check for both); `field:
+  # consequence` as an IDENTITY check on the matched node can.
+  - |
+    function f(o: { y?: { length: number } }) {
+      return o.y ? o.y!.length : o.y!.length;
+    }
+  # #1818 review round 1, N2a: nested ternary. The assertion's NEAREST
+  # ternary is the INNER one, whose own condition (`flag`) does not
+  # match the asserted object/property — so it must still flag, even
+  # though an OUTER ternary's condition happens to match. Proves
+  # `stopBy: kind: ternary_expression` is a real boundary: weakening it
+  # to `end` lets the search escalate past the inner ternary (which
+  # correctly fails) to the outer one (which wrongly succeeds).
+  - |
+    function f(o: { y?: { length: number } }, flag: boolean) {
+      return o.y
+        ? flag
+          ? 1
+          : o.y!.length
+        : 0;
+    }
+  # #1818 review round 1, N2b: filter+map, but the asserted receiver is
+  # an UNRELATED variable, not the map callback's own parameter — must
+  # still flag. Proves the `$M` metavariable binding is load-bearing:
+  # decoupling it (e.g. to an unconstrained parameter name) would make
+  # ANY assertion inside ANY filter-then-map chain's callback body
+  # suppress, regardless of what is actually being asserted.
+  - |
+    function f(
+      rs: Array<{ sym?: { name: string } }>,
+      stray: { sym?: { name: string } },
+    ) {
+      return rs.filter((r) => r.sym).map((m) => stray.sym!.name);
+    }

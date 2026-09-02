@@ -1,0 +1,37 @@
+# Dependencies and package outputs
+node_modules/
+dist/
+*.tgz
+.tmp/
+
+# Local environment and OS/editor noise
+.DS_Store
+.env
+.env.*
+!.env.example
+
+# Local-only agent and maintenance surfaces
+AGENTS.md
+CHANGELOG.md
+/docs/maintenance/
+
+# Pi runtime artifacts and local eval outputs
+.pi/
+
+# Local work history, workflow state, caches, and generated test evidence
+.memory/
+.gjc/
+.harness/
+.harness-project/
+cache/
+skill-test-runs/
+
+# Local-only internal analysis/eval/research docs.
+# Never commit this tree; keep future LLM navigation links in ignored AGENTS.md.
+/internal/
+
+# Recovery/salvage artifacts and local archives
+.recovery/
+.harness-archive/
+*.tar.gz
+.worktrees/

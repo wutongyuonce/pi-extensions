@@ -1,0 +1,5 @@
+2026-08-26T00:00:00.0000000Z  ✓  default  tests/clients/smells-rollup.test.ts (23 tests) 27ms
+2026-08-26T00:00:00.1000000Z stdout | tests/clients/smells-rollup.test.ts > rolls up a persisted emit failure
+2026-08-26T00:00:00.1100000Z {"outcome":"emit_failed","error":"ECONNRESET"}
+2026-08-26T00:00:01.0000000Z some-unrelated-tool: internal error, aborting
+2026-08-26T00:00:01.1000000Z ##[error]Process completed with exit code 1.

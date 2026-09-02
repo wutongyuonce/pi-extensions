@@ -1,0 +1,29 @@
+id: no-conditional-empty-object-spread
+language: TypeScript
+severity: hint
+message: "Conditional empty-object spread — use an explicit if/else to omit fields"
+note: |
+  `{...(cond ? {} : {x})}` hides field omission behind a ternary — an
+  explicit `if` reads better and lets the object's shape stay typed.
+  Matched structurally (spread of a ternary whose consequence or
+  alternative is an empty object literal), not by exact source text, so
+  it also catches the un-parenthesized and multi-property-spread forms.
+
+  FP-scan finding (pi-lens codebase, clients/ tools/ mcp/ index.ts): 147
+  hits, and every sampled hit is this exact shape used deliberately to
+  build an optional-field object (`...(hit.annotations ? {
+  annotations: hit.annotations } : {})`). That is a real, established
+  idiom here, not a shape mismatch — so the rule stays at `hint` rather
+  than `warning`: still discoverable in a scan, but it does not read as
+  a call to fix 147 existing sites.
+rule:
+  kind: spread_element
+  has:
+    # the ternary sits under a parenthesized_expression when the source
+    # parenthesizes it, so this needs stopBy: end — spread_element's
+    # DIRECT child is not the ternary in that (common) form.
+    stopBy: end
+    kind: ternary_expression
+    any:
+      - has: { field: consequence, stopBy: neighbor, kind: object, regex: '^\{\s*\}$' }
+      - has: { field: alternative, stopBy: neighbor, kind: object, regex: '^\{\s*\}$' }

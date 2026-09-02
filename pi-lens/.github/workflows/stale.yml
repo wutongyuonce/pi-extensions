@@ -1,0 +1,40 @@
+name: Stale issues and PRs
+
+on:
+  schedule:
+    # Run once a day at 00:00 UTC
+    - cron: "0 0 * * *"
+  workflow_dispatch:
+
+permissions:
+  issues: write
+  pull-requests: write
+
+jobs:
+  stale:
+    runs-on: ubuntu-latest
+    steps:
+      # yamllint disable-line rule:line-length
+      - uses: actions/stale@4391f3da665fdf50b6810c1a66712fb9ba21aa93 # v11.0.0
+        with:
+          stale-issue-message: >
+            This issue has been automatically marked as stale because it has not
+            had recent activity. It will be closed in 14 days if no further
+            activity occurs. If this is still relevant, please add a comment or
+            remove the `stale` label.
+          stale-pr-message: >
+            This pull request has been automatically marked as stale because it
+            has not had recent activity. It will be closed in 14 days if no
+            further activity occurs.
+          close-issue-message: >
+            Closing this issue due to inactivity. Please reopen if it is still
+            relevant.
+          close-pr-message: >
+            Closing this pull request due to inactivity. Please reopen when you
+            have time to continue the discussion.
+          days-before-stale: 60
+          days-before-close: 14
+          exempt-issue-labels: "pinned,security,good first issue,help wanted"
+          exempt-pr-labels: "pinned,security,help wanted"
+          stale-issue-label: "stale"
+          stale-pr-label: "stale"

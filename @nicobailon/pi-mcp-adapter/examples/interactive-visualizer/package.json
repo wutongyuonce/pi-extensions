@@ -1,0 +1,23 @@
+{
+  "name": "interactive-visualizer-example",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Local MCP visualizer example for pi-mcp-adapter",
+  "scripts": {
+    "build": "node ./scripts/build.mjs",
+    "install-local": "npm run build && node ./scripts/install-local.mjs",
+    "uninstall-local": "node ./scripts/uninstall-local.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/ext-apps": "^1.2.0",
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "chart.js": "^4.5.1",
+    "mermaid": "^11.12.0",
+    "zod": "^4.1.0"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.12",
+    "typescript": "^5.9.3"
+  }
+}

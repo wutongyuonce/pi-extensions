@@ -1,0 +1,50 @@
+id: no-unsafe-dictionary-any
+language: TypeScript
+severity: error
+metadata:
+  category: pi-lens-self-scan
+message: "Record<K, any> — the value type gives callers no contract; use Record<K, unknown> or a real value type"
+note: |
+  Adapted from dmmulroy/anti-slop's `no-unsafe-dictionary-type`
+  (src/rules/no-unsafe-dictionary-type.ts, MIT), narrowed to the `any`
+  arm only. Upstream also flags `unknown`, bare `object`, `{}`, and
+  unions/aliases that resolve to one of those — this port drops all of
+  that (see the `no-unsafe-dictionary-unknown.yml` sibling for the
+  `unknown` arm, shipped separately at `hint`). `Record<K, any>` is the
+  one arm this repo's own FP scan (AGENTS.md smell 3) found ZERO
+  legitimate uses for: `any` as a dictionary's value type doesn't just
+  widen, it turns off checking for every property read off that
+  dictionary, which `unknown` does not do.
+
+  Scope: a direct `Record<$K, any>` type reference, matched
+  structurally — the same "direct annotation only" cut as
+  `no-bare-object-param.yml`. Upstream's alias-resolution and
+  type-literal-index-signature arms (`{ [key: string]: any }`,
+  an alias that resolves to `Record<string, any>`) are dropped for the
+  same reason: same-file symbol/generic resolution ast-grep doesn't do.
+
+  FP-scan (napi engine, clients/ + tests/, 2026-08-19): 4 hits, not the
+  2 the original audit measured — the audit's grep missed two test
+  files. `clients/cache/rule-cache.ts:81` and
+  `clients/tree-sitter-query-loader.ts:129` are genuine dictionary
+  value-type contracts (`post_filter_params?: Record<string, any>` on
+  loaded query metadata) and are fixed in the same PR to
+  `Record<string, unknown>` — every consumer already narrows manually
+  (`clients/tree-sitter-client.ts` takes `postFilterParams?: unknown`
+  or `any` as a local parameter type at the point it's actually
+  destructured, never relies on the interface field being `any`).
+  `tests/clients/call-graph.test.ts:736` and
+  `tests/tools/lens-diagnostics.test.ts:198` are a different shape:
+  ad-hoc mutation/access of a raw JSON fixture object
+  (`raw.edges[0].evidenceKind = "..."`, `props.mode.enum`) across
+  several unrelated nested paths, where `unknown` would require a cast
+  at every access and buys nothing — the same "test fixture shaping"
+  class already exempted for `require-safety-comment` and the empty-
+  object-spread hint. Excluded by path rather than fixed.
+ignores:
+  - "**/tests/clients/call-graph.test.ts"
+  - "**/tests/tools/lens-diagnostics.test.ts"
+rule:
+  pattern:
+    context: "type T = Record<$K, any>;"
+    selector: generic_type

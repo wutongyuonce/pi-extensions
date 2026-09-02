@@ -1,0 +1,1336 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>rpiv-voice ◦ /v dictation overlay ◦ design study</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=B612+Mono:wght@400;700&family=Major+Mono+Display&family=VT323&display=swap" />
+<style>
+:root {
+  /* console palette ─ midnight phosphor / signal cyan / hot crimson */
+  --bg-deep:        #07090d;
+  --bg-panel:       #0c1118;
+  --bg-rail:        #0a0f15;
+  --bg-cell:        #11171f;
+  --grid-line:      #182230;
+  --grid-line-hi:   #233346;
+
+  --fg-text:        #d8e2ee;
+  --fg-mute:        #6e7e93;
+  --fg-dim:         #3c4a5e;
+
+  --ph-amber:       #ffb547;          /* dominant phosphor */
+  --ph-amber-soft:  rgba(255,181,71,0.16);
+  --ph-amber-glow:  rgba(255,181,71,0.55);
+  --ph-amber-hi:    #ffd28a;
+
+  --signal-cyan:    #4fe3c2;
+  --signal-cyan-2:  #2ab3a0;
+  --signal-mag:     #ff3d9a;
+  --signal-blue:    #6ea8ff;
+
+  --rec-red:        #ff2052;
+  --rec-red-glow:   rgba(255,32,82,0.55);
+  --warn-yellow:    #ffd23f;
+
+  --cell:           14px;             /* monospace cell width unit */
+  --row:            20px;             /* line-box height */
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  background: var(--bg-deep);
+  color: var(--fg-text);
+  margin: 0;
+  min-height: 100%;
+  font-family: "B612 Mono", ui-monospace, monospace;
+  font-size: 14px;
+  line-height: 1.45;
+  letter-spacing: 0.01em;
+  -webkit-font-smoothing: antialiased;
+}
+
+body {
+  /* atmospheric backdrop: blueprint grid + soft amber sun + film grain */
+  background:
+    radial-gradient(1100px 700px at 78% -10%, rgba(255,181,71,0.10), transparent 60%),
+    radial-gradient(900px 600px at -10% 110%, rgba(79,227,194,0.06), transparent 60%),
+    repeating-linear-gradient(0deg,  rgba(255,255,255,0.018) 0 1px, transparent 1px 56px),
+    repeating-linear-gradient(90deg, rgba(255,255,255,0.018) 0 1px, transparent 1px 56px),
+    var(--bg-deep);
+  padding: 56px 32px 96px;
+  overflow-x: hidden;
+}
+
+/* ── faint scanlines + grain over everything (CRT wink, kept tasteful) ── */
+body::before {
+  content: "";
+  position: fixed; inset: 0;
+  background:
+    repeating-linear-gradient(
+      to bottom,
+      rgba(255,255,255,0.0) 0px,
+      rgba(255,255,255,0.0) 2px,
+      rgba(255,255,255,0.018) 3px,
+      rgba(255,255,255,0.0) 4px
+    );
+  mix-blend-mode: overlay;
+  pointer-events: none;
+  z-index: 1000;
+}
+body::after {
+  content: "";
+  position: fixed; inset: 0;
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='160' height='160'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/><feColorMatrix values='0 0 0 0 1  0 0 0 0 1  0 0 0 0 1  0 0 0 0.06 0'/></filter><rect width='100%25' height='100%25' filter='url(%23n)'/></svg>");
+  opacity: 0.45;
+  mix-blend-mode: overlay;
+  pointer-events: none;
+  z-index: 1001;
+}
+
+/* ── Document scaffold ─────────────────────────────────────────────── */
+main {
+  max-width: 1280px;
+  margin: 0 auto;
+  display: grid;
+  gap: 48px;
+}
+
+/* ── Identity strip ────────────────────────────────────────────────── */
+.idstrip {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  align-items: end;
+  gap: 24px;
+  padding-bottom: 22px;
+  border-bottom: 1px dashed var(--grid-line-hi);
+}
+.brand-line {
+  font-family: "Major Mono Display", "B612 Mono", monospace;
+  font-size: 36px;
+  letter-spacing: 0.04em;
+  line-height: 1;
+  color: var(--ph-amber);
+  text-shadow: 0 0 12px var(--ph-amber-glow);
+}
+.brand-line .slash { color: var(--fg-text); text-shadow: none; }
+.brand-line .ver   { color: var(--fg-mute); font-size: 22px; margin-left: 14px; }
+
+.id-meta {
+  display: flex;
+  gap: 14px;
+  flex-wrap: wrap;
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.18em;
+  color: var(--fg-mute);
+}
+.id-meta b { color: var(--fg-text); font-weight: 400; }
+
+.id-coords {
+  text-align: right;
+  font-size: 11px;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+  color: var(--fg-dim);
+}
+.id-coords span { color: var(--signal-cyan); }
+
+/* ── Section caption used between panels ───────────────────────────── */
+.caption {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  gap: 16px;
+  align-items: center;
+  margin: 0 4px 14px;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.32em;
+  color: var(--fg-mute);
+}
+.caption hr {
+  border: 0; height: 1px;
+  background: linear-gradient(to right, var(--grid-line-hi), transparent);
+}
+.caption .num { color: var(--ph-amber); }
+
+/* ── Terminal frame (the TUI overlay itself) ───────────────────────── */
+.term {
+  position: relative;
+  background:
+    linear-gradient(180deg, rgba(255,181,71,0.025), transparent 30%),
+    var(--bg-panel);
+  border: 1px solid var(--grid-line-hi);
+  border-radius: 6px;
+  padding: 0;
+  box-shadow:
+    0 0 0 1px rgba(255,181,71,0.04) inset,
+    0 30px 80px -30px rgba(0,0,0,0.8),
+    0 0 60px -10px rgba(255,181,71,0.06);
+  overflow: hidden;
+}
+
+/* faux chrome strip top / bottom — like a vintage rack unit lip */
+.term-chrome {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  gap: 14px;
+  align-items: center;
+  padding: 8px 14px;
+  background:
+    linear-gradient(180deg, #141b25, #0c121a);
+  border-bottom: 1px solid var(--grid-line-hi);
+  font-size: 10px;
+  letter-spacing: 0.28em;
+  text-transform: uppercase;
+  color: var(--fg-mute);
+}
+.term-chrome .dots { display: flex; gap: 6px; }
+.term-chrome .dots i {
+  width: 9px; height: 9px; border-radius: 50%;
+  background: #1f2a38;
+  border: 1px solid #283448;
+}
+.term-chrome .dots i.live { background: var(--rec-red); border-color: #5b0e22; box-shadow: 0 0 8px var(--rec-red-glow); }
+.term-chrome .dots i.warm { background: var(--ph-amber); border-color: #6a4a14; }
+.term-chrome .dots i.cool { background: var(--signal-cyan); border-color: #105547; }
+.term-chrome .label   { color: var(--fg-text); }
+.term-chrome .session { color: var(--signal-cyan); letter-spacing: 0.22em; }
+
+.term-body {
+  padding: 18px 22px 14px;
+  font-size: 14px;
+  line-height: 1.4;
+  background:
+    repeating-linear-gradient(
+      to bottom,
+      rgba(255,255,255,0.0) 0 22px,
+      rgba(255,255,255,0.012) 22px 23px
+    );
+}
+
+/* ── Banner row ─────────────────────────────────────────────────────── */
+.banner {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  align-items: center;
+  gap: 16px;
+  margin-bottom: 14px;
+}
+
+.banner .mark {
+  font-family: "Major Mono Display", "B612 Mono", monospace;
+  font-size: 22px;
+  letter-spacing: 0.06em;
+  color: var(--ph-amber);
+  text-shadow: 0 0 10px var(--ph-amber-glow);
+}
+.banner .mark .arrow { color: var(--signal-cyan); }
+.banner .mark .slash { color: var(--fg-text); text-shadow: none; }
+
+.status-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 10px 4px 8px;
+  border: 1px solid color-mix(in srgb, var(--rec-red) 50%, transparent);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--rec-red) 10%, transparent);
+  font-size: 11px;
+  letter-spacing: 0.28em;
+  text-transform: uppercase;
+  color: var(--rec-red);
+}
+.rec-dot {
+  width: 8px; height: 8px; border-radius: 50%;
+  background: var(--rec-red);
+  box-shadow: 0 0 0 2px rgba(255,32,82,0.18), 0 0 12px var(--rec-red-glow);
+  animation: pulse 1.4s ease-in-out infinite;
+}
+@keyframes pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50%      { opacity: 0.45; transform: scale(0.78); }
+}
+
+.timer {
+  font-feature-settings: "tnum" 1;
+  font-variant-numeric: tabular-nums;
+  color: var(--ph-amber);
+  font-size: 13px;
+  letter-spacing: 0.18em;
+}
+.timer .sep { color: var(--fg-mute); }
+
+.banner-right {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+.chip {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+  padding: 3px 9px;
+  border: 1px solid var(--grid-line-hi);
+  border-radius: 3px;
+  background: var(--bg-cell);
+  font-size: 11px;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--fg-text);
+}
+.chip .k { color: var(--fg-dim); font-size: 10px; letter-spacing: 0.22em; }
+.chip .v { color: var(--ph-amber); }
+.chip.cy .v { color: var(--signal-cyan); }
+.chip.bl .v { color: var(--signal-blue); }
+.chip.mg .v { color: var(--signal-mag); }
+
+/* ── Two-column meter rack ─────────────────────────────────────────── */
+.rack {
+  display: grid;
+  grid-template-columns: 1.35fr 1fr;
+  gap: 16px;
+  margin: 8px 0 14px;
+}
+.cell {
+  background: var(--bg-cell);
+  border: 1px solid var(--grid-line);
+  border-radius: 4px;
+  padding: 10px 12px 12px;
+  position: relative;
+}
+.cell-head {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  align-items: center;
+  font-size: 10px;
+  letter-spacing: 0.3em;
+  text-transform: uppercase;
+  color: var(--fg-mute);
+  margin-bottom: 8px;
+}
+.cell-head .badge {
+  color: var(--signal-cyan);
+  border: 1px solid color-mix(in srgb, var(--signal-cyan) 35%, transparent);
+  padding: 1px 6px;
+  border-radius: 2px;
+  font-size: 9px;
+  letter-spacing: 0.24em;
+}
+
+/* ── Spectrogram (8 bands × scrolling cells) ──────────────────────── */
+.spectro {
+  --bands: 9;
+  --cols: 56;
+  display: grid;
+  grid-template-rows: repeat(var(--bands), 1fr);
+  gap: 2px;
+  height: 124px;
+  font-family: "B612 Mono", monospace;
+  font-size: 13px;
+  line-height: 1;
+  overflow: hidden;
+}
+.spectro .row {
+  display: grid;
+  grid-template-columns: 36px 1fr;
+  gap: 8px;
+  align-items: center;
+  color: var(--fg-dim);
+  font-size: 9px;
+  letter-spacing: 0.18em;
+}
+.spectro .row .hz { text-align: right; }
+.spectro .row .strip {
+  display: flex;
+  gap: 1px;
+  height: 10px;
+  overflow: hidden;
+  position: relative;
+}
+.spectro .row .strip::after {
+  /* fade left edge to suggest scroll-off */
+  content: ""; position: absolute; inset: 0;
+  background: linear-gradient(to right, var(--bg-cell) 0, transparent 6%, transparent 94%, var(--bg-cell) 100%);
+  pointer-events: none;
+}
+.spectro .row .strip i {
+  flex: 1 0 auto;
+  height: 100%;
+  background: currentColor;
+  opacity: 0;
+  animation: spectroPulse 2.6s linear infinite;
+}
+.spectro .row.b1 { color: #6ea8ff; }
+.spectro .row.b2 { color: #4fbfe3; }
+.spectro .row.b3 { color: #4fe3c2; }
+.spectro .row.b4 { color: #7be37a; }
+.spectro .row.b5 { color: #cae34f; }
+.spectro .row.b6 { color: #ffd23f; }
+.spectro .row.b7 { color: #ffb547; }
+.spectro .row.b8 { color: #ff7a18; }
+.spectro .row.b9 { color: #ff3d9a; }
+
+@keyframes spectroPulse {
+  0%   { opacity: 0; }
+  10%  { opacity: 0.9; }
+  60%  { opacity: 0.55; }
+  100% { opacity: 0; }
+}
+
+/* ── VU bars (the equalizer the current build already has, dressed up) ── */
+.vu {
+  display: flex;
+  align-items: flex-end;
+  gap: 3px;
+  height: 124px;
+  padding-top: 4px;
+}
+.vu i {
+  flex: 1;
+  background: linear-gradient(
+    to top,
+    var(--signal-cyan) 0 38%,
+    var(--ph-amber) 38% 76%,
+    var(--rec-red)  76% 100%
+  );
+  height: 18%;
+  transform-origin: bottom;
+  animation: bar 1.6s ease-in-out infinite;
+  border-top-left-radius: 1px;
+  border-top-right-radius: 1px;
+  box-shadow: 0 0 8px rgba(255,181,71,0.18);
+}
+@keyframes bar {
+  0%, 100% { transform: scaleY(0.25); }
+  50%      { transform: scaleY(1.0); }
+}
+/* per-bar phase offsets — mirrors the deterministic phase shimmer in voice-ui.ts */
+.vu i:nth-child(1)  { animation-delay: -0.00s; }
+.vu i:nth-child(2)  { animation-delay: -0.10s; }
+.vu i:nth-child(3)  { animation-delay: -0.22s; }
+.vu i:nth-child(4)  { animation-delay: -0.36s; }
+.vu i:nth-child(5)  { animation-delay: -0.48s; }
+.vu i:nth-child(6)  { animation-delay: -0.62s; }
+.vu i:nth-child(7)  { animation-delay: -0.74s; }
+.vu i:nth-child(8)  { animation-delay: -0.88s; }
+.vu i:nth-child(9)  { animation-delay: -1.02s; }
+.vu i:nth-child(10) { animation-delay: -1.14s; }
+.vu i:nth-child(11) { animation-delay: -1.28s; }
+.vu i:nth-child(12) { animation-delay: -1.40s; }
+.vu i:nth-child(13) { animation-delay: -1.32s; }
+.vu i:nth-child(14) { animation-delay: -1.18s; }
+.vu i:nth-child(15) { animation-delay: -1.04s; }
+.vu i:nth-child(16) { animation-delay: -0.92s; }
+.vu i:nth-child(17) { animation-delay: -0.78s; }
+.vu i:nth-child(18) { animation-delay: -0.64s; }
+.vu i:nth-child(19) { animation-delay: -0.50s; }
+.vu i:nth-child(20) { animation-delay: -0.34s; }
+
+.vu-readout {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 6px;
+  margin-top: 8px;
+  font-size: 10px;
+  letter-spacing: 0.22em;
+  text-transform: uppercase;
+}
+.vu-readout div {
+  border: 1px solid var(--grid-line);
+  padding: 4px 6px;
+  background: var(--bg-rail);
+  color: var(--fg-mute);
+}
+.vu-readout div b {
+  color: var(--ph-amber);
+  font-weight: 400;
+  display: block;
+  font-size: 12px;
+  letter-spacing: 0.12em;
+  margin-top: 2px;
+}
+.vu-readout div.peak b { color: var(--rec-red); }
+.vu-readout div.cy b   { color: var(--signal-cyan); }
+
+/* ── Waveform ribbon ──────────────────────────────────────────────── */
+.wave {
+  position: relative;
+  height: 38px;
+  margin: 0 0 14px;
+  border: 1px solid var(--grid-line);
+  background:
+    linear-gradient(to bottom, transparent 49%, var(--grid-line) 49% 51%, transparent 51%),
+    var(--bg-cell);
+  overflow: hidden;
+}
+.wave svg {
+  position: absolute; inset: 0;
+  width: 200%;
+  height: 100%;
+  animation: scrollwave 6s linear infinite;
+}
+@keyframes scrollwave {
+  from { transform: translateX(0); }
+  to   { transform: translateX(-50%); }
+}
+.wave .label {
+  position: absolute; left: 8px; top: 4px;
+  font-size: 9px; letter-spacing: 0.3em; text-transform: uppercase;
+  color: var(--fg-dim);
+}
+.wave .label .live {
+  color: var(--rec-red);
+  margin-left: 8px;
+}
+
+/* ── Transcript ───────────────────────────────────────────────────── */
+.transcript {
+  background: var(--bg-cell);
+  border: 1px solid var(--grid-line);
+  border-radius: 4px;
+  padding: 14px 16px 12px;
+  margin-bottom: 14px;
+  position: relative;
+}
+.transcript::before {
+  content: "TRANSCRIPT · LIVE";
+  position: absolute;
+  top: -8px; left: 14px;
+  background: var(--bg-panel);
+  padding: 0 8px;
+  font-size: 9px;
+  letter-spacing: 0.32em;
+  color: var(--ph-amber);
+}
+.transcript-meta {
+  display: grid;
+  grid-template-columns: auto 1fr auto auto;
+  gap: 14px;
+  font-size: 10px;
+  letter-spacing: 0.22em;
+  text-transform: uppercase;
+  color: var(--fg-mute);
+  margin-bottom: 10px;
+}
+.transcript-meta .seg { color: var(--signal-cyan); }
+.transcript-meta .lang { color: var(--ph-amber); }
+
+.utterance {
+  font-size: 16px;
+  line-height: 1.55;
+  color: var(--fg-text);
+  letter-spacing: 0.005em;
+}
+.utterance .ts {
+  color: var(--fg-dim);
+  font-size: 11px;
+  margin-right: 10px;
+  letter-spacing: 0.16em;
+}
+.utterance .w {
+  position: relative;
+  padding: 1px 2px;
+  border-radius: 2px;
+}
+/* confidence-coloring: low conf gets a soft amber underline */
+.utterance .w.low {
+  background: rgba(255,181,71,0.10);
+  border-bottom: 1px dotted var(--ph-amber);
+}
+.utterance .w.mid {
+  border-bottom: 1px dotted var(--grid-line-hi);
+}
+.utterance .w.tag {
+  color: var(--signal-cyan);
+}
+.utterance .partial {
+  color: var(--fg-mute);
+  font-style: italic;
+}
+.utterance .caret {
+  display: inline-block;
+  width: 9px; height: 18px;
+  background: var(--ph-amber);
+  vertical-align: -4px;
+  margin-left: 2px;
+  box-shadow: 0 0 10px var(--ph-amber-glow);
+  animation: caret 1s steps(2,end) infinite;
+}
+@keyframes caret { 50% { opacity: 0; } }
+
+/* ── History strip ────────────────────────────────────────────────── */
+.history {
+  display: grid;
+  grid-template-columns: 80px 1fr auto;
+  gap: 12px;
+  align-items: baseline;
+  padding: 6px 12px;
+  font-size: 12px;
+  border-top: 1px dashed var(--grid-line);
+  color: var(--fg-mute);
+}
+.history:first-of-type { border-top: 0; }
+.history .ts {
+  color: var(--fg-dim);
+  font-size: 10px;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+}
+.history .body { color: var(--fg-text); }
+.history .conf {
+  font-size: 10px;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+}
+.history .conf b { color: var(--signal-cyan); font-weight: 400; }
+
+/* ── Footer key hints ─────────────────────────────────────────────── */
+.footer {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  align-items: center;
+  gap: 14px;
+  padding-top: 10px;
+  border-top: 1px solid var(--grid-line);
+  font-size: 11px;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+  color: var(--fg-mute);
+}
+.keys {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+}
+.keybind {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.keybind kbd {
+  font-family: "B612 Mono", monospace;
+  font-size: 11px;
+  background: linear-gradient(180deg, #1c2531, #131a23);
+  border: 1px solid var(--grid-line-hi);
+  border-bottom-width: 2px;
+  border-radius: 3px;
+  padding: 2px 7px;
+  color: var(--fg-text);
+  letter-spacing: 0.06em;
+  text-transform: none;
+  min-width: 18px;
+  text-align: center;
+}
+.keybind.commit kbd { color: var(--signal-cyan); border-color: color-mix(in srgb, var(--signal-cyan) 40%, var(--grid-line-hi)); }
+.keybind.cancel kbd { color: var(--rec-red);    border-color: color-mix(in srgb, var(--rec-red) 40%, var(--grid-line-hi)); }
+.keybind.pause  kbd { color: var(--ph-amber);   border-color: color-mix(in srgb, var(--ph-amber) 40%, var(--grid-line-hi)); }
+.keybind.lang   kbd { color: var(--signal-mag); border-color: color-mix(in srgb, var(--signal-mag) 40%, var(--grid-line-hi)); }
+
+.footer .stamp {
+  color: var(--fg-dim);
+  font-size: 10px;
+}
+.footer .stamp b { color: var(--signal-cyan); font-weight: 400; }
+
+/* ── Variant rail (paused state) ──────────────────────────────────── */
+.variant-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+}
+.variant-grid .term { font-size: 12px; }
+
+.term.paused .status-pill {
+  border-color: color-mix(in srgb, var(--warn-yellow) 50%, transparent);
+  background: color-mix(in srgb, var(--warn-yellow) 12%, transparent);
+  color: var(--warn-yellow);
+}
+.term.paused .rec-dot {
+  background: var(--warn-yellow);
+  box-shadow: 0 0 0 2px rgba(255,210,63,0.20), 0 0 12px rgba(255,210,63,0.55);
+  animation: none;
+  border-radius: 1px;
+  width: 4px; height: 10px;
+}
+.term.paused .vu i,
+.term.paused .spectro .row .strip i {
+  animation-play-state: paused;
+  opacity: 0.35;
+}
+.term.paused .timer { color: var(--warn-yellow); }
+.term.paused .caret { animation: none; opacity: 0.4; }
+
+/* model-load skeleton */
+.term.loading .vu i,
+.term.loading .spectro .row .strip i,
+.term.loading .wave svg { animation: none; }
+.term.loading .vu i { background: var(--grid-line-hi); height: 10%; box-shadow: none; }
+.term.loading .spectro .row .strip i { display: none; }
+
+.loadbar {
+  background: var(--bg-rail);
+  border: 1px solid var(--grid-line);
+  height: 8px;
+  position: relative;
+  margin: 6px 0 8px;
+  overflow: hidden;
+}
+.loadbar::before {
+  content: "";
+  position: absolute; inset: 0;
+  width: 38%;
+  background: linear-gradient(90deg, transparent, var(--ph-amber), transparent);
+  animation: loadShimmer 1.6s linear infinite;
+}
+@keyframes loadShimmer {
+  from { transform: translateX(-100%); }
+  to   { transform: translateX(360%); }
+}
+.load-line {
+  font-size: 12px;
+  color: var(--fg-text);
+}
+.load-line .phase { color: var(--ph-amber); }
+.load-line .num   { color: var(--signal-cyan); font-feature-settings: "tnum" 1; }
+.load-line .stage {
+  display: inline-block;
+  margin-right: 8px;
+  color: var(--fg-mute);
+}
+.load-line .stage.done { color: var(--signal-cyan); }
+.load-line .stage.done::before { content: "✓ "; }
+.load-line .stage.now::before  { content: "▸ "; color: var(--ph-amber); }
+
+/* ── Annotation column under the hero ─────────────────────────────── */
+.annot-grid {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 16px;
+  margin-top: 26px;
+}
+.annot {
+  border-top: 1px solid var(--grid-line-hi);
+  padding-top: 12px;
+  font-size: 12px;
+  color: var(--fg-mute);
+  line-height: 1.55;
+}
+.annot h4 {
+  margin: 0 0 6px;
+  font-family: "B612 Mono", monospace;
+  font-size: 11px;
+  letter-spacing: 0.28em;
+  text-transform: uppercase;
+  color: var(--ph-amber);
+  font-weight: 700;
+}
+.annot h4 .num {
+  color: var(--signal-cyan);
+  margin-right: 6px;
+}
+.annot b { color: var(--fg-text); font-weight: 400; }
+
+/* ── Specimen / appendix sections ─────────────────────────────────── */
+.spec {
+  display: grid;
+  grid-template-columns: 280px 1fr;
+  gap: 36px;
+  border-top: 1px dashed var(--grid-line-hi);
+  padding-top: 36px;
+}
+.spec h3 {
+  font-family: "Major Mono Display", monospace;
+  font-size: 22px;
+  margin: 0 0 12px;
+  color: var(--ph-amber);
+  letter-spacing: 0.04em;
+}
+.spec .lede {
+  color: var(--fg-mute);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+/* token swatches */
+.swatches {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 8px;
+}
+.sw {
+  border: 1px solid var(--grid-line);
+  background: var(--bg-cell);
+  padding: 8px;
+  font-size: 10px;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--fg-mute);
+}
+.sw i {
+  display: block;
+  height: 28px;
+  margin-bottom: 6px;
+  border: 1px solid var(--grid-line-hi);
+}
+.sw b { color: var(--fg-text); font-weight: 400; }
+
+/* type specimen */
+.type {
+  display: grid;
+  gap: 10px;
+}
+.type .row {
+  display: grid;
+  grid-template-columns: 110px 1fr;
+  align-items: baseline;
+  gap: 14px;
+  padding: 8px 0;
+  border-bottom: 1px dashed var(--grid-line);
+}
+.type .meta {
+  font-size: 10px;
+  letter-spacing: 0.24em;
+  text-transform: uppercase;
+  color: var(--fg-mute);
+}
+.type .sample.major { font-family: "Major Mono Display", monospace; font-size: 28px; color: var(--ph-amber); letter-spacing: 0.04em; }
+.type .sample.b612-h { font-family: "B612 Mono", monospace; font-size: 18px; color: var(--fg-text); letter-spacing: 0.04em; }
+.type .sample.b612   { font-family: "B612 Mono", monospace; font-size: 14px; color: var(--fg-text); }
+.type .sample.b612-d { font-family: "B612 Mono", monospace; font-size: 12px; color: var(--fg-mute); letter-spacing: 0.16em; text-transform: uppercase; }
+
+/* ── Glyph palette ─────────────────────────────────────────────────── */
+.glyph-grid {
+  display: grid;
+  grid-template-columns: repeat(8, 1fr);
+  gap: 6px;
+}
+.glyph {
+  background: var(--bg-cell);
+  border: 1px solid var(--grid-line);
+  padding: 12px 6px 6px;
+  text-align: center;
+  font-family: "B612 Mono", monospace;
+}
+.glyph .ch {
+  display: block;
+  font-size: 22px;
+  color: var(--ph-amber);
+  line-height: 1;
+}
+.glyph .lbl {
+  display: block;
+  margin-top: 8px;
+  font-size: 9px;
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  color: var(--fg-mute);
+}
+
+/* ── Footer signature ─────────────────────────────────────────────── */
+.signoff {
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
+  align-items: center;
+  gap: 16px;
+  margin-top: 56px;
+  font-size: 10px;
+  letter-spacing: 0.32em;
+  text-transform: uppercase;
+  color: var(--fg-dim);
+}
+.signoff hr { border: 0; height: 1px; background: var(--grid-line-hi); }
+.signoff .mid { color: var(--ph-amber); letter-spacing: 0.42em; }
+
+@media (max-width: 980px) {
+  .rack { grid-template-columns: 1fr; }
+  .annot-grid { grid-template-columns: 1fr 1fr; }
+  .variant-grid { grid-template-columns: 1fr; }
+  .spec { grid-template-columns: 1fr; gap: 18px; }
+  .id-coords { display: none; }
+}
+</style>
+</head>
+<body>
+
+<main>
+
+  <!-- ─────────────────────────────────────────────────────────────── -->
+  <section class="idstrip">
+    <div>
+      <div class="brand-line">rpiv<span class="slash">·</span>voice<span class="ver">v0 · /v overlay</span></div>
+      <div class="id-meta" style="margin-top:10px;">
+        <span><b>local</b> stt</span><span>·</span>
+        <span>whisper <b>base.mul</b></span><span>·</span>
+        <span>silero <b>vad</b></span><span>·</span>
+        <span>16<b>k</b> pcm</span>
+      </div>
+    </div>
+    <div></div>
+    <div class="id-coords">
+      design study · console rev <span>02</span><br/>
+      anchor: bottom-center · width: 100% · maxH: 85<span>%</span>
+    </div>
+  </section>
+
+  <!-- ── HERO TUI: live recording state ────────────────────────────── -->
+  <section>
+    <div class="caption">
+      <span><span class="num">01</span> &nbsp; live · recording</span>
+      <hr/>
+      <span>frame · 96×26</span>
+    </div>
+
+    <div class="term">
+      <div class="term-chrome">
+        <div class="dots"><i class="live"></i><i class="warm"></i><i class="cool"></i></div>
+        <div><span class="label">pi</span> · interactive · <span class="session">session 7f3a-21</span></div>
+        <div>tty 96×26 · truecolor · kitty</div>
+      </div>
+
+      <div class="term-body">
+
+        <!-- BANNER -->
+        <div class="banner">
+          <div class="mark"><span class="arrow">▸</span> <span class="slash">/</span>v</div>
+          <div style="display:flex; align-items:center; gap:14px;">
+            <span class="status-pill">
+              <span class="rec-dot"></span>
+              recording
+            </span>
+            <span class="timer">00<span class="sep">:</span>04<span class="sep">.</span>87</span>
+          </div>
+          <div class="banner-right">
+            <span class="chip"><span class="k">dev</span><span class="v">USB Audio</span></span>
+            <span class="chip cy"><span class="k">lang</span><span class="v">en · auto</span></span>
+            <span class="chip bl"><span class="k">model</span><span class="v">whisper-base.mul · int8</span></span>
+            <span class="chip mg"><span class="k">vad</span><span class="v">silero · 0.5</span></span>
+          </div>
+        </div>
+
+        <!-- METER RACK: spectrogram + VU -->
+        <div class="rack">
+
+          <div class="cell">
+            <div class="cell-head">
+              <span>spectral · 8 band · 50 ms hop</span>
+              <span class="badge">FFT 512</span>
+            </div>
+            <div class="spectro" id="spectro">
+              <!-- 9 rows × N cells, populated by JS for visual variety -->
+              <div class="row b1"><span class="hz">8 kHz</span><span class="strip"></span></div>
+              <div class="row b2"><span class="hz">5.6 k</span><span class="strip"></span></div>
+              <div class="row b3"><span class="hz">3.2 k</span><span class="strip"></span></div>
+              <div class="row b4"><span class="hz">2.0 k</span><span class="strip"></span></div>
+              <div class="row b5"><span class="hz">1.2 k</span><span class="strip"></span></div>
+              <div class="row b6"><span class="hz">700</span><span class="strip"></span></div>
+              <div class="row b7"><span class="hz">400</span><span class="strip"></span></div>
+              <div class="row b8"><span class="hz">220</span><span class="strip"></span></div>
+              <div class="row b9"><span class="hz">100</span><span class="strip"></span></div>
+            </div>
+          </div>
+
+          <div class="cell">
+            <div class="cell-head">
+              <span>RMS · 20 bar · ▁▂▃▄▅▆▇█</span>
+              <span class="badge">PEAK -3 dBfs</span>
+            </div>
+            <div class="vu">
+              <i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i>
+              <i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i>
+            </div>
+            <div class="vu-readout">
+              <div>RMS<b>-12.4</b></div>
+              <div class="peak">PEAK<b>-2.8</b></div>
+              <div class="cy">SR<b>16k</b></div>
+              <div>SEG<b>4 / 5s</b></div>
+            </div>
+          </div>
+
+        </div>
+
+        <!-- WAVEFORM -->
+        <div class="wave">
+          <div class="label">waveform · 5 s window <span class="live">● flowing</span></div>
+          <svg viewBox="0 0 800 38" preserveAspectRatio="none">
+            <path d="M0 19
+              Q 10 2  20 19 T 40 19 T 60 19
+              Q 70 35 80 19 T 100 19 T 120 19
+              Q 130 5 140 19 T 160 19 Q 170 32 180 19
+              Q 190 8 200 19 T 220 19 T 240 19 T 260 19
+              Q 270 30 280 19 Q 290 4 300 19 T 320 19 T 340 19
+              Q 350 33 360 19 T 380 19 Q 390 6 400 19
+              Q 410 31 420 19 T 440 19 Q 450 8 460 19 T 480 19
+              Q 490 35 500 19 T 520 19 T 540 19 Q 550 4 560 19
+              Q 570 32 580 19 T 600 19 T 620 19 T 640 19
+              Q 650 7 660 19 Q 670 30 680 19 T 700 19 T 720 19
+              Q 730 5 740 19 T 760 19 T 780 19 T 800 19"
+              fill="none" stroke="#ffb547" stroke-width="1.2" opacity="0.95"/>
+            <path d="M0 19
+              Q 10 14  20 19 T 40 19 T 60 19 Q 70 26 80 19 T 100 19
+              Q 110 12 120 19 T 140 19 Q 150 28 160 19 T 180 19
+              Q 190 13 200 19 T 220 19 Q 230 27 240 19 T 260 19
+              Q 270 14 280 19 T 300 19 Q 310 26 320 19 T 340 19
+              Q 350 12 360 19 T 380 19 Q 390 28 400 19 T 420 19
+              Q 430 14 440 19 T 460 19 Q 470 25 480 19 T 500 19
+              Q 510 13 520 19 T 540 19 Q 550 27 560 19 T 580 19
+              Q 590 15 600 19 T 620 19 Q 630 26 640 19 T 660 19
+              Q 670 12 680 19 T 700 19 Q 710 27 720 19 T 740 19
+              Q 750 14 760 19 T 780 19 T 800 19"
+              fill="none" stroke="#4fe3c2" stroke-width="0.6" opacity="0.6"/>
+          </svg>
+        </div>
+
+        <!-- TRANSCRIPT -->
+        <div class="transcript">
+          <div class="transcript-meta">
+            <span>seg <span class="seg">04</span></span>
+            <span></span>
+            <span>conf <b style="color:var(--signal-cyan)">0.94</b></span>
+            <span class="lang">en-us</span>
+          </div>
+          <div class="utterance">
+            <span class="ts">00:00.4</span>
+            <span class="w">Refactor</span>
+            <span class="w">the</span>
+            <span class="w">advisor</span>
+            <span class="w tag">command</span>
+            <span class="w">so</span>
+            <span class="w mid">that</span>
+            <span class="w">it</span>
+            <span class="w">streams</span>
+            <span class="w">progress</span>
+            <span class="w">through</span>
+            <span class="w">the</span>
+            <span class="w tag">questionnaire</span>
+            <span class="w">overlay</span>
+            <span class="w">instead</span>
+            <span class="w">of</span>
+            <span class="w low">blocking</span>
+            <span class="w">on</span>
+            <span class="w">the</span>
+            <span class="partial">main thread</span><span class="caret"></span>
+          </div>
+        </div>
+
+        <!-- HISTORY -->
+        <div style="border:1px solid var(--grid-line); border-radius:4px; background: var(--bg-cell);">
+          <div style="font-size:9px; letter-spacing:0.32em; text-transform:uppercase; color:var(--fg-mute); padding:8px 12px 0;">
+            session history · scroll ↑↓
+          </div>
+          <div class="history">
+            <span class="ts">00:00.0</span>
+            <span class="body">add a unit test for the whisper segment cap edge case</span>
+            <span class="conf">conf <b>0.97</b> · <span style="color:var(--ph-amber)">en</span></span>
+          </div>
+          <div class="history">
+            <span class="ts">−00:18</span>
+            <span class="body">переключи модель на base, не tiny — too lossy on numbers</span>
+            <span class="conf">conf <b>0.86</b> · <span style="color:var(--ph-amber)">ru→en</span></span>
+          </div>
+          <div class="history">
+            <span class="ts">−00:42</span>
+            <span class="body">show the silero confidence on the timeline strip too</span>
+            <span class="conf">conf <b>0.92</b> · <span style="color:var(--ph-amber)">en</span></span>
+          </div>
+        </div>
+
+        <!-- FOOTER -->
+        <div class="footer" style="margin-top:14px;">
+          <div class="keys">
+            <span class="keybind commit"><kbd>↵</kbd> paste</span>
+            <span class="keybind pause"><kbd>␣</kbd> pause</span>
+            <span class="keybind cancel"><kbd>esc</kbd> cancel</span>
+            <span class="keybind"><kbd>⌥</kbd><kbd>↵</kbd> paste + send</span>
+            <span class="keybind lang"><kbd>⌥</kbd><kbd>l</kbd> lang</span>
+            <span class="keybind"><kbd>⌥</kbd><kbd>e</kbd> edit</span>
+          </div>
+          <div class="stamp">
+            decode <b>14 ms</b> · vad <b>holdoff 300</b> · cap <b>5 s</b>
+          </div>
+        </div>
+
+      </div>
+    </div>
+
+    <!-- annotations: design intent of each region -->
+    <div class="annot-grid">
+      <div class="annot">
+        <h4><span class="num">A</span> banner</h4>
+        Same line the current build draws (<b>▸ /v ● Recording</b>) — extended with a <b>tabular timer</b>, then live <b>device · language · model · vad</b> chips. Chips render as `[k v]` cells in plain ANSI, so the layout still fits a 24-row terminal.
+      </div>
+      <div class="annot">
+        <h4><span class="num">B</span> meter rack</h4>
+        Left: <b>spectrogram</b> drawn with `▁▂▃▄▅▆▇█` cells in 8 rows, color-mapped per band — purely a render of the existing FFT we already compute for VU.<br/>
+        Right: the original <b>20-bar VU</b> kept verbatim, plus a 4-cell readout (<b>RMS · PEAK · SR · SEG</b>) sourced from values already in `voice.ts`.
+      </div>
+      <div class="annot">
+        <h4><span class="num">C</span> waveform &amp; transcript</h4>
+        A single-row <b>5 s scrolling waveform</b> built from the same Int16 buffer the engine consumes — one extra reduce, no extra capture. Transcript marks <b>low-confidence words</b> with a soft amber underline and tags <b>code-y tokens</b> in cyan.
+      </div>
+      <div class="annot">
+        <h4><span class="num">D</span> footer</h4>
+        Adds discoverable bindings without losing the originals: <b>⌥↵ paste+send</b>, <b>⌥L language</b>, <b>⌥E edit-before-paste</b>. Right side is a quiet <b>perf stamp</b> — cheap honesty so the user trusts what is happening.
+      </div>
+    </div>
+  </section>
+
+  <!-- ── VARIANTS: paused + first-run model download ───────────────── -->
+  <section>
+    <div class="caption">
+      <span><span class="num">02</span> &nbsp; states · paused / first-run</span>
+      <hr/>
+      <span>same frame · different surface</span>
+    </div>
+
+    <div class="variant-grid">
+
+      <!-- PAUSED -->
+      <div class="term paused">
+        <div class="term-chrome">
+          <div class="dots"><i class="warm"></i><i></i><i></i></div>
+          <div><span class="label">pi</span> · paused</div>
+          <div>↻ resume · ␣</div>
+        </div>
+        <div class="term-body">
+          <div class="banner">
+            <div class="mark"><span class="arrow">▸</span> <span class="slash">/</span>v</div>
+            <div style="display:flex; align-items:center; gap:14px;">
+              <span class="status-pill"><span class="rec-dot"></span>paused</span>
+              <span class="timer">00<span class="sep">:</span>04<span class="sep">.</span>87</span>
+            </div>
+            <div class="banner-right">
+              <span class="chip"><span class="k">dev</span><span class="v">USB Audio</span></span>
+              <span class="chip cy"><span class="k">lang</span><span class="v">en</span></span>
+            </div>
+          </div>
+
+          <div class="rack">
+            <div class="cell">
+              <div class="cell-head"><span>spectral · suspended</span><span class="badge">HOLD</span></div>
+              <div class="spectro">
+                <div class="row b3"><span class="hz">3.2 k</span><span class="strip"></span></div>
+                <div class="row b5"><span class="hz">1.2 k</span><span class="strip"></span></div>
+                <div class="row b7"><span class="hz">400</span><span class="strip"></span></div>
+                <div class="row b9"><span class="hz">100</span><span class="strip"></span></div>
+              </div>
+            </div>
+            <div class="cell">
+              <div class="cell-head"><span>VU · 25% bias</span><span class="badge">MUTE-IN</span></div>
+              <div class="vu" style="height:84px;">
+                <i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i>
+                <i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i>
+              </div>
+            </div>
+          </div>
+
+          <div class="transcript" style="margin-top:14px;">
+            <div class="utterance">
+              <span class="ts">00:00.4</span>
+              Refactor the advisor command so that it streams progress through the questionnaire overlay instead of blocking on the main thread<span class="caret"></span>
+            </div>
+          </div>
+
+          <div class="footer" style="margin-top:10px;">
+            <div class="keys">
+              <span class="keybind commit"><kbd>↵</kbd> paste</span>
+              <span class="keybind pause"><kbd>␣</kbd> resume</span>
+              <span class="keybind cancel"><kbd>esc</kbd> cancel</span>
+            </div>
+            <div class="stamp">held · buffer <b>76 KB</b></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- FIRST RUN / MODEL LOAD -->
+      <div class="term loading">
+        <div class="term-chrome">
+          <div class="dots"><i class="cool"></i><i></i><i></i></div>
+          <div><span class="label">pi</span> · first-run</div>
+          <div>~/.pi/models/whisper-base</div>
+        </div>
+        <div class="term-body">
+          <div class="banner">
+            <div class="mark"><span class="arrow">▸</span> <span class="slash">/</span>v</div>
+            <div style="display:flex; align-items:center; gap:14px;">
+              <span class="status-pill" style="border-color:color-mix(in srgb, var(--signal-cyan) 50%, transparent); background:color-mix(in srgb, var(--signal-cyan) 12%, transparent); color:var(--signal-cyan);">
+                <span class="rec-dot" style="background:var(--signal-cyan); box-shadow:0 0 0 2px rgba(79,227,194,0.18), 0 0 12px rgba(79,227,194,0.5);"></span>
+                preparing
+              </span>
+              <span class="timer" style="color:var(--signal-cyan);">198 MB</span>
+            </div>
+            <div class="banner-right">
+              <span class="chip cy"><span class="k">net</span><span class="v">huggingface</span></span>
+              <span class="chip"><span class="k">target</span><span class="v">~/.pi/models</span></span>
+            </div>
+          </div>
+
+          <div class="cell" style="margin:10px 0 14px;">
+            <div class="cell-head"><span>setup · one-time</span><span class="badge">157 MB on disk</span></div>
+            <div class="loadbar"></div>
+            <div class="load-line">
+              <span class="stage done">resolve</span>
+              <span class="stage done">download</span>
+              <span class="stage now">extract</span>
+              <span class="stage">verify</span>
+              <span class="stage">warm-up</span>
+            </div>
+            <div class="load-line" style="margin-top:8px;">
+              <span class="phase">extracting</span>
+              encoder.int8.onnx ·
+              <span class="num">142.7 / 198.0 MB</span> ·
+              <span class="num">12.4 MB/s</span> ·
+              eta <span class="num">04 s</span>
+            </div>
+          </div>
+
+          <div class="transcript">
+            <div class="utterance" style="font-size:13px;">
+              <span style="color:var(--fg-mute);">First run only — the model lives at <b style="color:var(--ph-amber)">~/.pi/models/whisper-base</b>. Subsequent <b style="color:var(--fg-text)">/v</b> calls open in &lt; 200 ms, fully offline.</span>
+            </div>
+          </div>
+
+          <div class="footer" style="margin-top:14px;">
+            <div class="keys">
+              <span class="keybind cancel"><kbd>esc</kbd> abort</span>
+              <span class="keybind"><kbd>?</kbd> details</span>
+            </div>
+            <div class="stamp">cdn <b>resumable</b> · sha256 <b>verifying</b></div>
+          </div>
+        </div>
+      </div>
+
+    </div>
+  </section>
+
+  <!-- ── DESIGN SPEC ──────────────────────────────────────────────── -->
+  <section class="spec">
+    <div>
+      <h3>palette</h3>
+      <p class="lede">Phosphor amber dominates — it's the brand color and the only thing that should glow. Cyan carries signal &amp; success; crimson is reserved exclusively for <b>recording</b>; mauve marks language/auto-detect; yellow appears only when <b>paused</b>. Backgrounds stay near-black so the UI sits under Pi's chat without competing.</p>
+    </div>
+    <div class="swatches">
+      <div class="sw"><i style="background:#07090d"></i>bg deep<br/><b>#07090d</b></div>
+      <div class="sw"><i style="background:#0c1118"></i>bg panel<br/><b>#0c1118</b></div>
+      <div class="sw"><i style="background:#11171f"></i>bg cell<br/><b>#11171f</b></div>
+      <div class="sw"><i style="background:#182230"></i>grid<br/><b>#182230</b></div>
+      <div class="sw"><i style="background:#ffb547; box-shadow:0 0 14px rgba(255,181,71,.55)"></i>phosphor<br/><b>#ffb547</b></div>
+      <div class="sw"><i style="background:#4fe3c2"></i>signal cy<br/><b>#4fe3c2</b></div>
+      <div class="sw"><i style="background:#ff2052"></i>rec<br/><b>#ff2052</b></div>
+      <div class="sw"><i style="background:#ffd23f"></i>paused<br/><b>#ffd23f</b></div>
+    </div>
+  </section>
+
+  <section class="spec">
+    <div>
+      <h3>type</h3>
+      <p class="lede"><b>Major Mono Display</b> for the brand mark only — a single moment of personality at the top-left, never elsewhere. <b>B612 Mono</b> (designed by Airbus for cockpit displays) carries the entire body: it has the legibility of a flight instrument and slightly looser counters than JetBrains/Berkeley, which reads better in dense readouts.</p>
+    </div>
+    <div class="type">
+      <div class="row"><div class="meta">brand · 36</div><div class="sample major">▸ /v</div></div>
+      <div class="row"><div class="meta">readout · 18</div><div class="sample b612-h">PEAK -2.8 dB · 16 KHZ</div></div>
+      <div class="row"><div class="meta">body · 14</div><div class="sample b612">refactor the advisor command so that it streams progress</div></div>
+      <div class="row"><div class="meta">label · 12</div><div class="sample b612-d">spectral · 8 band · 50 ms hop</div></div>
+    </div>
+  </section>
+
+  <section class="spec">
+    <div>
+      <h3>glyphs</h3>
+      <p class="lede">Every visual in this study renders with a fixed Unicode set so it stays a real TUI: nothing here requires a sixel terminal or images. The 8-step block ramp covers VU + spectrogram, box-drawing fills the panel borders, and a tight set of marks does the rest.</p>
+    </div>
+    <div class="glyph-grid">
+      <div class="glyph"><span class="ch">▁</span><span class="lbl">U+2581</span></div>
+      <div class="glyph"><span class="ch">▂</span><span class="lbl">U+2582</span></div>
+      <div class="glyph"><span class="ch">▃</span><span class="lbl">U+2583</span></div>
+      <div class="glyph"><span class="ch">▄</span><span class="lbl">U+2584</span></div>
+      <div class="glyph"><span class="ch">▅</span><span class="lbl">U+2585</span></div>
+      <div class="glyph"><span class="ch">▆</span><span class="lbl">U+2586</span></div>
+      <div class="glyph"><span class="ch">▇</span><span class="lbl">U+2587</span></div>
+      <div class="glyph"><span class="ch">█</span><span class="lbl">U+2588</span></div>
+      <div class="glyph"><span class="ch">●</span><span class="lbl">REC</span></div>
+      <div class="glyph"><span class="ch">◐</span><span class="lbl">PAUSE</span></div>
+      <div class="glyph"><span class="ch">▸</span><span class="lbl">CMD</span></div>
+      <div class="glyph"><span class="ch">↵</span><span class="lbl">RETURN</span></div>
+      <div class="glyph"><span class="ch">␣</span><span class="lbl">SPACE</span></div>
+      <div class="glyph"><span class="ch">⎋</span><span class="lbl">ESC</span></div>
+      <div class="glyph"><span class="ch">⌥</span><span class="lbl">OPT</span></div>
+      <div class="glyph"><span class="ch">┃</span><span class="lbl">RAIL</span></div>
+    </div>
+  </section>
+
+  <section class="spec" style="border-bottom:1px dashed var(--grid-line-hi); padding-bottom:36px;">
+    <div>
+      <h3>budget</h3>
+      <p class="lede">All new visuals reuse data the pipeline already produces. We're not asking for new capture — only smarter render of the same Int16 LE buffer.</p>
+    </div>
+    <div style="display:grid; gap:10px; font-size:12px; color:var(--fg-text);">
+      <div style="display:grid; grid-template-columns:200px 1fr auto; gap:14px; padding:8px 0; border-bottom:1px dashed var(--grid-line);">
+        <span style="color:var(--ph-amber);">spectrogram</span>
+        <span>1× FFT-512 per 50 ms = 20 Hz; 8 band reduce; ring buffer 60 columns</span>
+        <span style="color:var(--signal-cyan);">~0.3% CPU</span>
+      </div>
+      <div style="display:grid; grid-template-columns:200px 1fr auto; gap:14px; padding:8px 0; border-bottom:1px dashed var(--grid-line);">
+        <span style="color:var(--ph-amber);">waveform ribbon</span>
+        <span>min/max reduce of the same Int16 chunk decibri already delivers</span>
+        <span style="color:var(--signal-cyan);">free</span>
+      </div>
+      <div style="display:grid; grid-template-columns:200px 1fr auto; gap:14px; padding:8px 0; border-bottom:1px dashed var(--grid-line);">
+        <span style="color:var(--ph-amber);">word-conf colors</span>
+        <span>sherpa-onnx exposes per-token probabilities; map to <b>low/mid/ok</b></span>
+        <span style="color:var(--signal-cyan);">existing field</span>
+      </div>
+      <div style="display:grid; grid-template-columns:200px 1fr auto; gap:14px; padding:8px 0; border-bottom:1px dashed var(--grid-line);">
+        <span style="color:var(--ph-amber);">history strip</span>
+        <span>append-only; 3-row LRU; same overlay scrolls instead of redrawing</span>
+        <span style="color:var(--signal-cyan);">~3 KB ram</span>
+      </div>
+      <div style="display:grid; grid-template-columns:200px 1fr auto; gap:14px; padding:8px 0;">
+        <span style="color:var(--ph-amber);">terminal floor</span>
+        <span>full layout fits 80×24; if rows&lt;20 we drop spectrogram + history first</span>
+        <span style="color:var(--signal-cyan);">graceful</span>
+      </div>
+    </div>
+  </section>
+
+  <div class="signoff">
+    <hr/>
+    <span class="mid">end of study · /v overlay · console rev 02</span>
+    <hr/>
+  </div>
+
+</main>
+
+<script>
+  // Populate the spectrogram strips so each row reads as a unique pattern of cells —
+  // this is the moving "tape" you'd see scroll left over time in the real TUI.
+  (function () {
+    const COLS = 56;
+    const rows = document.querySelectorAll('#spectro .row .strip, .term.paused .spectro .row .strip');
+    const seedFor = (rowIndex) => 0.35 + 0.15 * Math.sin(rowIndex * 0.7) + 0.18 * Math.cos(rowIndex * 1.3);
+
+    rows.forEach((strip, rowIndex) => {
+      const fragment = document.createDocumentFragment();
+      const seed = seedFor(rowIndex);
+      for (let c = 0; c < COLS; c++) {
+        const cell = document.createElement('i');
+        // visual stagger: each cell starts at a different point in the 2.6s loop
+        const delay = -((c * 0.045 + Math.sin(c * 0.6 + rowIndex) * 0.5) % 2.6);
+        cell.style.animationDelay = delay.toFixed(2) + 's';
+        // density bias by row — low-mids should be denser than highs/sub-bass
+        cell.style.opacity = '0';
+        const heightFactor = Math.max(0.25, seed + 0.35 * Math.sin(c * 0.55 + rowIndex * 1.1));
+        cell.style.height = Math.round(heightFactor * 100) + '%';
+        fragment.appendChild(cell);
+      }
+      strip.appendChild(fragment);
+    });
+  })();
+</script>
+</body>
+</html>

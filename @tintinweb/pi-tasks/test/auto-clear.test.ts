@@ -319,3 +319,142 @@ describe("auto-clear: reset (new session)", () => {
     expect(store.get("1")).toBeUndefined();
   });
 });
+
+describe("auto-clear: starting a new batch", () => {
+  /** Complete every task in the store and tell the manager about it. */
+  function completeAll(store: TaskStore, manager: AutoClearManager, turn: number): void {
+    for (const task of store.list()) {
+      store.update(task.id, { status: "completed" });
+      manager.trackCompletion(task.id, turn);
+    }
+  }
+
+  for (const mode of ["on_list_complete", "on_task_complete"] as const) {
+    it(`retires a finished list before the new tasks land (${mode})`, () => {
+      const store = new TaskStore();
+      const manager = new AutoClearManager(() => store, () => mode);
+      store.create("A", "Desc");
+      store.create("B", "Desc");
+      completeAll(store, manager, 1);
+
+      // The run ends here — nowhere near the delay either mode would need, and the
+      // countdown stops ticking with it.
+      manager.onRunEnded();
+      manager.startNewBatch();
+      expect(store.list()).toHaveLength(0);
+
+      // IDs are not reused — the new task is #3.
+      expect(store.create("C", "Desc").id).toBe("3");
+    });
+  }
+
+  it("keeps a list the agent is still building in the same run", () => {
+    // create → complete → create again is one batch taking shape, not a new one.
+    // Nothing but the run boundary tells it apart from the case above.
+    const store = new TaskStore();
+    const manager = new AutoClearManager(() => store, () => "on_list_complete");
+
+    manager.startNewBatch();
+    store.create("Step one", "Desc");
+    completeAll(store, manager, 1);
+
+    manager.startNewBatch();
+    store.create("Step two", "Desc");
+
+    expect(store.list().map(t => t.subject)).toEqual(["Step one", "Step two"]);
+  });
+
+  it("keeps the list in never mode", () => {
+    const store = new TaskStore();
+    const manager = new AutoClearManager(() => store, () => "never");
+    store.create("A", "Desc");
+    completeAll(store, manager, 1);
+
+    manager.onRunEnded();
+    manager.startNewBatch();
+    expect(store.list()).toHaveLength(1);
+  });
+
+  it("leaves a list with unfinished work alone", () => {
+    const store = new TaskStore();
+    const manager = new AutoClearManager(() => store, () => "on_list_complete");
+    store.create("Done", "Desc");
+    store.create("Still going", "Desc");
+    store.update("1", { status: "completed" });
+    manager.trackCompletion("1", 1);
+    store.update("2", { status: "in_progress" });
+
+    manager.onRunEnded();
+    manager.startNewBatch();
+    expect(store.list()).toHaveLength(2);
+  });
+
+  it("does nothing on an empty store", () => {
+    const store = new TaskStore();
+    const manager = new AutoClearManager(() => store, () => "on_list_complete");
+
+    manager.onRunEnded();
+    manager.startNewBatch();
+    expect(store.list()).toHaveLength(0);
+  });
+
+  it("clears a list a subagent finished after its run ended", () => {
+    const store = new TaskStore();
+    const manager = new AutoClearManager(() => store, () => "on_list_complete");
+    store.create("Cascaded", "Desc");
+    store.update("1", { status: "in_progress" });
+    manager.onRunEnded();
+    // Completion lands late, outside any turn — nothing ticks the countdown after it.
+    store.update("1", { status: "completed" });
+    manager.trackCompletion("1", 1);
+
+    manager.startNewBatch();
+    expect(store.list()).toHaveLength(0);
+  });
+
+  it("arms once per run, so the batch it starts is not swept mid-build", () => {
+    const store = new TaskStore();
+    const manager = new AutoClearManager(() => store, () => "on_list_complete");
+    store.create("Old", "Desc");
+    completeAll(store, manager, 1);
+
+    manager.onRunEnded();
+    manager.startNewBatch();
+    store.create("First of the new batch", "Desc");
+    completeAll(store, manager, 3);
+
+    // Still the same run: the next task joins that batch rather than replacing it.
+    manager.startNewBatch();
+    store.create("Second of the new batch", "Desc");
+    expect(store.list()).toHaveLength(2);
+  });
+
+  it("does not cut the new batch's own countdown short", () => {
+    const store = new TaskStore();
+    const manager = new AutoClearManager(() => store, () => "on_list_complete");
+    store.create("Old", "Desc");
+    completeAll(store, manager, 1);
+
+    manager.onRunEnded();
+    manager.startNewBatch();
+    store.create("New", "Desc");
+    completeAll(store, manager, 3);
+
+    expect(manager.onTurnStart(4)).toBe(false); // 3 + 4 not reached
+    expect(store.list()).toHaveLength(1);
+    expect(manager.onTurnStart(7)).toBe(true);
+  });
+
+  it("reset drops the armed boundary", () => {
+    const store = new TaskStore();
+    const manager = new AutoClearManager(() => store, () => "on_list_complete");
+    store.create("A", "Desc");
+    completeAll(store, manager, 1);
+
+    manager.onRunEnded();
+    manager.reset(); // /new — nothing may carry over into the next session
+
+    manager.startNewBatch();
+    expect(store.list()).toHaveLength(1);
+  });
+});

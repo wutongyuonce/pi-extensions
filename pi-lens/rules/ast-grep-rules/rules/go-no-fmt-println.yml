@@ -1,0 +1,43 @@
+# Go No fmt.Println in Production Code
+# Detects fmt.Println/Printf/Fprintln/Fprint/Fprintf calls outside tests and
+# examples, which should route through a structured logger instead.
+# Ported from vinhnx/VTCode rules/go/no-fmt-println.yml (#2200, refs #2195).
+id: go-no-fmt-println
+language: go
+severity: warning
+message: "Avoid fmt.Println/Printf-family calls in production code; use a structured logger"
+note: |
+  Direct console output via fmt.Println/Printf/Fprintln/Fprint/Fprintf is not
+  configurable and cannot be routed to log aggregators. Use log/slog
+  (Go 1.21+) or a structured logging library for production code.
+  fmt.Println is acceptable in tests, examples, and CLI tools, so this rule
+  excludes _test.go files and examples/ directories.
+  Detection-only: which logger to use, and whether a given call site is a
+  CLI entry point rather than library code, is a project policy call this
+  rule cannot make.
+rule:
+  any:
+    - pattern: $FUNC($$$)
+constraints:
+  FUNC:
+    regex: "^fmt\\.(Println|Printf|Fprintln|Fprint|Fprintf)$"
+    has:
+      kind: field_identifier
+ignores:
+  - "**/*_test.go"
+  - "**/examples/**"
+  - "tests/fixtures/**"
+  - "cases/**"
+tags:
+  - go
+  - idiom
+  - logging
+examples:
+  bad: |
+    func main() {
+        fmt.Println("hello")
+    }
+  good: |
+    func main() {
+        slog.Info("hello")
+    }

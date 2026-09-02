@@ -1,0 +1,408 @@
+name: Lint
+
+# #1844: mechanical lint batch. Four independent, cheap jobs -- each stays
+# well under a minute and needs no `npm install` (actionlint, vale, and
+# markdownlint-cli2 are self-contained). Kept out of ci.yml so a lint
+# finding never blocks on -- or waits behind -- the full install/build/test
+# lanes. The OSV scan lives in its own osv-scan.yml (see that file for why).
+
+on:
+  push:
+    branches: [master]
+  repository_dispatch:
+    types: [merge-train-post-merge]
+  pull_request:
+    branches: [master]
+    # Default types omit "edited". Without it, retitling a PR to fix a
+    # PR-title-lint failure replays the STALE payload from the original
+    # "opened" event instead of re-running against the new title (#1917
+    # review F3).
+    types: [opened, synchronize, reopened, edited]
+
+# A merge made with GITHUB_TOKEN suppresses its push event. Replayed
+# repository_dispatch runs validate the exact merge commit, and duplicate
+# events for that commit must not run concurrently.
+concurrency:
+  group: lint-${{ github.event_name == 'repository_dispatch' && github.event.client_payload.sha || github.ref }}
+  cancel-in-progress: true
+
+permissions: {}
+
+jobs:
+  validate-merge-train-dispatch:
+    name: Validate merge-train dispatch
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        if: github.event_name == 'repository_dispatch'
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Validate merge-train dispatch ancestry
+        if: github.event_name == 'repository_dispatch'
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_TOKEN: ${{ github.token }}
+          PAYLOAD_REPOSITORY: ${{ github.event.client_payload.repository }}
+          PAYLOAD_SHA: ${{ github.event.client_payload.sha }}
+          PAYLOAD_PR_NUMBER: ${{ github.event.client_payload.pr_number }}
+        run: node scripts/lib/merge-train-dispatch-validation.mjs
+
+  actionlint:
+    name: actionlint
+    needs: validate-merge-train-dispatch
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.sha || github.ref }}
+          persist-credentials: false
+
+
+      - name: Validate merge-train dispatch payload
+        if: github.event_name == 'repository_dispatch'
+        env:
+          PAYLOAD_REPOSITORY: ${{ github.event.client_payload.repository }}
+          PAYLOAD_SHA: ${{ github.event.client_payload.sha }}
+        run: |
+          set -euo pipefail
+          if [[ "$PAYLOAD_REPOSITORY" != "$GITHUB_REPOSITORY" ]]; then
+            echo "::error::repository_dispatch repository does not match this repository"
+            exit 1
+          fi
+          if [[ ! "$PAYLOAD_SHA" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "::error::repository_dispatch SHA must be a 40-hex commit"
+            exit 1
+          fi
+          checked_sha="$(git rev-parse --verify HEAD)"
+          if [[ "${PAYLOAD_SHA,,}" != "$checked_sha" ]]; then
+            echo "::error::checkout does not match the repository_dispatch SHA"
+            exit 1
+          fi
+
+      # Pinned release + checksum verification rather than piping a
+      # third-party install script or trusting an unpinned marketplace
+      # action (this repo dogfoods actionlint as a runner -- see
+      # clients/dispatch/runners -- so lint it with the same rigor).
+      - name: Download and verify actionlint v1.7.12 (linux_amd64)
+        run: |
+          set -eu
+          curl -sLO --proto '=https' --tlsv1.2 https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz
+          echo "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  actionlint_1.7.12_linux_amd64.tar.gz" | sha256sum -c -
+          tar -xzf actionlint_1.7.12_linux_amd64.tar.gz actionlint
+
+      # Bare invocation (no *.yml glob): actionlint auto-discovers every
+      # workflow under .github/workflows/, including a future .yaml
+      # extension the glob would silently miss (#1917 review F5).
+      - name: Lint workflows
+        run: ./actionlint -color
+
+  pr-title-lint:
+    name: PR title
+    needs: validate-merge-train-dispatch
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.sha || github.ref }}
+          persist-credentials: false
+
+
+      - name: Validate merge-train dispatch payload
+        if: github.event_name == 'repository_dispatch'
+        env:
+          PAYLOAD_REPOSITORY: ${{ github.event.client_payload.repository }}
+          PAYLOAD_SHA: ${{ github.event.client_payload.sha }}
+        run: |
+          set -euo pipefail
+          if [[ "$PAYLOAD_REPOSITORY" != "$GITHUB_REPOSITORY" ]]; then
+            echo "::error::repository_dispatch repository does not match this repository"
+            exit 1
+          fi
+          if [[ ! "$PAYLOAD_SHA" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "::error::repository_dispatch SHA must be a 40-hex commit"
+            exit 1
+          fi
+          checked_sha="$(git rev-parse --verify HEAD)"
+          if [[ "${PAYLOAD_SHA,,}" != "$checked_sha" ]]; then
+            echo "::error::checkout does not match the repository_dispatch SHA"
+            exit 1
+          fi
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
+        with:
+          node-version: "22"
+
+      - name: Validate PR title (conventional prefix + issue ref)
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: node scripts/check-pr-title.mjs
+
+  pr-body-lint:
+    name: PR body (advisory)
+    needs: validate-merge-train-dispatch
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    timeout-minutes: 5
+    # Advisory to start: this job is not in required-checks branch protection.
+    # A finding stays visible as a red check without blocking a merge.
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.sha || github.ref }}
+          persist-credentials: false
+
+
+      - name: Validate merge-train dispatch payload
+        if: github.event_name == 'repository_dispatch'
+        env:
+          PAYLOAD_REPOSITORY: ${{ github.event.client_payload.repository }}
+          PAYLOAD_SHA: ${{ github.event.client_payload.sha }}
+        run: |
+          set -euo pipefail
+          if [[ "$PAYLOAD_REPOSITORY" != "$GITHUB_REPOSITORY" ]]; then
+            echo "::error::repository_dispatch repository does not match this repository"
+            exit 1
+          fi
+          if [[ ! "$PAYLOAD_SHA" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "::error::repository_dispatch SHA must be a 40-hex commit"
+            exit 1
+          fi
+          checked_sha="$(git rev-parse --verify HEAD)"
+          if [[ "${PAYLOAD_SHA,,}" != "$checked_sha" ]]; then
+            echo "::error::checkout does not match the repository_dispatch SHA"
+            exit 1
+          fi
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
+        with:
+          node-version: "22"
+
+      - name: Validate PR body structure
+        run: node scripts/check-pr-body.mjs
+
+  oxfmt:
+    name: oxfmt format check (advisory)
+    needs: validate-merge-train-dispatch
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    # Advisory to start, same posture as the vale job below: not in
+    # required-checks branch protection, so a finding never blocks a merge on
+    # its own. No continue-on-error -- a real finding must show as a red
+    # advisory check a reviewer can see, not a silently-green one.
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.sha || github.ref }}
+          persist-credentials: false
+
+
+      - name: Validate merge-train dispatch payload
+        if: github.event_name == 'repository_dispatch'
+        env:
+          PAYLOAD_REPOSITORY: ${{ github.event.client_payload.repository }}
+          PAYLOAD_SHA: ${{ github.event.client_payload.sha }}
+        run: |
+          set -euo pipefail
+          if [[ "$PAYLOAD_REPOSITORY" != "$GITHUB_REPOSITORY" ]]; then
+            echo "::error::repository_dispatch repository does not match this repository"
+            exit 1
+          fi
+          if [[ ! "$PAYLOAD_SHA" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "::error::repository_dispatch SHA must be a 40-hex commit"
+            exit 1
+          fi
+          checked_sha="$(git rev-parse --verify HEAD)"
+          if [[ "${PAYLOAD_SHA,,}" != "$checked_sha" ]]; then
+            echo "::error::checkout does not match the repository_dispatch SHA"
+            exit 1
+          fi
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
+        with:
+          node-version: "22"
+
+      # The version comes from the `oxfmt` devDependency, which package.json
+      # pins exactly. The workflow holds no second copy of the version to
+      # drift out of sync (the single-source-of-truth rule). A full `npm ci`
+      # would also pin it, but costs this lane its "no install" cheapness for
+      # a single binary. `--ignore-scripts` blocks lifecycle-script execution
+      # (SonarCloud S6505, the #1923 posture); `--no-save` keeps the command
+      # off the repo's package.json and package-lock.json. No npx.
+      - name: Install oxfmt (version pinned by the devDependency)
+        run: |
+          set -eu
+          version=$(node -p "require('./package.json').devDependencies.oxfmt")
+          npm install --no-save --no-audit --no-fund --ignore-scripts "oxfmt@${version}"
+
+      # `npm run fmt:check` rather than a second spelling of the command:
+      # package.json defines the check once, so a contributor running it
+      # locally runs exactly what CI runs. npm puts node_modules/.bin on PATH,
+      # so this still resolves the pinned binary, and never npx.
+      #
+      # No path arguments: `.oxfmtrc.json` is the single source of truth for
+      # both which files are in scope and how they are formatted. oxfmt also
+      # honors .gitignore by default, which keeps dist/ and the compiled
+      # clients/*.js out.
+      - name: Check formatting
+        run: npm run fmt:check
+
+  markdownlint:
+    name: markdownlint
+    needs: validate-merge-train-dispatch
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.sha || github.ref }}
+          persist-credentials: false
+
+
+      - name: Validate merge-train dispatch payload
+        if: github.event_name == 'repository_dispatch'
+        env:
+          PAYLOAD_REPOSITORY: ${{ github.event.client_payload.repository }}
+          PAYLOAD_SHA: ${{ github.event.client_payload.sha }}
+        run: |
+          set -euo pipefail
+          if [[ "$PAYLOAD_REPOSITORY" != "$GITHUB_REPOSITORY" ]]; then
+            echo "::error::repository_dispatch repository does not match this repository"
+            exit 1
+          fi
+          if [[ ! "$PAYLOAD_SHA" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "::error::repository_dispatch SHA must be a 40-hex commit"
+            exit 1
+          fi
+          checked_sha="$(git rev-parse --verify HEAD)"
+          if [[ "${PAYLOAD_SHA,,}" != "$checked_sha" ]]; then
+            echo "::error::checkout does not match the repository_dispatch SHA"
+            exit 1
+          fi
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
+        with:
+          node-version: "22"
+
+      # SonarCloud S6505 (#1917 review, deferred; fixed here): `npx` can
+      # install AND execute a package's lifecycle scripts. `--ignore-scripts`
+      # closes that vector; `--no-save` keeps this from touching the repo's
+      # real package.json/package-lock.json (verified locally on a bare
+      # checkout -- no node_modules, no prior install -- that both files are
+      # byte-identical to HEAD after this command). Version stays pinned.
+      - name: Install markdownlint-cli2 (no npx, no lifecycle scripts)
+        run: npm install --no-save --no-audit --no-fund --ignore-scripts markdownlint-cli2@0.23.2
+
+      - name: Lint markdown
+        run: ./node_modules/.bin/markdownlint-cli2
+
+  record-post-merge-validation:
+    name: Record post-merge validation
+    if: always() && github.event_name == 'repository_dispatch' && needs.validate-merge-train-dispatch.result == 'success'
+    needs: [validate-merge-train-dispatch, actionlint, oxfmt, markdownlint, vale]
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - name: Record exact-SHA terminal state
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          PAYLOAD_SHA: ${{ github.event.client_payload.sha }}
+          PAYLOAD_PR_NUMBER: ${{ github.event.client_payload.pr_number }}
+          ACTIONLINT_RESULT: ${{ needs.actionlint.result }}
+          OXFMT_RESULT: ${{ needs.oxfmt.result }}
+          MARKDOWN_RESULT: ${{ needs.markdownlint.result }}
+          VALE_RESULT: ${{ needs.vale.result }}
+        run: |
+          set -euo pipefail
+          state=succeeded
+          unknown=0
+          for result in "$ACTIONLINT_RESULT" "$OXFMT_RESULT" "$MARKDOWN_RESULT" "$VALE_RESULT"; do
+            case "$result" in
+              success) ;;
+              failure) state=failed ;;
+              *) unknown=1 ;;
+            esac
+          done
+          if [[ "$state" != failed && "$unknown" == 1 ]]; then exit 0; fi
+          marker="<!-- merge-train-post-merge:sha=$PAYLOAD_SHA:workflow=lint.yml:state=$state -->"
+          body="Post-merge validation $state for $PAYLOAD_SHA.\n\n$marker"
+          curl --fail-with-body --silent --show-error \
+            --request POST \
+            --header "Authorization: Bearer $GITHUB_TOKEN" \
+            --header "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/issues/$PAYLOAD_PR_NUMBER/comments" \
+            --data "$(jq -n --arg body "$body" '{body:$body}')"
+
+  vale:
+    name: Vale prose lint (advisory)
+    needs: validate-merge-train-dispatch
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    # Advisory to start (see PR body / #1844): not wired into required-checks
+    # branch protection, so it never blocks a merge on its own. No
+    # continue-on-error, for the same reason osv-scan.yml gives -- a real
+    # finding should show as a red advisory check a reviewer can see, not a
+    # silently-green one.
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.sha || github.ref }}
+          persist-credentials: false
+
+
+      - name: Validate merge-train dispatch payload
+        if: github.event_name == 'repository_dispatch'
+        env:
+          PAYLOAD_REPOSITORY: ${{ github.event.client_payload.repository }}
+          PAYLOAD_SHA: ${{ github.event.client_payload.sha }}
+        run: |
+          set -euo pipefail
+          if [[ "$PAYLOAD_REPOSITORY" != "$GITHUB_REPOSITORY" ]]; then
+            echo "::error::repository_dispatch repository does not match this repository"
+            exit 1
+          fi
+          if [[ ! "$PAYLOAD_SHA" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "::error::repository_dispatch SHA must be a 40-hex commit"
+            exit 1
+          fi
+          checked_sha="$(git rev-parse --verify HEAD)"
+          if [[ "${PAYLOAD_SHA,,}" != "$checked_sha" ]]; then
+            echo "::error::checkout does not match the repository_dispatch SHA"
+            exit 1
+          fi
+
+      # Pinned release + checksum verification, matching the actionlint job
+      # above. The style package itself (.vale/styles/Google/) is vendored
+      # in the repo, not fetched via `vale sync` -- this step is the only
+      # network access the job makes.
+      - name: Download and verify vale v3.9.6 (Linux_64-bit)
+        run: |
+          set -eu
+          curl -sLO --proto '=https' --tlsv1.2 https://github.com/errata-ai/vale/releases/download/v3.9.6/vale_3.9.6_Linux_64-bit.tar.gz
+          echo "dd8519d9bdf381a3b1a30f1df7f6e589b69ec1e38a495e4bd9af8e450703dde0  vale_3.9.6_Linux_64-bit.tar.gz" | sha256sum -c -
+          tar -xzf vale_3.9.6_Linux_64-bit.tar.gz vale
+
+      # Explicit path list, not a bare invocation: .vale.ini's BasedOnStyles
+      # section already scopes which paths get styles applied, but vale
+      # still needs paths on the command line to know what to walk.
+      - name: Lint prose
+        run: ./vale docs AGENTS.md CLAUDE.md README.md CONTRIBUTING.md .claude/agents .changelog

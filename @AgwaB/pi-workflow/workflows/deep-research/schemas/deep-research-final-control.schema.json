@@ -1,0 +1,83 @@
+{
+  "type": "object",
+  "required": [
+    "schema",
+    "digest",
+    "finalReport",
+    "claimVerdictIndex"
+  ],
+  "properties": {
+    "schema": {
+      "type": "string",
+      "minLength": 1
+    },
+    "digest": {
+      "type": "string",
+      "minLength": 1
+    },
+    "finalReport": {
+      "type": "object",
+      "properties": {
+        "researchMetadata": {},
+        "coverageSummary": {},
+        "factSlotCoverage": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          },
+          "maxItems": 64
+        },
+        "mainFindings": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          },
+          "maxItems": 12
+        },
+        "recommendations": {},
+        "actionPlan": {},
+        "parentDecisionNotes": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          },
+          "maxItems": 12
+        },
+        "unverifiedButRelevant": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          },
+          "maxItems": 16
+        },
+        "remainingGaps": {}
+      },
+      "required": [
+        "researchMetadata",
+        "coverageSummary",
+        "factSlotCoverage",
+        "mainFindings",
+        "recommendations",
+        "actionPlan",
+        "parentDecisionNotes",
+        "unverifiedButRelevant",
+        "remainingGaps"
+      ]
+    },
+    "claimVerdictIndex": {
+      "type": "object",
+      "properties": {
+        "claims": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          },
+          "maxItems": 64
+        }
+      },
+      "required": [
+        "claims"
+      ]
+    }
+  }
+}

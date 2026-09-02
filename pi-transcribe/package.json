@@ -1,0 +1,64 @@
+{
+  "name": "@earendil-works/pi-transcribe",
+  "version": "0.0.1",
+  "description": "Local speech-to-text dictation for Pi",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/earendil-works/pi-transcribe.git"
+  },
+  "homepage": "https://github.com/earendil-works/pi-transcribe#readme",
+  "bugs": {
+    "url": "https://github.com/earendil-works/pi-transcribe/issues"
+  },
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "transcription",
+    "speech-to-text"
+  ],
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "check": "tsc --noEmit",
+    "test": "npm run check && node scripts/run-tests.mjs",
+    "prepublishOnly": "npm test",
+    "catalog:generate": "node scripts/generate-catalog.mjs",
+    "catalog:verify": "node scripts/verify-catalog.mjs",
+    "catalog:update-metadata": "node scripts/update-catalog-metadata.mjs"
+  },
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "0.83.0",
+    "@earendil-works/pi-tui": "^0.83.0",
+    "@huggingface/gguf": "^0.4.6",
+    "@types/node": "22.20.1",
+    "typebox": "^1.3.7",
+    "typescript": "5.9.3"
+  },
+  "dependencies": {
+    "@huggingface/hub": "2.15.0",
+    "@picovoice/pvrecorder-node": "1.2.9",
+    "opencc-js": "^1.4.1",
+    "transcribe-cpp": "0.2.2"
+  }
+}

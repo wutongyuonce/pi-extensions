@@ -1,0 +1,67 @@
+name: Grammar health (nightly)
+
+# A bad tree-sitter grammar WASM can crash the whole host runtime instead of
+# failing gracefully (e.g. tree-sitter-swift @ tree-sitter-wasms 0.1.13 triggers a
+# fatal V8 Turboshaft-WASM crash on Node 24 — #423). Such a crash can't be caught
+# in-process and is Node/platform/arch-specific, so this nightly:
+#   1. loads + exercises EVERY grammar in an isolated child process on each OS, so
+#      a crasher is caught here — across platforms — before it reaches a user; and
+#   2. force-loads the currently-blocked Swift grammar (BLOCKED_GRAMMARS, #432) to
+#      watch whether it STILL crashes on the current runtime — the signal that the
+#      block can eventually be lifted. Informational (never fails the nightly).
+
+on:
+  schedule:
+    - cron: "0 6 * * *" # 06:00 UTC nightly
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  # 1. Run the guard against the currently-shipped/downloaded grammars on every OS.
+  guard:
+    name: Grammar-load guard (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
+        with:
+          node-version: "24" # the version where #423 reproduces
+      - name: Install dependencies (downloads core grammars via prepare)
+        run: npm install --no-audit --no-fund
+      - name: Build
+        run: npm run build
+      - name: Load + exercise every grammar in an isolated child process
+        run: node scripts/check-grammar-load.mjs
+
+  # 2. Watch whether the blocked Swift grammar still crashes on the current Node.
+  #    The runtime refuses to load it (BLOCKED_GRAMMARS, #432); this force-loads it
+  #    anyway (PILENS_UNSAFE_FORCE_GRAMMAR_LOAD) to see if a newer Node/V8 has fixed
+  #    the underlying V8 Turboshaft-WASM crash — the trigger to LIFT the block.
+  #    Informational only: continue-on-error keeps the nightly green either way.
+  swift-crash-watch:
+    name: Swift crash-watch (lift signal, #432)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
+        with:
+          node-version: "24" # the version where #423 reproduces
+      - name: Install dependencies (downloads the prebuilt swift grammar)
+        run: npm install --no-audit --no-fund
+      - name: Build
+        run: npm run build
+      - name: Force-load swift and see whether it still crashes
+        continue-on-error: true
+        env:
+          PILENS_UNSAFE_FORCE_GRAMMAR_LOAD: "1"
+        run: node scripts/check-grammar-load.mjs swift

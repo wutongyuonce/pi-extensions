@@ -1,0 +1,68 @@
+{
+  "name": "pi-sandbox",
+  "version": "0.6.5",
+  "description": "OS-level sandboxing for pi with interactive permission prompts",
+  "keywords": [
+    "pi-package",
+    "pi-extension"
+  ],
+  "type": "module",
+  "packageManager": "pnpm@10.34.3",
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/carderne/pi-sandbox.git"
+  },
+  "author": "Chris Arderne <chris@rdrn.me>",
+  "license": "MIT",
+  "bugs": {
+    "url": "https://github.com/carderne/pi-sandbox/issues"
+  },
+  "homepage": "https://github.com/carderne/pi-sandbox",
+  "scripts": {
+    "fmt": "oxfmt index.ts src test",
+    "lint": "oxlint index.ts src test",
+    "check": "tsc --noEmit",
+    "test": "tsx --test test/**/*.test.ts",
+    "all": "pnpm run fmt && pnpm run lint && pnpm run check && pnpm test",
+    "ci:fmt": "oxfmt --check index.ts src test",
+    "ci:lint": "pnpm run lint",
+    "ci:check": "pnpm run check",
+    "ci:test": "pnpm test"
+  },
+  "dependencies": {
+    "@carderne/sandbox-runtime": "^0.0.70"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.80.0",
+    "@earendil-works/pi-tui": "*"
+  },
+  "peerDependenciesMeta": {
+    "@earendil-works/pi-coding-agent": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.80.0",
+    "@earendil-works/pi-tui": "^0.80.0",
+    "@types/node": "^24",
+    "oxfmt": "^0.47.0",
+    "oxlint": "^1.62.0",
+    "tsx": "^4.23.1",
+    "typescript": "^5"
+  },
+  "pnpm": {
+    "overrides": {
+      "minimatch": ">=10.2.1",
+      "lodash-es": ">=4.18.1"
+    }
+  }
+}

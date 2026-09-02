@@ -1,0 +1,11 @@
+id: kotlin-prefer-is-empty
+valid:
+  - |
+    if (items.isEmpty()) return
+  - |
+    if (items.size > 0) return
+invalid:
+  - |
+    if (items.size == 0) return
+  - |
+    if (name.length == 0) return

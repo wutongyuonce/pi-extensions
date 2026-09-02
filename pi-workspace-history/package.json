@@ -1,0 +1,70 @@
+{
+  "name": "pi-workspace-history",
+  "version": "0.3.0",
+  "type": "module",
+  "description": "Real workspace undo/redo for Pi. Bring Claude Code style /rewind and OpenCode /undo safety to @earendil-works/pi-coding-agent.",
+  "author": "wcldyx",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-plugin",
+    "pi-extension",
+    "pi-agent",
+    "pi-coding-agent",
+    "workspace-history",
+    "undo",
+    "redo",
+    "rewind",
+    "rollback",
+    "snapshot",
+    "git-snapshot",
+    "time-machine",
+    "claude-code",
+    "opencode"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/wcldyx/pi-workspace-history.git"
+  },
+  "homepage": "https://github.com/wcldyx/pi-workspace-history#readme",
+  "bugs": {
+    "url": "https://github.com/wcldyx/pi-workspace-history/issues"
+  },
+  "files": [
+    ".pi/extensions/workspace-history.ts",
+    "README.md",
+    "README.zh-CN.md",
+    "CHANGELOG.md"
+  ],
+  "pi": {
+    "extensions": [
+      ".pi/extensions/workspace-history.ts"
+    ]
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "tsx tests/workspace-history.test.ts",
+    "bench:first-turn": "tsx tests/benchmark-first-turn.ts"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.84.4"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "0.84.4",
+    "@earendil-works/pi-coding-agent": "0.84.4",
+    "@types/node": "^24.0.0",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.0"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  },
+  "dependencies": {
+    "ignore": "^7.0.5"
+  }
+}

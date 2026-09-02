@@ -1,0 +1,19 @@
+{
+	"provenance": {
+		"runner": "pyright",
+		"tool": "pyright",
+		"version": "1.1.408",
+		"command": "pyright --outputjson bad.py",
+		"argv": [
+			"--outputjson",
+			"bad.py"
+		],
+		"workspace": "tests/fixtures/tool-smoke/python-types",
+		"platform": "win32-x64",
+		"capturedAt": "2026-08-21"
+	},
+	"file": "bad.py",
+	"exitCode": 1,
+	"stdout": "{\n    \"version\": \"1.1.408\",\n    \"time\": \"1787308732557\",\n    \"generalDiagnostics\": [\n        {\n            \"file\": \"c:\\\\Users\\\\apman\\\\AppData\\\\Local\\\\Temp\\\\pi-lens-capture-XyMGrH\\\\bad.py\",\n            \"severity\": \"error\",\n            \"message\": \"Type \\\"str\\\" is not assignable to return type \\\"int\\\"\\n  \\\"str\\\" is not assignable to \\\"int\\\"\",\n            \"range\": {\n                \"start\": {\n                    \"line\": 4,\n                    \"character\": 11\n                },\n                \"end\": {\n                    \"line\": 4,\n                    \"character\": 26\n                }\n            },\n            \"rule\": \"reportReturnType\"\n        },\n        {\n            \"file\": \"c:\\\\Users\\\\apman\\\\AppData\\\\Local\\\\Temp\\\\pi-lens-capture-XyMGrH\\\\bad.py\",\n            \"severity\": \"error\",\n            \"message\": \"Argument of type \\\"Literal[42]\\\" cannot be assigned to parameter \\\"name\\\" of type \\\"str\\\" in function \\\"greet\\\"\\n  \\\"Literal[42]\\\" is not assignable to \\\"str\\\"\",\n            \"range\": {\n                \"start\": {\n                    \"line\": 7,\n                    \"character\": 6\n                },\n                \"end\": {\n                    \"line\": 7,\n                    \"character\": 8\n                }\n            },\n            \"rule\": \"reportArgumentType\"\n        }\n    ],\n    \"summary\": {\n        \"filesAnalyzed\": 1,\n        \"errorCount\": 2,\n        \"warningCount\": 0,\n        \"informationCount\": 0,\n        \"timeInSec\": 0.245\n    }\n}\n\n",
+	"stderr": ""
+}

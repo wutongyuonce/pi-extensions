@@ -1,0 +1,19 @@
+id: kotlin-no-println
+valid:
+  - |
+    fun main() {
+        logger.info { "starting up" }
+    }
+  - |
+    fun main() {
+        writer.println("hi")
+    }
+invalid:
+  - |
+    fun main() {
+        println("starting up")
+    }
+  - |
+    fun main() {
+        print("no newline")
+    }

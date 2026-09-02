@@ -1,0 +1,57 @@
+{
+  "name": "@juicesharp/rpiv-btw",
+  "version": "2.9.0",
+  "description": "Pi extension. The /btw slash command, for putting a one-off side question to the same primary model without polluting the main conversation.",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "rpiv",
+    "btw",
+    "side-question",
+    "overlay"
+  ],
+  "type": "module",
+  "license": "MIT",
+  "author": "juicesharp",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/juicesharp/rpiv-mono.git",
+    "directory": "packages/rpiv-btw"
+  },
+  "homepage": "https://github.com/juicesharp/rpiv-mono/tree/main/packages/rpiv-btw#readme",
+  "bugs": {
+    "url": "https://github.com/juicesharp/rpiv-mono/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "test": "vitest run"
+  },
+  "files": [
+    "index.ts",
+    "btw.ts",
+    "btw-budget.ts",
+    "btw-messages.ts",
+    "btw-ui.ts",
+    "pi-compat.ts",
+    "prompts/",
+    "docs/",
+    "!docs/*.png",
+    "!docs/*.jpg",
+    "!docs/*.svg",
+    "README.md",
+    "LICENSE"
+  ],
+  "pi": {
+    "image": "https://raw.githubusercontent.com/juicesharp/rpiv-mono/main/packages/rpiv-btw/docs/cover.png",
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  }
+}

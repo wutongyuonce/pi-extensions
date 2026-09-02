@@ -1,0 +1,66 @@
+# Kotlin Prefer data class
+# Detects a plain class whose primary constructor is made entirely of
+# val/var properties and that carries no additional behavior (a function, an
+# init block, or a computed property), a strong signal it's a value holder
+# that should be a data class.
+# Ported from vinhnx/VTCode rules/kotlin/prefer-data-class.yml (#2198, refs #2195).
+id: kotlin-prefer-data-class
+language: kotlin
+severity: warning
+message: "This class looks like a plain value holder; consider a data class"
+note: |
+  A data class generates equals/hashCode/toString/copy/componentN for free,
+  which a hand-written value holder either lacks or must maintain by hand.
+  Detection-only: adding `data` changes equality semantics (structural
+  instead of referential) and generates a public API surface (copy,
+  componentN) the class may not want to expose, neither of which this rule
+  can verify — it excludes classes carrying any modifier
+  (open/abstract/sealed/inner/data/enum/…) and classes with a function, an
+  init block, or a computed property in their body, but a caller may still
+  have other reasons the plain class is intentional.
+  A class that extends another type through its primary constructor (a
+  delegation specifier, e.g. `class Ok(val v: String) : Result()`) still
+  matches: since Kotlin 1.1, a data class may extend another class, so
+  inheritance alone is not a reason to exclude it.
+rule:
+  all:
+    - kind: class_declaration
+    - not:
+        has:
+          kind: modifiers
+    - has:
+        kind: primary_constructor
+        has:
+          kind: class_parameter
+        not:
+          has:
+            kind: class_parameter
+            not:
+              has:
+                kind: binding_pattern_kind
+    - not:
+        has:
+          kind: class_body
+          any:
+            - has:
+                kind: function_declaration
+            - has:
+                kind: anonymous_initializer
+            - has:
+                kind: property_declaration
+                any:
+                  - has:
+                      kind: getter
+                  - has:
+                      kind: setter
+files:
+  - "**/*.kt"
+tags:
+  - kotlin
+  - idiom
+  - readability
+examples:
+  bad: |
+    class Point(val x: Int, val y: Int)
+  good: |
+    data class Point(val x: Int, val y: Int)

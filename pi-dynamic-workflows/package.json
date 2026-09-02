@@ -1,0 +1,68 @@
+{
+  "name": "pi-dynamic-workflows",
+  "version": "1.0.1",
+  "description": "Claude-Code-style dynamic workflow orchestration for Pi.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./workflow": {
+      "types": "./types/workflow.d.ts"
+    }
+  },
+  "files": [
+    "dist/",
+    "extensions/",
+    "src/",
+    "types/",
+    "README.md"
+  ],
+  "scripts": {
+    "test": "npm run check && npm run build && npm run test:unit",
+    "test:unit": "tsx --test tests/**/*.test.ts",
+    "check": "biome check .",
+    "format": "biome format --write .",
+    "lint": "biome lint .",
+    "build": "tsc",
+    "dev": "tsx src/index.ts"
+  },
+  "keywords": [
+    "pi-package",
+    "pi",
+    "workflow",
+    "agents"
+  ],
+  "pi": {
+    "extensions": [
+      "extensions/workflow.ts"
+    ]
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Michaelliv/pi-dynamic-workflows.git"
+  },
+  "author": "michaelliv",
+  "license": "MIT",
+  "dependencies": {
+    "acorn": "^8.16.0"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "^0.78.0",
+    "@earendil-works/pi-coding-agent": "^0.78.0",
+    "@earendil-works/pi-tui": "^0.78.0",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.4.16",
+    "@earendil-works/pi-ai": "0.78.0",
+    "@earendil-works/pi-coding-agent": "0.78.0",
+    "@earendil-works/pi-tui": "0.78.0",
+    "tsx": "latest",
+    "typebox": "latest",
+    "typescript": "latest"
+  }
+}

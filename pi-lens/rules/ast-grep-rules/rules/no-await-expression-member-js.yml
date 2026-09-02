@@ -1,0 +1,22 @@
+id: no-await-expression-member-js
+language: JavaScript
+severity: hint
+message: "(await expr).prop — do not rewrite to await expr.prop (that reads .prop off the unresolved promise). Keep the parens, or destructure first: const x = await expr; x.prop"
+note: |
+  `(await expr).prop` awaits `expr` first, THEN reads `.prop` off the
+  resolved value. `await expr.prop` is NOT equivalent: `.` binds
+  tighter than `await`, so it reads `.prop` off the still-pending
+  Promise first (almost always `undefined`, since Promise objects
+  don't have arbitrary properties) and only then awaits that.
+  The rule previously told the caller to make this exact swap — bad
+  advice that fabricates a bug at every fix site (#1806 audit). The
+  correct move is either to keep the parenthesized form as-is (it's
+  already correct, just not "unnecessary") or to destructure into a
+  named variable first: `const resolved = await expr; resolved.prop`.
+  There's no autofix here on purpose — which form reads better is a
+  judgment call, not a mechanical rewrite.
+  Exception: (await import(...)).prop is the standard dynamic import pattern.
+rule:
+  pattern: "(await $EXPR).$PROP"
+  not:
+    pattern: "(await import($$$ARGS)).$PROP"

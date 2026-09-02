@@ -1,0 +1,41 @@
+# C++ No printf
+# Detects C-style `printf` in C++ code.
+# Ported from vinhnx/VTCode rules/cpp/no-printf.yml (#2201, refs #2195).
+id: cpp-no-printf
+language: cpp
+severity: warning
+message: "Avoid printf in C++; prefer std::cout/std::format for type-safe formatting"
+note: |
+  printf's format string and argument types aren't checked by the compiler,
+  so a mismatch is undefined behavior instead of a compile error.
+  std::cout/std::format (C++20) and iostreams are type-checked.
+  Detection-only: replacing printf changes call-site syntax and, for
+  std::format, requires a C++20 toolchain, both project policy calls this
+  rule cannot make. Scoped to bare `printf`; `fprintf`/`sprintf` overlap the
+  existing `fix-format-security-error-cpp` CodeRabbit rule and are left to
+  it.
+rule:
+  kind: call_expression
+  has:
+    field: function
+    any:
+      # A bare call: printf(...).
+      - kind: identifier
+        regex: "^printf$"
+      # A namespace-qualified call: std::printf(...) or ::printf(...). C++
+      # inherits printf into std:: via <cstdio>. The qualifier isn't part of
+      # the identifier node's text, so only the trailing name is checked.
+      - kind: qualified_identifier
+        has:
+          field: name
+          kind: identifier
+          regex: "^printf$"
+tags:
+  - cpp
+  - idiom
+  - type-safety
+examples:
+  bad: |
+    printf("count: %d\n", count);
+  good: |
+    std::cout << "count: " << count << "\n";

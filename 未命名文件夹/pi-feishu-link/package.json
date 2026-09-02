@@ -1,0 +1,56 @@
+{
+  "name": "pi-feishu-link",
+  "version": "0.2.3",
+  "description": "High-reliability Feishu/Lark bridge for Pi — zero-config onboarding, persistent outbox (at-least-once), streaming output, native pi command adapter, permission bridge, one-click diagnostics",
+  "type": "module",
+  "license": "MIT",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-extension",
+    "feishu",
+    "lark",
+    "bridge",
+    "bot"
+  ],
+  "dependencies": {
+    "@larksuiteoapi/node-sdk": "^1.72.0",
+    "qrcode-terminal": "^0.12.0"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "devDependencies": {
+    "@types/node": "^24.3.0",
+    "@types/qrcode-terminal": "^0.12.2",
+    "sharp": "^0.35.3",
+    "typescript": "^5.9.2"
+  },
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ],
+    "image": "assets/preview.png"
+  },
+  "files": [
+    "src",
+    "assets",
+    "scripts",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md"
+  ],
+  "scripts": {
+    "check": "tsc --noEmit",
+    "test": "node --experimental-strip-types --import ./test/register.mjs --test \"test/**/*.test.ts\""
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/amlyczz/pi-feishu-link.git"
+  },
+  "homepage": "https://github.com/amlyczz/pi-feishu-link",
+  "bugs": {
+    "url": "https://github.com/amlyczz/pi-feishu-link/issues"
+  }
+}

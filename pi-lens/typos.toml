@@ -1,0 +1,113 @@
+# pi-lens spellcheck config (dogfood activation, refs #1844).
+#
+# TWO lanes read this file, and they read it differently:
+#
+# 1. typos-lsp (auxiliary LSP, clients/lsp/server.ts + auxiliary-lsp.ts) —
+#    the LIVE lane; its binary auto-installs via pi-lens's own github-release
+#    installer strategy. Its findings stay ADVISORY: `allowBlocking` flips on
+#    once a repo-local typos config exists (clients/typos-config.ts), but
+#    `blockOnErrorWhenAllowed` (auxiliary-lsp.ts) only promotes to blocking
+#    at LSP severity 1 (Error), and typos-lsp's own default severity is
+#    WARNING (stated in both clients/lsp/server.ts and auxiliary-lsp.ts) —
+#    this file does not raise `diagnostic-severity`, so findings stay
+#    advisory. That is a deliberate choice, not an oversight: a spelling
+#    checker blocking edits is the wrong failure mode.
+#    IMPORTANT: typos-lsp ignores the `[files]` section below entirely
+#    (`files.*` globs are CLI-only per clients/typos-config.ts's own
+#    comment) — CHANGELOG.md, the vendored CodeRabbit pack, and the other
+#    excludes below still surface as ADVISORY LSP findings. Only
+#    `[default.extend-words]` (dictionary tuning) reaches this lane.
+#
+# 2. typos-cli (clients/dispatch/runners/spellcheck.ts) — INERT here. The
+#    runner only checks whether a `typos` binary is on PATH; there is no
+#    install-fallback strategy registered for it (see the PR body), and
+#    `typos-cli` itself is unpublished on npm. `[files] extend-exclude`
+#    below only takes effect for a session with `typos` manually installed.
+#
+# Verified with a manually downloaded typos-cli 1.49.0 (real binary run, not
+# tuned to silence — see the PR body for the planted-violation proof and the
+# full sweep of what `typos .` reported on the current tree before this file
+# existed).
+
+[files]
+# CLI-lane only (see header) — inert until a `typos` binary is installed.
+extend-exclude = [
+    # Historical record. CLAUDE.md forbids hand-editing CHANGELOG.md, so a
+    # typo inside an old entry can never be "fixed" without breaking that
+    # rule — exclude the file instead of fighting it entry by entry.
+    "CHANGELOG.md",
+    # Vendored CodeRabbit ast-grep rule pack, pinned at an upstream commit
+    # (AGENTS.md "Rule catalogs") — not pi-lens's prose to correct.
+    "rules/ast-grep-rules/coderabbit/**",
+    # Generated FROM the rule files above (AGENTS.md: "edit the rule files,
+    # not the docs") and truncated mid-word by the table generator ("objec…",
+    # "Thi…"), so most hits here are ellipsis artifacts, not misspellings —
+    # plus it inherits any real vendored typo ("insufficent") it doesn't own.
+    "docs/ast-grep_rules_catalog.md",
+    # Runner fixtures deliberately contain typos to exercise the
+    # spellcheck/biome parsers themselves (same #1917/#1933 precedent as
+    # .oxlintrc.json's tests/fixtures exclude) — the typos ARE the test data.
+    "tests/fixtures/**",
+    # Runner/rule tests assert on captured typo output for the same reason.
+    "tests/clients/dispatch/**",
+    # Docstring documents an intentional "recieve" -> "receive" example of
+    # what the runner corrects. Excluding the one file beats allowlisting the
+    # word globally, which would defeat typos' own purpose on real "recieve"
+    # typos elsewhere.
+    "clients/dispatch/runners/spellcheck.ts",
+]
+
+[default]
+# `# spellchecker:disable-line` on the exact line — reaches BOTH lanes
+# (`[default]` is not under `[files]`, so typos-lsp reads it too, unlike
+# `[files] extend-exclude` above). Used instead of a global extend-words
+# entry for a handful of source lines that spell out a deliberately-fake
+# example typo ("immedaite" in clients/lens-config.ts and its test,
+# "ERRORs" in clients/project-diagnostics/scanner.ts): a global word
+# allowlist would blind the checker to a REAL "immedaite"/"erro" typo
+# anywhere else in the repo, forever. Scoping to the exact line keeps the
+# checker live everywhere else.
+extend-ignore-re = [
+    "(?Rm)^.*(#|//)\\s*spellchecker:disable-line$",
+]
+
+# Dictionary tuning — reaches BOTH lanes (typos-lsp and typos-cli).
+[default.extend-words]
+# "mis-cased" / "mis-parses" / "mis-attribution" / "mis-resolves" /
+# "mis-offers" — a hyphenated "mis-" prefix this codebase's prose uses
+# routinely; typos' tokenizer splits it into a bare "mis" token and flags it.
+mis = "mis"
+# ".edn" (Clojure EDN format), a real file-kind extension
+# (clients/file-kinds.ts, clients/formatters.ts), not a truncation of "end".
+edn = "edn"
+# HashiCorp brand abbreviation inside camelCase identifiers like
+# `hashiCorpReleaseProduct` (clients/installer/index.ts, tests).
+hashi = "hashi"
+# Valid English spelling, already allowlisted for typos-lsp's bundled
+# default (rules/typos/_typos.toml, #967) — repeated here so the same
+# tolerance applies once a project-local config supersedes the bundle.
+unparseable = "unparseable"
+dito = "dito"
+# Valid English variant of "overridable" (CHANGELOG's own vocabulary).
+overrideable = "overrideable"
+# Substring of "non-enumerables" (clients/dispatch/integration.ts).
+enumerables = "enumerables"
+# Substring of "coreutils" (clients/installer/index.ts).
+coreutil = "coreutil"
+# Plural-noun usage ("no bypassing criticals"), not a misspelling
+# (clients/trivy-client.ts).
+criticals = "criticals"
+# Substring of the identifier `boundaryCalle`
+# (clients/dispatch/rules/unsafe-boundary.ts).
+calle = "calle"
+# "PnP" (Yarn Plug'n'Play) splits into "Pn" + "P" (clients/sg-runner.ts).
+pn = "pn"
+# `caf2ee8` is a git commit-hash fragment in a code comment
+# (tests/index-integration.test.ts), not the word "calf".
+caf = "caf"
+# `(ba+)+` is a regex literal used as a ReDoS example (rules/ast-grep-rules,
+# skills docs), not the word "by"/"be".
+ba = "ba"
+# All-contributors table entry — a real contributor's surname
+# (README.md), not "Stubs".
+stubbs = "stubbs"

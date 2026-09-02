@@ -1,0 +1,39 @@
+{
+  "command.description": "Dite texto com a sua voz — STT local, sem nuvem",
+
+  "error.requires_interactive": "/voice requer o modo interativo",
+  "error.model_download_failed": "Falha ao baixar o modelo STT. Verifique sua conexão com a internet.",
+  "error.engine_load_failed": "Falha ao carregar o modelo STT.",
+  "error.mic_unavailable": "Microfone indisponível. Verifique se há um dispositivo de entrada conectado e se o Pi tem permissão de microfone.",
+
+  "splash.preparing": "Preparando o modelo…",
+  "splash.downloading": "Baixando Whisper…",
+  "splash.extracting": "Extraindo arquivos do modelo…",
+  "splash.verifying": "Verificando arquivos do modelo…",
+  "splash.loading_engine": "Carregando o modelo de voz…",
+  "splash.initializing_mic": "Inicializando o microfone…",
+
+  "footer.enter_paste": "Enter para colar",
+  "footer.space_pause": "Espaço para pausar",
+  "footer.space_resume": "Espaço para retomar",
+  "footer.tab_settings": "Tab para configurações",
+  "footer.esc_cancel": "Esc para cancelar",
+  "footer.esc_back": "Esc para voltar",
+  "footer.ctrl_s_save": "Ctrl-S para salvar",
+  "footer.enter_toggle": "Enter para alternar",
+
+  "transcript.placeholder": "Ouvindo...",
+
+  "notify.settings_saved": "Configurações de voz salvas",
+
+  "status.recording": "Gravando",
+  "status.paused": "Pausado",
+
+  "settings.microphone_label": "Microfone",
+  "settings.microphone_value_default": "Entrada padrão do sistema",
+  "settings.language_label": "Idioma",
+  "settings.language_value_auto": "Detecção automática",
+  "settings.language_hint": "Execute /languages para mudar.",
+  "settings.hallucination_filter_label": "Filtrar ruído do Whisper",
+  "settings.hallucination_filter_hint": "Descarta artefatos de silêncio. Desligue ao ditar palavras isoladas."
+}

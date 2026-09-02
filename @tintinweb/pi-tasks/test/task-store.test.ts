@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -517,5 +517,114 @@ describe("TaskStore (absolute path)", () => {
     } finally {
       rmSync(parentDir, { recursive: true, force: true });
     }
+  });
+});
+
+describe("TaskStore (list ID resolution)", () => {
+  it("resolves a bare list ID under the user's home directory, not the working directory", async () => {
+    // PI_TASKS=my-list is a shared-list name, not a path — it must land in
+    // ~/.pi/tasks/. TASKS_DIR is computed at module load, so the module has to be
+    // re-imported after HOME is stubbed.
+    const home = mkdtempSync(join(tmpdir(), "pi-tasks-home-"));
+    vi.stubEnv("HOME", home);
+    vi.resetModules();
+    try {
+      const { TaskStore: FreshTaskStore } = await import("../src/task-store.js");
+      new FreshTaskStore("my-list").create("Shared list task", "d");
+
+      expect(existsSync(join(home, ".pi", "tasks", "my-list.json"))).toBe(true);
+    } finally {
+      vi.unstubAllEnvs();
+      vi.resetModules();
+      rmSync(home, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("TaskStore (malformed files)", () => {
+  let dir: string;
+  let file: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "pi-tasks-malformed-"));
+    file = join(dir, "tasks.json");
+  });
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it("continues IDs after the highest existing task when nextId is missing", () => {
+    // A truncated write, a bad merge or a hand edit can drop the envelope fields.
+    // `nextId` decides every future ID, so an unusable one used to produce the task
+    // ID "NaN", then IDs restarting at "0" and colliding with live tasks.
+    writeFileSync(file, JSON.stringify({
+      tasks: [
+        { id: "1", subject: "One", description: "d", status: "completed" },
+        { id: "7", subject: "Seven", description: "d", status: "pending" },
+      ],
+    }));
+
+    expect(new TaskStore(file).create("Next", "d").id).toBe("8");
+  });
+
+  it("starts from 1 when nextId is missing and there are no tasks", () => {
+    writeFileSync(file, JSON.stringify({ tasks: [] }));
+
+    expect(new TaskStore(file).create("First", "d").id).toBe("1");
+  });
+
+  it("does not reissue an ID that a task already holds", () => {
+    writeFileSync(file, JSON.stringify({
+      nextId: 2,
+      tasks: [
+        { id: "1", subject: "One", description: "d", status: "pending" },
+        { id: "5", subject: "Five", description: "d", status: "pending" },
+      ],
+    }));
+
+    expect(new TaskStore(file).create("Next", "d").id).toBe("6");
+  });
+
+  it("keeps the tasks it has when the file has no task array", () => {
+    const store = new TaskStore(file);
+    store.create("Keep me", "d");
+    writeFileSync(file, JSON.stringify({ nextId: 5 }));
+
+    expect(store.list().map(t => t.subject)).toEqual(["Keep me"]);
+  });
+
+  it("keeps the tasks it has when the file is not valid JSON", () => {
+    const store = new TaskStore(file);
+    store.create("Keep me", "d");
+    writeFileSync(file, "{ this is not json");
+
+    expect(store.list().map(t => t.subject)).toEqual(["Keep me"]);
+  });
+
+  it("keeps the tasks it has when the file holds a JSON array", () => {
+    const store = new TaskStore(file);
+    store.create("Keep me", "d");
+    writeFileSync(file, JSON.stringify([{ id: "1" }]));
+
+    expect(store.list().map(t => t.subject)).toEqual(["Keep me"]);
+  });
+
+  it("skips entries that are not task records", () => {
+    writeFileSync(file, JSON.stringify({
+      nextId: 3,
+      tasks: [null, 5, "nope", { subject: "no id" }, { id: "2", subject: "Real", description: "d", status: "pending" }],
+    }));
+
+    expect(new TaskStore(file).list().map(t => t.subject)).toEqual(["Real"]);
+  });
+
+  it("respects a valid nextId", () => {
+    writeFileSync(file, JSON.stringify({
+      nextId: 42,
+      tasks: [{ id: "1", subject: "One", description: "d", status: "pending" }],
+    }));
+
+    expect(new TaskStore(file).create("Next", "d").id).toBe("42");
   });
 });

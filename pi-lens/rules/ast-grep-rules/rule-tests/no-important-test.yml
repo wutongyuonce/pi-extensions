@@ -1,0 +1,21 @@
+id: no-important
+valid:
+  - |
+    .button {
+      color: red;
+    }
+  - |
+    .button {
+      color: red;
+    }
+    /* !important mentioned only in a comment, not a declaration */
+invalid:
+  - |
+    .button {
+      color: red !important;
+    }
+  - |
+    .modal {
+      display: none !important;
+      z-index: 9999 !important;
+    }

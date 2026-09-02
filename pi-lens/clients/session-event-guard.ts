@@ -1,0 +1,249 @@
+/**
+ * One home for "this event arrived on a ctx the SDK already invalidated"
+ * (#1925).
+ *
+ * pi invalidates a captured extension ctx when the session is replaced —
+ * `ctx.newSession()`, `ctx.fork()`, `ctx.switchSession()`, `ctx.reload()`.
+ * Every accessor on that ctx then throws from the SDK's `assertActive()`
+ * (`core/extensions/loader.js` in the installed
+ * `@earendil-works/pi-coding-agent`). An event already queued when the swap
+ * happens still reaches pi-lens, carrying the dead ctx, and the first
+ * unguarded `ctx.signal` / `ctx.ui` / `ctx.cwd` read throws.
+ *
+ * That throw does not escape into pi's loop. `ExtensionRunner.emit` wraps every
+ * handler call in a try/catch and routes the error to `emitError`
+ * (`core/extensions/runner.js:586-606` in the installed SDK), so the throw
+ * surfaces as an extension error report against pi-lens. The report names the
+ * wrong cause. It reads as a pi-lens handler bug when the real event is a
+ * benign race with a session swap, it says nothing about which handler keeps
+ * losing, and it counts nothing. This wrapper converts that noisy misattributed
+ * error into a counted, bounded, attributable skip.
+ *
+ * #1924 fixed that for `agent_settled` with an inline try/catch. #1925 found
+ * four more handlers with the same shape. Five inline copies of one policy is
+ * the parallel-state defect AGENTS.md names, so the policy lives here instead.
+ * `agent_settled` is a consumer of this path, not a special case.
+ *
+ * ## What this module actually covers
+ *
+ * Not every `pi.on` registration in `index.ts` goes through here, and the doc
+ * used to read as if they all did. Seven do today:
+ *
+ * - {@link wrapSessionEventHandler} — `tool_result`, `turn_start`,
+ *   `agent_end`, `turn_end`, `agent_settled` (#1925) and `session_start`
+ *   (#1929). All six return nothing, so a skipped event resolving to
+ *   `undefined` is exactly their own early-exit value.
+ * - {@link wrapSessionEventHandlerWithResult} — `context` (#1929), which must
+ *   hand the host back a message list on the live path.
+ *
+ * Five registrations stay unwrapped on purpose: `resources_discover`,
+ * `session_before_fork`, `tool_call`, `session_shutdown`, and `message_end`.
+ * `tests/clients/session-event-guard-sweep.test.ts` is the source of truth for
+ * that split. It scans every registration in `index.ts` and reds unless the
+ * handler is wrapped or carries a written reason, so this paragraph can go
+ * stale but the contract cannot.
+ *
+ * The wrapper does three things and nothing else:
+ *
+ * 1. **Probes once, before dispatch.** {@link probeCtxActive} answers `false`
+ *    only when an `assertActive()`-wrapped accessor threw the SDK's own stale
+ *    message. `undefined` (no ctx, unexpected shape, unrecognised throw) is
+ *    inconclusive and always dispatches — never guess a session dead.
+ * 2. **Still classifies a stale throw that races in mid-handler.** The probe
+ *    is a point-in-time read; the swap can land between the probe and the
+ *    handler's own first ctx read, and for an async handler it can land at any
+ *    await. Both the synchronous throw and the rejected promise are
+ *    classified by {@link isStaleExtensionCtxError}.
+ * 3. **Makes the skip visible.** One bounded record and one ledger kind for
+ *    the whole class, keyed by the event name so aggregation still answers
+ *    WHICH handler is being skipped. A silent guard and a guard that never
+ *    fires read identically from a log, which is exactly how vacuous guards
+ *    survive review.
+ *
+ * Anything that is NOT the SDK's stale-ctx error propagates unchanged. The
+ * wrapper narrows nothing else: a handler bug must stay as loud as it was.
+ */
+
+import { emitBounded } from "./bounded-telemetry.js";
+import { probeCtxActive } from "./session-lifecycle.js";
+
+/**
+ * The pi SDK invalidates a captured `pi`/command ctx after a session
+ * replacement or reload; every later `pi.*` call then throws with this
+ * signature. Matched by MESSAGE — not by `===` against a captured instance —
+ * so a fire-and-forget task that races a session swap can recognise the benign
+ * stale-ctx throw and degrade to a no-op. Substring-matched on the stable
+ * "stale after session replacement or reload" phrase so it survives incidental
+ * wording changes around it.
+ *
+ * Deliberately a NARROWER match than {@link probeCtxActive}'s (which accepts
+ * the shorter "stale after session replacement", the message
+ * `ExtensionRunner.invalidate()` uses for its own probe path). Widening this
+ * one is a behavior change: it decides which throws get swallowed.
+ */
+export function isStaleExtensionCtxError(err: unknown): boolean {
+	return (
+		err instanceof Error &&
+		err.message.includes("stale after session replacement or reload")
+	);
+}
+
+/** Where the staleness was detected, for the record's metadata. */
+type StaleDetectionPoint = "pre-dispatch" | "mid-handler";
+
+/**
+ * Record one skipped session event. Bounded per event name: the ledger counts
+ * every occurrence exactly, and only the first per event name this session
+ * also writes the detailed `latency.log` row, so a replaced session whose
+ * queue drains a hundred stale events cannot storm the log.
+ */
+function recordStaleSkip(
+	eventName: string,
+	detectedAt: StaleDetectionPoint,
+): void {
+	emitBounded(
+		"session_event_stale_ctx_skip",
+		eventName,
+		{
+			durationMs: 0,
+			metadata: { event: eventName, detectedAt },
+		},
+		{
+			ledgerKind: "extension-ctx-stale",
+			risingEdgePer: "identity",
+			reason: `${eventName} skipped: extension ctx is stale (${detectedAt})`,
+		},
+	);
+}
+
+export interface SessionEventGuardOptions {
+	/** pi-lens's debug sink, so a skip is also visible in a dogfood trace. */
+	dbg?: (message: string) => void;
+}
+
+/** A pi event handler, in the shape `pi.on` delivers. */
+type SessionEventHandler = (event: never, ctx: never) => unknown;
+
+function isThenable(value: unknown): value is PromiseLike<unknown> {
+	return (
+		typeof (value as { then?: unknown } | null | undefined)?.then === "function"
+	);
+}
+
+/**
+ * The one policy. Both public wrappers are this function with a different
+ * stale-path value, so the probe point, the classification, and the record can
+ * never drift apart between a void handler and a value-returning one.
+ */
+function guardSessionEvent<E, C, R>(
+	eventName: string,
+	handler: (event: E, ctx: C) => R,
+	onStaleResult: (event: E) => Awaited<R>,
+	options: SessionEventGuardOptions,
+): (event: E, ctx: C) => R {
+	const skip = (event: E, detectedAt: StaleDetectionPoint): Awaited<R> => {
+		recordStaleSkip(eventName, detectedAt);
+		try {
+			options.dbg?.(
+				`${eventName} skipped: extension ctx is stale after session replacement or reload`,
+			);
+		} catch {
+			// A debug sink must never decide whether an event is handled.
+		}
+		return onStaleResult(event);
+	};
+
+	return (event: E, ctx: C): R => {
+		// `false` is the only confirmed verdict. `undefined` means the probe
+		// could not tell, and an inconclusive probe must dispatch.
+		if (probeCtxActive(ctx) === false)
+			// SAFETY: `R` is the handler's declared return type, which is either a
+			// plain value or a promise of one. `skip` yields `Awaited<R>`, the
+			// settled form. TypeScript cannot see that a host awaiting an `R` is
+			// equally satisfied by the settled value, but every `pi.on` caller
+			// either awaits the result or ignores it, so both forms behave the
+			// same at the call site. The same reasoning covers the two casts
+			// below.
+			return skip(event, "pre-dispatch") as unknown as R;
+		try {
+			const result = handler(event, ctx);
+			if (isThenable(result)) {
+				// Recover the rejection in place. The host awaits the same promise
+				// it would have awaited anyway; it just resolves instead.
+				// SAFETY: the recovered promise settles to `Awaited<R>`, which the
+				// host consumes exactly as it would an `R` — see the note above.
+				return Promise.resolve(result).catch((err: unknown) => {
+					if (isStaleExtensionCtxError(err)) return skip(event, "mid-handler");
+					throw err;
+				}) as unknown as R;
+			}
+			return result;
+		} catch (err) {
+			if (isStaleExtensionCtxError(err))
+				// SAFETY: a synchronous handler's `R` is already its settled form,
+				// so `Awaited<R>` and `R` coincide here — see the note above.
+				return skip(event, "mid-handler") as unknown as R;
+			throw err;
+		}
+	};
+}
+
+/**
+ * Wrap one `pi.on` handler so a stale ctx becomes an observable no-op instead
+ * of a throw into the host.
+ *
+ * The returned function keeps the handler's own signature and its return
+ * value, so a wrapped registration is a drop-in for the bare one. A skipped
+ * event resolves to `undefined`, which is what every handler wrapped this way
+ * already returns on its early-exit paths.
+ *
+ * Use {@link wrapSessionEventHandlerWithResult} when `undefined` is NOT the
+ * handler's own no-op value.
+ */
+export function wrapSessionEventHandler<H extends SessionEventHandler>(
+	eventName: string,
+	handler: H,
+	options: SessionEventGuardOptions = {},
+): H {
+	return guardSessionEvent<never, never, unknown>(
+		eventName,
+		handler,
+		() => undefined,
+		options,
+	) as H;
+}
+
+export interface SessionEventResultGuardOptions<
+	E,
+	R,
+> extends SessionEventGuardOptions {
+	/**
+	 * The value the host receives when the event is skipped. It takes the
+	 * EVENT, never the ctx: the ctx is the thing that just proved dead, and
+	 * reading it here would throw inside the guard that exists to absorb that
+	 * throw.
+	 *
+	 * State the value deliberately per event. `context` returns `undefined`,
+	 * pi's "this extension contributed nothing" answer, so the host keeps its
+	 * own message list untouched — never a partially built injection.
+	 */
+	onStaleResult: (event: E) => Awaited<R>;
+}
+
+/**
+ * {@link wrapSessionEventHandler} for a handler whose return value the host
+ * consumes (#1929).
+ *
+ * The live path returns exactly what the handler returned. The stale path
+ * returns `onStaleResult(event)` instead of assuming `undefined`, so a handler
+ * whose no-op value is something else does not get one silently substituted.
+ * Probe, classification, and the bounded record are identical to the void
+ * wrapper's — they are the same function underneath.
+ */
+export function wrapSessionEventHandlerWithResult<E, C, R>(
+	eventName: string,
+	handler: (event: E, ctx: C) => R,
+	options: SessionEventResultGuardOptions<E, R>,
+): (event: E, ctx: C) => R {
+	return guardSessionEvent(eventName, handler, options.onStaleResult, options);
+}

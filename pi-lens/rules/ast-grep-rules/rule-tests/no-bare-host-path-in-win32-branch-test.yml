@@ -1,0 +1,87 @@
+id: no-bare-host-path-in-win32-branch
+valid:
+  # DOCUMENTED LIMITATION (#1339 review): the exact pre-fix #1150 shape --
+  # bare dirname in an unguarded helper CALLED FROM the guarded branch.
+  # ast-grep has no cross-function reach, so this is deliberately a
+  # negative fixture; it exists so a future strengthening flips it to a
+  # positive consciously, not accidentally. Review-enforced meanwhile
+  # (AGENTS.md defect-shape 2).
+  - |
+    import * as path from "node:path";
+    import { isWindowsPath } from "./path-utils.js";
+    function resolveNonExisting(filePath: string) {
+      return path.dirname(filePath);
+    }
+    function normalize(filePath: string) {
+      if (isWindowsPath(filePath)) {
+        return resolveNonExisting(filePath);
+      }
+    }
+  - |
+    import * as path from "node:path";
+    import { isWindowsPath } from "./path-utils.js";
+    function f(filePath: string) {
+      if (isWindowsPath(filePath)) {
+        return path.win32.dirname(filePath);
+      }
+      return path.dirname(filePath);
+    }
+  - |
+    import * as path from "node:path";
+    import { isWindowsPath } from "./path-utils.js";
+    function f(filePath: string) {
+      return isWindowsPath(filePath)
+        ? path.win32.basename(filePath)
+        : path.basename(filePath);
+    }
+  - |
+    import { dirname } from "node:path";
+    function f(filePath: string) {
+      if (someOtherPredicate(filePath)) {
+        return dirname(filePath);
+      }
+    }
+invalid:
+  # Fresh probes from the #1339 review, encoded so they stay covered.
+  - |
+    import * as path from "node:path";
+    import { isWindowsPath } from "./path-utils.js";
+    function f(filePath: string) {
+      if (isWindowsPath(filePath)) {
+        for (const part of parts) {
+          const nested = path.join(filePath, part);
+        }
+      }
+    }
+  - |
+    import * as path from "node:path";
+    import { isWindowsPath } from "./path-utils.js";
+    function f(filePath: string) {
+      if (isWindowsPath(filePath)) {
+        return filePath.split(path.sep);
+      }
+    }
+  - |
+    import * as path from "node:path";
+    import { isFullyQualifiedWin32 } from "./path-utils.js";
+    function f(filePath: string, other: boolean) {
+      if (isFullyQualifiedWin32(filePath) && other) {
+        return path.basename(filePath);
+      }
+    }
+  - |
+    import * as path from "node:path";
+    import { isWindowsPath } from "./path-utils.js";
+    function f(filePath: string) {
+      if (isWindowsPath(filePath)) {
+        return path.dirname(filePath);
+      }
+    }
+  - |
+    import { join, sep } from "node:path";
+    import { isFullyQualifiedWin32 } from "./path-utils.js";
+    function f(filePath: string) {
+      if (isFullyQualifiedWin32(filePath)) {
+        return join(filePath, sep);
+      }
+    }

@@ -1,0 +1,14 @@
+id: no-sort-without-comparator
+language: TypeScript
+severity: warning
+message: ".sort()/.toSorted() without a compare function sorts by string order — numbers sort wrong (e.g. [10,9,1] becomes [1,10,9])"
+metadata:
+  category: bug
+note: |
+  Array.prototype.sort() and toSorted() coerce elements to strings and sort
+  lexicographically by default, so [10, 9, 1].sort() yields [1, 10, 9]. Pass an
+  explicit compare function for any non-string array: .sort((a, b) => a - b).
+rule:
+  any:
+    - pattern: $A.sort()
+    - pattern: $A.toSorted()

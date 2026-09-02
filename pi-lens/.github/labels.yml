@@ -1,0 +1,86 @@
+# Type labels
+- name: bug
+  color: d73a4a
+  description: Something is broken / behaves wrong
+- name: feature
+  color: 0e8a16
+  description: Net-new capability that did not exist before
+- name: enhancement
+  color: a2eeef
+  description: Improve/harden/refactor/perf/test an existing capability
+- name: documentation
+  color: 0075ca
+  description: Docs only
+
+# Area labels
+- name: area:config
+  color: "0052cc"
+  description: Configuration and project/global settings
+- name: area:diagnostics
+  color: "0052cc"
+  description: Diagnostic model, surfacing, suppression, project-diagnostics
+- name: area:dispatch
+  color: "0052cc"
+  description: Runners, linters, formatters
+- name: area:installer
+  color: "0052cc"
+  description: Tool auto-install and binary fetch
+- name: area:lsp
+  color: "0052cc"
+  description: Language servers and LSP lifecycle
+- name: area:observability
+  color: "0052cc"
+  description: Telemetry, health, status, logging
+- name: area:perf
+  color: "0052cc"
+  description: Performance and event-loop discipline
+- name: area:project-intelligence
+  color: "0052cc"
+  description: Codebase model, scan, debt, ranking
+- name: area:read-guard
+  color: "0052cc"
+  description: Read-guard and edit substrate
+- name: area:security
+  color: "0052cc"
+  description: Security scanners, rules, and hardening
+- name: area:session
+  color: "0052cc"
+  description: Session lifecycle and state
+- name: area:tests
+  color: "0052cc"
+  description: Test suite, harnesses, and coverage
+
+# Triage / workflow labels
+- name: duplicate
+  color: cfd3d7
+  description: Duplicate of an existing issue
+- name: good first issue
+  color: 7057ff
+  description: Good for newcomers
+- name: help wanted
+  color: "008672"
+  description: Extra attention is needed
+- name: invalid
+  color: e4e669
+  description: This doesn't seem right
+- name: question
+  color: d876e3
+  description: Further information is requested
+- name: wontfix
+  color: ffffff
+  description: This won't be worked on
+- name: breaking
+  color: b60205
+  description: Breaking change
+- name: conflict
+  color: e11d21
+  description: Merge-train warden - mergeStateStatus is DIRTY; required checks are silently skipped until resolved
+- name: red-ci
+  color: e11d21
+  description: Merge-train warden - a required check is failing on the current head
+- name: train:approved
+  color: 0e8a16
+  description: Maintainer review verdict - the merge train may land this PR once its current head concludes green
+- name: train:squash
+  color: 1d76db
+  description: Merge train - squash instead of the default merge commit

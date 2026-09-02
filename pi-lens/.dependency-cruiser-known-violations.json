@@ -1,0 +1,1379 @@
+// Follow-up reduction tracked in issue #2125; 30 entries, seven traverse a dynamic-import edge. Entry 30 (instance-registry-lock -> degradation-ledger, #2173): the machine-global lock records its own timeout telemetry; the ledger sits upstream of the reaper/registry chain, so the edge closes a baseline-class cycle rather than introducing new coupling.
+[
+  {
+    "type": "cycle",
+    "from": "clients/degradation-ledger.js",
+    "to": "clients/extension-log.js",
+    "unresolvedTo": "./extension-log.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-client-cycles"
+    },
+    "cycle": [
+      {
+        "name": "clients/extension-log.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/file-utils.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/git-tracked-ignore.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/degradation-ledger.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      }
+    ]
+  },
+  {
+    "type": "cycle",
+    "from": "clients/degradation-ledger.js",
+    "to": "clients/latency-logger.js",
+    "unresolvedTo": "./latency-logger.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-client-cycles"
+    },
+    "cycle": [
+      {
+        "name": "clients/latency-logger.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/file-utils.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/git-tracked-ignore.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/degradation-ledger.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      }
+    ]
+  },
+  {
+    "type": "cycle",
+    "from": "clients/dependency-checker.js",
+    "to": "clients/dispatch/runners/utils/runner-helpers.js",
+    "unresolvedTo": "./dispatch/runners/utils/runner-helpers.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-client-cycles"
+    },
+    "cycle": [
+      {
+        "name": "clients/dispatch/runners/utils/runner-helpers.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/installer/index.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/dependency-checker.js",
+        "dependencyTypes": [
+          "local",
+          "dynamic-import"
+        ]
+      }
+    ]
+  },
+  {
+    "type": "cycle",
+    "from": "clients/dispatch/runners/utils/runner-helpers.js",
+    "to": "clients/lsp/config.js",
+    "unresolvedTo": "../../../lsp/config.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-client-cycles"
+    },
+    "cycle": [
+      {
+        "name": "clients/lsp/config.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/lsp/server.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/installer/index.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/dependency-checker.js",
+        "dependencyTypes": [
+          "local",
+          "dynamic-import"
+        ]
+      },
+      {
+        "name": "clients/dispatch/runners/utils/runner-helpers.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      }
+    ]
+  },
+  {
+    "type": "cycle",
+    "from": "clients/extension-log.js",
+    "to": "clients/log-cleanup.js",
+    "unresolvedTo": "./log-cleanup.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-client-cycles"
+    },
+    "cycle": [
+      {
+        "name": "clients/log-cleanup.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/file-utils.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/git-tracked-ignore.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/degradation-ledger.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/extension-log.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      }
+    ]
+  },
+  {
+    "type": "cycle",
+    "from": "clients/file-utils.js",
+    "to": "clients/git-tracked-ignore.js",
+    "unresolvedTo": "./git-tracked-ignore.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-client-cycles"
+    },
+    "cycle": [
+      {
+        "name": "clients/git-tracked-ignore.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/file-utils.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      }
+    ]
+  },
+  {
+    "type": "cycle",
+    "from": "clients/file-utils.js",
+    "to": "clients/lens-config.js",
+    "unresolvedTo": "./lens-config.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-client-cycles"
+    },
+    "cycle": [
+      {
+        "name": "clients/lens-config.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/extension-log.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/file-utils.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      }
+    ]
+  },
+  {
+    "type": "cycle",
+    "from": "clients/file-utils.js",
+    "to": "clients/project-lens-config.js",
+    "unresolvedTo": "./project-lens-config.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-client-cycles"
+    },
+    "cycle": [
+      {
+        "name": "clients/project-lens-config.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/extension-log.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/file-utils.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      }
+    ]
+  },
+  {
+    "type": "cycle",
+    "from": "clients/file-utils.js",
+    "to": "clients/safe-spawn.js",
+    "unresolvedTo": "./safe-spawn.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-client-cycles"
+    },
+    "cycle": [
+      {
+        "name": "clients/safe-spawn.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/degradation-ledger.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/extension-log.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/file-utils.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      }
+    ]
+  },
+  {
+    "type": "cycle",
+    "from": "clients/file-utils.js",
+    "to": "clients/spawn-timeout-cooldown.js",
+    "unresolvedTo": "./spawn-timeout-cooldown.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-client-cycles"
+    },
+    "cycle": [
+      {
+        "name": "clients/spawn-timeout-cooldown.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/latency-logger.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/file-utils.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      }
+    ]
+  },
+  {
+    "type": "cycle",
+    "from": "clients/git-tracked-ignore.js",
+    "to": "clients/safe-spawn.js",
+    "unresolvedTo": "./safe-spawn.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-client-cycles"
+    },
+    "cycle": [
+      {
+        "name": "clients/safe-spawn.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/degradation-ledger.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/extension-log.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/file-utils.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/git-tracked-ignore.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      }
+    ]
+  },
+  {
+    "type": "cycle",
+    "from": "clients/installer/managed-tool-refresh.js",
+    "to": "clients/installer/index.js",
+    "unresolvedTo": "./index.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-client-cycles"
+    },
+    "cycle": [
+      {
+        "name": "clients/installer/index.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/installer/managed-tool-refresh.js",
+        "dependencyTypes": [
+          "local",
+          "dynamic-import"
+        ]
+      }
+    ]
+  },
+  {
+    "type": "cycle",
+    "from": "clients/instance-reaper.js",
+    "to": "clients/degradation-ledger.js",
+    "unresolvedTo": "./degradation-ledger.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-client-cycles"
+    },
+    "cycle": [
+      {
+        "name": "clients/degradation-ledger.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/extension-log.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/file-utils.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/git-tracked-ignore.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/safe-spawn.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/resource-sampler.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/instance-reaper.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      }
+    ]
+  },
+  {
+    "type": "cycle",
+    "from": "clients/instance-reaper.js",
+    "to": "clients/instance-registry.js",
+    "unresolvedTo": "./instance-registry.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-client-cycles"
+    },
+    "cycle": [
+      {
+        "name": "clients/instance-registry.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/instance-reaper.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      }
+    ]
+  },
+  {
+    "type": "cycle",
+    "from": "clients/instance-reaper.js",
+    "to": "clients/latency-logger.js",
+    "unresolvedTo": "./latency-logger.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-client-cycles"
+    },
+    "cycle": [
+      {
+        "name": "clients/latency-logger.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/file-utils.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/git-tracked-ignore.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/safe-spawn.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/resource-sampler.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/instance-reaper.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      }
+    ]
+  },
+  {
+    "type": "cycle",
+    "from": "clients/instance-registry.js",
+    "to": "clients/degradation-ledger.js",
+    "unresolvedTo": "./degradation-ledger.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-client-cycles"
+    },
+    "cycle": [
+      {
+        "name": "clients/degradation-ledger.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/extension-log.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/file-utils.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/git-tracked-ignore.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/safe-spawn.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/resource-sampler.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/instance-reaper.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/instance-registry.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      }
+    ]
+  },
+  {
+    "type": "cycle",
+    "from": "clients/latency-logger.js",
+    "to": "clients/log-cleanup.js",
+    "unresolvedTo": "./log-cleanup.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-client-cycles"
+    },
+    "cycle": [
+      {
+        "name": "clients/log-cleanup.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/file-utils.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/git-tracked-ignore.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/degradation-ledger.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/latency-logger.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      }
+    ]
+  },
+  {
+    "type": "cycle",
+    "from": "clients/lens-config.js",
+    "to": "clients/project-lens-config.js",
+    "unresolvedTo": "./project-lens-config.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-client-cycles"
+    },
+    "cycle": [
+      {
+        "name": "clients/project-lens-config.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/extension-log.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/file-utils.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/lens-config.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      }
+    ]
+  },
+  {
+    "type": "cycle",
+    "from": "clients/lsp/config.js",
+    "to": "clients/lsp/session-roots.js",
+    "unresolvedTo": "./session-roots.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-client-cycles"
+    },
+    "cycle": [
+      {
+        "name": "clients/lsp/session-roots.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/lsp/server.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/installer/index.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/dependency-checker.js",
+        "dependencyTypes": [
+          "local",
+          "dynamic-import"
+        ]
+      },
+      {
+        "name": "clients/dispatch/runners/utils/runner-helpers.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/lsp/config.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      }
+    ]
+  },
+  {
+    "type": "cycle",
+    "from": "clients/lsp/index.js",
+    "to": "clients/warm-attach.js",
+    "unresolvedTo": "../warm-attach.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-client-cycles"
+    },
+    "cycle": [
+      {
+        "name": "clients/warm-attach.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/lsp-lazy.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/lsp/index.js",
+        "dependencyTypes": [
+          "local",
+          "dynamic-import"
+        ]
+      }
+    ]
+  },
+  {
+    "type": "cycle",
+    "from": "clients/lsp/index.js",
+    "to": "clients/widget-state.js",
+    "unresolvedTo": "../widget-state.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-client-cycles"
+    },
+    "cycle": [
+      {
+        "name": "clients/widget-state.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/diagnostic-line-freshness.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/lsp/index.js",
+        "dependencyTypes": [
+          "local",
+          "dynamic-import"
+        ]
+      }
+    ]
+  },
+  {
+    "type": "cycle",
+    "from": "clients/lsp/server.js",
+    "to": "clients/lsp/wait-policy/index.js",
+    "unresolvedTo": "./wait-policy/index.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-client-cycles"
+    },
+    "cycle": [
+      {
+        "name": "clients/lsp/wait-policy/index.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/lsp/wait-policy/classification.js",
+        "dependencyTypes": [
+          "local",
+          "export"
+        ]
+      },
+      {
+        "name": "clients/lsp/config.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/lsp/server.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      }
+    ]
+  },
+  {
+    "type": "cycle",
+    "from": "clients/project-lens-config.js",
+    "to": "clients/workspace-topology.js",
+    "unresolvedTo": "./workspace-topology.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-client-cycles"
+    },
+    "cycle": [
+      {
+        "name": "clients/workspace-topology.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/latency-logger.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/file-utils.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/project-lens-config.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      }
+    ]
+  },
+  {
+    "type": "cycle",
+    "from": "clients/project-snapshot.js",
+    "to": "clients/word-index.js",
+    "unresolvedTo": "./word-index.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-client-cycles"
+    },
+    "cycle": [
+      {
+        "name": "clients/word-index.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/project-snapshot.js",
+        "dependencyTypes": [
+          "local",
+          "dynamic-import"
+        ]
+      }
+    ]
+  },
+  {
+    "type": "cycle",
+    "from": "clients/resource-sampler.js",
+    "to": "clients/degradation-ledger.js",
+    "unresolvedTo": "./degradation-ledger.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-client-cycles"
+    },
+    "cycle": [
+      {
+        "name": "clients/degradation-ledger.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/extension-log.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/file-utils.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/git-tracked-ignore.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/safe-spawn.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/resource-sampler.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      }
+    ]
+  },
+  {
+    "type": "cycle",
+    "from": "clients/safe-spawn.js",
+    "to": "clients/extension-log.js",
+    "unresolvedTo": "./extension-log.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-client-cycles"
+    },
+    "cycle": [
+      {
+        "name": "clients/extension-log.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/file-utils.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/safe-spawn.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      }
+    ]
+  },
+  {
+    "type": "cycle",
+    "from": "clients/safe-spawn.js",
+    "to": "clients/latency-logger.js",
+    "unresolvedTo": "./latency-logger.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-client-cycles"
+    },
+    "cycle": [
+      {
+        "name": "clients/latency-logger.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/file-utils.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/safe-spawn.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      }
+    ]
+  },
+  {
+    "type": "cycle",
+    "from": "clients/safe-spawn.js",
+    "to": "clients/resource-sampler.js",
+    "unresolvedTo": "./resource-sampler.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-client-cycles"
+    },
+    "cycle": [
+      {
+        "name": "clients/resource-sampler.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/degradation-ledger.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/extension-log.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/file-utils.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/safe-spawn.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      }
+    ]
+  },
+  {
+    "type": "cycle",
+    "from": "clients/workspace-topology.js",
+    "to": "clients/latency-logger.js",
+    "unresolvedTo": "./latency-logger.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-client-cycles"
+    },
+    "cycle": [
+      {
+        "name": "clients/latency-logger.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/file-utils.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/lens-config.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/project-lens-config.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/workspace-topology.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      }
+    ]
+  },
+  {
+    "type": "cycle",
+    "from": "clients/instance-registry-lock.js",
+    "to": "clients/degradation-ledger.js",
+    "unresolvedTo": "./degradation-ledger.js",
+    "dependencyTypes": [
+      "local",
+      "import"
+    ],
+    "rule": {
+      "severity": "error",
+      "name": "no-client-cycles"
+    },
+    "cycle": [
+      {
+        "name": "clients/degradation-ledger.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/extension-log.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/file-utils.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/git-tracked-ignore.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/safe-spawn.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/resource-sampler.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/instance-reaper.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/instance-registry.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      },
+      {
+        "name": "clients/instance-registry-lock.js",
+        "dependencyTypes": [
+          "local",
+          "import"
+        ]
+      }
+    ]
+  }
+]

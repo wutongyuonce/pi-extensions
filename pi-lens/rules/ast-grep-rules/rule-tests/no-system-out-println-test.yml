@@ -1,0 +1,7 @@
+id: no-system-out-println
+valid:
+  - 'logger.info("ready");'
+  - 'System.out.printf("%s", value);'
+invalid:
+  - 'System.out.println(value);'
+  - 'System.err.print(error);'

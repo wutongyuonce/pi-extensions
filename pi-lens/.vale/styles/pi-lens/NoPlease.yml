@@ -1,0 +1,13 @@
+extends: existence
+message: "Avoid \"please\" in instructions; state the action directly (imperative mood)."
+link: "https://developers.google.com/style/word-list"
+# Error, not warning: this is a house contract rule (AGENTS.md's own prose
+# contract says "No `please`"), not a stylistic suggestion, and it should
+# actually gate the advisory job rather than sit unenforced (#1933 review
+# F2). The two prior real hits (AGENTS.md's own quote of this rule and
+# CONTRIBUTING.md's "Please read it") are fixed in this same PR, not
+# excepted, so the tree passes clean at this severity.
+level: error
+ignorecase: true
+tokens:
+  - '\bplease\b'

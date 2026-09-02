@@ -1,0 +1,5 @@
+2026-08-26T00:00:00.0000000Z  ✓  default  tests/clients/some-passing.test.ts (4 tests) 12ms
+2026-08-26T00:00:01.0000000Z  FAIL  tests/clients/broken-import.test.ts [ tests/clients/broken-import.test.ts ]
+2026-08-26T00:00:01.1000000Z Error: Cannot find module './missing-dependency'
+2026-08-26T00:00:01.1000000Z     at Object.<anonymous> (tests/clients/broken-import.test.ts:3:1)
+2026-08-26T00:00:02.1000000Z ##[error]Process completed with exit code 1.

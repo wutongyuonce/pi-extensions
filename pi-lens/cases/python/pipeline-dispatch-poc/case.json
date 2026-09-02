@@ -1,0 +1,9 @@
+{
+	"name": "python-pipeline-dispatch-poc",
+	"description": "PoC headless pi case that updates a tiny Python invoice utility project and captures pipeline/dispatch feedback.",
+	"model": "opencode/minimax-m2.5-free",
+	"allowedTools": ["read", "write", "edit", "bash"],
+	"expectedFiles": ["src/main.py", "src/totals.py"],
+	"expectedToolCalls": ["read", "write"],
+	"forbiddenChangedFiles": ["pyproject.toml"]
+}

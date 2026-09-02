@@ -1,0 +1,20 @@
+{
+	"provenance": {
+		"runner": "mypy",
+		"tool": "mypy",
+		"version": "2.3.1",
+		"command": "mypy --no-error-summary --show-column-numbers bad.py",
+		"argv": [
+			"--no-error-summary",
+			"--show-column-numbers",
+			"bad.py"
+		],
+		"workspace": "tests/fixtures/tool-smoke/python-types",
+		"platform": "win32-x64",
+		"capturedAt": "2026-08-21"
+	},
+	"file": "bad.py",
+	"exitCode": 1,
+	"stdout": "bad.py:5:12: error: Incompatible return value type (got \"str\", expected \"int\")  [return-value]\r\nbad.py:8:7: error: Argument 1 to \"greet\" has incompatible type \"int\"; expected \"str\"  [arg-type]\r\n",
+	"stderr": ""
+}

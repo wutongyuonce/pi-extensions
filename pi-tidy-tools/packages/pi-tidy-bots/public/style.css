@@ -1,0 +1,898 @@
+:root {
+  --bg: #0a0c10;
+  --surface: #12151c;
+  --surface-2: #171b24;
+  --border: #20262f;
+  --text: #e8ecf3;
+  --muted: #828b9d;
+  --accent: #2dd4bf;
+  --accent-ink: #06251f;
+  --user-bubble: #1c2740;
+  --danger: #f87171;
+  --check: #1f7a4d;
+  --radius: 16px;
+}
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+  border-radius: 6px;
+}
+@media (prefers-reduced-motion: reduce) {
+  .spinner,
+  .step-dot {
+    animation: none;
+  }
+  * {
+    scroll-behavior: auto !important;
+  }
+}
+* {
+  box-sizing: border-box;
+}
+html,
+body {
+  height: 100%;
+  overflow: hidden;
+  overscroll-behavior: none;
+}
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font:
+    14px/1.5 "Inter",
+    -apple-system,
+    "Segoe UI",
+    sans-serif;
+}
+#conn-banner {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 60;
+  background: #f59e0b;
+  color: #231a02;
+  text-align: center;
+  padding: 6px 12px;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.5px;
+}
+#app {
+  display: flex;
+  height: 100vh;
+  height: 100dvh;
+  max-width: 100vw;
+  overflow-x: clip;
+  position: relative;
+}
+
+/* ── Roster ─────────────────────────────────────────── */
+#roster {
+  width: clamp(240px, 24vw, 320px);
+  border-right: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  background: var(--bg);
+}
+#roster header {
+  padding: 18px 16px 8px;
+}
+.brand {
+  font-weight: 700;
+  font-size: 15px;
+  letter-spacing: 0.2px;
+}
+.brand-mark {
+  color: var(--accent);
+  margin-right: 6px;
+}
+.brand-sub {
+  color: var(--muted);
+  font-size: 10px;
+  letter-spacing: 2px;
+  margin-top: 2px;
+}
+.roster-head {
+  padding: 8px 16px 4px;
+  color: var(--muted);
+  font-size: 10px;
+  letter-spacing: 2px;
+}
+#bot-count {
+  color: var(--accent);
+}
+#bot-list {
+  list-style: none;
+  margin: 0;
+  padding: 4px 8px;
+  overflow-y: auto;
+  flex: 1;
+}
+#bot-list li {
+  border-radius: 14px;
+}
+#bot-list li:hover {
+  background: var(--surface);
+}
+#bot-list li.selected {
+  background: var(--surface-2);
+}
+.bot-row-btn {
+  all: unset;
+  cursor: pointer;
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  width: 100%;
+  padding: 9px 10px;
+  box-sizing: border-box;
+  border-radius: 14px;
+  min-height: 44px;
+}
+.bot-line {
+  flex: 1;
+  min-width: 0;
+}
+.bot-row-name {
+  font-weight: 600;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.bot-preview {
+  color: var(--muted);
+  font-size: 12px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.bot-ts {
+  color: var(--muted);
+  font-size: 11px;
+}
+.online-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--accent);
+  display: inline-block;
+}
+.offline-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--border);
+  display: inline-block;
+}
+#presence-strip {
+  padding: 10px 16px;
+  color: var(--muted);
+  font-size: 11px;
+  border-top: 1px solid var(--border);
+}
+
+/* ── Blobs ──────────────────────────────────────────── */
+.blob {
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+  position: relative;
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 15px;
+  font-weight: 700;
+  color: rgba(0, 0, 0, 0.6);
+  user-select: none;
+  background: radial-gradient(
+    circle at 35% 30%,
+    var(--blob, #2dd4bf),
+    color-mix(in srgb, var(--blob, #2dd4bf) 60%, #000)
+  );
+}
+.blob.large {
+  width: 38px;
+  height: 38px;
+}
+
+/* ── Chat column ────────────────────────────────────── */
+#chat-pane {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+}
+
+/* ── Chat header: minimal ───────────────────────────── */
+#chat-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 12px clamp(12px, 1.6vw, 22px);
+}
+.avatar-btn {
+  all: unset;
+  cursor: pointer;
+  display: inline-flex;
+  border-radius: 50%;
+}
+.bot-name {
+  font-size: 16px;
+  font-weight: 700;
+}
+.bot-title {
+  color: var(--muted);
+  font-size: 12px;
+}
+.bot-identity {
+  flex: 1;
+  min-width: 0;
+}
+.presence-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--accent);
+  display: inline-block;
+}
+.ghost-btn {
+  background: none;
+  border: none;
+  color: var(--muted);
+  font-size: 15px;
+  cursor: pointer;
+  padding: 6px 8px;
+  border-radius: 8px;
+}
+.ghost-btn:hover {
+  color: var(--text);
+  background: var(--surface-2);
+}
+
+/* ── Transcript ─────────────────────────────────────── */
+#transcript {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+  touch-action: pan-y;
+  padding: clamp(14px, 2.4vw, 22px);
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+.entry {
+  display: flex;
+  gap: 10px;
+  max-width: 760px;
+}
+.entry-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  max-width: 760px;
+}
+.entry.user {
+  align-self: flex-end;
+}
+.entry .meta {
+  display: none;
+}
+.bubble {
+  background: var(--surface);
+  border-radius: var(--radius);
+  padding: 12px 15px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.entry.user .bubble {
+  background: var(--user-bubble);
+}
+.entry.system .bubble {
+  color: var(--muted);
+  font-style: italic;
+  background: none;
+  padding-left: 0;
+}
+.bubble .source {
+  color: var(--muted);
+  font-size: 11px;
+  margin-bottom: 4px;
+}
+.bubble .working {
+  color: var(--muted);
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+.spinner {
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  border: 2px solid var(--muted);
+  border-top-color: var(--accent);
+  animation: spin 0.8s linear infinite;
+}
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+/* ── Issue 49: digest label accompanies the reason ──── */
+.step-label {
+  color: var(--muted);
+  font-size: 11px;
+  /* Secondary snippet: truncates instead of starving the step name. */
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 45%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ── Steps checklist card ───────────────────────────── */
+.steps {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin: 2px 0 6px;
+  background: var(--surface-2);
+  border-radius: 14px;
+  padding: 12px 14px;
+}
+.step {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 13px;
+}
+.step-check {
+  width: 20px;
+  height: 20px;
+  border-radius: 6px;
+  background: var(--check);
+  color: #d7ffe9;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+  flex: none;
+}
+.step-running {
+  width: 20px;
+  height: 20px;
+  border-radius: 6px;
+  background: var(--surface);
+  flex: none;
+  position: relative;
+}
+.step-running::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  margin: auto;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  border: 2px solid var(--muted);
+  border-top-color: var(--accent);
+  animation: spin 0.8s linear infinite;
+}
+.step-name {
+  flex: 1;
+  /* Without this the name's automatic minimum collapses to one character
+     when the label is long (overflow-wrap: anywhere inherits in). */
+  min-width: 0;
+}
+.step-dur {
+  color: var(--muted);
+  font-family: ui-monospace, monospace;
+  font-size: 11px;
+}
+.step-output {
+  margin: 4px 0 2px;
+  padding: 8px 10px;
+  background: var(--bg);
+  border-radius: 8px;
+  font-family: ui-monospace, monospace;
+  font-size: 11px;
+  color: var(--muted);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 180px;
+  overflow-y: auto;
+}
+.step-error {
+  color: var(--danger);
+  font-size: 12px;
+}
+
+/* ── Handoff microline + completion divider (issue 58) ─ */
+.entry.microline {
+  align-self: center;
+  color: var(--muted);
+  font-size: 12px;
+  justify-content: center;
+  max-width: none;
+}
+.entry.completion {
+  align-self: stretch;
+  flex-direction: column;
+  gap: 6px;
+  max-width: none;
+}
+.completion-divider {
+  align-items: center;
+  color: var(--muted);
+  display: flex;
+  font-size: 12px;
+  gap: 10px;
+  justify-content: center;
+  max-width: none;
+}
+.completion-divider::before,
+.completion-divider::after {
+  border-top: 1px solid var(--border, #232a38);
+  content: "";
+  flex: 1;
+}
+
+/* ── Composer card ──────────────────────────────────── */
+──────────────────────────────────── */ #composer {
+  margin: 0 clamp(12px, 1.6vw, 22px);
+  margin-bottom: max(clamp(10px, 1.6vw, 16px), env(safe-area-inset-bottom));
+  background: var(--surface);
+  border: 1px solid var(--border, #232a38);
+  border-radius: var(--radius);
+  display: flex;
+  flex-direction: column;
+  padding: 8px 10px 10px;
+  gap: 6px;
+}
+.composer-top {
+  display: flex;
+  align-items: center;
+}
+#composer-target {
+  all: unset;
+  cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 9px;
+  border-radius: 999px;
+  background: var(--surface-2, #171c27);
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1.4;
+}
+#composer-target:focus-visible {
+  outline: 1px solid var(--accent);
+}
+.composer-target-label {
+  color: var(--muted);
+}
+.composer-target-caret {
+  color: var(--muted);
+  font-size: 10px;
+}
+#composer-target-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  display: inline-block;
+}
+.composer-bottom {
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+}
+#composer-attach {
+  all: unset;
+  cursor: pointer;
+  flex: none;
+  width: 38px;
+  height: 38px;
+  border-radius: 50%;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--surface-2, #171c27);
+  color: var(--muted);
+  font-size: 16px;
+}
+#composer-attach.has-image {
+  background: var(--accent);
+  color: var(--accent-ink);
+}
+#composer-attach:focus-visible {
+  outline: 1px solid var(--accent);
+}
+#composer-input {
+  background: none;
+  border: none;
+  color: var(--text);
+  font: inherit;
+  font-size: 16px;
+  outline: none;
+  resize: none;
+  flex: 1;
+  min-width: 0;
+  min-height: 24px;
+  max-height: 160px;
+  padding: 2px 4px 4px;
+}
+#send {
+  flex: none;
+  width: 38px;
+  height: 38px;
+  border-radius: 50%;
+  border: none;
+  background: var(--accent);
+  color: var(--accent-ink);
+  font-size: 16px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+/* ── Panels ─────────────────────────────────────────── */
+#routines-panel,
+#settings-panel {
+  position: absolute;
+  top: 60px;
+  right: 14px;
+  z-index: 20;
+  background: var(--surface-2);
+  border-radius: 14px;
+  padding: 10px;
+  min-width: 250px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.5);
+}
+#routines-panel[hidden],
+#settings-panel[hidden] {
+  display: none;
+}
+.settings-title {
+  color: var(--muted);
+  font-size: 11px;
+  letter-spacing: 1.5px;
+}
+#settings-panel button,
+.routine-row button {
+  text-align: left;
+  background: none;
+  border: none;
+  color: var(--text);
+  padding: 7px 10px;
+  border-radius: 8px;
+  cursor: pointer;
+  font-size: 13px;
+}
+#settings-panel button:hover,
+.routine-row button:hover {
+  background: var(--surface);
+}
+#settings-panel button.primary,
+.routine-row button.primary {
+  background: var(--accent);
+  color: var(--accent-ink);
+  font-weight: 700;
+}
+.routine-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  font-size: 13px;
+}
+.routine-row .blob {
+  width: 22px;
+  height: 22px;
+}
+.routine-row .routine-schedule {
+  font-family: ui-monospace, monospace;
+  color: var(--accent);
+  font-size: 12px;
+}
+.routine-row .routine-name {
+  flex: 1;
+}
+
+/* ── Mobile: app layout fits the visual viewport (keyboard-aware), roster is a drawer ── */
+@media (max-width: 760px) {
+  #roster {
+    position: fixed;
+    top: 0;
+    bottom: 0;
+    left: 0;
+    width: min(78vw, 320px);
+    z-index: 40;
+    transform: translateX(-105%);
+    transition: transform 0.22s ease;
+    overflow-y: auto;
+    border-right: 1px solid var(--border);
+  }
+  body.drawer-open #roster {
+    transform: none;
+  }
+  /* Routing pills (handoffs + completion receipts) take the full row at phone
+     widths — the squeezed pill collapsed to one word per line and collided
+     with the neighboring bubble. Long briefs clamp to 3 lines. */
+  #chat-header {
+    padding: 10px 14px;
+  }
+  .entry,
+  .entry-stack {
+    max-width: 100%;
+  }
+  .entry .meta {
+    display: none;
+  }
+  #composer {
+    margin: 0 10px;
+    margin-bottom: max(10px, env(safe-area-inset-bottom));
+  }
+  .avatar-btn {
+    display: inline-flex;
+  }
+}
+@media (min-width: 761px) {
+  .avatar-btn {
+    display: none;
+  }
+}
+
+/* ── Markdown tables (issue 44) ─────────────────────── */
+.md-body table {
+  display: block;
+  max-width: 100%;
+  overflow-x: auto;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+.md-body th,
+.md-body td {
+  border: 1px solid var(--border, #232a38);
+  padding: 4px 8px;
+  white-space: nowrap;
+}
+.md-body th {
+  background: var(--surface-2, #171c27);
+}
+
+/* ── Inline markdown images ─────────────────────────── */
+.md-body img {
+  max-width: 100%;
+  height: auto;
+  border-radius: 8px;
+  display: block;
+}
+
+/* ── Console footer (running commit) ────────────────── */
+#console-footer {
+  text-align: center;
+  color: var(--muted);
+  font-size: 11px;
+  padding: 0 10px 6px;
+}
+
+/* ── Delivery state ─────────────────────────────────── */
+.delivery-note {
+  color: var(--muted);
+  font-size: 11px;
+  margin-top: 6px;
+}
+.delivery-note.failed {
+  color: var(--danger);
+}
+
+/* ── Queued + empty state ───────────────────────────── */
+.queue-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  border-radius: 999px;
+  background: var(--accent);
+  color: var(--accent-ink);
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1;
+}
+.queue-pill {
+  background: var(--surface);
+  border-radius: 999px;
+  font-size: 12px;
+  padding: 7px 13px;
+  color: var(--muted);
+}
+.queue-pill .queue-count {
+  color: var(--accent);
+}
+.empty-state {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  text-align: center;
+  max-width: 34ch;
+  margin: 0 auto;
+}
+.empty-title {
+  color: var(--text);
+  font-size: 14px;
+  font-weight: 500;
+}
+.empty-sub {
+  color: var(--muted);
+  font-size: 12.5px;
+}
+@keyframes breathe {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.7;
+  }
+}
+.breathe {
+  animation: breathe 2.4s ease-in-out infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .breathe {
+    animation: none;
+  }
+}
+
+/* ── UI question cards (ask_user_question relay) ────── */
+.ui-card {
+  background: var(--surface-2);
+  border: 1px solid var(--border, #232a38);
+  border-radius: 12px;
+  padding: 10px 12px;
+  display: grid;
+  gap: 8px;
+}
+.ui-card.resolved {
+  opacity: 0.65;
+}
+.ui-card .ui-message {
+  color: var(--muted, #8a93a6);
+  font-size: 12px;
+}
+.ui-card .ui-answer {
+  font-size: 12px;
+  color: var(--accent, #2dd4bf);
+}
+.ui-actions {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  align-items: center;
+}
+.ui-actions button {
+  border-radius: 999px;
+  padding: 8px 15px;
+  font-size: 13px;
+  cursor: pointer;
+  border: none;
+  background: var(--surface-2);
+  color: var(--text);
+}
+.ui-actions button.primary {
+  background: var(--accent);
+  color: var(--accent-ink);
+  font-weight: 700;
+}
+.ui-actions button:disabled,
+.ui-actions input:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+.ui-actions .ui-input {
+  flex: 1;
+  min-width: 120px;
+  background: var(--surface, #171c27);
+  border: 1px solid var(--border, #232a38);
+  color: var(--text);
+  border-radius: 8px;
+  padding: 6px 8px;
+  font: inherit;
+}
+
+/* ── Composer attachment chip (issue 45) ────────────── */
+.composer-attachment {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 2px;
+}
+/* Author display rules defeat the UA [hidden] default — restate it. */
+.composer-attachment[hidden] {
+  display: none;
+}
+.composer-attachment img {
+  width: 40px;
+  height: 40px;
+  object-fit: cover;
+  border-radius: 8px;
+  flex: none;
+}
+.composer-attach-meta {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  flex: 1;
+}
+.composer-attach-meta span {
+  font-size: 11px;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+#composer-attach-name {
+  color: var(--text);
+}
+#composer-attach-remove {
+  all: unset;
+  cursor: pointer;
+  flex: none;
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--muted);
+  font-size: 12px;
+}
+#composer-attach-remove:hover {
+  color: var(--text);
+  background: var(--surface-2, #171c27);
+}
+
+/* ── Ordered turn parts (issue 37) ──────────────────── */
+.parts-zone {
+  display: grid;
+  gap: 8px;
+}
+.toolgroup {
+  margin-top: 4px;
+}
+.toolgroup-badge {
+  all: unset;
+  cursor: pointer;
+  display: block;
+  width: 100%;
+  color: var(--muted);
+  font-size: 12px;
+  padding: 4px 2px;
+}
+.toolgroup-badge:hover {
+  color: var(--text);
+}
+.toolgroup-parts {
+  display: grid;
+  gap: 4px;
+}
+.toolgroup-parts .step {
+  padding-left: 10px;
+}
+.step-counts {
+  color: var(--muted);
+  font-size: 12px;
+  margin-top: 6px;
+}

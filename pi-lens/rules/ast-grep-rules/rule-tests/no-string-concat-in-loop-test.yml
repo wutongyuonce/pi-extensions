@@ -1,0 +1,100 @@
+id: no-string-concat-in-loop
+valid:
+  - |
+    StringBuilder result = new StringBuilder();
+    for (String item : items) {
+      result.append(item);
+    }
+  - 'String result = prefix + suffix;'
+  - |
+    int total = 0;
+    for (int value : values) {
+      total = total + value;
+    }
+  - |
+    double count = 0;
+    while (ready()) {
+      count += 1;
+    }
+  # PR #2212 review F1: numeric accumulation whose right-hand side merely
+  # contains a string literal, deep inside a call argument. The pre-fix rule
+  # searched for a string_literal with `stopBy: end` and fired on both lines.
+  - |
+    class Counter {
+      void run(java.util.Map<String, Integer> counts, java.util.List<String> keys) {
+        int total = 0;
+        for (String key : keys) {
+          total += counts.get("label");
+          total = total + counts.getOrDefault("k", 0);
+        }
+      }
+    }
+  # A String-named local in a different method must not license numeric
+  # accumulation here. This pins the method scoping of the declaration arm.
+  - |
+    class Scoped {
+      String build(java.util.List<String> items) {
+        String total = "";
+        return total;
+      }
+      int count(java.util.List<String> items) {
+        int total = 0;
+        for (String item : items) {
+          total += item.length();
+        }
+        return total;
+      }
+    }
+invalid:
+  - |
+    String result = "";
+    for (String item : items) {
+      result += item + " ";
+    }
+  - |
+    while (ready()) {
+      result = result + " " ;
+    }
+  # PR #2212 review F2: the canonical true positive. No string literal appears
+  # anywhere in either statement, so the pre-fix rule reported nothing.
+  - |
+    class Builder {
+      String join(java.util.List<String> items) {
+        String s = "";
+        for (String x : items) {
+          s += x;
+        }
+        return s;
+      }
+    }
+  - |
+    class Builder {
+      String join(java.util.List<String> items) {
+        String t = "";
+        for (String x : items) {
+          t = t + x;
+        }
+        return t;
+      }
+    }
+  # The accumulator is a String field, not a local.
+  - |
+    class Accumulator {
+      private String buffer = "";
+      void add(java.util.List<String> items) {
+        for (String item : items) {
+          buffer += item;
+        }
+      }
+    }
+  # do-while loops allocate the same way as for and while.
+  - |
+    class Looper {
+      String pump() {
+        String out = "";
+        do {
+          out += next();
+        } while (ready());
+        return out;
+      }
+    }

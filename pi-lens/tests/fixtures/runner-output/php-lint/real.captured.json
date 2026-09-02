@@ -1,0 +1,19 @@
+{
+	"provenance": {
+		"runner": "php-lint",
+		"tool": "php",
+		"version": "8.3.32",
+		"command": "php -l syntax-error.php",
+		"argv": [
+			"-l",
+			"syntax-error.php"
+		],
+		"workspace": "tests/fixtures/tool-smoke/php",
+		"platform": "win32-x64",
+		"capturedAt": "2026-08-21"
+	},
+	"file": "syntax-error.php",
+	"exitCode": 255,
+	"stdout": "\nParse error: syntax error, unexpected variable \"$name\", expecting \";\" in syntax-error.php on line 6\nErrors parsing syntax-error.php\n",
+	"stderr": ""
+}

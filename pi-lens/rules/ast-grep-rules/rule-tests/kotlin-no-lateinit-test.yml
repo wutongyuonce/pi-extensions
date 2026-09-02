@@ -1,0 +1,17 @@
+id: kotlin-no-lateinit
+valid:
+  - |
+    class UserRepository(private val apiClient: ApiClient)
+  - |
+    class Foo {
+        var name: String = ""
+    }
+invalid:
+  - |
+    class UserRepository {
+        lateinit var apiClient: ApiClient
+    }
+  - |
+    class Foo {
+        lateinit var items: MutableList<String>
+    }

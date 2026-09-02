@@ -1,0 +1,78 @@
+name: Parser smoke (real binaries, tier 1)
+
+# Holds runner PARSERS to real binary output (#1937).
+#
+# The nightly `tool-smoke` lane runs Step 1: each tool spawns and exits cleanly.
+# That bar is too low to catch a wrong parser. The taplo runner passed Step 1
+# for months while spawning `taplo check --output=json`, a flag taplo rejects,
+# and reporting every malformed TOML file as clean. The vale runner (#1933) did
+# the same with an envelope vale has never emitted.
+#
+# This lane runs Step 2 instead: install the real binary, run pi-lens's real
+# dispatch path over a planted violation, and FAIL when the runner produces no
+# findings. It is advisory — a scheduled workflow gates no pull request — but it
+# is allowed to go red, because a step that cannot fail is telemetry nobody
+# reads.
+#
+# Scope is tier 1: the fixtures whose tools install as a pip package, an npm
+# package, or a single GitHub-release binary. No JVM, Go, Rust, or .NET setup,
+# which is what keeps the run short. The selection lives on the fixture rows in
+# scripts/smoke-tools.mjs (`tier1: true`), not here — a language list in this
+# file would be a second copy that drifts.
+
+on:
+  schedule:
+    - cron: '0 4 * * *' # daily 04:00 UTC, ahead of the 06:00 tool-smoke lane
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  parser-smoke:
+    name: Step 2 — planted violation must produce findings
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # The installer resolves GitHub release assets through the REST API.
+    # Unauthenticated is 60 requests/hour per IP and shared runners exhaust it.
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
+        with:
+          node-version: '22'
+
+      # pip carries ruff, yamllint, and sqlfluff. Everything else in tier 1 is
+      # an npm package or a GitHub-release binary the harness fetches itself.
+      # yamllint disable-line rule:line-length
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+
+      # `npm ci --ignore-scripts` rather than `npm install`: the lockfile pins
+      # every resolved version, and no dependency lifecycle script runs in a job
+      # that goes on to download and execute third-party binaries. Skipping
+      # scripts also skips `prepare`, so the two steps it would have run are
+      # spelled out below.
+      - name: Install dependencies
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: Download core grammars
+        run: node scripts/download-grammars.js --core --dest grammars
+
+      - name: Build dist
+        run: npm run build:dist
+
+      - name: Tier-1 parsers against real binaries
+        # --min-pass is the floor that keeps a green verdict honest. An
+        # unavailable tool reports a warning, never a failure, so without it a
+        # run where every install failed would exit 0 having proved nothing.
+        # Raise it when tier 1 grows; the coverage test holds it to the fixture
+        # count so it cannot silently rot.
+        run: >-
+          node scripts/smoke-tools.mjs --step2 --tier1 --install --verbose
+          --min-pass=10

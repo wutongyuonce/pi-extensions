@@ -1,0 +1,7 @@
+id: kotlin-no-unnecessary-let
+valid:
+  - |
+    val length = name?.let { it.length }
+invalid:
+  - |
+    val length = name.let { it.length }

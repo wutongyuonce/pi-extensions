@@ -1,0 +1,56 @@
+id: no-unsafe-dictionary-unknown
+language: TypeScript
+severity: hint
+message: "Record<K, unknown> — every read still needs a runtime narrow; prefer a real value type where the shape is known"
+note: |
+  Adapted from dmmulroy/anti-slop's `no-unsafe-dictionary-type`
+  (src/rules/no-unsafe-dictionary-type.ts, MIT), narrowed to the
+  `unknown` arm — the sibling of `no-unsafe-dictionary-any.yml`, which
+  covers the `any` arm at `error`.
+
+  Shipped at `hint`, not `error` or `warning`: AGENTS.md smell 3
+  already records that `Record<string, unknown>` dictionaries are the
+  CORRECT, idiomatic contract at this repo's own validator/parser/
+  telemetry/metadata boundaries (9+ legitimate hits in the original
+  FP scan that got the wider `no-unknown-laundering` fan-out dropped
+  down to the alias-only arm). That finding doesn't generalize to every
+  repository this catalog ships to, so the pattern stays in the catalog
+  as a discoverable hint — "here's every open dictionary whose value
+  type forces the caller to narrow before use, go look and decide" —
+  rather than a rule that tells this repo's own idiom it's wrong.
+
+  Self-scan note: do NOT try to make pi-lens's own tree clean against
+  this rule (that is #1718's baseline problem, not this PR's). Recorded
+  in the adopting PR body per rule instead: 2026-08-19 hit count on
+  clients/ + tests/, napi engine.
+
+  Scope: same direct-annotation cut as the `any` arm — a `Record<$K,
+  unknown>` type reference, matched structurally. Alias resolution and
+  type-literal index signatures are out of scope for the same reason.
+
+  2026-08-20 (refs #1727, #1777): CONSIDERED for promotion to `error`,
+  KEPT at `hint`. Four-corpus census, ast-grep CLI 0.45:
+
+  | corpus | hits |
+  |---|---:|
+  | pi-lens `clients/` | 142 |
+  | pi-lens `tests/` | 247 |
+  | pi core `packages/` | 299 (162 outside test paths) |
+  | opencode `packages/` | 533 (392) |
+  | oh-my-pi `packages/` | 2994 (1727) |
+
+  Verdict: promoting this rule would contradict AGENTS.md's own written
+  guidance in the same repository. Smell 3 records `Record<string,
+  unknown>` as the CORRECT contract at this codebase's validator, parser,
+  telemetry, and metadata boundaries. The suppression that would rescue it
+  — "suppress when the enclosing scope narrows the value before use" —
+  needs data flow from the dictionary's declaration to each read, which
+  ast-grep's structural matcher does not do; a syntactic stand-in would be
+  the vacuous guard this repo's review process screens for. The `any` arm
+  (`no-unsafe-dictionary-any.yml`) stays the error-tier member of the
+  pair, and it is clean on pi-lens: `any` turns checking OFF for every
+  property read, which is the discriminator `unknown` does not share.
+rule:
+  pattern:
+    context: "type T = Record<$K, unknown>;"
+    selector: generic_type

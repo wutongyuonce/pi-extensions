@@ -1,0 +1,41 @@
+id: no-reflect-get-js
+language: JavaScript
+severity: error
+message: "Reflect.get(obj, key) — use a typed property access (obj.prop or obj[key]) instead"
+metadata:
+  category: pi-lens-self-scan
+note: |
+  Reflect.get reaches for reflection where a typed property access
+  already works. Prefer dot or bracket access.
+
+  2026-08-20 (refs #1856): PROMOTED from `warning` to `error` with the
+  same structural Proxy get-trap carve-out as the TypeScript twin. Both
+  arities remain diagnostic elsewhere, but only the two-argument branch is
+  fixable because a receiver changes access semantics.
+rule:
+  all:
+    - pattern: $CALL
+    - any:
+        - pattern: Reflect.get($OBJ, $KEY)
+        - pattern: Reflect.get($GET_TARGET, $PROP, $RECEIVER)
+    - not:
+        inside:
+          kind: method_definition
+          stopBy: end
+          has:
+            field: name
+            regex: "^get$"
+          inside:
+            pattern: new Proxy($TARGET, $HANDLER)
+            stopBy: end
+rewriters:
+  - id: rewrite-two-argument-reflect-get-js
+    rule:
+      pattern: Reflect.get($OBJ, $KEY)
+    fix: "$OBJ[$KEY]"
+transform:
+  REWRITTEN:
+    rewrite:
+      rewriters: [rewrite-two-argument-reflect-get-js]
+      source: $CALL
+fix: $REWRITTEN

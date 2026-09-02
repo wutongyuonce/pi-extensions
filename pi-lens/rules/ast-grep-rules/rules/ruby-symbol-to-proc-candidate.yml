@@ -1,0 +1,25 @@
+id: ruby-symbol-to-proc-candidate
+language: Ruby
+severity: warning
+message: "Use a symbol-to-proc shorthand for this simple iterator block"
+note: |
+  A block that forwards its one parameter to one receiver method can use the
+  equivalent symbol-to-proc form. Side-effect-oriented iterators such as
+  `each` are excluded because replacing them is less useful as a default hint.
+rule:
+  pattern: $LIST.$ITER { |$X| $X.$METHOD }
+  not:
+    pattern: $LIST.$ITER { |$X| $X.$METHOD($$$ARGS) }
+constraints:
+  ITER:
+    regex: '^(map|collect|filter|select|reject|find|detect|any\?|all\?|none\?|one\?|flat_map|sort_by|group_by)$'
+  METHOD:
+    regex: '^[A-Za-z_][A-Za-z0-9_]*[?!=]?$'
+fix: "$LIST.$ITER(&:$METHOD)"
+tags:
+  - ruby
+  - style
+  - modernization
+examples:
+  bad: "names.map { |name| name.upcase }"
+  good: "names.map(&:upcase)"

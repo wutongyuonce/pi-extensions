@@ -1,0 +1,52 @@
+{
+  "name": "pi-observational-memory",
+  "version": "3.0.4",
+  "description": "Observational memory extension for pi — cache-friendly tiered compaction with observations and reflections.",
+  "type": "module",
+  "license": "MIT",
+  "author": "elpapi42",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/elpapi42/pi-observational-memory.git"
+  },
+  "homepage": "https://github.com/elpapi42/pi-observational-memory#readme",
+  "keywords": [
+    "pi",
+    "pi-agent",
+    "pi-package",
+    "extension",
+    "observational-memory",
+    "memory",
+    "compaction"
+  ],
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "files": [
+    "src/",
+    "LICENSE",
+    "README.md"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-agent-core": "*",
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-agent-core": "^0.81.0",
+    "@earendil-works/pi-ai": "^0.81.0",
+    "@earendil-works/pi-coding-agent": "^0.81.0",
+    "@earendil-works/pi-tui": "^0.81.0",
+    "@types/node": "^22.0.0",
+    "typebox": "^1.1.38",
+    "typescript": "^5.6.0",
+    "vitest": "^4.1.5"
+  }
+}

@@ -1,0 +1,10 @@
+id: no-unsafe-dictionary-any
+valid:
+  - "type T = Record<string, unknown>;"
+  - "function f(x: Record<string, string>) {}"
+  - "interface I { m: Record<string, number>; }"
+invalid:
+  - "type T = Record<string, any>;"
+  - "function f(x: Record<string, any>) {}"
+  - "interface I { m: Record<string, any>; }"
+  - "const m: Record<number, any> = {};"

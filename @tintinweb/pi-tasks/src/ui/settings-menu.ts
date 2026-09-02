@@ -8,6 +8,7 @@
 
 import { getSettingsListTheme } from "@earendil-works/pi-coding-agent";
 import { Container, type SettingItem, SettingsList, Spacer, Text } from "@earendil-works/pi-tui";
+import { BUILT_IN_SORT_ORDERS } from "../task-sort.js";
 import { saveTasksConfig, type TasksConfig } from "../tasks-config.js";
 
 // ── Types ───────────────────────────────────────────────────────────────────
@@ -26,19 +27,24 @@ export async function openSettingsMenu(
   cfg: TasksConfig,
   onBack: () => Promise<void>,
   clearDelayTurns: number,
+  cwd: string,
 ): Promise<void> {
   await ui.custom((_tui, theme, _kb, done) => {
+    // A sort spec can't be reconstructed by cycling a menu value, so it is shown
+    // read-only; picking a preset is the deliberate way to drop it.
+    const customSort = Array.isArray(cfg.sortOrder);
     const items: SettingItem[] = [
       {
         id: "taskScope",
         label: "Task storage",
         description:
           "memory: tasks live only in memory, lost when session ends. " +
-          "session: persisted per session (tasks-<sessionId>.json), survives resume. " +
+          "session: persisted per session in the workspace (.pi/tasks/tasks-<sessionId>.json), survives resume. " +
+          "session-global: same, but kept outside the workspace under pi's agent directory. " +
           "project: shared across all sessions (tasks.json). " +
           "Takes effect on next session start.",
         currentValue: cfg.taskScope ?? "session",
-        values: ["memory", "session", "project"],
+        values: ["memory", "session", "session-global", "project"],
       },
       {
         id: "autoCascade",
@@ -50,10 +56,19 @@ export async function openSettingsMenu(
         values: ["on", "off"],
       },
       {
+        id: "collapseCompleted",
+        label: "Collapse completed tasks",
+        description:
+          "When ON, completed tasks are replaced by a single 'N completed' line and the " +
+          "visible limit applies only to the tasks left. When OFF, they are listed individually.",
+        currentValue: (cfg.collapseCompleted ?? false) ? "on" : "off",
+        values: ["on", "off"],
+      },
+      {
         id: "showAll",
         label: "Show all tasks in widget",
         description:
-          "When ON, every task is shown regardless of the visible limit. " +
+          "When ON, every listed task is shown regardless of the visible limit. " +
           "When OFF, the list is capped by 'Max visible tasks'.",
         currentValue: (cfg.showAll ?? false) ? "on" : "off",
         values: ["on", "off"],
@@ -71,10 +86,13 @@ export async function openSettingsMenu(
         id: "sortOrder",
         label: "Widget sort order",
         description:
-          '"status" groups by completed → in-progress → pending. ' +
-          '"id" sorts by creation order.',
-        currentValue: cfg.sortOrder ?? "id",
-        values: ["id", "status", "recent", "oldest"],
+          '"active" groups by in-progress → pending → completed; "status" is the reverse. ' +
+          '"id" sorts by creation order. A custom sort spec in tasks-config.json shows as ' +
+          '"custom" and can only be changed there.',
+        currentValue: customSort ? "custom" : (cfg.sortOrder ?? "id") as string,
+        // "custom" is shown but deliberately left out of the cycle: cycling away from
+        // a spec replaces it, and there is no value to cycle back to.
+        values: [...BUILT_IN_SORT_ORDERS],
       },
       {
         id: "hiddenAt",
@@ -92,7 +110,7 @@ export async function openSettingsMenu(
           "never: completed tasks stay visible until manually cleared. " +
           "on_list_complete: cleared automatically after all tasks are done. " +
           "on_task_complete: each task cleared shortly after it completes. " +
-          `Clearing lags ~${clearDelayTurns} turns.`,
+          `Clearing lags ~${clearDelayTurns} turns, or happens right away when a later batch of work starts.`,
         currentValue: cfg.autoClearCompleted ?? "on_list_complete",
         values: ["never", "on_list_complete", "on_task_complete"],
       },
@@ -105,31 +123,35 @@ export async function openSettingsMenu(
       /* onChange */ (id, newValue) => {
         if (id === "autoCascade") {
           cfg.autoCascade = newValue === "on";
-          saveTasksConfig(cfg);
+          saveTasksConfig(cfg, cwd);
         }
         if (id === "taskScope") {
-          cfg.taskScope = newValue as "memory" | "session" | "project";
-          saveTasksConfig(cfg);
+          cfg.taskScope = newValue as TasksConfig["taskScope"];
+          saveTasksConfig(cfg, cwd);
         }
         if (id === "autoClearCompleted") {
           cfg.autoClearCompleted = newValue as TasksConfig["autoClearCompleted"];
-          saveTasksConfig(cfg);
+          saveTasksConfig(cfg, cwd);
+        }
+        if (id === "collapseCompleted") {
+          cfg.collapseCompleted = newValue === "on";
+          saveTasksConfig(cfg, cwd);
         }
         if (id === "showAll") {
           cfg.showAll = newValue === "on";
-          saveTasksConfig(cfg);
+          saveTasksConfig(cfg, cwd);
         }
         if (id === "maxVisible") {
           cfg.maxVisible = Number(newValue);
-          saveTasksConfig(cfg);
+          saveTasksConfig(cfg, cwd);
         }
         if (id === "sortOrder") {
           cfg.sortOrder = newValue as TasksConfig["sortOrder"];
-          saveTasksConfig(cfg);
+          saveTasksConfig(cfg, cwd);
         }
         if (id === "hiddenAt") {
           cfg.hiddenAt = newValue as "top" | "bottom";
-          saveTasksConfig(cfg);
+          saveTasksConfig(cfg, cwd);
         }
       },
       /* onCancel */ () => done(undefined),

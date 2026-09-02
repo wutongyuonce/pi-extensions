@@ -21,9 +21,10 @@
  *
  * VERSION GATE: `.runtime` only exists in the post-migration facade world (Pi >=
  * 0.80.8, where `ModelRuntime` is first exported). The repo's dev dependency is
- * pinned pre-migration (0.80.6), so we DYNAMICALLY import Pi and skip cleanly when
- * it predates the migration. CI runs a dedicated job on `pi@latest` (see
- * .github/workflows/ci.yml) so this guard actually runs against current Pi.
+ * pinned post-migration, so this runs by default — but it stays gated because CI
+ * also runs the suite against the peer-range floor (see .github/workflows/ci.yml),
+ * where Pi predates the migration. There we DYNAMICALLY import Pi and skip
+ * cleanly; a static `import { ModelRuntime }` would be a link-time error.
  */
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";

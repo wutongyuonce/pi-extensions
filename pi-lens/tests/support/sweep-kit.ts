@@ -1,0 +1,861 @@
+/**
+ * Shared machinery for this repo's registered-or-fail sweeps — #1755.
+ *
+ * Seven sweeps now guard pi-lens (session-state conformance, the
+ * finding-delivery registry #1692, the host-event shape scan #1706, the
+ * hardcoded-machine-paths guard #1735, the ast-grep self-scan #1729, the
+ * changelog guard, and the charter/telemetry sweeps #1741/#1743). Each one
+ * hand-rolled the same four pieces, and each one re-learned the same lessons
+ * in review. This module owns those four pieces once:
+ *
+ * 1. **Source scanning.** One comment/string stripper ({@link stripSource}),
+ *    with the string policy as a caller option — #1692 needs string contents
+ *    INTACT because a surface's evidence is often itself a string argument,
+ *    while the session-state walk needs them BLANKED so a call named inside a
+ *    string is not read as a call.
+ * 2. **Registry semantics.** Registered-or-fail, exemptions that require a
+ *    reason, and stale-entry self-detection ({@link auditRegistry}).
+ * 3. **Tag and evidence binding.** One seam per tag, call-shaped needles, and
+ *    nearest-exclusive assignment with a declared claim capacity — #1692's
+ *    final algorithm, lifted rather than re-derived
+ *    ({@link scanTaggedSeams}, {@link assignNearestExclusive},
+ *    {@link checkSeamEvidence}).
+ * 4. **The emptiness guard.** A sweep that scans zero files or matches zero
+ *    registry entries FAILS ({@link assertNonEmptyScan}). AGENTS.md defect
+ *    shape 10, the #1718 lesson: a dead sweep must never read as clean.
+ *
+ * ## The attack catalogue this kit inherits
+ *
+ * #1692 paid four review rounds for these. A sweep built on this kit gets the
+ * defenses for free; a sweep that re-implements the machinery pays again.
+ * `tests/support/sweep-kit.test.ts` carries one NAMED fixture per attack, so
+ * a future sweep author reads the threat model out of the tests.
+ *
+ * - **Comment/string laundering** (#1635 R1, #1692 F1). A call or declaration
+ *    named only in a comment or a string is not one. Defense: strip before
+ *    you scan, and pick the string policy deliberately.
+ * - **Keyword-position regex** (#1635 R2). `typeof /resetX()/` mis-lexes as
+ *    division under a preceding-CHARACTER check, leaving the regex body
+ *    unstripped and a phantom call visible. Defense: decide regex position
+ *    from the preceding TOKEN.
+ * - **Proximity laundering** (#1692 R1a). A new untagged seam pasted right
+ *    after a tagged one inherits its tag under any lookback window. Defense:
+ *    bind to exactly the immediately-preceding non-blank line, and let each
+ *    tag line bind at most one seam ({@link bindTagsToSeams}).
+ * - **Valid-tag laundering** (#1692 R1b). A rogue seam wearing a REAL id
+ *    passes a whole-file evidence search, because that id's evidence lives
+ *    somewhere else. Defense: bound the evidence search to the seam's own
+ *    region.
+ * - **Region overlap / close-range laundering** (#1692 R1c). A rogue seam
+ *    placed inside the real seam's window shares the one real occurrence, and
+ *    a per-region check clears both. Defense: nearest-EXCLUSIVE assignment
+ *    with a declared claim capacity ({@link assignNearestExclusive}).
+ * - **Identity-stub laundering** (#1692 R2). Keep the evidence ARGUMENT
+ *    (`store: "gitleaks"`) and swap the callee for an identity stub. Defense:
+ *    require a call-shaped occurrence of a declared callee within a tight
+ *    window of the claimed occurrence.
+ * - **Stale allowlist** (#1735). An allowlist entry whose file no longer
+ *    matches the sweep is dead weight that reads as a screen. Defense:
+ *    {@link auditRegistry} reports it ({@link RegistryAudit.staleExemptions}).
+ * - **Dead scan** (#1718, #1729). Zero files scanned, or zero rules resolved,
+ *    reports as a clean run. Defense: {@link assertNonEmptyScan}, and
+ *    {@link auditRegistry}'s two SEPARATE floors — `minScanned` for "the walk
+ *    found nothing to look at" and `minFlagged` for "the walk was healthy but
+ *    the detector matched nothing". Same symptom, two causes, two fixes, so
+ *    they never share a message (#1755 review F4).
+ * - **Prototype-chain exemption** (#1755 review F1). An item named `toString`,
+ *    `constructor`, `valueOf` or `__proto__` satisfies `item in exemptions`
+ *    against a map that never mentions it, and the stale-exemption check reads
+ *    own keys only, so it cannot report the phantom. Defense: `Object.hasOwn`.
+ * - **Misplaced tag** (#1755 review F2/F3). A tag far above its seam across a
+ *    run of blank lines, or written inline at the end of a seam line where it
+ *    silently tags the NEXT seam instead. Defense: a bounded blank-line gap
+ *    (`maxBlankGap`, default 1) and outright rejection of inline tags — see
+ *    {@link bindTagsToSeams}.
+ *
+ * ## Known limits, named rather than papered over
+ *
+ * - {@link listSourceFiles}'s `exclude` filters FILES only. It never prunes a
+ *   directory walk, so excluding `vendor/x.ts` still descends into `vendor/`.
+ *   That is cheap on these trees; a sweep over a `node_modules`-sized tree
+ *   needs directory pruning this kit does not offer (#1755 review F5).
+ * - Under `strings: "blank"`, a call written inside a TEMPLATE EXPRESSION
+ *   (`` `${resetThing()}` ``) is blanked with the rest of the template, so a
+ *   reachability walk cannot see it. This matches the behavior the
+ *   session-state sweep shipped with before the kit, and it is a false
+ *   NEGATIVE — the direction that matters for a guard. No such call exists in
+ *   `clients/` today. A sweep that needs them visible wants `strings: "keep"`
+ *   and a needle-based check (#1755 review F6).
+ *
+ * This module is deliberately STATELESS — no module-level caches, no latches.
+ * A sweep helper that memoized its own scan would be exactly the
+ * process-lifetime-state shape the session-state sweep exists to catch.
+ */
+
+import * as fs from "node:fs";
+import * as path from "node:path";
+import { toPosix } from "../../clients/path-utils.js";
+
+// ── 1. Source scanning ──────────────────────────────────────────────────────
+
+/** What {@link stripSource} does with string and template literal CONTENTS. */
+export type StringPolicy =
+	/**
+	 * Blank string/template contents along with comments (delimiters kept).
+	 * Use when a bare identifier inside a string must not read as code — the
+	 * session-state reachability walk's requirement.
+	 */
+	| "blank"
+	/**
+	 * Keep string/template contents verbatim; blank only comments. Use when the
+	 * thing you search for is itself a string or template fragment — #1692's
+	 * evidence needles (`store: "gitleaks"`, `${trivyAgeLabel}`).
+	 */
+	| "keep";
+
+export interface StripOptions {
+	/** Default `"blank"`. */
+	strings?: StringPolicy;
+}
+
+const KEYWORDS_BEFORE_REGEX = new Set([
+	"return",
+	"typeof",
+	"instanceof",
+	"in",
+	"of",
+	"case",
+	"await",
+	"yield",
+	"delete",
+	"void",
+	"new",
+	"do",
+	"else",
+	"throw",
+]);
+
+/**
+ * Blank comments — and, under `strings: "blank"`, string and template literal
+ * contents — IN PLACE. Length, line count and column layout are preserved, so
+ * an index or line number found in the stripped text lines up with the raw
+ * source. Every sweep in this repo depends on that invariant.
+ *
+ * REGEX LITERALS are lexed in both modes, and have to be: `safe-spawn.ts`'s
+ * `arg.replace(/"/g, '""')` puts a bare `"` inside a regex, and a scanner that
+ * does not know it is inside a regex reads that quote as a string opener and
+ * swallows the rest of the file — a FALSE NEGATIVE, the direction that
+ * matters for a sweep. Under `strings: "keep"` the regex BODY is preserved
+ * (only its position is tracked); under `"blank"` it is blanked, since an
+ * identifier inside a regex is not a call.
+ *
+ * A `/` opens a regex only where a VALUE may start, decided from the preceding
+ * TOKEN rather than the preceding CHARACTER (#1635 review R2): a character
+ * check reads the `f` of `typeof /x()/` as an identifier, calls the regex a
+ * division, and leaves a phantom call visible to the scan.
+ */
+export function stripSource(
+	source: string,
+	options: StripOptions = {},
+): string {
+	const blankStrings = (options.strings ?? "blank") === "blank";
+	const out = source.split("");
+	const blank = (index: number) => {
+		if (out[index] !== "\n") out[index] = " ";
+	};
+	const regexMayStart = (index: number): boolean => {
+		let end = -1;
+		for (let j = index - 1; j >= 0; j--) {
+			const prev = out[j];
+			if (prev === " " || prev === "\t" || prev === "\n" || prev === "\r") {
+				continue;
+			}
+			end = j;
+			break;
+		}
+		if (end < 0) return true; // start of file
+		const prev = out[end];
+		if (!/[\w$]/.test(prev)) return !/[)\]"'`]/.test(prev);
+		let start = end;
+		while (start > 0 && /[\w$]/.test(out[start - 1])) start--;
+		return KEYWORDS_BEFORE_REGEX.has(out.slice(start, end + 1).join(""));
+	};
+	let quote: string | undefined;
+	let lineComment = false;
+	let blockComment = false;
+	let regex = false;
+	let regexClass = false;
+	for (let i = 0; i < source.length; i++) {
+		const ch = source[i];
+		const next = source[i + 1];
+		if (regex) {
+			if (blankStrings) blank(i);
+			if (ch === "\\") {
+				if (blankStrings) blank(i + 1);
+				i++;
+			} else if (ch === "[") regexClass = true;
+			else if (ch === "]") regexClass = false;
+			else if (ch === "/" && !regexClass) regex = false;
+			else if (ch === "\n") regex = false; // unterminated: bail, don't swallow
+			continue;
+		}
+		if (lineComment) {
+			if (ch === "\n") lineComment = false;
+			else blank(i);
+			continue;
+		}
+		if (blockComment) {
+			blank(i);
+			if (ch === "*" && next === "/") {
+				blank(i + 1);
+				blockComment = false;
+				i++;
+			}
+			continue;
+		}
+		if (quote) {
+			if (ch === "\\") {
+				if (blankStrings) {
+					blank(i);
+					blank(i + 1);
+				}
+				i++;
+			} else if (ch === quote) {
+				quote = undefined;
+			} else if (ch === "\n" && quote !== "`") {
+				// A `'`/`"` string cannot span a raw newline in valid source, so
+				// reaching one means this scanner mis-identified the opener. Recover
+				// at the line break rather than swallowing the rest of the file.
+				quote = undefined;
+			} else if (blankStrings) {
+				blank(i);
+			}
+			continue;
+		}
+		if (ch === "/" && next === "/") {
+			blank(i);
+			blank(i + 1);
+			lineComment = true;
+			i++;
+			continue;
+		}
+		if (ch === "/" && next === "*") {
+			blank(i);
+			blank(i + 1);
+			blockComment = true;
+			i++;
+			continue;
+		}
+		if (ch === "/" && regexMayStart(i)) {
+			if (blankStrings) blank(i);
+			regex = true;
+			regexClass = false;
+			continue;
+		}
+		if (ch === '"' || ch === "'" || ch === "`") quote = ch;
+	}
+	return out.join("");
+}
+
+export interface ListSourceFilesOptions {
+	/** File extensions to include, with the dot. Default `[".ts"]`. */
+	extensions?: readonly string[];
+	/** Skip `.d.ts` declaration files. Default `true`. */
+	skipDeclarations?: boolean;
+	/** Skip `*.test.<ext>` files. Default `false`. */
+	skipTests?: boolean;
+	/** Return `true` to drop a file, given its root-relative posix path. */
+	exclude?: (relativePosixPath: string) => boolean;
+}
+
+/**
+ * Every matching file under `root`, recursively, as ABSOLUTE paths sorted for
+ * deterministic ordering across platforms (`readdirSync` order is not a
+ * contract, and a sweep whose output order shifts between Windows and CI
+ * Linux produces diff noise that hides real changes).
+ */
+export function listSourceFiles(
+	root: string,
+	options: ListSourceFilesOptions = {},
+): string[] {
+	const extensions = options.extensions ?? [".ts"];
+	const skipDeclarations = options.skipDeclarations ?? true;
+	const skipTests = options.skipTests ?? false;
+	const walk = (dir: string): string[] =>
+		fs.readdirSync(dir, { withFileTypes: true }).flatMap((entry) => {
+			const entryPath = path.join(dir, entry.name);
+			if (entry.isDirectory()) return walk(entryPath);
+			if (!extensions.some((ext) => entry.name.endsWith(ext))) return [];
+			if (skipDeclarations && /\.d\.[cm]?ts$/.test(entry.name)) return [];
+			if (skipTests && /\.test\.[cm]?[jt]s$/.test(entry.name)) return [];
+			if (options.exclude?.(relativePosix(root, entryPath))) return [];
+			return [entryPath];
+		});
+	return walk(root).sort();
+}
+
+/** `root`-relative posix path for an absolute path. */
+export function relativePosix(root: string, absolute: string): string {
+	return toPosix(path.relative(root, absolute));
+}
+
+// ── 2. Registry semantics ───────────────────────────────────────────────────
+
+export interface RegistryAuditInput {
+	/** Sweep name, used in every composed message. */
+	sweepName: string;
+	/** The items the scan currently flags — the sweep's REDS. */
+	flagged: Iterable<string>;
+	/** Items the registry covers. */
+	registered: Iterable<string>;
+	/** Exempted item → the reason it is exempt. A reason is REQUIRED. */
+	exemptions?: Readonly<Record<string, string>>;
+	/** Minimum reason length that counts as a real reason. Default 15. */
+	minReasonLength?: number;
+	/**
+	 * Minimum flagged items before the audit trusts its own input. Default 1:
+	 * a sweep that flags nothing is dead, not clean (defect shape 10, #1718).
+	 */
+	minFlagged?: number;
+	/**
+	 * How many source items the scan actually LOOKED at, and the floor it must
+	 * clear (#1755 review F4). `minFlagged` alone cannot tell "scanned 0 files"
+	 * from "scanned 370 files, matched none" — two different bugs with two
+	 * different fixes, and the first is #1718's exactly. Pass both to get
+	 * distinguishable failures; omit both to skip the check.
+	 */
+	scannedCount?: number;
+	minScanned?: number;
+	/** Appended to the unaccounted-items message: what the author should do. */
+	remediation?: string;
+}
+
+export interface RegistryAudit {
+	flaggedCount: number;
+	/** Echo of `scannedCount`, so a caller can assert on the walk separately. */
+	scannedCount?: number;
+	/** Flagged, but neither registered nor exempted. */
+	unaccounted: string[];
+	/** Exempted, but the scan no longer flags it — dead weight (#1735). */
+	staleExemptions: string[];
+	/** Exempted with a missing or too-short reason. */
+	reasonlessExemptions: string[];
+	/** Every problem as a ready-to-print message. Empty means clean. */
+	problems: string[];
+}
+
+/**
+ * Registered-or-fail, with exemption reasons and stale-entry self-detection.
+ *
+ * Deliberately asymmetric: a REGISTERED item the scan does not flag is fine
+ * (registries routinely cover state a mechanical heuristic cannot see, such as
+ * closure-held latches), but an EXEMPTED item the scan does not flag is stale
+ * — an exemption's only job is to excuse a live hit, so one that excuses
+ * nothing is a screen that stopped screening. That is #1735's pattern, here as
+ * library behavior.
+ */
+export function auditRegistry(input: RegistryAuditInput): RegistryAudit {
+	const flagged = [...input.flagged];
+	const flaggedSet = new Set(flagged);
+	const registered = new Set(input.registered);
+	const exemptions = input.exemptions ?? {};
+	const minReasonLength = input.minReasonLength ?? 15;
+	const minFlagged = input.minFlagged ?? 1;
+	const problems: string[] = [];
+
+	// Two distinct emptiness failures, reported separately (#1755 review F4).
+	// "Scanned nothing" means the scan lost its target — a moved root, a bad
+	// glob, #1718's nonexistent machine path. "Scanned plenty, matched nothing"
+	// means the DETECTOR broke while the walk stayed healthy. Same symptom, two
+	// causes, so they must not share a message.
+	if (
+		input.minScanned !== undefined &&
+		(input.scannedCount ?? 0) < input.minScanned
+	) {
+		problems.push(
+			`${input.sweepName}: the scan LOOKED AT ${input.scannedCount ?? 0} source item(s), ` +
+				`below the declared floor of ${input.minScanned} — the walk itself is broken ` +
+				"(moved root, bad glob, nonexistent path), so nothing downstream means anything.",
+		);
+	}
+
+	if (flagged.length < minFlagged) {
+		problems.push(
+			`${input.sweepName}: the scan flagged ${flagged.length} item(s), below the ` +
+				`declared floor of ${minFlagged} — a sweep that matches nothing reads as ` +
+				"clean while guarding nothing. Fix the scan or lower the floor deliberately.",
+		);
+	}
+
+	// `Object.hasOwn`, never `item in exemptions` (#1755 review F1). The `in`
+	// operator walks the PROTOTYPE CHAIN, so a flagged item named `toString`,
+	// `constructor`, `valueOf` or `__proto__` would exempt itself against an
+	// exemption map that never mentions it — and `staleExemptions` below reads
+	// `Object.keys` (own properties only), so it could never report the phantom
+	// exemption as stale either. No sweep's id namespace collides today, but the
+	// kit is built for six more with arbitrary id namespaces.
+	const unaccounted = flagged.filter(
+		(item) => !registered.has(item) && !Object.hasOwn(exemptions, item),
+	);
+	if (unaccounted.length > 0) {
+		problems.push(
+			`${input.sweepName}: ${unaccounted.length} flagged item(s) are neither ` +
+				"registered nor exempted:\n" +
+				unaccounted.map((item) => `  ${item}`).join("\n") +
+				(input.remediation ? `\n\n${input.remediation}` : ""),
+		);
+	}
+
+	const staleExemptions = Object.keys(exemptions).filter(
+		(item) => !flaggedSet.has(item),
+	);
+	if (staleExemptions.length > 0) {
+		problems.push(
+			`${input.sweepName}: ${staleExemptions.length} exemption(s) name an item the ` +
+				"scan no longer flags — remove them, a stale exemption is dead weight, not a screen:\n" +
+				staleExemptions.map((item) => `  ${item}`).join("\n"),
+		);
+	}
+
+	const reasonlessExemptions = Object.entries(exemptions)
+		.filter(([, reason]) => (reason ?? "").trim().length < minReasonLength)
+		.map(([item]) => item);
+	if (reasonlessExemptions.length > 0) {
+		problems.push(
+			`${input.sweepName}: ${reasonlessExemptions.length} exemption(s) carry no real ` +
+				`reason (under ${minReasonLength} characters):\n` +
+				reasonlessExemptions.map((item) => `  ${item}`).join("\n"),
+		);
+	}
+
+	return {
+		flaggedCount: flagged.length,
+		scannedCount: input.scannedCount,
+		unaccounted,
+		staleExemptions,
+		reasonlessExemptions,
+		problems,
+	};
+}
+
+// ── 3. Tag and evidence binding ─────────────────────────────────────────────
+
+/** One call-shaped seam found in STRIPPED source. `line` is 1-based. */
+export interface SeamHit {
+	line: number;
+	text: string;
+}
+
+/** A seam plus the registry ids its tag comment names (empty when untagged). */
+export interface TaggedSeam {
+	seam: SeamHit;
+	ids: string[];
+	/**
+	 * The seam's own line carries a tag comment (#1755 review F3). That is a
+	 * misplacement, never a binding — see {@link bindTagsToSeams}.
+	 */
+	inlineTagOnSeamLine?: boolean;
+}
+
+/**
+ * Every line of `strippedSource` matching `pattern`.
+ *
+ * `pattern` should be CALL-SHAPED (`\bfoo\.push\(`, `^function format\w*Mode\(`)
+ * rather than a bare name: a bare name matches the import line and any doc
+ * comment mentioning it, which is how #1692's first version stayed 19/19 green
+ * with all three real gate calls stubbed to identity.
+ */
+export function findSeams(strippedSource: string, pattern: RegExp): SeamHit[] {
+	const hits: SeamHit[] = [];
+	strippedSource.split("\n").forEach((text, index) => {
+		if (pattern.test(text)) hits.push({ line: index + 1, text: text.trim() });
+	});
+	return hits;
+}
+
+/** Default tag shape: `@<name>: id[,id]`. */
+export function tagPattern(tagName: string): RegExp {
+	return new RegExp(`@${tagName}:\\s*([\\w:,-]+)`);
+}
+
+/**
+ * Bind each seam to EXACTLY the immediately-preceding non-blank RAW line — no
+ * lookback window, no "nearest tag wins".
+ *
+ * #1692 review round R1a: a four-line lookback let a NEW untagged seam inherit
+ * the previous seam's tag, which is precisely how someone adds an unregistered
+ * surface — paste a second call right after an already-tagged one.
+ *
+ * `consumedTagLines` carries #1692's second guard forward: a tag LINE binds at
+ * most one seam. Stated honestly, it is REDUNDANT under the strict binding
+ * rule above — a tag line can be the immediately-preceding non-blank line of
+ * only one seam, because any second seam finds the FIRST seam above it
+ * instead. No mutation test reds when it is removed, and the kit does not
+ * claim one. It is kept because it is the invariant the rule exists to
+ * enforce, and it becomes load-bearing the moment a caller relaxes binding.
+ *
+ * BLANK-LINE GAP (#1755 review F2). The lookback skips blank lines, but only
+ * `maxBlankGap` of them (default 1). #1692's version skipped an UNBOUNDED run,
+ * so a tag eight blank lines above a seam still bound to it — "immediately
+ * preceding" in the code but not on the screen, and a reviewer scrolling past
+ * that much whitespace does not read the two as one unit. Callers that need
+ * the old unbounded rule pass `maxBlankGap: Number.POSITIVE_INFINITY` and say
+ * why.
+ *
+ * INLINE TAGS (#1755 review F3). A tag written at the END of a seam line
+ * (`advisoryParts.push(x); // @surface: alpha`) does NOT tag that seam — the
+ * line above it is what a seam reads. Worse, it would silently tag the NEXT
+ * seam down. That shape is rejected outright: the seam is returned untagged
+ * with `inlineTagOnSeamLine` set, and {@link findUnregisteredSeams} reports it
+ * with the fix. Put the tag on its own line above the seam.
+ */
+export function bindTagsToSeams(
+	rawSource: string,
+	seams: readonly SeamHit[],
+	tag: RegExp,
+	maxBlankGap = 1,
+): TaggedSeam[] {
+	const rawLines = rawSource.split("\n");
+	const consumedTagLines = new Set<number>();
+	const seamLineIndexes = new Set(seams.map((s) => s.line - 1));
+	return seams.map((seam) => {
+		const seamLineIndex = seam.line - 1;
+		// F3: a tag on the seam's OWN line is a misplacement, not a binding.
+		if (tag.test(rawLines[seamLineIndex] ?? "")) {
+			return { seam, ids: [], inlineTagOnSeamLine: true };
+		}
+		let i = seamLineIndex - 1; // 0-based index of the raw line just above
+		let skipped = 0;
+		while (i >= 0 && rawLines[i].trim() === "") {
+			if (skipped >= maxBlankGap) return { seam, ids: [] };
+			skipped++;
+			i--;
+		}
+		if (i < 0) return { seam, ids: [] };
+		// A tag sitting on ANOTHER seam's line never binds either — same F3
+		// misplacement, seen from below.
+		if (seamLineIndexes.has(i)) return { seam, ids: [] };
+		const m = tag.exec(rawLines[i]);
+		if (!m || consumedTagLines.has(i)) return { seam, ids: [] };
+		consumedTagLines.add(i);
+		return { seam, ids: m[1].split(",").map((s) => s.trim()) };
+	});
+}
+
+/** Every real seam in `rawSource`, paired with its (possibly empty) tag ids. */
+export function scanTaggedSeams(
+	rawSource: string,
+	seamPattern: RegExp,
+	tag: RegExp,
+	maxBlankGap?: number,
+): TaggedSeam[] {
+	const stripped = stripSource(rawSource);
+	return bindTagsToSeams(
+		rawSource,
+		findSeams(stripped, seamPattern),
+		tag,
+		maxBlankGap,
+	);
+}
+
+/**
+ * Seams that carry no tag, or a tag naming an id outside `registryIds`.
+ * Returns ready-to-print problem strings; empty means every seam is registered.
+ */
+export function findUnregisteredSeams(
+	rawSource: string,
+	seamPattern: RegExp,
+	tag: RegExp,
+	registryIds: ReadonlySet<string>,
+	registryName = "the registry",
+	maxBlankGap?: number,
+): string[] {
+	const problems: string[] = [];
+	for (const { seam, ids, inlineTagOnSeamLine } of scanTaggedSeams(
+		rawSource,
+		seamPattern,
+		tag,
+		maxBlankGap,
+	)) {
+		if (inlineTagOnSeamLine) {
+			problems.push(
+				`line ${seam.line}: the tag comment sits on the seam's own line, where it ` +
+					"tags nothing — move it to its own line directly above the seam — " +
+					seam.text,
+			);
+			continue;
+		}
+		if (ids.length === 0) {
+			problems.push(`line ${seam.line}: untagged seam — ${seam.text}`);
+			continue;
+		}
+		for (const id of ids) {
+			if (!registryIds.has(id)) {
+				problems.push(
+					`line ${seam.line}: tagged "${id}", which is not in ${registryName} — ${seam.text}`,
+				);
+			}
+		}
+	}
+	return problems;
+}
+
+/** 1-based line numbers in `strippedSource` where `needle` occurs. */
+export function occurrenceLines(
+	strippedSource: string,
+	needle: string,
+): number[] {
+	const out: number[] = [];
+	strippedSource.split("\n").forEach((line, i) => {
+		if (line.includes(needle)) out.push(i + 1);
+	});
+	return out;
+}
+
+/**
+ * Greedy nearest-neighbor, EXCLUSIVE assignment of evidence occurrences to the
+ * seams competing for them — #1692 review round R1c.
+ *
+ * The per-region check it replaced asked "is evidence somewhere in MY window",
+ * not "is this evidence actually MINE and nobody else's", so a rogue seam
+ * placed inside a real gate's window passed just by sharing the window.
+ *
+ * Candidates are (seam, occurrence) pairs inside the `back`/`forward` window,
+ * sorted by ascending distance; the closest pair is taken first and both sides
+ * leave the pool. `capacity` is the per-occurrence claim capacity: 1 by
+ * default (one seam per occurrence), raised only when N legitimate seams
+ * genuinely share one upstream call and the sweep DECLARES that number.
+ *
+ * Callers must run one assignment PER ID: two different ids legitimately
+ * reusing the same call are not competitors, and folding them into one
+ * assignment would fail the honest one.
+ */
+export function assignNearestExclusive(
+	seamLines: readonly number[],
+	occurrences: readonly number[],
+	back: number,
+	forward: number,
+	capacity: number,
+): Map<number, number> {
+	const pairs: Array<{ seamLine: number; occLine: number; dist: number }> = [];
+	for (const seamLine of seamLines) {
+		for (const occLine of occurrences) {
+			if (occLine >= seamLine - back && occLine <= seamLine + forward) {
+				pairs.push({ seamLine, occLine, dist: Math.abs(seamLine - occLine) });
+			}
+		}
+	}
+	pairs.sort((a, b) => a.dist - b.dist);
+	const occClaimCount = new Map<number, number>();
+	const claimedSeam = new Set<number>();
+	const assignment = new Map<number, number>();
+	for (const p of pairs) {
+		if (claimedSeam.has(p.seamLine)) continue;
+		const used = occClaimCount.get(p.occLine) ?? 0;
+		if (used >= capacity) continue;
+		occClaimCount.set(p.occLine, used + 1);
+		claimedSeam.add(p.seamLine);
+		assignment.set(p.seamLine, p.occLine);
+	}
+	return assignment;
+}
+
+/**
+ * True when some line within `proximity` of `lineIdx` (0-based) holds a
+ * call-shaped occurrence of `calleeName`.
+ *
+ * #1692 review R2's defense: the evidence ARGUMENT alone (`store: "gitleaks"`)
+ * survives swapping the callee for an identity stub. Requiring the callee near
+ * that SPECIFIC argument occurrence is what a stub cannot fake.
+ */
+export function hasNearbyCallSite(
+	lines: readonly string[],
+	lineIdx: number,
+	calleeName: string,
+	proximity: number,
+): boolean {
+	const start = Math.max(0, lineIdx - proximity);
+	const end = Math.min(lines.length, lineIdx + proximity + 1);
+	for (let i = start; i < end; i++) {
+		if (lines[i].includes(`${calleeName}(`)) return true;
+	}
+	return false;
+}
+
+/** Window defaults lifted from #1692's shipped form. */
+export const DEFAULT_EVIDENCE_WINDOW = {
+	back: 150,
+	forward: 10,
+	calleeProximity: 3,
+} as const;
+
+export interface SeamEvidenceInput {
+	/** The registry id whose seams are being proved. */
+	id: string;
+	/** ALL tagged seams in the scanned file — every seam is a competitor. */
+	taggedSeams: readonly TaggedSeam[];
+	/** The file's lines, comment-stripped with string contents KEPT. */
+	strippedLines: readonly string[];
+	/** Literal substrings each seam of `id` must exclusively claim. */
+	evidence: readonly string[];
+	/**
+	 * Callee names that must appear call-shaped near a claimed ARGUMENT
+	 * occurrence. Empty or omitted skips the identity-stub check — appropriate
+	 * only for surfaces that name no gate.
+	 */
+	callees?: readonly string[];
+	/** Per-occurrence claim capacity. Default 1. */
+	capacity?: number;
+	back?: number;
+	forward?: number;
+	calleeProximity?: number;
+}
+
+/**
+ * Prove that every seam tagged `id` exclusively claims each of `id`'s evidence
+ * needles, and that an ARGUMENT-shaped needle sits next to a real call.
+ *
+ * A needle that is already call-shaped (contains `(`) is its own callee proof
+ * and skips the proximity check. Returns problem strings; empty means proved.
+ */
+export function checkSeamEvidence(input: SeamEvidenceInput): string[] {
+	const problems: string[] = [];
+	const seamsForId = input.taggedSeams
+		.filter(({ ids }) => ids.includes(input.id))
+		.map(({ seam }) => seam.line);
+	if (seamsForId.length === 0) return problems;
+	const back = input.back ?? DEFAULT_EVIDENCE_WINDOW.back;
+	const forward = input.forward ?? DEFAULT_EVIDENCE_WINDOW.forward;
+	const proximity =
+		input.calleeProximity ?? DEFAULT_EVIDENCE_WINDOW.calleeProximity;
+	const capacity = input.capacity ?? 1;
+	const callees = input.callees ?? [];
+	const whole = input.strippedLines.join("\n");
+	for (const needle of input.evidence) {
+		const occurrences = occurrenceLines(whole, needle);
+		const assignment = assignNearestExclusive(
+			seamsForId,
+			occurrences,
+			back,
+			forward,
+			capacity,
+		);
+		for (const seamLine of seamsForId) {
+			const claimed = assignment.get(seamLine);
+			if (claimed === undefined) {
+				problems.push(
+					`"${input.id}": the seam at line ${seamLine} could not exclusively claim an ` +
+						`occurrence of "${needle}" within ${back}/${forward} lines — either no ` +
+						"occurrence is that close, or a competing seam claimed the nearest one first",
+				);
+				continue;
+			}
+			if (callees.length > 0 && !needle.includes("(")) {
+				const satisfied = callees.some((callee) =>
+					hasNearbyCallSite(
+						input.strippedLines,
+						claimed - 1,
+						callee,
+						proximity,
+					),
+				);
+				if (!satisfied) {
+					problems.push(
+						`"${input.id}": the occurrence of "${needle}" claimed by the seam at line ` +
+							`${seamLine} (line ${claimed}) is not within ${proximity} lines of a ` +
+							`call-shaped ${callees.join("/")}( — possible identity-stub`,
+					);
+				}
+			}
+		}
+	}
+	return problems;
+}
+
+// ── 3b. Per-file symbol-count pin ───────────────────────────────────────────
+
+export interface SymbolCountAuditInput {
+	/** Sweep name, used in every composed message. */
+	sweepName: string;
+	/** file → count of stateful symbols the scan detects there RIGHT NOW. */
+	counts: Readonly<Record<string, number>>;
+	/** file → count the registry/exemption list has PINNED. */
+	pinned: Readonly<Record<string, number>>;
+	/** Appended to the drift message: what the author should do. */
+	remediation?: string;
+}
+
+/**
+ * A per-file stateful-SYMBOL-COUNT pin, layered on {@link auditRegistry}'s
+ * registered-or-fail semantics rather than a parallel mechanism (#1817).
+ *
+ * The session-state sweep's file-level coverage audit ({@link auditRegistry}
+ * called directly on file paths) answers "is this FILE registered or
+ * exempted" — it cannot see that a NEW stateful symbol landed inside a file
+ * that already answered yes. That is exactly how #1801 review F1 shipped:
+ * `tree-sitter-client.ts`'s `staleGrammarVersionAt` memo sat invisible inside
+ * an already-registered module while the sweep stayed 55/55 green.
+ *
+ * The fix folds each file's LIVE detected-symbol count into its registry id
+ * (`file@N`) and re-uses {@link auditRegistry} unchanged: a file whose count
+ * changed presents a DIFFERENT id than the one pinned, and an id the pin does
+ * not name is, to `auditRegistry`, an ordinary unaccounted item. No new
+ * registry, no new exemption semantics — the same machinery, one extra
+ * dimension folded into the id.
+ *
+ * This is coarser than full symbol-to-reset attribution (option (a) in
+ * #1817): it says a file's total changed, not which symbol changed or
+ * whether the new one needs a reset. That is the deliberate trade — cheap
+ * enough to pin all ~72 currently-flagged files in one table, and it still
+ * makes the #1801 shape structurally impossible to add silently, because the
+ * pin can only ever fail LOUD (an unmatched id), never pass on a symbol it
+ * never saw.
+ */
+export function auditSymbolCounts(input: SymbolCountAuditInput): RegistryAudit {
+	const key = (file: string, count: number) => `${file}@${count}`;
+	return auditRegistry({
+		sweepName: input.sweepName,
+		flagged: Object.entries(input.counts).map(([file, count]) =>
+			key(file, count),
+		),
+		registered: Object.entries(input.pinned).map(([file, count]) =>
+			key(file, count),
+		),
+		// Count-drift is a supplementary check layered on a coverage sweep that
+		// already declares its own scanned/flagged floors — a second emptiness
+		// floor here would just duplicate that message under a different name.
+		minFlagged: 0,
+		remediation:
+			input.remediation ??
+			"A file's pinned stateful-symbol count no longer matches what the scan " +
+				"detects. First decide whether the new (or removed) symbol needs its " +
+				"own registry entry, a reset, or an exemption reason, or it is an " +
+				"import-time constant the scan cannot distinguish (SWEEP_HEURISTIC_LIMITS " +
+				"item 5) — THEN update the pin to the new count.",
+	});
+}
+
+// ── 4. The emptiness guard ──────────────────────────────────────────────────
+
+/**
+ * Fail when a sweep scanned or matched too little to mean anything — AGENTS.md
+ * defect shape 10, the #1718 lesson.
+ *
+ * #1718's self-scan pointed at a nonexistent machine path and reported a clean
+ * run for months. #1729's rule filter could resolve to zero rules and print
+ * `[]`. Both read as "no findings". Every sweep declares a floor and calls this
+ * BEFORE trusting an empty result set.
+ */
+export function assertNonEmptyScan(
+	label: string,
+	count: number,
+	minimum = 1,
+): void {
+	if (count < minimum) {
+		throw new Error(
+			`${label}: scanned/matched ${count}, below the declared floor of ${minimum}. ` +
+				"An empty sweep must fail, not read as clean — if the target genuinely " +
+				"went away, delete the sweep instead of letting it pass on nothing.",
+		);
+	}
+}

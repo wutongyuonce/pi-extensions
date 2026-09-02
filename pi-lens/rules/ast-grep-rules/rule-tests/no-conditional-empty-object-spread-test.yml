@@ -1,0 +1,9 @@
+id: no-conditional-empty-object-spread
+valid:
+  - 'const o = {...(cond ? {a: 1} : {b: 2})}'
+  - 'const o = {...base}'
+  - 'const o = {...(cond ? extra : other)}'
+invalid:
+  - 'const o = {...(cond ? {} : {x})}'
+  - 'const o = {...(cond ? {y} : {})}'
+  - 'const o = {...cond ? {} : {x}}'

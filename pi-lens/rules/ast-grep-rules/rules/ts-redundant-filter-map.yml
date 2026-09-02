@@ -1,0 +1,10 @@
+id: ts-redundant-filter-map
+language: typescript
+severity: warning
+message: arr.filter(x => x).map(...) - use flatMap or a single pass
+metadata:
+  weight: 3
+  category: slop
+rule:
+  kind: call_expression
+  pattern: "$ARR.filter($F).map($G)"

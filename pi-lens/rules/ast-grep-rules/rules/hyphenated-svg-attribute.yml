@@ -1,0 +1,32 @@
+id: hyphenated-svg-attribute
+language: Tsx
+severity: warning
+message: "Use camelCase for this known SVG attribute in JSX"
+note: |
+  React JSX uses camelCase for SVG attributes. The rule is limited to the
+  known SVG attribute names below, so custom elements and web components with
+  legitimate hyphenated properties are not reported.
+rule:
+  kind: jsx_attribute
+  has:
+    kind: property_identifier
+    regex: "^(stroke-width|stroke-linecap|stroke-linejoin|stroke-miterlimit|stroke-dasharray|stroke-dashoffset|fill-rule|clip-rule|clip-path|font-family|font-size|font-weight|text-anchor|dominant-baseline|stop-color|stop-opacity|fill-opacity|stroke-opacity|color-interpolation-filters|shape-rendering|vector-effect|flood-color|flood-opacity|lighting-color|marker-height|marker-width|xlink-href|mask-type)$"
+  inside:
+    any:
+      - kind: jsx_self_closing_element
+        has:
+          field: name
+          regex: '^(svg|path|circle|rect|line|polyline|polygon|ellipse|g|defs|use|symbol|clipPath|mask|pattern|marker|linearGradient|radialGradient|stop|text|tspan|foreignObject)$'
+      - kind: jsx_opening_element
+        has:
+          field: name
+          regex: '^(svg|path|circle|rect|line|polyline|polygon|ellipse|g|defs|use|symbol|clipPath|mask|pattern|marker|linearGradient|radialGradient|stop|text|tspan|foreignObject)$'
+has_fix: false
+tags:
+  - tsx
+  - jsx
+  - svg
+  - modernization
+examples:
+  bad: "const icon = <svg stroke-width=\"2\" />;"
+  good: "const icon = <svg strokeWidth=\"2\" />;"

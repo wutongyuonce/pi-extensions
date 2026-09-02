@@ -1,0 +1,32 @@
+id: no-unknown-laundering
+language: TypeScript
+severity: error
+message: "type alias to bare 'unknown' — give the alias real shape or inline 'unknown' at the one call site that needs it"
+metadata:
+  category: pi-lens-self-scan
+note: |
+  `type X = unknown` adds a name but zero type information — every
+  consumer of X still has to narrow from scratch, so the alias only
+  launders the fact that nothing was typed. Give it real shape, or drop
+  the alias and let the (rare) genuine unknown-input site say so
+  directly.
+
+  FP-scan finding (pi-lens codebase, clients/ tools/ mcp/ index.ts):
+  the originally proposed wider fan-out — bare `unknown` return types,
+  `unknown` parameters, and `Record<string, unknown>` / index-signature
+  dictionaries — was dropped from this rule. Each of those arms fired
+  overwhelmingly on legitimate, idiomatic TypeScript already in this
+  codebase: `unknown` parameters on type-guard/validator functions
+  (`errorMessage(err: unknown)`, `asRecord(value: unknown)`), `unknown`
+  return types on parsers and a `ProxyHandler.get` trap (whose signature
+  TypeScript itself requires), and `Record<string, unknown>` on
+  telemetry/metadata bags (`metadata?: Record<string, unknown>`). A
+  declared `unknown` at those positions is the CORRECT contract — it
+  forces the caller to narrow — so it is not syntactically distinguishable
+  from a laundered one; only `type X = unknown` stayed a reliable
+  precision signal (zero hits in the same scan).
+
+  2026-08-20 (refs #1856): PROMOTED from `warning` to `error` after a
+  fresh scan confirmed zero hits in pi-lens's own tree.
+rule:
+  pattern: "type $T = unknown"

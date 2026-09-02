@@ -1,0 +1,157 @@
+import { beforeEach, describe, expect, it, vi } from "vitest";
+
+const logLatency = vi.hoisted(() => vi.fn());
+
+vi.mock("../../clients/latency-logger.js", () => ({ logLatency }));
+
+import {
+	isFreshSessionStart,
+	planToolSet,
+	recordToolSetMutation,
+	supportsDeferredTools,
+} from "../../clients/tool-set-policy.js";
+
+const LAZY = new Set(["ast_grep_search", "ast_grep_replace", "lsp_navigation"]);
+/** What the host hands us on EVERY session_start: all tools active. */
+const ALL_ACTIVE = [
+	"lens_diagnostics",
+	"pi_lens_activate_tools",
+	"ast_grep_search",
+	"ast_grep_replace",
+	"lsp_navigation",
+];
+
+describe("tool-set cache policy", () => {
+	beforeEach(() => logLatency.mockClear());
+
+	it("classifies only startup and new as fresh logical sessions", () => {
+		expect(isFreshSessionStart(undefined)).toBe(true);
+		expect(isFreshSessionStart("startup")).toBe(true);
+		expect(isFreshSessionStart("new")).toBe(true);
+		for (const reason of ["fork", "reload", "resume"]) {
+			expect(isFreshSessionStart(reason), reason).toBe(false);
+		}
+	});
+
+	it("reads the host's own deferred-tool capability flag", () => {
+		expect(
+			supportsDeferredTools({ compat: { supportsToolReferences: true } }),
+		).toBe(true);
+		expect(
+			supportsDeferredTools({ compat: { supportsToolReferences: false } }),
+		).toBe(false);
+		// Unknown (no flag / no compat / no model) is reported as false rather
+		// than guessed.
+		expect(supportsDeferredTools({ compat: {} })).toBe(false);
+		expect(supportsDeferredTools({})).toBe(false);
+		expect(supportsDeferredTools(undefined)).toBe(false);
+	});
+
+	describe("planToolSet", () => {
+		it("restores remembered tools in ACTIVATION order, not registration order", () => {
+			// A host rebuild reports tools in REGISTRATION order; the parent's
+			// array had them appended in ACTIVATION order. The active-tools
+			// array is what serializes into the request's tool block, so a
+			// transposition is a changed prefix — i.e. a cache miss on the
+			// first post-fork/resume/reload turn (#1453 review residual).
+			const registrationOrder = [
+				"lens_diagnostics",
+				"pi_lens_activate_tools",
+				"ast_grep_search",
+				"lsp_navigation",
+			];
+			const lazy = new Set(["ast_grep_search", "lsp_navigation"]);
+			// The parent activated lsp_navigation FIRST, then ast_grep_search.
+			const remembered = new Set(["lsp_navigation", "ast_grep_search"]);
+
+			const plan = planToolSet(registrationOrder, lazy, remembered);
+
+			expect(plan.desired).toEqual([
+				"lens_diagnostics",
+				"pi_lens_activate_tools",
+				"lsp_navigation",
+				"ast_grep_search",
+			]);
+			expect(plan.changed).toBe(false);
+		});
+
+		it("shrinks to the baseline when nothing was activated (startup/new)", () => {
+			const plan = planToolSet(ALL_ACTIVE, LAZY, new Set());
+
+			expect(plan.desired).toEqual([
+				"lens_diagnostics",
+				"pi_lens_activate_tools",
+			]);
+			expect(plan).toMatchObject({
+				addedCount: 0,
+				removedCount: 3,
+				changed: true,
+			});
+		});
+
+		it("restores baseline + remembered from an all-active rebuild", () => {
+			const plan = planToolSet(ALL_ACTIVE, LAZY, new Set(["ast_grep_search"]));
+
+			expect(plan.desired).toEqual([
+				"lens_diagnostics",
+				"pi_lens_activate_tools",
+				"ast_grep_search",
+			]);
+			expect(plan).toMatchObject({
+				addedCount: 0,
+				removedCount: 2,
+				changed: true,
+			});
+		});
+
+		it("re-adds a remembered tool the host did not report as active", () => {
+			const plan = planToolSet(
+				["lens_diagnostics"],
+				LAZY,
+				new Set(["lsp_navigation"]),
+			);
+
+			expect(plan.desired).toEqual(["lens_diagnostics", "lsp_navigation"]);
+			expect(plan).toMatchObject({
+				addedCount: 1,
+				removedCount: 0,
+				changed: true,
+			});
+		});
+
+		it("reports no change when the active set already matches", () => {
+			const plan = planToolSet(
+				["lens_diagnostics", "ast_grep_search"],
+				LAZY,
+				new Set(["ast_grep_search"]),
+			);
+
+			expect(plan.changed).toBe(false);
+			expect(plan.addedCount).toBe(0);
+			expect(plan.removedCount).toBe(0);
+		});
+	});
+
+	it("logs bounded mutation counts, reason, and deferral capability", () => {
+		recordToolSetMutation({
+			addedCount: 2,
+			removedCount: 0,
+			reason: "lazy_activation",
+			deferralApplies: false,
+		});
+
+		expect(logLatency).toHaveBeenCalledOnce();
+		expect(logLatency).toHaveBeenCalledWith({
+			type: "phase",
+			filePath: "<pi-lens>",
+			phase: "tool_set_mutation",
+			durationMs: 0,
+			metadata: {
+				addedCount: 2,
+				removedCount: 0,
+				reason: "lazy_activation",
+				deferralApplies: false,
+			},
+		});
+	});
+});

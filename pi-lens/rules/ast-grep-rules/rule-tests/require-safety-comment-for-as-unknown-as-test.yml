@@ -1,0 +1,177 @@
+id: require-safety-comment-for-as-unknown-as
+valid:
+  - |
+    // SAFETY: checked above
+    const a = x as unknown as Foo;
+  - |
+    const b = /* SAFETY: inline */ x as unknown as Foo;
+  - |
+    // SAFETY: arg is validated upstream
+    foo(x as unknown as Foo);
+  # 2026-08-20 (#1727/#1777): this rule now owns the `as unknown as` shape
+  # alone, so a single concrete `as` and a concrete CHAIN are both out of scope
+  # here (the chain belongs to no-chained-type-assertions.yml). Widening the
+  # pattern back to any assertion reds both.
+  - 'const c = x as Foo;'
+  - 'const d = x as A as B;'
+  # #1847: the `inside:` kind list omitted `export_statement`, so a
+  # SAFETY: comment above an EXPORTED cast could not satisfy the valve.
+  # Dropping `export_statement` from the rule's kind list reds this case.
+  - |
+    // SAFETY: node exposes this at runtime, absent from @types/node
+    export const b = (globalThis as unknown as { z: number }).z;
+  # #1847: same gap for a class-field cast — the kind list omitted
+  # `public_field_definition`. Dropping it from the rule's kind list
+  # reds this case.
+  - |
+    class Foo {
+      // SAFETY: server always sends this field at runtime
+      bar: unknown = (globalThis as unknown as { z: number }).z;
+    }
+  # #1852 review (F1): same gap for an enum member's initializer cast —
+  # the kind list omitted `enum_assignment`. Dropping it from the
+  # rule's kind list reds this case. Covers plain, `const`, and
+  # `export` enum alike — `enum_assignment` is the member node itself,
+  # unaffected by keywords on the enclosing `enum_declaration`.
+  # (`declare enum` members have no initializer expression to cast, so
+  # there is nothing to probe for that flavor.)
+  - |
+    enum Direction {
+      // SAFETY: node exposes this at runtime, absent from @types/node
+      Up = (globalThis as unknown as { z: number }).z,
+    }
+  - |
+    const enum Direction {
+      // SAFETY: node exposes this at runtime, absent from @types/node
+      Up = (globalThis as unknown as { z: number }).z,
+    }
+  - |
+    export enum Direction {
+      // SAFETY: node exposes this at runtime, absent from @types/number
+      Up = (globalThis as unknown as { z: number }).z,
+    }
+  # #1852 review over-suppression probe: two casts inside ONE exported
+  # declaration under a single SAFETY: comment. This is pre-existing
+  # behavior, not new — the same one-comment-covers-the-whole-statement
+  # trade already applied to `lexical_declaration`/`variable_declaration`
+  # before #1847 (verified: an unexported `const pair = {a: x as unknown
+  # as Foo, b: y as unknown as Foo}` under one SAFETY: comment was
+  # already 0 findings on master). The "Scope and known gap" note above
+  # states the valve is statement-scoped, not cast-scoped, by design:
+  # "a comment is accepted if it directly precedes... the assertion's
+  # containing... statement." `export_statement` inherits that same
+  # trade; it does not introduce a new one. Locked in here so a future
+  # narrowing of the scope is a deliberate choice, not an accident.
+  - |
+    // SAFETY: both fields document the same upstream payload shape
+    export const pair = { a: x as unknown as Foo, b: y as unknown as Foo };
+  # #1870: tree-sitter-typescript calls an object-literal member a `pair`.
+  # A comment directly above that pair is the natural local anchor.
+  - |
+    const config = {
+      // SAFETY: input is validated by the config loader
+      value: input as unknown as string,
+    };
+  - |
+    configure({
+      // SAFETY: input is validated by the config loader
+      value: input as unknown as string,
+    });
+  # Direct comments immediately above casts in array elements and call
+  # arguments are supported by the direct-cast arm.
+  - |
+    const values = [
+      // SAFETY: input is validated by the config loader
+      input as unknown as string,
+    ];
+  - |
+    configure(
+      // SAFETY: input is validated by the config loader
+      input as unknown as string,
+    );
+invalid:
+  - "const a = x as unknown as Foo;"
+  - |
+    const b = x as unknown as Foo; // no safety note
+  - |
+    // some other comment
+    const c = x as unknown as Foo;
+  # The comment must actually claim safety. A comment mentioning the word in
+  # prose without the `SAFETY:` marker does not clear it — deleting the
+  # `SAFETY\s*:` regex from the rule reds this case.
+  - |
+    // this cast is safe, trust me
+    const d = x as unknown as Foo;
+  # #1834: the `follows: {stopBy: end}` scan is unbounded — it must not walk
+  # past the contiguous comment block into an EARLIER statement's SAFETY:
+  # comment. A stray SAFETY: comment anywhere earlier in the same block must
+  # not exempt a later, undocumented cast.
+  - |
+    function f(x: unknown, y: unknown) {
+      // SAFETY: this comment documents a DIFFERENT assertion below.
+      const a = (y as unknown as string).length;
+
+      const b = (x as unknown as string).length;
+      return a + b;
+    }
+  # SAFETY: on cast A must not bleed to cast B directly below it, even with
+  # no other statement in between.
+  - |
+    // SAFETY: documents castA only
+    const castA = a as unknown as Foo;
+    const castB = b as unknown as Foo;
+  # #1847: an exported cast with no SAFETY: comment must still flag —
+  # adding `export_statement` to the valve must not turn it into a
+  # blanket exemption for every exported cast.
+  - "export const b = (globalThis as unknown as { z: number }).z;"
+  # #1847: an undocumented class-field cast must still flag — adding
+  # `public_field_definition` to the valve must not exempt every field
+  # cast regardless of a SAFETY: comment.
+  - |
+    class Foo {
+      bar: unknown = (globalThis as unknown as { z: number }).z;
+    }
+  # #1852 review (F1): an undocumented enum-member cast must still flag
+  # — adding `enum_assignment` to the valve must not exempt every enum
+  # member cast regardless of a SAFETY: comment.
+  - |
+    enum Direction {
+      Up = (globalThis as unknown as { z: number }).z,
+    }
+  # #1852 review over-suppression probe: a SAFETY: comment separated
+  # from the cast by an unrelated statement must NOT suppress. This is
+  # already enforced by #1834's `stopBy: {not: {kind: comment}}` bound
+  # (the comment is no longer the statement's immediate preceding
+  # sibling once another statement sits between them), but it had no
+  # dedicated minimal fixture — the existing #1834 cases both pair the
+  # comment with a DIFFERENT documented cast, not a bare intervening
+  # statement.
+  - |
+    // SAFETY: documents nothing below — an unrelated call sits between
+    doSomethingUnrelated();
+     const b = x as unknown as Foo;
+  # A comment on an unrelated sibling pair must not reach a later pair.
+  - |
+    const config = {
+      unrelated: 1,
+      // SAFETY: this documents a different property
+      other: 2,
+      target: input as unknown as string,
+    };
+  # An outer pair comment must not cross into a nested pair.
+  - |
+    const config = {
+      // SAFETY: only the parent property is validated
+      parent: {
+        nestedTarget: value as unknown as string,
+      },
+    };
+  # A nested pair comment must not travel outward to a parent cast.
+  - |
+    const config = {
+      parent: value as unknown as string,
+      // SAFETY: only the nested property is validated
+      nested: {
+        child: value as unknown as string,
+      },
+    };

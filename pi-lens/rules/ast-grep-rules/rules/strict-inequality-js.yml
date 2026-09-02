@@ -1,0 +1,23 @@
+id: strict-inequality-js
+language: JavaScript
+message: "Use !== instead of !="
+severity: warning
+note: |
+  != performs type coercion which leads to unexpected comparisons.
+  Use !== for strict inequality checks.
+  EXCEPT `$X != null` / `$X != undefined` (and the reversed operand order):
+  `!= null` is the canonical JS/TS idiom for "is not null or undefined" —
+  rewriting it to `!==` changes behavior by dropping the other nullish
+  case, which is a real bug, not a style fix (#966).
+rule:
+  all:
+    - pattern: $X != $Y
+    - not:
+        any:
+          - has:
+              field: right
+              regex: "^(null|undefined)$"
+          - has:
+              field: left
+              regex: "^(null|undefined)$"
+fix: $X !== $Y

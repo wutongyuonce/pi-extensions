@@ -1,0 +1,39 @@
+{
+  "command.description": "Диктуйте текст голосом — локальне розпізнавання, без хмари",
+
+  "error.requires_interactive": "/voice потребує інтерактивного режиму",
+  "error.model_download_failed": "Не вдалося завантажити модель STT. Перевірте підключення до інтернету.",
+  "error.engine_load_failed": "Не вдалося завантажити модель STT.",
+  "error.mic_unavailable": "Мікрофон недоступний. Перевірте, що пристрій вводу підключено й у Pi є дозвіл на мікрофон.",
+
+  "splash.preparing": "Підготовка моделі…",
+  "splash.downloading": "Завантаження Whisper…",
+  "splash.extracting": "Розпаковування файлів моделі…",
+  "splash.verifying": "Перевірка файлів моделі…",
+  "splash.loading_engine": "Завантаження мовленнєвої моделі…",
+  "splash.initializing_mic": "Ініціалізація мікрофона…",
+
+  "footer.enter_paste": "Enter — вставити",
+  "footer.space_pause": "Пробіл — пауза",
+  "footer.space_resume": "Пробіл — продовжити",
+  "footer.tab_settings": "Tab — налаштування",
+  "footer.esc_cancel": "Esc — скасувати",
+  "footer.esc_back": "Esc — назад",
+  "footer.ctrl_s_save": "Ctrl-S — зберегти",
+  "footer.enter_toggle": "Enter — перемкнути",
+
+  "transcript.placeholder": "Слухаю...",
+
+  "notify.settings_saved": "Налаштування голосу збережено",
+
+  "status.recording": "Запис",
+  "status.paused": "Пауза",
+
+  "settings.microphone_label": "Мікрофон",
+  "settings.microphone_value_default": "Пристрій вводу за замовчуванням",
+  "settings.language_label": "Мова",
+  "settings.language_value_auto": "Автовизначення",
+  "settings.language_hint": "Використайте /languages, щоб змінити.",
+  "settings.hallucination_filter_label": "Фільтр шумів Whisper",
+  "settings.hallucination_filter_hint": "Прибирає артефакти тиші. Вимкніть для диктування одного слова."
+}

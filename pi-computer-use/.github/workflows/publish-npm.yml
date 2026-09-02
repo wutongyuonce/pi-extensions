@@ -1,0 +1,496 @@
+name: Release
+
+# Release order matters:
+# 1. Build and validate every helper from the selected source commit.
+# 2. Build and inspect the exact npm tarball without publishing it.
+# 3. Publish that tarball to npm.
+# 4. Create the GitHub tag and release with the same validated helper artifacts.
+#
+# No public package, tag, or release is created before every build and package
+# check succeeds.
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to release, e.g. v0.4.0"
+        required: true
+      source_ref:
+        description: "Source ref to build/publish; defaults to tag"
+        required: false
+      assets_only:
+        description: "Only rebuild and replace GitHub Release helper assets; do not publish npm or edit release state"
+        required: false
+        type: boolean
+        default: false
+
+permissions: {}
+
+concurrency:
+  group: release-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  KEYCHAIN_PASSWORD: ci-keychain-password
+  RELEASE_TAG: ${{ inputs.tag }}
+  SOURCE_REF: ${{ inputs.source_ref || github.sha }}
+
+jobs:
+  build-signed-helper:
+    runs-on: macos-14
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ env.SOURCE_REF }}
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: Verify tag matches package version
+        env:
+          RELEASE_TAG: ${{ env.RELEASE_TAG }}
+        run: |
+          set -euo pipefail
+          VERSION="${RELEASE_TAG#v}"
+          VERSION="$VERSION" node -e 'const version = process.env.VERSION; const pkg = require("./package.json"); if (pkg.version !== version) { throw new Error(`package.json version ${pkg.version} does not match release tag ${version}`); }'
+
+      - name: Import code-signing certificate
+        env:
+          APPLICATION_CERT_BASE64: ${{ secrets.APPLICATION_CERT_BASE64 }}
+          CERT_PASSWORD: ${{ secrets.CERT_PASSWORD }}
+          SIGN_IDENTITY: ${{ secrets.SIGN_IDENTITY }}
+        run: |
+          set -euo pipefail
+          security create-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+          security set-keychain-settings -t 3600 -l build.keychain
+
+          echo "$APPLICATION_CERT_BASE64" | base64 --decode > application.p12
+          security import application.p12 -k build.keychain -P "$CERT_PASSWORD" \
+            -T /usr/bin/codesign > /dev/null 2>&1
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASSWORD" build.keychain > /dev/null 2>&1
+          rm application.p12
+
+          if ! security find-identity -p codesigning build.keychain | grep -qF "$SIGN_IDENTITY"; then
+            echo "Error: signing identity '$SIGN_IDENTITY' not found in imported cert" >&2
+            security find-identity -p codesigning build.keychain
+            exit 1
+          fi
+
+      - name: Build universal helper binaries
+        run: node scripts/build-native.mjs --arch universal --no-sign
+
+      - name: Assemble helper apps inside package tree
+        env:
+          RELEASE_TAG: ${{ env.RELEASE_TAG }}
+        run: |
+          set -euo pipefail
+          VERSION="${RELEASE_TAG#v}"
+          APP="prebuilt/macos/universal/pi-computer-use.app"
+          rm -rf "$APP"
+          mkdir -p "$APP/Contents/MacOS"
+          cp "prebuilt/macos/universal/bridge" "$APP/Contents/MacOS/bridge"
+          chmod 755 "$APP/Contents/MacOS/bridge"
+          cat > "$APP/Contents/Info.plist" <<PLIST
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+          <key>CFBundleIdentifier</key><string>com.injaneity.pi-computer-use</string>
+          <key>CFBundleName</key><string>pi-computer-use</string>
+          <key>CFBundleDisplayName</key><string>pi-computer-use</string>
+          <key>CFBundleExecutable</key><string>bridge</string>
+          <key>CFBundlePackageType</key><string>APPL</string>
+          <key>CFBundleShortVersionString</key><string>${VERSION}</string>
+          <key>CFBundleVersion</key><string>${VERSION}</string>
+          <key>LSMinimumSystemVersion</key><string>14.0</string>
+          <key>LSUIElement</key><true/>
+          </dict></plist>
+          PLIST
+
+      - name: Sign helper apps
+        env:
+          SIGN_IDENTITY: ${{ secrets.SIGN_IDENTITY }}
+        run: |
+          set -euo pipefail
+          APP="prebuilt/macos/universal/pi-computer-use.app"
+          codesign --force --deep --timestamp --options runtime \
+            --entitlements scripts/pi-computer-use.entitlements \
+            --identifier com.injaneity.pi-computer-use \
+            --sign "$SIGN_IDENTITY" "$APP"
+          codesign --verify --strict --verbose=2 "$APP"
+          DR=$(codesign -dr - "$APP" 2>&1)
+          echo "$DR"
+          echo "$DR" | grep -q 'identifier "com.injaneity.pi-computer-use"'
+          echo "$DR" | grep -q 'certificate leaf'
+
+      - name: Notarize and staple helper apps
+        if: vars.NOTARIZE == 'true'
+        env:
+          TEAM_ID: ${{ secrets.TEAM_ID }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APP_SPECIFIC_PASSWORD: ${{ secrets.APP_SPECIFIC_PASSWORD }}
+        run: |
+          set -euo pipefail
+          APP="prebuilt/macos/universal/pi-computer-use.app"
+          ZIP="notarize-helper.zip"
+          /usr/bin/ditto -c -k --keepParent "$APP" "$ZIP"
+          xcrun notarytool submit "$ZIP" \
+            --apple-id "$APPLE_ID" \
+            --team-id "$TEAM_ID" \
+            --password "$APP_SPECIFIC_PASSWORD" \
+            --wait --timeout 20m
+          xcrun stapler staple "$APP"
+          rm "$ZIP"
+
+      - name: Package release assets
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+          /usr/bin/ditto -c -k --keepParent prebuilt/macos/universal/pi-computer-use.app release-assets/pi-computer-use.app.zip
+          cd release-assets
+          shasum -a 256 pi-computer-use.app.zip > SHA256SUMS
+
+      - name: Upload release payload
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-assets-${{ env.RELEASE_TAG }}
+          path: release-assets/*
+          if-no-files-found: error
+          retention-days: 14
+
+  build-windows-helper:
+    runs-on: windows-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ env.SOURCE_REF }}
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: Build Windows helper
+        run: node scripts/build-native.mjs --platform windows
+
+      - name: Validate Windows helper
+        shell: bash
+        run: test -f prebuilt/windows/windows-bridge.exe
+
+      - name: Upload Windows helper payload
+        uses: actions/upload-artifact@v7
+        with:
+          name: windows-helper-${{ env.RELEASE_TAG }}
+          path: prebuilt/windows/windows-bridge.exe
+          if-no-files-found: error
+          retention-days: 14
+
+  build-linux-helper:
+    name: Build Linux helper (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.SOURCE_REF }}
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: Run Linux checks
+        run: npm run typecheck && npm run test:linux && npm run test:linux-scripts
+
+      - name: Build Linux helper
+        run: node scripts/build-native.mjs --platform linux --arch "${{ matrix.arch }}"
+
+      - name: Validate and package Linux helper
+        run: |
+          set -euo pipefail
+          BINARY="prebuilt/linux/${{ matrix.arch }}/linux-bridge"
+          test -x "$BINARY"
+          file "$BINARY" | grep -q 'ELF 64-bit'
+          mkdir -p release-assets
+          cp "$BINARY" "release-assets/linux-bridge-${{ matrix.arch }}"
+          chmod 755 "release-assets/linux-bridge-${{ matrix.arch }}"
+
+      - name: Upload Linux helper payload
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-helper-${{ matrix.arch }}-${{ env.RELEASE_TAG }}
+          path: release-assets/linux-bridge-${{ matrix.arch }}
+          if-no-files-found: error
+          retention-days: 14
+
+  validate-release:
+    if: ${{ !inputs.assets_only }}
+    runs-on: ubuntu-latest
+    needs:
+      - build-linux-helper
+      - build-signed-helper
+      - build-windows-helper
+    permissions:
+      actions: read
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ env.SOURCE_REF }}
+          persist-credentials: false
+
+      - name: Download release payload
+        uses: actions/download-artifact@v8
+        with:
+          name: release-assets-${{ env.RELEASE_TAG }}
+          path: release-assets
+
+      - name: Download Windows helper payload
+        uses: actions/download-artifact@v8
+        with:
+          name: windows-helper-${{ env.RELEASE_TAG }}
+          path: release-assets
+
+      - name: Download Linux helper payloads
+        uses: actions/download-artifact@v4
+        with:
+          pattern: linux-helper-*-${{ env.RELEASE_TAG }}
+          path: release-assets
+          merge-multiple: true
+
+      - name: Validate release notes
+        run: |
+          set -euo pipefail
+          VERSION="${RELEASE_TAG#v}"
+          RELEASE_NOTES="notes/release-v${VERSION}.md"
+          test -f "$RELEASE_NOTES"
+          grep -q '^## Features$' "$RELEASE_NOTES"
+          grep -q '^## Changelog$' "$RELEASE_NOTES"
+          grep -q '^> ' "$RELEASE_NOTES"
+
+      - name: Validate release payload
+        run: |
+          set -euo pipefail
+          cd release-assets
+          test -f pi-computer-use.app.zip
+          test -f windows-bridge.exe
+          test -f linux-bridge-x64
+          test -f linux-bridge-arm64
+          test -f SHA256SUMS
+          sha256sum -c SHA256SUMS
+          sha256sum windows-bridge.exe linux-bridge-x64 linux-bridge-arm64 >> SHA256SUMS
+          sha256sum -c SHA256SUMS
+          test "$(awk 'NF == 2 { print $2 }' SHA256SUMS | sort -u | wc -l)" -eq 4
+
+      - name: Verify version is unpublished
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          VERSION="${RELEASE_TAG#v}"
+          if gh api "repos/${GH_REPO}/git/ref/tags/${RELEASE_TAG}" >/dev/null 2>&1; then
+            echo "::error::Git tag $RELEASE_TAG already exists."
+            exit 1
+          fi
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            echo "::error::GitHub Release $RELEASE_TAG already exists."
+            exit 1
+          fi
+          if npm view "@injaneity/pi-computer-use@${VERSION}" version >/dev/null 2>&1; then
+            echo "::error::npm version $VERSION already exists."
+            exit 1
+          fi
+
+  update-github-release-assets:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.assets_only }}
+    runs-on: ubuntu-latest
+    needs:
+      - build-signed-helper
+      - build-linux-helper
+      - build-windows-helper
+    permissions:
+      actions: read
+      contents: write
+    steps:
+      - name: Download release payload
+        uses: actions/download-artifact@v8
+        with:
+          name: release-assets-${{ env.RELEASE_TAG }}
+          path: release-assets
+
+      - name: Download Windows helper payload
+        uses: actions/download-artifact@v8
+        with:
+          name: windows-helper-${{ env.RELEASE_TAG }}
+          path: release-assets
+      - name: Download Linux helper payloads
+        uses: actions/download-artifact@v4
+        with:
+          pattern: linux-helper-*-${{ env.RELEASE_TAG }}
+          path: release-assets
+          merge-multiple: true
+
+
+      - name: Replace assets on existing GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          cd release-assets
+          test -f pi-computer-use.app.zip
+          test -f windows-bridge.exe
+          test -f linux-bridge-x64
+          test -f linux-bridge-arm64
+          test -f SHA256SUMS
+          sha256sum -c SHA256SUMS
+          sha256sum windows-bridge.exe linux-bridge-x64 linux-bridge-arm64 >> SHA256SUMS
+          sha256sum -c SHA256SUMS
+          test "$(awk 'NF == 2 { print $2 }' SHA256SUMS | sort -u | wc -l)" -eq 4
+          gh release upload "$RELEASE_TAG" \
+            pi-computer-use.app.zip \
+            windows-bridge.exe \
+            linux-bridge-x64 \
+            linux-bridge-arm64 \
+            SHA256SUMS \
+            --clobber
+
+          expected_asset_names="$(printf '%s\n' SHA256SUMS pi-computer-use.app.zip windows-bridge.exe linux-bridge-x64 linux-bridge-arm64 | sort)"
+          actual_asset_names="$(gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name' | sort)"
+          if [[ "$actual_asset_names" != "$expected_asset_names" ]]; then
+            echo "::error::GitHub Release asset set does not match expected files."
+            diff -u <(printf '%s\n' "$expected_asset_names") <(printf '%s\n' "$actual_asset_names") || true
+            exit 1
+          fi
+
+  publish-release:
+    runs-on: macos-14
+    needs: validate-release
+    permissions:
+      actions: read
+      contents: write
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ env.SOURCE_REF }}
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: Download release payload
+        uses: actions/download-artifact@v8
+        with:
+          name: release-assets-${{ env.RELEASE_TAG }}
+          path: release-assets
+
+      - name: Download Windows helper payload
+        uses: actions/download-artifact@v8
+        with:
+          name: windows-helper-${{ env.RELEASE_TAG }}
+          path: prebuilt/windows
+
+      - name: Download Linux helper payloads
+        uses: actions/download-artifact@v8
+        with:
+          pattern: linux-helper-*-${{ env.RELEASE_TAG }}
+          path: release-linux
+          merge-multiple: true
+
+      - name: Assemble npm package and GitHub assets
+        run: |
+          set -euo pipefail
+          mkdir -p prebuilt/macos/universal prebuilt/linux/x64 prebuilt/linux/arm64
+          rm -rf prebuilt/macos/universal/pi-computer-use.app
+          /usr/bin/ditto -x -k release-assets/pi-computer-use.app.zip prebuilt/macos/universal
+          codesign --verify --strict prebuilt/macos/universal/pi-computer-use.app
+          test -f prebuilt/windows/windows-bridge.exe
+          cp release-linux/linux-bridge-x64 prebuilt/linux/x64/linux-bridge
+          cp release-linux/linux-bridge-arm64 prebuilt/linux/arm64/linux-bridge
+          chmod 755 prebuilt/linux/x64/linux-bridge prebuilt/linux/arm64/linux-bridge
+          cp prebuilt/windows/windows-bridge.exe release-assets/windows-bridge.exe
+          cp release-linux/linux-bridge-x64 release-assets/linux-bridge-x64
+          cp release-linux/linux-bridge-arm64 release-assets/linux-bridge-arm64
+          cd release-assets
+          shasum -a 256 windows-bridge.exe linux-bridge-x64 linux-bridge-arm64 >> SHA256SUMS
+          shasum -a 256 -c SHA256SUMS
+          test "$(awk 'NF == 2 { print $2 }' SHA256SUMS | sort -u | wc -l | tr -d ' ')" -eq 4
+
+      - name: Run checks
+        run: npm test
+
+      - name: Build and verify npm tarball
+        run: |
+          set -euo pipefail
+          PACKAGE_TARBALL="$(npm pack --ignore-scripts --silent)"
+          node scripts/check-package-assets.mjs "$PACKAGE_TARBALL"
+          echo "PACKAGE_TARBALL=$PACKAGE_TARBALL" >> "$GITHUB_ENV"
+
+      - name: Publish npm package
+        run: npm publish "$PACKAGE_TARBALL" --access public --provenance
+
+      - name: Create GitHub tag and release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          VERSION="${RELEASE_TAG#v}"
+          gh release create "$RELEASE_TAG" \
+            --target "$SOURCE_REF" \
+            --title "$RELEASE_TAG" \
+            --notes-file "notes/release-v${VERSION}.md" \
+            release-assets/pi-computer-use.app.zip \
+            release-assets/windows-bridge.exe \
+            release-assets/linux-bridge-x64 \
+            release-assets/linux-bridge-arm64 \
+            release-assets/SHA256SUMS
+          expected="$(printf '%s\n' SHA256SUMS linux-bridge-arm64 linux-bridge-x64 pi-computer-use.app.zip windows-bridge.exe | sort)"
+          actual="$(gh release view "$RELEASE_TAG" --json assets --jq '.assets[].name' | sort)"
+          test "$actual" = "$expected"

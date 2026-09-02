@@ -65,6 +65,7 @@ import {
   SessionManager,
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
+import { fauxModelBackend } from "./faux-model-backend.js";
 import { getModel, registerFauxProvider } from "./pi-ai.js";
 
 /** Path to the pi-subagents extension entrypoint (repo `src/index.ts`). */
@@ -137,8 +138,15 @@ export interface RunPrintModeOptions {
    * neither this nor `PI_PROVIDER`+`PI_MODEL` is set, the model is left for pi to
    * resolve from your local config (settings default → first authed model) — i.e.
    * it picks up whatever your `pi` install is logged into, no env required.
+   *
+   * `false` pins the run faux even under `PI_E2E_LIVE=1`. A suite whose whole
+   * point is a scripted response — a provider error with no content, a
+   * three-level delegation chain — has nothing to gain from a real model and
+   * cannot assert anything once one answers instead. Without this, running the
+   * documented pre-publish smoke turns those suites red on a healthy tree,
+   * which is worse than not running them: it hides a real regression in noise.
    */
-  live?: { provider: string; model: string };
+  live?: { provider: string; model: string } | false;
 }
 
 export interface PrintModeRun {
@@ -235,6 +243,9 @@ const DEFAULT_SYSTEM_PROMPT =
   "You are a headless orchestrator. Use the Agent tool to delegate, then report the result.";
 
 function isLive(options: RunPrintModeOptions): boolean {
+  // An explicit `false` wins over the env var — the env var is a blanket switch,
+  // and a suite that pins itself faux is stating something the switch can't know.
+  if (options.live === false) return false;
   return Boolean(options.live) || /^(1|true|yes)$/i.test(process.env.PI_E2E_LIVE ?? "");
 }
 
@@ -268,13 +279,17 @@ export async function runPrintMode(options: RunPrintModeOptions): Promise<PrintM
   let faux: ReturnType<typeof registerFauxProvider> | undefined;
   let model: Model<string> | undefined;
   let modelRegistry: unknown;
+  let modelRuntime: unknown;
   if (live) {
     // Explicit pin wins (options.live or PI_PROVIDER + PI_MODEL). Otherwise leave
     // `model` undefined: createAgentSession then calls findInitialModel() against
     // the real, auth-backed registry + your local settings default — i.e. it
     // picks up whatever your `pi` install is logged into, no env needed.
-    const provider = options.live?.provider ?? process.env.PI_PROVIDER;
-    const modelId = options.live?.model ?? process.env.PI_MODEL;
+    // `live: false` never reaches here (isLive returned false), but narrow it
+    // away rather than asserting: the pin is a plain option, not a type-level fact.
+    const pin = options.live || undefined;
+    const provider = pin?.provider ?? process.env.PI_PROVIDER;
+    const modelId = pin?.model ?? process.env.PI_MODEL;
     if (provider && modelId) {
       // getModel's overloads need the concrete provider literal; cast through.
       // Since pi-ai 0.80 it is a static builtin-catalog lookup that returns
@@ -287,29 +302,19 @@ export async function runPrintMode(options: RunPrintModeOptions): Promise<PrintM
         );
       }
     }
-    modelRegistry = undefined; // let createAgentSession build the real, auth-backed registry
+    // Let createAgentSession build the real, auth-backed registry/runtime.
+    modelRegistry = undefined;
+    modelRuntime = undefined;
   } else {
     if (!options.steps && !options.respond) {
       throw new Error("runPrintMode (faux mode): provide `respond` or `steps`");
     }
     faux = registerFauxProvider({ provider: "faux", models: [{ id: "faux-1", contextWindow: 200_000 }] });
     model = faux.getModel();
-    // Structural faux registry (matches the existing e2e suites): the parent
+    // Structural faux registry + runtime (see faux-model-backend.ts): the parent
     // session uses `model` directly; subagents inherit it via ctx.model since
     // resolveDefaultModel falls back to the parent model when no model is pinned.
-    modelRegistry = {
-      find: () => model,
-      getAll: () => [model],
-      getAvailable: () => [model],
-      hasConfiguredAuth: () => true,
-      isUsingOAuth: () => false,
-      // createAgentSession's injected streamFn checks `auth.ok` and throws
-      // Error(auth.error) otherwise — so the `ok: true` flag is mandatory, not
-      // cosmetic. Without it the turn dies before streaming (empty error message).
-      getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "faux", headers: {} }),
-      registerProvider: () => {},
-      unregisterProvider: () => {},
-    };
+    ({ modelRegistry, modelRuntime } = fauxModelBackend(model));
 
     // Pad the response queue: one context-branching responder per expected model
     // call. The queue is a single FIFO shared by parent + child, but every entry
@@ -352,8 +357,9 @@ export async function runPrintMode(options: RunPrintModeOptions): Promise<PrintM
     cwd,
     agentDir,
     model,
-    // Structural faux registry in faux mode; undefined in live mode (defaults).
+    // Structural faux registry/runtime in faux mode; undefined in live mode (defaults).
     modelRegistry: modelRegistry as any,
+    modelRuntime: modelRuntime as any,
     resourceLoader: loader,
     sessionManager: SessionManager.inMemory(cwd),
     // Live: real settings so an omitted model resolves to your local default
@@ -521,10 +527,19 @@ export async function runPrintMode(options: RunPrintModeOptions): Promise<PrintM
  * own output; for a background spawn it's the "started in background" envelope.
  */
 export function agentToolResults(session: AgentSession): string[] {
+  return toolResultsNamed(session, "Agent");
+}
+
+/**
+ * The same, for any tool by name — `SubagentWorkflow`'s launch envelope is read
+ * exactly the way an `Agent` spawn's is, and duplicating the walk to say so
+ * would leave two copies to keep in step with pi's message shape.
+ */
+export function toolResultsNamed(session: AgentSession, toolName: string): string[] {
   const out: string[] = [];
   for (const msg of session.messages) {
     if (msg.role !== "toolResult") continue;
-    if ((msg as { toolName?: string }).toolName !== "Agent") continue;
+    if ((msg as { toolName?: string }).toolName !== toolName) continue;
     const text = (msg.content as Array<{ type?: string; text?: string }>)
       .map((b) => (b.type === "text" ? (b.text ?? "") : ""))
       .join("");
@@ -569,11 +584,24 @@ export function invokedToolNames(session: AgentSession): string[] {
  * `subagent_type`) rather than just that *some* spawn happened.
  */
 export function agentToolCalls(session: AgentSession): Array<Record<string, unknown>> {
+  return toolCallsNamed(session, "Agent");
+}
+
+/**
+ * The same, for any tool by name. A live workflow smoke has to read the
+ * `SubagentWorkflow` call's own arguments — whether it carried `script` or
+ * `name` is the difference between two different code paths, and a model that
+ * merely *narrates* running a workflow leaves no call here at all.
+ */
+export function toolCallsNamed(
+  session: AgentSession,
+  toolName: string,
+): Array<Record<string, unknown>> {
   const out: Array<Record<string, unknown>> = [];
   for (const msg of session.messages) {
     if (msg.role !== "assistant") continue;
     for (const block of msg.content as Array<{ type?: string; name?: string; arguments?: unknown }>) {
-      if (block.type === "toolCall" && block.name === "Agent") {
+      if (block.type === "toolCall" && block.name === toolName) {
         out.push((block.arguments ?? {}) as Record<string, unknown>);
       }
     }

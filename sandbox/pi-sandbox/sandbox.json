@@ -1,0 +1,53 @@
+{
+  "enabled": true,
+  "permissionPromptTimeoutSeconds": 600,
+  "allowBrowserProcess": true,
+  "network": {
+    "allowLocalBinding": true,
+    "allowUnauthenticatedSocksProxy": true,
+    "allowAllUnixSockets": true,
+    "allowedDomains": [
+      "localhost",
+      "127.0.0.1",
+      "html.duckduckgo.com",
+      "*.npmjs.org",
+      "*.pypi.org",
+      "*.github.com",
+      "raw.githubusercontent.com",
+      "mcp.context7.com"
+    ],
+    "deniedDomains": []
+  },
+  "filesystem": {
+    "denyRead": [
+      "/Users"
+    ],
+    "allowRead": [
+      ".",
+      "~/projects",
+      "~/.config",
+      "~/.cargo",
+      "~/.local",
+      "~/Library",
+      "~/.cache",
+      "/Applications/Google Chrome.app",
+      "/System/Volumes/Data/Applications/Google Chrome.app"
+    ],
+    "allowWrite": [
+      ".",
+      "/tmp",
+      "~/.pi/",
+      "~/.cache/uv",
+      "~/.rustup",
+      "~/.agent-browser",
+      "~/Library/Application Support/Google/Chrome",
+      "~/Library/Application Support/Google/Chrome for Testing/Crashpad"
+    ],
+    "denyWrite": [
+      ".env",
+      ".env.*",
+      "*.pem",
+      "*.key"
+    ]
+  }
+}

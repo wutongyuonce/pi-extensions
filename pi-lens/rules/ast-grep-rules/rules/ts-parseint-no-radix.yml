@@ -1,0 +1,18 @@
+id: ts-parseint-no-radix
+language: typescript
+severity: warning
+message: parseInt(x) without radix - use parseInt(x, 10)
+metadata:
+  weight: 2
+  category: slop
+rule:
+  # Two patterns: bare parseInt and the `Number.` alias. The `not` clause
+  # excludes the 2-arg form (radix present). The `, $$$REST` tail is
+  # intentionally absent — the 2-arg check is what defines "with radix".
+  any:
+    - pattern: "parseInt($X)"
+      not:
+        pattern: "parseInt($X, $$$REST)"
+    - pattern: "Number.parseInt($X)"
+      not:
+        pattern: "Number.parseInt($X, $$$REST)"

@@ -1,0 +1,81 @@
+{
+  "type": "object",
+  "required": [
+    "schema",
+    "digest",
+    "question",
+    "extractedFacts",
+    "claims",
+    "sources"
+  ],
+  "properties": {
+    "schema": {
+      "type": "string",
+      "minLength": 1
+    },
+    "digest": {
+      "type": "string",
+      "minLength": 1
+    },
+    "question": {},
+    "extractedFacts": {
+      "type": "array",
+      "items": {
+        "type": "object"
+      },
+      "maxItems": 32
+    },
+    "claims": {
+      "type": "array",
+      "items": {
+        "type": "object"
+      },
+      "maxItems": 24
+    },
+    "sources": {
+      "type": "array",
+      "items": {
+        "type": "object"
+      },
+      "maxItems": 24
+    },
+    "additionalUnverifiedLeads": {
+      "type": "array",
+      "items": {
+        "type": "object"
+      },
+      "maxItems": 24
+    },
+    "budgetLedger": {
+      "type": "object",
+      "properties": {
+        "searchBudget": {
+          "type": "number"
+        },
+        "searchCallsUsed": {
+          "type": "number"
+        },
+        "searchQueriesAttempted": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 12
+        },
+        "omittedSearchQueries": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "maxItems": 12
+        },
+        "budgetExhausted": {
+          "type": "boolean"
+        },
+        "gapRecorded": {
+          "type": "boolean"
+        }
+      }
+    }
+  }
+}

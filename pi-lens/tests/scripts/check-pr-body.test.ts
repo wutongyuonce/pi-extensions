@@ -1,0 +1,904 @@
+import { readFileSync } from "node:fs";
+import { describe, expect, it, afterEach, vi } from "vitest";
+import {
+	detectEscapedNewlineBody,
+	detectFlattenedBody,
+	lintPullRequestEvent,
+	lintPrBody,
+	repairEscapedNewlineBody,
+	repairFlattenedBody,
+	resolveLivePrBody,
+	resolveTouchesTests,
+} from "../../scripts/check-pr-body.mjs";
+
+const body = `Summary\nOpening context.\n\n## Tests\nTargeted tests pass.\n\n## Blast radius\nNo runtime module touched.\n\n## Class sweep\nWhole-tree grep completed.\n\n## Observability\nThe advisory check run is the record.`;
+const flattenedBody =
+	"## Summary Await the first lifecycle run's asynchronous word-index snapshot promotion before reseeding the current-format snapshot for the fallback run. ## Tests - Native master flake justification for the count barrier: 2/10 forced runs reproduced the promotion race. - Fixed lifecycle test: 5/5 tests passed. ### Test assessment - tests/clients/word-index-lifecycle.test.ts uniquely pins the ordering guard. ## Blast radius This change is test-only. ## Class sweep The async-persist lifecycle race is fully covered. ## Observability The test observes existing project snapshot records.";
+const multiRoundFlattenedBody =
+	"## Summary Preserve the repair context across multiple review rounds. ## Tests - The repair fixture exercises distinct numbered fix rounds. ### Test assessment - tests/scripts/check-pr-body.test.ts uniquely pins numbered fix-round repair. ## Fix round 1 The first review round records the initial correction. ## Fix round 2 The second review round records the follow-up correction. ## Blast radius This change is test-only. ## Class sweep Numbered fix rounds remain distinct during repair. ## Observability The repaired body is validated by the existing body lint.";
+const motivatingFlattenedBodies = [
+	"## Summary Fix #2052 R1 by making MCP LSP readiness consult the authoritative session-root registry. When the 128-root registry evicts a root, a later request re-registers it instead of returning from the stale lspReadyCwds memo. Add the remainder matrix cells: one mixed inside/outside batch, and an explicit /Users/... case-boundary fixture whose expected result follows the actual filesystem. ## Tests - Red-first mutation proof against the old memo-only guard: firstRootStillServed=false - npm run lint: passed. - npm run build: passed before every test run. - tests/clients/lsp/root-coalescing.test.ts: 12/12 focused tests passed. ### Test assessment - root-coalescing.test.ts uniquely pins the session-root registry and eviction transition. ## Blast radius MCP server readiness and the LSP session-root registry. ## Class sweep The memo-versus-registry readiness pair is fixed here. ## Observability Evicted roots recover; foreign roots retain the existing bounded decline record.",
+	"## Summary Fixes #2104 by making the stale-open-issues detector prove exhaustion for the open-issue population. If the safety bound is reached while a full page remains, the detector throws instead of interpreting a partial population. ## Tests - tests/scripts/stale-open-issues.test.ts adds a page-aware regression. - F1 mutation red after dropping the exhaustive flag. - Green targeted run: 20 tests passed. ### Test assessment - stale-open-issues.test.ts uniquely pins exhaustive pagination and truncation disclosure. ## Blast radius The scheduled stale-open-issues detector and its pagination helper. ## Class sweep Bounded API reads classify truncation before interpreting results. ## Observability Successful comments include the scanned population; a bound hit fails the workflow.",
+	flattenedBody,
+].map((candidate) => candidate.replaceAll("\\n", " "));
+
+describe("flattened PR body repair", () => {
+	it("detects the clearly flattened real-world shape and repairs it", () => {
+		expect(lintPrBody(flattenedBody)).toMatchObject({ valid: false });
+		expect(detectFlattenedBody(flattenedBody)).toBe(true);
+		const repaired = repairFlattenedBody(flattenedBody);
+		expect(lintPrBody(repaired, { requireTestAssessment: true })).toEqual({
+			valid: true,
+			errors: [],
+		});
+	});
+
+	it("repairs flattened bodies with distinct numbered fix rounds", () => {
+		expect(detectFlattenedBody(multiRoundFlattenedBody)).toBe(true);
+		const repaired = repairFlattenedBody(multiRoundFlattenedBody);
+		expect(repaired).not.toBe(multiRoundFlattenedBody);
+		expect(lintPrBody(repaired, { requireTestAssessment: true })).toEqual({
+			valid: true,
+			errors: [],
+		});
+	});
+
+	it.each([
+		body,
+		"Summary\nShort body.\n\n## Tests\nDone.\n\n## Blast radius\nNone.\n\n## Class sweep\nDone.\n\n## Observability\nRecorded.",
+	])("does not detect a normal or short valid body", (candidate) => {
+		expect(detectFlattenedBody(candidate)).toBe(false);
+		expect(repairFlattenedBody(candidate)).toBe(candidate);
+	});
+
+	it("does not classify a long valid body with incidental inline headings", () => {
+		const incidental = `${body}\n\nExtra context.\n\n\nThe text mentions ## Tests and ## Blast radius as examples.`;
+		expect(lintPrBody(incidental)).toMatchObject({ valid: true });
+		expect(detectFlattenedBody(incidental)).toBe(false);
+	});
+
+	it("rejects the minimum-length boundary", () => {
+		const boundary = "x ## Summary x ## Tests x".padEnd(199, "x");
+		expect(boundary).toHaveLength(199);
+		expect(
+			boundary.match(/(?<!^)\s#{2,4}\s+(?:Summary|Tests)(?=\s|$)/g),
+		).toHaveLength(2);
+		expect(detectFlattenedBody(boundary)).toBe(false);
+	});
+
+	it("requires at least two inline headings", () => {
+		const oneHeading = `x ## Summary ${"x".repeat(220)}`;
+		expect(oneHeading).not.toMatch(/\r?\n/);
+		expect(
+			oneHeading.match(/(?<!^)\s#{2,4}\s+(?:Summary|Tests)(?=\s|$)/g),
+		).toHaveLength(1);
+		expect(detectFlattenedBody(oneHeading)).toBe(false);
+	});
+
+	it.each([
+		[
+			"form feed",
+			flattenedBody.replace("word-index", "\fetchOpenPullRequests"),
+		],
+		["tab", flattenedBody.replace("word-index", "\tpx")],
+		["lone carriage return", flattenedBody.replace("word-index", "\retch")],
+		["escaped form feed", `${flattenedBody} \\fetchOpenPullRequests`],
+		["escaped tab", `${flattenedBody} \\tpx`],
+		["escaped carriage return", `${flattenedBody} \\retch`],
+		[
+			"escaped newline",
+			flattenedBody.replace("word-index", "`fetch\\nOpenPullRequests`"),
+		],
+		[
+			"missing heading letter",
+			flattenedBody.replace("## Summary", "## ummary"),
+		],
+		["missing identifier letter", `${flattenedBody} etchOpenPullRequests`],
+	])("refuses data-loss marker: %s", (_name, candidate) => {
+		expect(detectFlattenedBody(candidate)).toBe(false);
+		expect(repairFlattenedBody(candidate)).toBe(candidate);
+	});
+
+	it.each(motivatingFlattenedBodies)(
+		"repairs a flattened motivating body shape",
+		(candidate) => {
+			expect(detectFlattenedBody(candidate)).toBe(true);
+			expect(
+				lintPrBody(repairFlattenedBody(candidate), {
+					requireTestAssessment: true,
+				}),
+			).toMatchObject({ valid: true });
+		},
+	);
+
+	it.each([
+		[
+			"plain quoted headings",
+			`${flattenedBody} \"## Summary one ## Tests two\"`,
+		],
+		[
+			"fenced quoted headings",
+			`${flattenedBody} \`\`\`text ## Summary one ## Tests two \`\`\``,
+		],
+	])("refuses structurally corrupted headings: %s", (_name, candidate) => {
+		expect(detectFlattenedBody(candidate)).toBe(true);
+		expect(repairFlattenedBody(candidate)).toBe(candidate);
+	});
+
+	it.each(
+		[
+			[
+				"quoted Test assessment mid-sentence",
+				"## Summary Opening context. Workers keep writing the ## Test assessment heading inline inside the Tests prose. ## Tests Targeted coverage. ## Blast radius Runtime impact. ## Class sweep Covered. ## Observability Recorded.",
+			],
+			[
+				"quoted Fix round mid-sentence",
+				"## Summary Opening context. Workers carried a ## Fix round 1 heading inline in the evidence. ## Tests Targeted coverage. ## Blast radius Runtime impact. ## Class sweep Covered. ## Observability Recorded.",
+			],
+		].map(([name, candidate]) => [name, candidate.padEnd(220, " ")]),
+	)("refuses a mid-sentence quoted heading: %s", (_name, candidate) => {
+		expect(detectFlattenedBody(candidate)).toBe(true);
+		expect(repairFlattenedBody(candidate)).toBe(candidate);
+	});
+
+	it("refuses duplicate template headings through the count check", () => {
+		const duplicate =
+			"## Summary Opening context. ## Tests First report. ## Tests Second report. ## Blast radius Runtime impact. ## Class sweep Covered. ## Observability Recorded.".padEnd(
+				220,
+				" ",
+			);
+		expect(detectFlattenedBody(duplicate)).toBe(true);
+		expect(repairFlattenedBody(duplicate)).toBe(duplicate);
+	});
+
+	it("refuses an extra repaired heading through the count check", () => {
+		const extraHeading =
+			"## Summary Opening context. ## Tests Targeted coverage.\n### Existing nested heading\n## Blast radius Runtime impact. ## Class sweep Covered. ## Observability Recorded.".padEnd(
+				220,
+				" ",
+			);
+		expect(detectFlattenedBody(extraHeading)).toBe(true);
+		expect(repairFlattenedBody(extraHeading)).toBe(extraHeading);
+	});
+
+	it("is idempotent", () => {
+		const repaired = repairFlattenedBody(flattenedBody);
+		expect(repairFlattenedBody(repaired)).toBe(repaired);
+	});
+});
+
+const escapedNewlineFlattenedBody =
+	"## Summary\\nRestore real newlines for the escaped-newline flattening class (#2145).\\n\\n## Tests\\nAdds fixtures pinning literal backslash-n repair outside fences.\\n\\n## Blast radius\\nLimited to the body-lint script.\\n\\n## Class sweep\\nEscaped-newline flattening is the sibling of the space-flattening class already handled.\\n\\n## Observability\\nA notice logs the repaired PR number.";
+
+const escapedNewlineWithFence =
+	'## Summary\\nRestore real newlines outside fences only (#2145).\\n\\n## Tests\\n```json\\n{"note": "line1\\nline2"}\\n```\\nThe JSON example above documents a genuine escaped newline.\\n\\n## Blast radius\\nLimited to the body-lint script.\\n\\n## Class sweep\\nFence content must never be rewritten during escaped-newline repair.\\n\\n## Observability\\nA notice logs the repaired PR number.';
+
+const escapedNewlineWithTildeFence =
+	"## Summary\\nRestore real newlines outside fences only (#2145).\\n\\n## Tests\\n~~~text\\nexample fenced content\\n~~~\\nThe tilde fence above must not be repaired.\\n\\n## Blast radius\\nLimited to the body-lint script.\\n\\n## Class sweep\\nTilde fences are valid CommonMark and GitHub renders them.\\n\\n## Observability\\nA notice logs the repaired PR number.";
+
+// #2145 review F1: a Windows path carries a genuine "\n" substring (inside
+// "\node_modules") that is real content, not a flattening artifact. A blind
+// global replace would split it into "C:" + a real newline + "ode_modules\pi"
+// while the repaired body still validates, so this must refuse outright.
+const escapedNewlineWithWindowsPath =
+	"## Summary\\nRestore real newlines for the escaped-newline flattening class (#2145).\\n\\n## Tests\\nInstall under C:\\node_modules\\pi and confirm the smoke test passes.\\n\\n## Blast radius\\nLimited to the body-lint script.\\n\\n## Class sweep\\nEscaped-newline flattening is the sibling of the space-flattening class already handled.\\n\\n## Observability\\nA notice logs the repaired PR number.";
+
+// #2145 review F3: pins the realNewlines cap directly. This body is already
+// correctly formatted (real headings on their own real lines) and merely
+// documents the "\n" escape in prose. Without the cap, the later checks
+// (literal count >= 2, headings >= 2) all still pass on this body's existing
+// structure, so the cap is the only thing standing between this and a false
+// positive on an ordinary valid PR body.
+const healthyBodyWithProseEscapes = `${body}\n\nNote: this fixture documents the \\n escape three times: \\n and \\n appear here for illustration.`;
+
+// #2145 review F3: pins the literalNewlines < 2 gate directly. Exactly one
+// literal join converts into two heading-only lines ("## Summary" already
+// sits on its own real line; "## Tests" appears only after the one literal
+// join is converted), so the heading-count check alone cannot reject this —
+// only the minimum-occurrence gate can.
+const singleLiteralNewlineTwoHeadings = `## Summary\n${"Padding prose to reach the two-hundred character minimum length threshold so the detector's length gate does not short-circuit this fixture before reaching the guard actually under test here now, today.".padEnd(170, ".")}\\n## Tests`;
+
+// #2145 review F3: pins the candidateHeadingLines >= 2 gate directly. Two
+// literal joins pass the minimum-occurrence gate, but neither resulting line
+// is a template heading, so only the heading-count check can reject this.
+const twoLiteralNewlinesNoHeadings =
+	"Plain narrative text with no headings at all, just prose that keeps going for a while so the length threshold is comfortably satisfied here.\\nA second paragraph continues the narrative without introducing any heading syntax whatsoever, staying safely non-heading.\\nA third paragraph closes out the fixture with more filler text to be safe about the length floor.";
+
+describe("escaped-newline PR body repair", () => {
+	it("detects and repairs the literal backslash-n flattened shape", () => {
+		expect(escapedNewlineFlattenedBody).not.toMatch(/\r?\n/);
+		expect(detectEscapedNewlineBody(escapedNewlineFlattenedBody)).toBe(true);
+		const repaired = repairEscapedNewlineBody(escapedNewlineFlattenedBody);
+		expect(repaired).toContain("## Summary\nRestore real newlines");
+		expect(lintPrBody(repaired)).toEqual({ valid: true, errors: [] });
+	});
+
+	it("does not detect or touch a normal valid body", () => {
+		expect(detectEscapedNewlineBody(body)).toBe(false);
+		expect(repairEscapedNewlineBody(body)).toBe(body);
+	});
+
+	it("refuses a flattened body that carries a backtick fence, leaving it untouched", () => {
+		expect(detectEscapedNewlineBody(escapedNewlineWithFence)).toBe(false);
+		expect(repairEscapedNewlineBody(escapedNewlineWithFence)).toBe(
+			escapedNewlineWithFence,
+		);
+	});
+
+	it("refuses a flattened body that carries a tilde fence, leaving it untouched", () => {
+		expect(detectEscapedNewlineBody(escapedNewlineWithTildeFence)).toBe(false);
+		expect(repairEscapedNewlineBody(escapedNewlineWithTildeFence)).toBe(
+			escapedNewlineWithTildeFence,
+		);
+	});
+
+	it("leaves a correct multi-line body with a fenced literal backslash-n untouched", () => {
+		const validWithFence = `${body}\n\n\`\`\`json\n{"note": "line1\\nline2"}\n\`\`\``;
+		expect(lintPrBody(validWithFence)).toMatchObject({ valid: true });
+		expect(detectEscapedNewlineBody(validWithFence)).toBe(false);
+		expect(repairEscapedNewlineBody(validWithFence)).toBe(validWithFence);
+	});
+
+	it("refuses a body whose only literal backslash-n sits inside a real path (F1)", () => {
+		expect(detectEscapedNewlineBody(escapedNewlineWithWindowsPath)).toBe(false);
+		expect(repairEscapedNewlineBody(escapedNewlineWithWindowsPath)).toBe(
+			escapedNewlineWithWindowsPath,
+		);
+	});
+
+	it("does not misfire on a healthy body that merely documents the \\n escape (F3 cap)", () => {
+		expect(lintPrBody(healthyBodyWithProseEscapes)).toMatchObject({
+			valid: true,
+		});
+		expect(detectEscapedNewlineBody(healthyBodyWithProseEscapes)).toBe(false);
+		expect(repairEscapedNewlineBody(healthyBodyWithProseEscapes)).toBe(
+			healthyBodyWithProseEscapes,
+		);
+	});
+
+	it("refuses a single literal join even when it lands between two headings (F3 count gate)", () => {
+		expect(singleLiteralNewlineTwoHeadings.length).toBeGreaterThanOrEqual(200);
+		expect(detectEscapedNewlineBody(singleLiteralNewlineTwoHeadings)).toBe(
+			false,
+		);
+	});
+
+	it("refuses two literal joins that never produce a template heading (F3 heading gate)", () => {
+		expect(twoLiteralNewlinesNoHeadings.length).toBeGreaterThanOrEqual(200);
+		expect(detectEscapedNewlineBody(twoLiteralNewlinesNoHeadings)).toBe(false);
+	});
+
+	it("is idempotent", () => {
+		const repaired = repairEscapedNewlineBody(escapedNewlineFlattenedBody);
+		expect(repairEscapedNewlineBody(repaired)).toBe(repaired);
+	});
+});
+
+describe("flattened body CI entrypoint", () => {
+	afterEach(() => vi.unstubAllEnvs());
+
+	function stubApi() {
+		vi.stubEnv("GITHUB_TOKEN", "t");
+		vi.stubEnv("GITHUB_API_URL", "https://api.example");
+		vi.stubEnv("GITHUB_REPOSITORY", "o/r");
+	}
+
+	it("checks the repaired body and reports a warning without writing", async () => {
+		stubApi();
+		const log = vi.spyOn(console, "log").mockImplementation(() => {});
+		const fetchImpl = vi.fn().mockImplementation(async (url: string) => {
+			if (String(url).includes("/files"))
+				return new Response(
+					JSON.stringify([{ filename: "tests/foo.test.ts" }]),
+					{ status: 200 },
+				);
+			return new Response(JSON.stringify({ body: flattenedBody }), {
+				status: 200,
+			});
+		});
+		expect(
+			await lintPullRequestEvent(fetchImpl, {
+				pull_request: { number: 2144, body: flattenedBody },
+			}),
+		).toEqual({ valid: true, repaired: true });
+		expect(fetchImpl).not.toHaveBeenCalledWith(
+			expect.anything(),
+			expect.objectContaining({ method: "PATCH" }),
+		);
+		expect(log).toHaveBeenCalledWith("PR body OK: 2144");
+		log.mockRestore();
+	});
+
+	it("checks an escaped-newline flattened body and reports a warning", async () => {
+		stubApi();
+		const log = vi.spyOn(console, "log").mockImplementation(() => {});
+		const fetchImpl = vi.fn().mockImplementation(async (url: string) => {
+			if (String(url).includes("/files"))
+				return new Response(JSON.stringify([]), { status: 200 });
+			return new Response(
+				JSON.stringify({ body: escapedNewlineFlattenedBody }),
+				{ status: 200 },
+			);
+		});
+		expect(
+			await lintPullRequestEvent(fetchImpl, {
+				pull_request: { number: 2145, body: escapedNewlineFlattenedBody },
+			}),
+		).toEqual({ valid: true, repaired: true });
+		expect(fetchImpl).not.toHaveBeenCalledWith(
+			expect.anything(),
+			expect.objectContaining({ method: "PATCH" }),
+		);
+		expect(log).toHaveBeenCalledWith("PR body OK: 2145");
+		log.mockRestore();
+	});
+
+	it("reports no repair when the payload is flattened but the live body is clean", async () => {
+		stubApi();
+		const fetchImpl = vi
+			.fn()
+			.mockImplementation(async (url: string) =>
+				String(url).includes("/files")
+					? new Response(JSON.stringify([]), { status: 200 })
+					: new Response(JSON.stringify({ body }), { status: 200 }),
+			);
+
+		expect(
+			await lintPullRequestEvent(fetchImpl, {
+				pull_request: { number: 2145, body: flattenedBody },
+			}),
+		).toEqual({ valid: true, repaired: false });
+	});
+
+	it("refuses a flattened fenced template and preserves lint errors", async () => {
+		stubApi();
+		const fencedBody =
+			flattenedBody + " ```text ## Summary one ## Tests two ```";
+		const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+		const fetchImpl = vi
+			.fn()
+			.mockImplementation(async (url: string) =>
+				String(url).includes("/files")
+					? new Response(JSON.stringify([]), { status: 200 })
+					: new Response(JSON.stringify({ body: fencedBody }), { status: 200 }),
+			);
+		expect(
+			await lintPullRequestEvent(fetchImpl, {
+				pull_request: { number: 2144, body: fencedBody },
+			}),
+		).toEqual({ valid: false, repaired: false });
+		expect(fetchImpl).not.toHaveBeenCalledWith(
+			expect.anything(),
+			expect.objectContaining({ method: "PATCH" }),
+		);
+		expect(errors).toHaveBeenCalled();
+		errors.mockRestore();
+	});
+
+	it("reports original errors and does not write when repair remains invalid", async () => {
+		stubApi();
+		const invalidFlattenedBody = flattenedBody.replace(
+			"## Blast radius This change is test-only.",
+			"## Blast radius",
+		);
+		const errors = vi.spyOn(console, "error").mockImplementation(() => {});
+		const fetchImpl = vi.fn().mockImplementation(async (url: string) =>
+			String(url).includes("/files")
+				? new Response("[]", { status: 200 })
+				: new Response(JSON.stringify({ body: invalidFlattenedBody }), {
+						status: 200,
+					}),
+		);
+		const result = await lintPullRequestEvent(fetchImpl, {
+			pull_request: { number: 2144, body: invalidFlattenedBody },
+		});
+		expect(result).toMatchObject({ valid: false, repaired: false });
+		expect(errors).toHaveBeenCalledWith(
+			expect.stringContaining("PR body is missing a Summary section"),
+		);
+		expect(fetchImpl).not.toHaveBeenCalledWith(
+			expect.anything(),
+			expect.objectContaining({ method: "PATCH" }),
+		);
+		errors.mockRestore();
+	});
+});
+
+describe("PR body lint (#1844)", () => {
+	it("accepts the required sections", () => {
+		expect(lintPrBody(body)).toEqual({ valid: true, errors: [] });
+	});
+
+	it.each(["Tests", "Blast radius", "Class sweep", "Observability"])(
+		"rejects a missing %s section",
+		(section) => {
+			const result = lintPrBody(body.replace(`## ${section}\n`, ""));
+			expect(result.valid).toBe(false);
+			expect(result.errors.join(" ")).toContain(`## ${section}`);
+		},
+	);
+
+	it.each(["Tests", "Blast radius", "Class sweep", "Observability"])(
+		"rejects an empty %s section",
+		(section) => {
+			const result = lintPrBody(
+				body.replace(new RegExp(`## ${section}\\n[^#]*`), `## ${section}\n`),
+			);
+			expect(result.valid).toBe(false);
+			expect(result.errors.join(" ")).toContain(`## ${section}`);
+		},
+	);
+
+	it("accepts not applicable with a reason", () => {
+		expect(
+			lintPrBody(
+				body.replace(
+					"No runtime module touched.",
+					"Not applicable: no runtime module changed.",
+				),
+			),
+		).toMatchObject({ valid: true });
+	});
+
+	it("does not let Fix round headings satisfy required sections", () => {
+		expect(
+			lintPrBody("## Fix round 1\nOnly review history here."),
+		).toMatchObject({
+			valid: false,
+		});
+	});
+
+	it("rejects the unfilled template", () => {
+		const template = readFileSync(".github/PULL_REQUEST_TEMPLATE.md", "utf8");
+		expect(lintPrBody(template)).toMatchObject({ valid: false });
+	});
+
+	it("accepts case-insensitive fleet synonyms", () => {
+		expect(
+			lintPrBody(
+				"## WHAT CHANGED AND WHY\nReal summary.\n\n## verification\nRan tests.\n\n## BLAST RADIUS\nNone.\n\n## CLASS SWEEP\nDone.\n\n## OBSERVABILITY\nRecorded.",
+			),
+		).toMatchObject({ valid: true });
+	});
+
+	it("ignores fenced headings and fenced template instructions", () => {
+		expect(lintPrBody("```md\n## Tests\nInstructions\n```\n")).toMatchObject({
+			valid: false,
+		});
+	});
+
+	it("counts a fenced red-run transcript as Tests content", () => {
+		const transcript = body.replace(
+			"Targeted tests pass.",
+			"```text\nFAIL tests/scripts/check-pr-body.test.ts\n```",
+		);
+		expect(lintPrBody(transcript)).toMatchObject({ valid: true });
+	});
+
+	it("does not count a fenced heading as a required section", () => {
+		expect(
+			lintPrBody(
+				"Summary\nOpening context.\n\n```md\n## Tests\nquoted heading\n```\n\n## Blast radius\nNone.\n\n## Class sweep\nDone.\n\n## Observability\nRecorded.",
+			),
+		).toMatchObject({ valid: false });
+	});
+
+	it.each([
+		["unchecked", "- [ ] item", false],
+		["checked", "- [x] item", true],
+	])("handles %s-only sections", (_name, item, valid) => {
+		const result = lintPrBody(body.replace("Targeted tests pass.", item));
+		expect(result.valid).toBe(valid);
+	});
+
+	it("accepts H3 and H4 section headings", () => {
+		const h3 = body.replaceAll("## ", "### ");
+		expect(lintPrBody(h3)).toMatchObject({ valid: true });
+	});
+
+	it("keeps headings before an unterminated fence visible", () => {
+		const unclosed = body + "\n\n```text\nunterminated transcript";
+		expect(lintPrBody(unclosed)).toMatchObject({ valid: true });
+	});
+
+	it("guards null body input", () => {
+		const result = lintPrBody(null as unknown as string);
+		expect(result.valid).toBe(false);
+		expect(result.errors).toContain(
+			"PR body is missing a Summary section. See .github/PULL_REQUEST_TEMPLATE.md.",
+		);
+	});
+
+	it("accepts an opening paragraph instead of a Summary heading", () => {
+		expect(
+			lintPrBody(
+				body.replace("Summary\nOpening context.\n\n", "Opening context.\n\n"),
+			),
+		).toMatchObject({ valid: true });
+	});
+
+	it("rejects a body with no Summary or opening paragraph", () => {
+		expect(
+			lintPrBody(body.replace("Summary\nOpening context.\n\n", "")),
+		).toMatchObject({ valid: false });
+	});
+});
+
+describe("live PR body resolution (#2085)", () => {
+	const payloadPr = { number: 2085, body: "fallback" };
+	const flattenedCloseKeywordBody =
+		"## Summary\\nThis worker body references Closes #2145 while preserving the complete report.\\n\\n## Tests\\nThe real flattened fixture reaches the body lint as literal newline soup.\\n\\n## Blast radius\\nOnly checking behavior changes.\\n\\n## Class sweep\\nThe shared live-body seam covers sibling readers.\\n\\n## Observability\\nA warning records that checking used normalized text.";
+
+	afterEach(() => vi.unstubAllEnvs());
+
+	it("uses the live body and API URL", async () => {
+		vi.stubEnv("GITHUB_API_URL", "https://api.github.test");
+		vi.stubEnv("GITHUB_REPOSITORY", "apmantza/pi-lens");
+		vi.stubEnv("GITHUB_TOKEN", "test-token");
+		const fetchImpl = vi
+			.fn()
+			.mockResolvedValue(
+				new Response(JSON.stringify({ body: "live" }), { status: 200 }),
+			);
+		expect(await resolveLivePrBody(payloadPr, fetchImpl)).toEqual({
+			body: "live",
+			normalized: false,
+		});
+		expect(fetchImpl).toHaveBeenCalledWith(
+			"https://api.github.test/repos/apmantza/pi-lens/pulls/2085",
+			expect.objectContaining({ signal: expect.any(AbortSignal) }),
+		);
+	});
+
+	it("normalizes flattened live bodies for checking and warns without writing", async () => {
+		vi.stubEnv("GITHUB_API_URL", "https://api.github.test");
+		vi.stubEnv("GITHUB_REPOSITORY", "apmantza/pi-lens");
+		vi.stubEnv("GITHUB_TOKEN", "test-token");
+		const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+		const fetchImpl = vi.fn().mockResolvedValue(
+			new Response(JSON.stringify({ body: flattenedCloseKeywordBody }), {
+				status: 200,
+			}),
+		);
+
+		const normalized = await resolveLivePrBody(
+			{ number: 2145, body: flattenedCloseKeywordBody },
+			fetchImpl,
+		);
+
+		expect(normalized).toMatchObject({ normalized: true });
+		expect(normalized.body).toContain("## Tests\n");
+		expect(normalized.body).toContain("Closes #2145");
+		expect(warning).toHaveBeenCalledWith(
+			expect.stringContaining("Normalized flattened PR body"),
+		);
+		expect(fetchImpl).toHaveBeenCalledTimes(1);
+		warning.mockRestore();
+	});
+
+	it("does not mangle a genuine backslash-n inside a code span", async () => {
+		vi.stubEnv("GITHUB_API_URL", "https://api.github.test");
+		vi.stubEnv("GITHUB_REPOSITORY", "apmantza/pi-lens");
+		vi.stubEnv("GITHUB_TOKEN", "test-token");
+		const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+		const codeSpanBody = `${escapedNewlineFlattenedBody.replace(
+			"literal backslash-n repair outside fences.",
+			"literal `line1\\nline2` repair outside fences.",
+		)}`;
+		const fetchImpl = vi
+			.fn()
+			.mockResolvedValue(
+				new Response(JSON.stringify({ body: codeSpanBody }), { status: 200 }),
+			);
+
+		const normalized = await resolveLivePrBody(payloadPr, fetchImpl);
+		expect(normalized).toMatchObject({ normalized: true });
+		expect(normalized.body).toContain("## Summary\n");
+		expect(codeSpanBody).toContain("`line1\\nline2`");
+		expect(normalized.body).toContain("`line1\\nline2`");
+		warning.mockRestore();
+	});
+
+	it("treats a null live body as an empty body", async () => {
+		vi.stubEnv("GITHUB_API_URL", "https://api.github.test");
+		vi.stubEnv("GITHUB_REPOSITORY", "apmantza/pi-lens");
+		vi.stubEnv("GITHUB_TOKEN", "test-token");
+		const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+		const fetchImpl = vi
+			.fn()
+			.mockResolvedValue(
+				new Response(JSON.stringify({ body: null }), { status: 200 }),
+			);
+
+		try {
+			expect(await resolveLivePrBody(payloadPr, fetchImpl)).toEqual({
+				body: "",
+				normalized: false,
+			});
+			expect(warning).not.toHaveBeenCalled();
+		} finally {
+			warning.mockRestore();
+		}
+	});
+
+	it.each([
+		[
+			"non-2xx",
+			new Response("denied", { status: 403 }),
+			"GitHub API returned 403",
+		],
+		[
+			"malformed shape",
+			new Response(JSON.stringify({ body: 42 }), { status: 200 }),
+			"no body",
+		],
+	])("falls back and warns for %s", async (_name, response, reason) => {
+		vi.stubEnv("GITHUB_API_URL", "https://api.github.test");
+		vi.stubEnv("GITHUB_REPOSITORY", "apmantza/pi-lens");
+		vi.stubEnv("GITHUB_TOKEN", "test-token");
+		const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+		const fetchImpl = vi.fn().mockResolvedValue(response);
+		expect(await resolveLivePrBody(payloadPr, fetchImpl)).toEqual({
+			body: "fallback",
+			normalized: false,
+		});
+		expect(warning).toHaveBeenCalledWith(
+			expect.stringContaining("::warning::"),
+		);
+		expect(warning).toHaveBeenCalledWith(expect.stringContaining(reason));
+		warning.mockRestore();
+	});
+
+	it("falls back without a token and does not fetch", async () => {
+		vi.stubEnv("GITHUB_TOKEN", "");
+		const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+		const fetchImpl = vi.fn();
+		expect(await resolveLivePrBody(payloadPr, fetchImpl)).toEqual({
+			body: "fallback",
+			normalized: false,
+		});
+		expect(fetchImpl).not.toHaveBeenCalled();
+		expect(warning).toHaveBeenCalledWith(
+			expect.stringContaining("GITHUB_TOKEN is not set"),
+		);
+		warning.mockRestore();
+	});
+});
+
+describe("conditional Test assessment section (value discipline)", () => {
+	const assessed = `${body}
+
+### Test assessment
+foo.test.ts uniquely pins the retry ladder; nothing made redundant.`;
+
+	it("does not require the section by default", () => {
+		expect(lintPrBody(body)).toMatchObject({ valid: true });
+	});
+
+	it("requires the section when the PR touches tests/", () => {
+		const result = lintPrBody(body, { requireTestAssessment: true });
+		expect(result.valid).toBe(false);
+		expect(result.errors.join(" ")).toContain("Test assessment");
+	});
+
+	it("accepts an answered section when required", () => {
+		expect(lintPrBody(assessed, { requireTestAssessment: true })).toMatchObject(
+			{ valid: true },
+		);
+	});
+
+	it("rejects an empty section when required", () => {
+		const result = lintPrBody(
+			`${body}
+
+### Test assessment
+`,
+			{
+				requireTestAssessment: true,
+			},
+		);
+		expect(result.valid).toBe(false);
+		expect(result.errors.join(" ")).toContain("Test assessment");
+	});
+
+	it("rejects the template placeholder as content", () => {
+		const template = readFileSync(".github/PULL_REQUEST_TEMPLATE.md", "utf8");
+		const placeholder =
+			/### Test assessment\r?\n\r?\n([^#]*)/.exec(template)?.[1] ?? "";
+		expect(placeholder.trim().length).toBeGreaterThan(0);
+		const result = lintPrBody(
+			`${body}
+
+### Test assessment
+${placeholder}`,
+			{ requireTestAssessment: true },
+		);
+		expect(result.valid).toBe(false);
+	});
+});
+
+describe("resolveTouchesTests", () => {
+	const payloadPr = { number: 7, body: "fallback" };
+
+	afterEach(() => {
+		vi.unstubAllEnvs();
+	});
+
+	it("returns true when a tests/ file is in the list", async () => {
+		vi.stubEnv("GITHUB_TOKEN", "t");
+		vi.stubEnv("GITHUB_API_URL", "https://api.example");
+		vi.stubEnv("GITHUB_REPOSITORY", "o/r");
+		const fetchImpl = vi
+			.fn()
+			.mockResolvedValue(
+				new Response(
+					JSON.stringify([
+						{ filename: "clients/foo.ts" },
+						{ filename: "tests/clients/foo.test.ts" },
+					]),
+					{ status: 200 },
+				),
+			);
+		expect(await resolveTouchesTests(payloadPr, fetchImpl)).toBe(true);
+	});
+
+	it("returns false for a production-only PR", async () => {
+		vi.stubEnv("GITHUB_TOKEN", "t");
+		vi.stubEnv("GITHUB_API_URL", "https://api.example");
+		vi.stubEnv("GITHUB_REPOSITORY", "o/r");
+		const fetchImpl = vi.fn().mockResolvedValue(
+			new Response(JSON.stringify([{ filename: "clients/foo.ts" }]), {
+				status: 200,
+			}),
+		);
+		expect(await resolveTouchesTests(payloadPr, fetchImpl)).toBe(false);
+	});
+
+	it("returns null and warns when the list is paginated", async () => {
+		vi.stubEnv("GITHUB_TOKEN", "t");
+		vi.stubEnv("GITHUB_API_URL", "https://api.example");
+		vi.stubEnv("GITHUB_REPOSITORY", "o/r");
+		const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+		const fetchImpl = vi.fn().mockResolvedValue(
+			new Response("[]", {
+				status: 200,
+				headers: { link: '<next>; rel="next"' },
+			}),
+		);
+		expect(await resolveTouchesTests(payloadPr, fetchImpl)).toBe(null);
+		expect(warning).toHaveBeenCalledWith(
+			expect.stringContaining("::warning::"),
+		);
+		warning.mockRestore();
+	});
+
+	it("returns null and warns on a fetch failure", async () => {
+		vi.stubEnv("GITHUB_TOKEN", "t");
+		vi.stubEnv("GITHUB_API_URL", "https://api.example");
+		vi.stubEnv("GITHUB_REPOSITORY", "o/r");
+		const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+		const fetchImpl = vi
+			.fn()
+			.mockResolvedValue(new Response("boom", { status: 500 }));
+		expect(await resolveTouchesTests(payloadPr, fetchImpl)).toBe(null);
+		expect(warning).toHaveBeenCalledWith(
+			expect.stringContaining("::warning::"),
+		);
+		warning.mockRestore();
+	});
+});
+
+describe("nested headings are structure, not content (#2124 F1)", () => {
+	it("still flags an empty Tests section that carries only the nested heading", () => {
+		const result = lintPrBody(
+			body.replace(
+				"## Tests\nTargeted tests pass.",
+				"## Tests\n### Test assessment",
+			),
+		);
+		expect(result.valid).toBe(false);
+		expect(result.errors.join(" ")).toContain("## Tests");
+	});
+
+	it("rejects a required Test assessment satisfied only by a deeper heading", () => {
+		const result = lintPrBody(
+			`${body}
+
+### Test assessment
+#### sub`,
+			{
+				requireTestAssessment: true,
+			},
+		);
+		expect(result.valid).toBe(false);
+		expect(result.errors.join(" ")).toContain("Test assessment");
+	});
+});
+
+describe("renames out of tests/ still require the assessment (#2124 F3)", () => {
+	// #2223: the unstub used to run only after the assertion below, so a
+	// failing assertion left GITHUB_TOKEN/GITHUB_API_URL/GITHUB_REPOSITORY
+	// stubbed for every later test in this file.
+	afterEach(() => vi.unstubAllEnvs());
+
+	it("counts previous_filename", async () => {
+		vi.stubEnv("GITHUB_TOKEN", "t");
+		vi.stubEnv("GITHUB_API_URL", "https://api.example");
+		vi.stubEnv("GITHUB_REPOSITORY", "o/r");
+		const fetchImpl = vi.fn().mockResolvedValue(
+			new Response(
+				JSON.stringify([
+					{
+						filename: "attic/foo.test.ts",
+						previous_filename: "tests/clients/foo.test.ts",
+					},
+				]),
+				{ status: 200 },
+			),
+		);
+		expect(await resolveTouchesTests({ number: 7 }, fetchImpl)).toBe(true);
+	});
+});
+
+describe("the event entrypoint consumes the tri-state (#2124 F2)", () => {
+	const assessedBody = `${body}
+
+### Test assessment
+foo.test.ts uniquely pins the retry ladder.`;
+
+	afterEach(() => vi.unstubAllEnvs());
+
+	function stubApi() {
+		vi.stubEnv("GITHUB_TOKEN", "t");
+		vi.stubEnv("GITHUB_API_URL", "https://api.example");
+		vi.stubEnv("GITHUB_REPOSITORY", "o/r");
+	}
+
+	function fetchFor(bodyText: string, files: unknown) {
+		return vi.fn().mockImplementation(async (url: string | URL | Request) => {
+			if (String(url).includes("/files")) {
+				if (files instanceof Error) throw files;
+				return new Response(JSON.stringify(files), { status: 200 });
+			}
+			return new Response(JSON.stringify({ body: bodyText }), { status: 200 });
+		});
+	}
+
+	it("requires the section when the live file list touches tests/", async () => {
+		stubApi();
+		const result = await lintPullRequestEvent(
+			fetchFor(body, [{ filename: "tests/clients/foo.test.ts" }]),
+			{ pull_request: { number: 7, body } },
+		);
+		expect(result.valid).toBe(false);
+	});
+
+	it("accepts the assessed body when required", async () => {
+		stubApi();
+		const result = await lintPullRequestEvent(
+			fetchFor(assessedBody, [{ filename: "tests/clients/foo.test.ts" }]),
+			{ pull_request: { number: 7, body: assessedBody } },
+		);
+		expect(result).toMatchObject({ valid: true });
+	});
+
+	it("skips the section for production-only PRs", async () => {
+		stubApi();
+		const result = await lintPullRequestEvent(
+			fetchFor(body, [{ filename: "clients/foo.ts" }]),
+			{ pull_request: { number: 7, body } },
+		);
+		expect(result).toMatchObject({ valid: true });
+	});
+
+	it("skips the section on file-list fetch trouble", async () => {
+		stubApi();
+		const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+		const result = await lintPullRequestEvent(
+			fetchFor(body, new Error("boom")),
+			{ pull_request: { number: 7, body } },
+		);
+		expect(result).toMatchObject({ valid: true });
+		warning.mockRestore();
+	});
+});

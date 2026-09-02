@@ -1,0 +1,23 @@
+{
+	"provenance": {
+		"runner": "sqlfluff",
+		"tool": "sqlfluff",
+		"version": "4.3.0",
+		"command": "sqlfluff lint --format json --dialect ansi bad.sql",
+		"argv": [
+			"lint",
+			"--format",
+			"json",
+			"--dialect",
+			"ansi",
+			"bad.sql"
+		],
+		"workspace": "tests/fixtures/tool-smoke/sql",
+		"platform": "win32-x64",
+		"capturedAt": "2026-08-21"
+	},
+	"file": "bad.sql",
+	"exitCode": 1,
+	"stdout": "[{\"filepath\": \"bad.sql\", \"violations\": [{\"start_line_no\": 3, \"start_line_pos\": 1, \"code\": \"LT09\", \"description\": \"Select targets should be on a new line unless there is only one select target.\", \"name\": \"layout.select_targets\", \"warning\": false, \"fixes\": [{\"type\": \"delete\", \"edit\": \"\", \"start_line_no\": 3, \"start_line_pos\": 7, \"start_file_pos\": 108, \"end_line_no\": 3, \"end_line_pos\": 8, \"end_file_pos\": 109}, {\"type\": \"create_before\", \"edit\": \"\\n\", \"start_line_no\": 3, \"start_line_pos\": 8, \"start_file_pos\": 109, \"end_line_no\": 3, \"end_line_pos\": 8, \"end_file_pos\": 109}, {\"type\": \"create_before\", \"edit\": \"\\n\", \"start_line_no\": 3, \"start_line_pos\": 10, \"start_file_pos\": 111, \"end_line_no\": 3, \"end_line_pos\": 10, \"end_file_pos\": 111}, {\"type\": \"delete\", \"edit\": \"\", \"start_line_no\": 3, \"start_line_pos\": 11, \"start_file_pos\": 112, \"end_line_no\": 3, \"end_line_pos\": 12, \"end_file_pos\": 113}, {\"type\": \"create_before\", \"edit\": \"\\n\", \"start_line_no\": 3, \"start_line_pos\": 12, \"start_file_pos\": 113, \"end_line_no\": 3, \"end_line_pos\": 12, \"end_file_pos\": 113}], \"start_file_pos\": 102, \"end_line_no\": 3, \"end_line_pos\": 11, \"end_file_pos\": 112}, {\"start_line_no\": 3, \"start_line_pos\": 10, \"code\": \"LT01\", \"description\": \"Expected single whitespace between comma ',' and naked identifier.\", \"name\": \"layout.spacing\", \"warning\": false, \"fixes\": [{\"type\": \"create_after\", \"edit\": \" \", \"start_line_no\": 3, \"start_line_pos\": 10, \"start_file_pos\": 111, \"end_line_no\": 3, \"end_line_pos\": 10, \"end_file_pos\": 111}], \"start_file_pos\": 111, \"end_line_no\": 3, \"end_line_pos\": 11, \"end_file_pos\": 112}], \"statistics\": {\"source_chars\": 126, \"templated_chars\": 126, \"segments\": 32, \"raw_segments\": 19}, \"timings\": {\"templating\": 0.0, \"lexing\": 0.0, \"parsing\": 0.0, \"linting\": 0.015000000013969839, \"AL01\": 0.0, \"AL02\": 0.0, \"AL03\": 0.0, \"AL04\": 0.015000000013969839, \"AL05\": 0.0, \"AL06\": 0.0, \"AL07\": 0.0, \"AL08\": 0.0, \"AL09\": 0.0, \"AL10\": 0.0, \"AM01\": 0.0, \"AM02\": 0.0, \"AM03\": 0.0, \"AM04\": 0.0, \"AM05\": 0.0, \"AM06\": 0.0, \"AM07\": 0.0, \"AM08\": 0.0, \"AM09\": 0.0, \"CP01\": 0.0, \"CP02\": 0.0, \"CP03\": 0.0, \"CP04\": 0.0, \"CP05\": 0.0, \"CV01\": 0.0, \"CV02\": 0.0, \"CV03\": 0.0, \"CV04\": 0.0, \"CV05\": 0.0, \"CV06\": 0.0, \"CV07\": 0.0, \"CV08\": 0.0, \"CV09\": 0.0, \"CV10\": 0.0, \"CV11\": 0.0, \"CV12\": 0.0, \"JJ01\": 0.0, \"LT01\": 0.0, \"LT02\": 0.0, \"LT03\": 0.0, \"LT04\": 0.0, \"LT05\": 0.0, \"LT06\": 0.0, \"LT07\": 0.0, \"LT08\": 0.0, \"LT09\": 0.0, \"LT10\": 0.0, \"LT11\": 0.0, \"LT12\": 0.0, \"LT13\": 0.0, \"LT14\": 0.0, \"LT15\": 0.0, \"OR01\": 0.0, \"PG01\": 0.0, \"PG02\": 0.0, \"RF01\": 0.0, \"RF02\": 0.0, \"RF03\": 0.0, \"RF04\": 0.0, \"RF05\": 0.0, \"RF06\": 0.0, \"RF07\": 0.0, \"ST01\": 0.0, \"ST02\": 0.0, \"ST03\": 0.0, \"ST04\": 0.0, \"ST05\": 0.0, \"ST06\": 0.0, \"ST07\": 0.0, \"ST08\": 0.0, \"ST09\": 0.0, \"ST10\": 0.0, \"ST11\": 0.0, \"ST12\": 0.0, \"TQ01\": 0.0, \"TQ02\": 0.0, \"TQ03\": 0.0, \"TQ04\": 0.0}}]\r\n",
+	"stderr": ""
+}

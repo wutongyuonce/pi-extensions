@@ -1,0 +1,21 @@
+{
+	"provenance": {
+		"runner": "phpstan",
+		"tool": "phpstan",
+		"version": "2.2.8",
+		"command": "phpstan analyse --error-format=json --no-progress bad.php",
+		"argv": [
+			"analyse",
+			"--error-format=json",
+			"--no-progress",
+			"bad.php"
+		],
+		"workspace": "tests/fixtures/tool-smoke/phpstan",
+		"platform": "win32-x64",
+		"capturedAt": "2026-08-21"
+	},
+	"file": "bad.php",
+	"exitCode": 1,
+	"stdout": "{\"totals\":{\"errors\":0,\"file_errors\":1},\"files\":{\"__WORKSPACE__\\\\bad.php\":{\"errors\":1,\"messages\":[{\"message\":\"Function greet() should return int but returns string.\",\"line\":5,\"ignorable\":true,\"identifier\":\"return.type\"}]}},\"errors\":[]}",
+	"stderr": "Note: Using configuration file __WORKSPACE__\\phpstan.neon.\r\nInstructions for interpreting errors\r\n---------\r\n\r\nEach error has an associated identifier, like `argument.type`\r\nor `return.missing`.\r\n\r\nEach error identifier has documentation at URL https://phpstan.org/error-identifiers/<identifier>\r\nThis page contains code example, explanation why is this an error\r\nand instruction how to fix it.\r\nBefore fixing the error, fetch the documentation page for its identifier.\r\n\r\nThe error usually indicates a real bug or incorrect type in the code. Fix the underlying cause, do not just make the error go away.\r\nDo not add `@phpstan-ignore` comments, `@phpstan-ignore-next-line` comments, or baseline entries to suppress the error.\r\nDo not use assert() or inline @var PHPDoc tag to override PHPStan's inferred type.\r\nDo not add type casts just to silence errors.\r\nDo not widen parameter or return types just to make the error go away.\r\n"
+}

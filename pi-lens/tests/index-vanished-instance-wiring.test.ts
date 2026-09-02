@@ -1,0 +1,160 @@
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import extension from "../index.js";
+import { _resetSessionLifecycleForTests } from "../clients/session-lifecycle.js";
+import { createPiMock, makeCtx } from "./support/pi-mock.js";
+import { removeTempDirSync } from "./clients/test-utils.js";
+
+/**
+ * End-to-end wiring guard for the #1123 item 2 vanished-instance marker: a
+ * REAL session_start (registerInstance/sweepOrphans path untouched) against a
+ * registry file seeded with a dead-pid entry must log the marker line BEFORE
+ * sweepOrphans prunes that same entry — the two must not race the other way,
+ * or the vanished set would already be empty by the time the marker runs.
+ *
+ * `logSessionStart` is spied (not the real writer, which no-ops under
+ * `isTestMode()` — see clients/sessionstart-logger.ts) so the exact line is
+ * observable without depending on real sessionstart.log I/O.
+ *
+ * The synthetic pid below is made dead deterministically by the test's
+ * process.kill(pid, 0) seam; it never relies on the runner's process table.
+ */
+
+vi.mock("../clients/bootstrap.js", () => ({
+	loadBootstrapClients: async () => ({
+		metricsClient: { reset: () => {} },
+		todoScanner: {},
+		biomeClient: { isAvailable: () => false },
+		ruffClient: { isAvailable: () => false },
+		knipClient: {
+			isAvailable: () => false,
+			analyze: async () => ({
+				success: false,
+				summary: "unavailable",
+				issues: [],
+			}),
+		},
+		jscpdClient: { isAvailable: () => false },
+		depChecker: { isAvailable: () => false },
+		testRunnerClient: { detectRunner: () => null },
+		goClient: { isGoAvailableAsync: async () => false },
+		rustClient: { isAvailableAsync: async () => false },
+		agentBehaviorClient: { recordToolCall: () => {}, formatWarnings: () => "" },
+		complexityClient: { isSupportedFile: () => false, analyzeFile: () => null },
+	}),
+}));
+vi.mock("../clients/runtime-session.js", () => ({
+	handleSessionStart: async () => {},
+}));
+
+const { logSessionStartSpy } = vi.hoisted(() => ({
+	logSessionStartSpy: vi.fn(),
+}));
+vi.mock("../clients/sessionstart-logger.js", async (importActual) => {
+	const actual =
+		await importActual<typeof import("../clients/sessionstart-logger.js")>();
+	return {
+		...actual,
+		logSessionStart: (msg: string) => logSessionStartSpy(msg),
+	};
+});
+
+function registryFilePath(): string {
+	return path.join(process.env.PI_LENS_HOME as string, "instances.json");
+}
+
+describe("index session_start vanished-instance wiring (#1123 item 2)", () => {
+	let tmp: string;
+	let prevDataDir: string | undefined;
+
+	beforeEach(() => {
+		logSessionStartSpy.mockClear();
+		// The #473 concurrent-session guard's classifier state is process-module-
+		// scope (by design — it detects an in-process subagent bind sharing the
+		// SAME module instance as its parent). Reset it so each test's
+		// session_start is classified "primary", not a false "concurrent-
+		// secondary" left over from a previous test's ctx in this same file.
+		_resetSessionLifecycleForTests();
+		tmp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-lens-vanished-wiring-"));
+		prevDataDir = process.env.PILENS_DATA_DIR;
+		process.env.PILENS_DATA_DIR = path.join(tmp, "data");
+	});
+
+	afterEach(() => {
+		if (prevDataDir === undefined) delete process.env.PILENS_DATA_DIR;
+		else process.env.PILENS_DATA_DIR = prevDataDir;
+		removeTempDirSync(tmp);
+		vi.restoreAllMocks();
+		vi.clearAllMocks();
+	});
+
+	it("logs the marker for a dead-pid registry entry, then the reaper still prunes it", async () => {
+		const deadPid = process.pid + 100_000;
+		const realProcessKill = process.kill.bind(process);
+		vi.spyOn(process, "kill").mockImplementation((pid, signal) => {
+			if (pid === deadPid && signal === 0) {
+				throw Object.assign(new Error("synthetic dead pid"), { code: "ESRCH" });
+			}
+			return realProcessKill(pid, signal);
+		});
+		fs.mkdirSync(process.env.PI_LENS_HOME as string, { recursive: true });
+		fs.writeFileSync(
+			registryFilePath(),
+			JSON.stringify({
+				instances: [
+					{
+						pid: deadPid,
+						startedAt: "2026-08-06T20:00:00.000Z",
+						projectRoot: "/dead-project",
+						rssBytes: 512 * 1024 * 1024,
+						heartbeatAt: "2026-08-06T22:30:00.000Z",
+						lspChildCount: 0,
+						lspChildren: [],
+					},
+				],
+			}),
+			"utf-8",
+		);
+
+		const pi = createPiMock();
+		extension(pi.asExtensionAPI());
+		await pi.emit("session_start", {}, makeCtx({ cwd: tmp }));
+		// registerInstance/logVanishedInstances/sweepOrphans are fire-and-forget
+		// (session_start must not block on registry I/O) — give the microtask/IO
+		// chain a tick to land.
+		await new Promise((r) => setTimeout(r, 50));
+
+		// logSessionStart (via dbg()) also carries plenty of other session_start
+		// trace lines — isolate the marker line specifically.
+		const markerLines = logSessionStartSpy.mock.calls
+			.map((call) => call[0] as string)
+			.filter((line) => line.includes("previous instance pid"));
+		expect(markerLines).toHaveLength(1);
+		const line = markerLines[0];
+		expect(line).toContain(`previous instance pid ${deadPid}`);
+		expect(line).toContain("2026-08-06T22:30:00.000Z");
+		expect(line).toContain("512MB");
+		expect(line).toContain("exited without shutdown");
+
+		// The reaper's own dead-pid prune still ran afterward — the marker read
+		// must not have swallowed or blocked it.
+		const raw = JSON.parse(fs.readFileSync(registryFilePath(), "utf-8"));
+		expect(raw.instances.map((i: { pid: number }) => i.pid)).not.toContain(
+			deadPid,
+		);
+	});
+
+	it("logs nothing when the registry has no dead entries", async () => {
+		const pi = createPiMock();
+		extension(pi.asExtensionAPI());
+		await pi.emit("session_start", {}, makeCtx({ cwd: tmp }));
+		await new Promise((r) => setTimeout(r, 50));
+
+		const markerLines = logSessionStartSpy.mock.calls
+			.map((call) => call[0] as string)
+			.filter((line) => line.includes("previous instance pid"));
+		expect(markerLines).toHaveLength(0);
+	});
+});

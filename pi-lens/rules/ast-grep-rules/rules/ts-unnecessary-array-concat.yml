@@ -1,0 +1,9 @@
+id: ts-unnecessary-array-concat
+language: typescript
+severity: warning
+message: "concat([item]) with a single-element array - use push(item) or spread [...arr, item]"
+metadata:
+  weight: 3
+  category: slop
+rule:
+  pattern: "$ARR.concat([$ITEM])"

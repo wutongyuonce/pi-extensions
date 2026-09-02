@@ -1,0 +1,330 @@
+id: no-non-null-assertion
+language: TypeScript
+message: "Non-null assertion '!' used — prefer explicit null checks or optional chaining"
+severity: warning
+note: |
+  The ! operator bypasses TypeScript's null checking which can lead to
+  runtime errors. Use optional chaining (?.), nullish coalescing (??),
+  or explicit null checks instead.
+
+  #1777 census and decision: the original false-positive census (49
+  hits across pi-lens, nestjs/nest, and colinhacks/zod) found 88% of
+  hits were the narrow-after-check idiom TypeScript can't itself
+  verify. Two of those idiom shapes are common enough, and structural
+  enough, to exclude with an ast-grep relational constraint instead of
+  demoting the whole rule — so the rule stays at `warning` and gets
+  narrower instead:
+
+  1. `$M.get($K)!` when the enclosing function ALSO contains a call to
+     `$M.has($K)` — same receiver, same key (ast-grep enforces the
+     metavariable binding, so a `.has()` check on a DIFFERENT key or a
+     DIFFERENT map does not suppress the finding).
+  2. `$A.pop()!` / `$A.shift()!` inside a `while`/`for`/`if` whose
+     condition references `$A.length` — again same-array-binding, so a
+     length check on a different array does not suppress it.
+
+  Both exclusions are scoped to the nearest enclosing function via a
+  `stopBy` BOUNDARY rule, not the whole file.
+
+  Review round 1 found two proven defects in the first version of this
+  narrowing, both fixed here:
+
+  - **F1 (high):** the original `stopBy: end` on the `inside` relation
+    is a search-DEPTH flag, not a stop condition — it walked ancestors
+    all the way to the file root. The `any:` kind list only chose which
+    ancestor could SATISFY the match; it did not stop the walk. Result:
+    a `.has()`/`.length` guard in an OUTER function suppressed a
+    closure's `!` inside an INNER function, and closures are common in
+    this codebase. Fixed by giving `stopBy` its own RULE (the same
+    function-kind `any:` list) so the ancestor walk halts at the
+    nearest enclosing function no matter what — it can find a
+    satisfying guard there or fail, but it can never look further out.
+  - **F2 (medium):** the `has: pattern: $M.has($K)` search is blind to
+    branch polarity — `if (!m.has(k)) { return m.get(k)!; }` (a REAL
+    bug: the key is proven ABSENT on that branch) was suppressed
+    exactly like `if (m.has(k)) { return m.get(k)!; }` (safe). ast-grep
+    has no dataflow model to tell "guards the branch I'm in" from
+    "guards the branch I'm NOT in," so the fix is a blunter, safer
+    instrument: `not: inside: { kind: unary_expression }` on the `has`
+    pattern removes ANY negated `.has()` call from counting as a guard,
+    full stop. This closes the real-bug shape but also cost one
+    previously-correct suppression: `if (!m.has(k)) return; ...
+    m.get(k)!` (an early-return guard clause, genuinely safe) now flags
+    again, because ast-grep can't distinguish it from the bug shape
+    that shares its `!m.has(k)` syntax. Accepted: the two shapes are
+    structurally identical to a syntax matcher, and re-flagging safe
+    code is cheaper than missing the bug shape. Both directions are
+    fixtured in `rule-tests/no-non-null-assertion-test.yml`.
+
+  Approximation caveat: even after F1/F2, ast-grep matches
+  structurally, not semantically. It cannot verify the guard genuinely
+  DOMINATES the use (no intervening mutation of `$M`/`$A` or
+  reassignment of the narrowed variable) or that the key is the same
+  value at runtime versus merely the same source text. It also can't
+  read branch polarity beyond the single `!` case F2 special-cases —
+  `if (x.has(k) === false)` or `if (x.has(k) ? false : true)` would
+  still slip past undetected. The suppression is deliberately biased
+  toward false negatives — leaving a real risk unflagged — over false
+  positives, which is the correct default bias for a lint the census
+  showed fires mostly on legitimate code; F2 is the one place that
+  bias is deliberately overridden, because a same-branch bug is worse
+  than an unnecessary warning on safe code.
+
+  Re-census on the F1/F2/F5-fixed rule, four corpora, hit count before
+  (no exclusions) → after:
+  - pi-lens (this repo, `clients/` `tools/` `index.ts`): 43 → 36 (7
+    suppressed, -16%). All 7 verified by hand: `.get()!`-after-`.has()`
+    guard clauses in `tree-sitter-client.ts` (`loadLanguage`,
+    `getParser`) and `review-graph/builder.ts`, plus
+    `pop()!`/`shift()!` inside `while (x.length > 0)` loops in
+    `call-graph.ts`, `pipeline.ts`, `tree-sitter-client.ts`
+    (`bindingNames`), and `review-graph/workspace-modules.ts`.
+    `project-report.ts:531`'s `indices.get(w)!` was an 8th hit
+    suppressed by the PRE-F2 rule — its only `indices.has(w)` in scope
+    is `if (!indices.has(w))`, i.e. exactly the F2 negation blind spot,
+    and it happened to land on genuinely safe code (the `else` branch
+    where `w` having been visited already implies `indices` has an
+    entry) purely by accident, not because the rule proved anything.
+    The F2 fix removes that accidental suppression along with the real
+    ones, so it correctly flags again post-fix.
+  - inspiration-pi: 674 → 655 (19 suppressed, -2.8%).
+  - inspiration-opencode: 1067 → 1060 (7 suppressed, -0.7%).
+  - inspiration-oh-my-pi: 3569 → 3544 (25 suppressed, -0.7%).
+
+  Honest read of the residual: pi-lens's own residual (36) is NOT
+  dominated by the genuine cross-boundary-risk class
+  (`dart.getCommand(cwd)!` right after `dart.isAvailableAsync(cwd)`,
+  and similar) — that class accounts for roughly 7 of the 36. The rest
+  (~29) are still legitimate-idiom shaped, just not expressible by
+  these two structural constraints: a property re-asserted after its
+  parent was checked (`r.enclosingSymbol!.name` after `.filter((r) =>
+  r.enclosingSymbol)` in `read-guard.ts`), a boolean flag standing in
+  for a narrowed variable, a value narrowed by a ternary rather than
+  `.has()` (`index.forward!` in `word-index.ts`), and a
+  module-singleton pattern (`format-service.ts`'s
+  `globalFormatService!`). Tracked as #1818.
+
+  2026-08-20 (#1818 round 2): two of the four named unexpressed shapes
+  DO have a cheap structural signature after all, and are now
+  excluded:
+
+  1. **Ternary-narrow**: `$TO.$TP ? ...$TO.$TP!... : ...` — the
+     `$TO.$TP!` sits under the `consequence` field of a ternary whose
+     `condition` is the identical `$TO.$TP` truthy check, even when
+     the assertion is nested inside a closure passed to `.map()` (the
+     `word-index.ts` and `lsp/index.ts` cases). `field: consequence`
+     on the `inside` relation ties the MATCHED NODE ITSELF to the
+     consequence branch, so a same-shaped assertion sitting in the
+     `alternative` branch (a real narrowing bug: falsy there) is left
+     unaffected, and so is one nested inside an unrelated INNER
+     ternary whose own condition does not match (see the review-round-1
+     fixtures below).
+  2. **Filter-then-map re-assert**: `$OBJ.filter(($F) => $F.$PROP)
+     .map(($M) => ...$M.$PROP!...)` — `$M` is the SAME metavariable as
+     both the map callback's own parameter and the asserted receiver,
+     so the exclusion fires only when the narrowed value is literally
+     that parameter, not an unrelated same-named variable elsewhere
+     (the `read-guard.ts` case, 2 sites × 3 properties each).
+
+  Both follow the same discipline as the `#1777` exclusions above:
+  `stopBy` is a RULE (nearest ternary, never `end`) on the ternary
+  exclusion, and the suppression is guarded by same-metavariable
+  binding, not mere presence of the guard shape anywhere in scope.
+  Fixtured (suppressed shape, mismatched-binding lookalike, and — for
+  the ternary — the opposite-branch and nested-ternary bug lookalikes)
+  in `rule-tests/no-non-null-assertion-test.yml`.
+
+  2026-08-20, review round 1 (four findings, all fixed in this
+  revision):
+
+  - **N1 (medium):** the original ternary exclusion used `has: field:
+    consequence` — an EXISTENCE check on the ternary as a whole, not
+    an identity check on the matched node. `o.y ? o.y!.length :
+    o.y!.length` (the identical assertion in BOTH branches) made the
+    alternative-branch instance inherit the suppression, because the
+    consequence branch's matching text satisfied the existence check
+    regardless of which instance was actually being evaluated. Fixed
+    by switching to `field: consequence` directly on the `inside`
+    relation, which IS an identity check on the matched node's actual
+    position. Fixtured as an `invalid` case (both-branches-same-shape
+    must still flag on the alternative instance).
+  - **N2 (medium):** two mutation-proof gaps. (a) The ternary
+    `stopBy: kind: ternary_expression` was provably load-bearing but
+    had no fixture proving it: `o.y ? (flag ? 1 : o.y!.length) : 0` —
+    the assertion's NEAREST ternary is the inner one, whose own
+    condition (`flag`) does not match `$TO.$TP`, so it must still
+    flag; weakening `stopBy` to `end` lets the search escalate past
+    the inner ternary to the outer one (whose condition DOES match)
+    and wrongly suppresses it. (b) The filter-map `$M` binding had no
+    fixture proving an unrelated variable inside the SAME callback
+    still flags: `rs.filter((r) => r.sym).map((m) => stray.sym!.name)`
+    — decoupling `$M` from the map callback's own parameter (e.g. to
+    an unconstrained `$ANY`) wrongly suppresses `stray.sym!` too, since
+    the filter-map SHAPE would match even though the asserted value is
+    not the map's own parameter. Both fixtured as `invalid` cases.
+  - **N3 (low):** the filter-map exclusion's intermediate "nearest
+    enclosing arrow_function" `inside`/`stopBy` layer could not be
+    shown load-bearing by any constructed fixture — removed; see the
+    exclusion's own comment below for why it was redundant.
+  - **N4 (low):** this rule's `note:` is unaffected; the mismatched
+    before/after scope pairing N4 named lives in
+    `no-unknown-returns.yml`'s note, fixed there.
+
+  Re-census, pi-lens `clients/` `tools/` `index.ts`: 36 → 27 (9
+  suppressed). All 9 verified by hand: 1 in `word-index.ts`, 2 in
+  `lsp/index.ts` (an `AbortSignal`-narrowed-by-truthy-ternary variant
+  of the same idiom), and the 6 `read-guard.ts` sites already named
+  above. Four-corpus census (F1/F2-fixed rule → round-2 rule; these
+  corpora move independently of pi-lens's own history and the
+  upstream trees have drifted since the #1777 note, so treat this as
+  a fresh baseline rather than a delta against the numbers above):
+  inspiration-pi 659 → 657, inspiration-opencode 1078 → 1071,
+  inspiration-oh-my-pi 3548 → 3543.
+
+  The two remaining named shapes — a boolean flag standing in for a
+  narrowed variable, and a property re-asserted after its PARENT
+  (rather than itself) was checked — were re-probed and are still not
+  expressible: both require proving that an assignment or a `.filter`
+  predicate on a DIFFERENT expression than the one being asserted
+  actually dominates the assertion, which needs a dataflow model, not
+  a syntax-tree relation. The module-singleton case
+  (`format-service.ts`'s `globalFormatService!`) was also re-probed: a
+  direct `if (!$X) { $X = ...; }` guard immediately before `return
+  $X!` would be structurally expressible the same way as the
+  `#1777` `.has()` exclusion, but `format-service.ts`'s actual
+  instance routes the check through an intermediate boolean
+  (`shouldCreateNew`) rather than testing `$X` directly, which is the
+  boolean-flag shape, not a new one — so no rule was added for it
+  rather than risk a suppression that can't tell "just assigned" from
+  "assigned in an unrelated earlier branch." The residual (27, was 36)
+  is smaller but still idiom-dominated: pending the maintainer's
+  standing decision, severity stays `warning`.
+rule:
+  pattern: $X!
+  not:
+    any:
+      - kind: function_type
+      - kind: method_signature
+      - all:
+          # #1818 round 2 (review round 1 N1 fix): ternary-narrow.
+          # `$TO.$TP ? ...$TO.$TP!... : ...` — the consequence branch is
+          # reached only when `$TO.$TP` is truthy, but a closure nested in
+          # that branch (an arrow passed to `.map()`, etc.) loses TS's own
+          # narrowing across the function boundary. `stopBy` bounds the
+          # walk to the NEAREST enclosing ternary (never an outer one —
+          # see the round-1-N2a fixture below for why that matters).
+          # `field: consequence` on the `inside` relation is an IDENTITY
+          # check on the matched node's own position in that ternary's
+          # subtree — it ties OUR SPECIFIC node to the consequence branch,
+          # not merely to "a same-shaped node exists somewhere in the
+          # consequence." The original version used `has: field:
+          # consequence` instead, which is an EXISTENCE check on the
+          # ternary as a whole: `o.y ? o.y!.length : o.y!.length` (the
+          # same assertion repeated in BOTH branches) made the
+          # alternative-branch instance — a real narrowing bug, since
+          # `o.y` is falsy on that branch — inherit the suppression,
+          # because the consequence branch's identical text satisfied the
+          # existence check for both instances. `field: consequence`
+          # closes that gap: it only matches a node that IS reachable via
+          # the consequence field specifically, so the alternative-branch
+          # instance is left flagged. Named `$TO`/`$TP`, not `$X`/`$P`:
+          # the outer `pattern: $X!` already binds `$X` to the WHOLE
+          # asserted expression (e.g. `index.forward`), so reusing `$X`
+          # here would force it to match `index.forward.$P!` — a
+          # different shape — instead of decomposing `index.forward` into
+          # object+property.
+          - pattern: $TO.$TP!
+          - inside:
+              stopBy:
+                kind: ternary_expression
+              kind: ternary_expression
+              field: consequence
+              has:
+                field: condition
+                pattern: $TO.$TP
+      - all:
+          # #1818 round 2 (review round 1 N3: simplified): a property
+          # re-asserted after a `.filter()` on that SAME property,
+          # immediately chained into `.map()` — TS's narrowing from
+          # `.filter((r) => r.$PROP)` does not carry into the separate
+          # `.map()` callback closure. `$M` (the map callback's
+          # parameter) is the SAME metavariable as the assertion's
+          # receiver, so the exclusion only fires when the asserted value
+          # is literally the map callback's own parameter, not an
+          # unrelated same-named variable (fixtured: `stray.sym!` inside
+          # a `.filter(...).map((m) => ...)` callback must still flag,
+          # because `$M` can only bind to "m", never to "stray"); `$PROP`
+          # must match on both the filter predicate and the assertion.
+          # An earlier version of this exclusion added an intermediate
+          # "nearest enclosing arrow_function" boundary before this
+          # `inside`; review round 1 could not construct a case where
+          # that boundary changed the result — the outer `stopBy: end`
+          # below already walks to the SAME call_expression regardless of
+          # which arrow_function ancestor the search starts from, because
+          # the pattern match on that call_expression is a self-contained
+          # structural check independent of the path taken to reach it —
+          # so the intermediate layer was removed rather than kept as
+          # decoration that looked load-bearing but wasn't.
+          - pattern: $M.$PROP!
+          - inside:
+              stopBy: end
+              kind: call_expression
+              pattern: $OBJ.filter(($F) => $F.$PROP).map(($M) => $BODY)
+      - all:
+          - pattern: $M.get($K)!
+          - inside:
+              # stopBy is a boundary RULE, not a search-depth flag: the
+              # ancestor walk stops at the nearest node matching this
+              # rule, so it can never escalate past the nearest
+              # enclosing function into an outer scope (#1777 F1 fix).
+              stopBy:
+                any:
+                  - kind: function_declaration
+                  - kind: method_definition
+                  - kind: arrow_function
+                  - kind: function_expression
+              any:
+                - kind: function_declaration
+                - kind: method_definition
+                - kind: arrow_function
+                - kind: function_expression
+              has:
+                stopBy: end
+                pattern: $M.has($K)
+                # Exclude a negated has() check from counting as a guard
+                # (#1777 F2 fix): ast-grep can't read branch polarity, so
+                # this can't tell a `if (!m.has(k)) return;` early-return
+                # guard clause (safe) from `if (!m.has(k)) { ...
+                # m.get(k)! }` (a real bug — the key is proven ABSENT in
+                # that branch). Refusing to treat ANY negated has() as a
+                # guard is the only structural signal available; it
+                # trades a few now-unflagged-turned-flagged early-return
+                # guard clauses for closing the real-bug shape. See the
+                # rule note for the accepted regression.
+                not:
+                  inside:
+                    kind: unary_expression
+      - all:
+          - any:
+              - pattern: $A.pop()!
+              - pattern: $A.shift()!
+          - inside:
+              # Same stopBy boundary fix as the get/has exclusion above.
+              stopBy:
+                any:
+                  - kind: function_declaration
+                  - kind: method_definition
+                  - kind: arrow_function
+                  - kind: function_expression
+              # No function kinds here (#1777 F5): a function node has no
+              # `condition` field, so it could never satisfy the `has`
+              # check below — the stopBy boundary above already keeps
+              # the walk from escalating past the function regardless.
+              any:
+                - kind: while_statement
+                - kind: for_statement
+                - kind: if_statement
+              has:
+                field: condition
+                stopBy: end
+                pattern: $A.length

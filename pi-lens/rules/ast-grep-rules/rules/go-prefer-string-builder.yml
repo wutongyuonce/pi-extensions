@@ -1,0 +1,43 @@
+# Go Prefer strings.Builder Over Repeated Concatenation
+# Detects repeated string concatenation (x = x + y / x += "y") that should use
+# strings.Builder instead. The += arm requires a string literal because
+# ast-grep has no type information to distinguish string and numeric operands.
+# Ported from vinhnx/VTCode rules/go/prefer-string-builder.yml
+# (#2200, refs #2195).
+id: go-prefer-string-builder
+language: go
+severity: hint
+message: "Use strings.Builder instead of repeated string concatenation"
+note: |
+  Repeated string concatenation with + creates a new string allocation on
+  each operation (O(n^2) total). strings.Builder accumulates bytes in a
+  buffer and produces the final string with one allocation.
+  Detection-only, with no autofix: a single concatenation site cannot show
+  this is a genuine accumulation loop rather than a one-off assignment where
+  concatenation is clearer, and no fix can safely introduce the surrounding
+  strings.Builder declaration and .String() call. Scoped to non-test Go
+  files.
+rule:
+  any:
+    - pattern: $VAR = $VAR + $OTHER
+    - pattern: $VAR += "$OTHER"
+ignores:
+  - "**/*_test.go"
+tags:
+  - go
+  - idiom
+  - performance
+examples:
+  bad: |
+    func concat(a string, b string) string {
+        a = a + b
+        return a
+    }
+  good: |
+    func build(parts []string) string {
+        var b strings.Builder
+        for _, p := range parts {
+            b.WriteString(p)
+        }
+        return b.String()
+    }

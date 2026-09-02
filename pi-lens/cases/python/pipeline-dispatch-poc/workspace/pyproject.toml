@@ -1,0 +1,7 @@
+[project]
+name = "python-pipeline-dispatch-poc"
+version = "0.0.0"
+requires-python = ">=3.11"
+
+[tool.ruff]
+line-length = 88

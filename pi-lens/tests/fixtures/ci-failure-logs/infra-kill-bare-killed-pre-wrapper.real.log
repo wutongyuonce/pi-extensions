@@ -1,0 +1,37 @@
+2026-08-25T19:13:17.4796512Z  [32m✓[39m [30m[42m default [49m[39m tests/clients/dispatch/runners/terraform-kotlin-runners.test.ts [2m([22m[2m9 tests[22m[2m)[22m[32m 160[2mms[22m[39m
+2026-08-25T19:13:17.7255746Z  [32m✓[39m [30m[42m default [49m[39m tests/clients/memory-sampler.test.ts [2m([22m[2m21 tests[22m[2m)[22m[32m 9[2mms[22m[39m
+2026-08-25T19:13:18.1327070Z  [32m✓[39m [30m[42m default [49m[39m tests/clients/blocker-past-eof-turn-end.test.ts [2m([22m[2m4 tests[22m[2m)[22m[32m 148[2mms[22m[39m
+2026-08-25T19:13:18.1884310Z  [32m✓[39m [30m[42m default [49m[39m tests/clients/lsp/pull-diagnostic-timeout-telemetry.test.ts [2m([22m[2m9 tests[22m[2m)[22m[33m 848[2mms[22m[39m
+2026-08-25T19:13:18.4286598Z  [32m✓[39m [30m[42m default [49m[39m tests/clients/safe-spawn-windows-classification.test.ts [2m([22m[2m15 tests[22m[2m)[22m[32m 12[2mms[22m[39m
+2026-08-25T19:13:18.4855274Z  [32m✓[39m [30m[42m default [49m[39m tests/clients/runtime-session-warm.test.ts [2m([22m[2m7 tests[22m[2m)[22m[33m 302[2mms[22m[39m
+2026-08-25T19:13:18.9686478Z  [32m✓[39m [30m[42m default [49m[39m tests/clients/lsp/launch.test.ts [2m([22m[2m12 tests[22m[2m | [22m[33m5 skipped[39m[2m)[22m[32m 300[2mms[22m[39m
+2026-08-25T19:13:18.9928289Z Killed
+2026-08-25T19:13:19.1366871Z  [32m✓[39m [30m[42m default [49m[39m tests/clients/review-graph/qualified-name-resolution.test.ts [2m([22m[2m8 tests[22m[2m)[22m[33m 423[2mms[22m[39m
+2026-08-25T19:13:19.2857508Z  [32m✓[39m [30m[42m default [49m[39m tests/clients/tool-render.test.ts [2m([22m[2m14 tests[22m[2m)[22m[32m 27[2mms[22m[39m
+2026-08-25T19:13:19.4161606Z  [32m✓[39m [30m[42m default [49m[39m tests/clients/bounded-telemetry.test.ts [2m([22m[2m16 tests[22m[2m)[22m[32m 14[2mms[22m[39m
+2026-08-25T19:13:19.4713862Z  [32m✓[39m [30m[42m default [49m[39m tests/clients/sgconfig.test.ts [2m([22m[2m8 tests[22m[2m)[22m[33m 858[2mms[22m[39m
+2026-08-25T19:13:19.5946099Z  [32m✓[39m [30m[42m default [49m[39m tests/clients/performance-report.test.ts [2m([22m[2m13 tests[22m[2m)[22m[32m 94[2mms[22m[39m
+2026-08-25T19:13:19.6877027Z  [32m✓[39m [30m[42m default [49m[39m tests/clients/security-scan-probe-telemetry.test.ts [2m([22m[2m17 tests[22m[2m)[22m[32m 32[2mms[22m[39m
+2026-08-25T19:13:19.8262949Z  [32m✓[39m [30m[42m default [49m[39m tests/clients/dispatch/runners/actionlint.test.ts [2m([22m[2m19 tests[22m[2m)[22m[32m 15[2mms[22m[39m
+2026-08-25T19:13:20.2085986Z  [32m✓[39m [30m[42m default [49m[39m tests/clients/grammar-truncation.test.ts [2m([22m[2m7 tests[22m[2m)[22m[32m 52[2mms[22m[39m
+2026-08-25T19:13:20.3586263Z  [32m✓[39m [30m[42m default [49m[39m tests/tools/lens-diagnostic-mark.test.ts [2m([22m[2m11 tests[22m[2m)[22m[32m 54[2mms[22m[39m
+2026-08-25T19:13:20.9144225Z  [32m✓[39m [30m[42m default [49m[39m tests/clients/lsp/cascade-tier-backlog.test.ts [2m([22m[2m15 tests[22m[2m)[22m[33m 317[2mms[22m[39m
+2026-08-25T19:13:21.3572771Z  [32m✓[39m [30m[42m default [49m[39m tests/scripts/changelog.test.ts [2m([22m[2m21 tests[22m[2m)[22m[32m 202[2mms[22m[39m
+2026-08-25T19:13:21.5581666Z  [32m✓[39m [30m[42m default [49m[39m tests/scripts/compat-contracts.test.ts [2m([22m[2m26 tests[22m[2m)[22m[32m 12[2mms[22m[39m
+2026-08-25T19:13:22.0066571Z  [32m✓[39m [30m[42m default [49m[39m tests/index-lsp-idle-reset.test.ts [2m([22m[2m4 tests[22m[2m)[22m[33m 932[2mms[22m[39m
+2026-08-25T19:13:22.0099697Z      [33m[2m✓[22m[39m does not touch a stale event ctx when the detached idle timer fires [33m 556[2mms[22m[39m
+2026-08-25T19:13:22.2251110Z  [32m✓[39m [30m[42m default [49m[39m tests/clients/language-profile.test.ts [2m([22m[2m15 tests[22m[2m)[22m[32m 42[2mms[22m[39m
+2026-08-25T19:13:22.4541409Z Expected at least one target file. All matched files may have been excluded by ignore rules.
+2026-08-25T19:13:22.5272644Z  [32m✓[39m [30m[42m default [49m[39m tests/clients/review-graph/import-resolvers.test.ts [2m([22m[2m26 tests[22m[2m)[22m[32m 49[2mms[22m[39m
+2026-08-25T19:13:22.6041034Z No files found matching the given patterns.
+2026-08-25T19:13:23.0368146Z  [32m✓[39m [30m[42m default [49m[39m tests/clients/dispatch/oxfmt-ignored-file-noop.test.ts [2m([22m[2m6 tests[22m[2m)[22m[33m 703[2mms[22m[39m
+2026-08-25T19:13:23.0520319Z  [32m✓[39m [30m[42m default [49m[39m tests/clients/tree-sitter-symbols.test.ts [2m([22m[2m29 tests[22m[2m)[22m[33m 3302[2mms[22m[39m
+2026-08-25T19:13:23.0553013Z      [33m[2m✓[22m[39m extracts symbols for cpp [33m 601[2mms[22m[39m
+2026-08-25T19:13:23.0564988Z      [33m[2m✓[22m[39m extracts symbols for csharp [33m 384[2mms[22m[39m
+2026-08-25T19:13:23.0565998Z      [33m[2m✓[22m[39m extracts symbols for swift [33m 467[2mms[22m[39m
+2026-08-25T19:13:23.0566914Z      [33m[2m✓[22m[39m extracts symbols for ocaml [33m 485[2mms[22m[39m
+2026-08-25T19:13:23.1097469Z  [32m✓[39m [30m[42m default [49m[39m tests/clients/debug-handles.test.ts [2m([22m[2m11 tests[22m[2m)[22m[33m 301[2mms[22m[39m
+2026-08-25T19:13:23.3197912Z  [32m✓[39m [30m[42m default [49m[39m tests/clients/cascade-budget.test.ts [2m([22m[2m14 tests[22m[2m)[22m[32m 21[2mms[22m[39m
+2026-08-25T19:13:23.6936859Z  [32m✓[39m [30m[42m default [49m[39m tests/clients/dispatch/rules/high-fan-out-complexity-test-noise.test.ts [2m([22m[2m11 tests[22m[2m)[22m[32m 106[2mms[22m[39m
+2026-08-25T19:13:23.8810306Z  [32m✓[39m [30m[42m default [49m[39m tests/clients/ext-gate-before-ignore.test.ts [2m([22m[2m8 tests[22m[2m)[22m[32m 120[2mms[22m[39m
+2026-08-25T19:13:24.0267915Z ##[error]Process completed with exit code 137.

@@ -1,0 +1,21 @@
+{
+	"provenance": {
+		"runner": "eslint",
+		"tool": "eslint",
+		"version": "10.9.0",
+		"command": "eslint --format json --no-error-on-unmatched-pattern bad.js",
+		"argv": [
+			"--format",
+			"json",
+			"--no-error-on-unmatched-pattern",
+			"bad.js"
+		],
+		"workspace": "tests/fixtures/tool-smoke/js-eslint-warning",
+		"platform": "win32-x64",
+		"capturedAt": "2026-08-22"
+	},
+	"file": "bad.js",
+	"exitCode": 0,
+	"stdout": "[{\"filePath\":\"__WORKSPACE__\\\\bad.js\",\"messages\":[{\"ruleId\":\"no-unused-vars\",\"severity\":1,\"message\":\"'unused' is assigned a value but never used.\",\"line\":5,\"column\":8,\"messageId\":\"unusedVar\",\"endLine\":5,\"endColumn\":14,\"suggestions\":[{\"messageId\":\"removeVar\",\"data\":{\"varName\":\"unused\"},\"fix\":{\"range\":[205,222],\"text\":\"\"},\"desc\":\"Remove unused variable 'unused'.\"}]}],\"suppressedMessages\":[],\"errorCount\":0,\"fatalErrorCount\":0,\"warningCount\":1,\"fixableErrorCount\":0,\"fixableWarningCount\":0,\"source\":\"// Tool-smoke fixture (#1954) — eslint.config.cjs downgrades no-unused-vars\\n// to \\\"warn\\\", so a real run reports one severity-1 finding and exits 0\\n// (--max-warnings is not set).\\nexport function demo() {\\n\\tconst unused = 1;\\n\\treturn 2;\\n}\\n\",\"usedDeprecatedRules\":[]}]\n",
+	"stderr": ""
+}

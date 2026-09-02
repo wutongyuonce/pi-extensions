@@ -1,0 +1,12 @@
+id: strict-inequality-js
+valid:
+  - 'a !== b'
+  - 'a === b'
+  - 'a < b'
+  - 'value != null'
+  - 'null != value'
+  - 'value != undefined'
+invalid:
+  - 'a != b'
+  - 'a != "x"'
+  - '0 != x'

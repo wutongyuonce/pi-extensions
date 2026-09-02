@@ -1,0 +1,30 @@
+id: no-console-except-error-js
+language: JavaScript
+severity: warning
+message: "Avoid console.log/debug/warn in production code — use a logger or console.error inside catch only"
+note: |
+  console.log/debug/warn usually indicate leftover debug output shipped to
+  production. Allow console.error ONLY inside catch blocks (logging the
+  error there is useful for production triage).
+  Console output IS the point in a CLI script's own stdout contract and in
+  a logging implementation's console fallback/sink — flagging it there
+  just trains users to ignore the rule; `ignores` below carves those paths
+  out while application/library code elsewhere still gets flagged (#965).
+ignores:
+  - "scripts/**"
+  - "bin/**"
+  - "**/logger.ts"
+  - "**/logger.js"
+  - "**/logger.mjs"
+rule:
+  any:
+    - pattern: console.error($$$)
+      not:
+        inside:
+          kind: catch_clause
+          stopBy: end
+    - pattern: console.$METHOD($$$)
+constraints:
+  METHOD:
+    regex: "log|debug|warn"
+fix: ""

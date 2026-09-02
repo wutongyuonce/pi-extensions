@@ -1,0 +1,9 @@
+id: ts-object-hasown-check
+language: typescript
+severity: warning
+message: "obj.hasOwnProperty(key) - use Object.hasOwn(obj, key) or Object.prototype.hasOwnProperty.call"
+metadata:
+  weight: 2
+  category: slop
+rule:
+  pattern: "$O.hasOwnProperty($K)"

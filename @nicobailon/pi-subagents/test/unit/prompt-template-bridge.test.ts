@@ -1,0 +1,244 @@
+import assert from "node:assert/strict";
+import { describe, it } from "node:test";
+
+import {
+	PROMPT_TEMPLATE_SUBAGENT_CANCEL_EVENT,
+	PROMPT_TEMPLATE_SUBAGENT_REQUEST_EVENT,
+	PROMPT_TEMPLATE_SUBAGENT_RESPONSE_EVENT,
+	PROMPT_TEMPLATE_SUBAGENT_STARTED_EVENT,
+	PROMPT_TEMPLATE_SUBAGENT_UPDATE_EVENT,
+	registerPromptTemplateDelegationBridge,
+	type PromptTemplateBridgeEvents,
+} from "../../src/slash/prompt-template-bridge.ts";
+
+class FakeEvents implements PromptTemplateBridgeEvents {
+	private handlers = new Map<string, Array<(data: unknown) => void>>();
+
+	on(event: string, handler: (data: unknown) => void): () => void {
+		const list = this.handlers.get(event) ?? [];
+		list.push(handler);
+		this.handlers.set(event, list);
+		return () => {
+			const current = this.handlers.get(event) ?? [];
+			this.handlers.set(event, current.filter((h) => h !== handler));
+		};
+	}
+
+	emit(event: string, data: unknown): void {
+		for (const handler of [...this.handlers.get(event) ?? []]) handler(data);
+	}
+}
+
+function once(events: FakeEvents, event: string): Promise<unknown> {
+	return new Promise((resolve) => {
+		const unsubscribe = events.on(event, (payload) => {
+			unsubscribe();
+			resolve(payload);
+		});
+	});
+}
+
+function structuredRequest(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+	return {
+		requestId: "r1",
+		ownerRunId: "owner-1",
+		nodeId: "node-1",
+		agent: "worker",
+		task: "do work",
+		context: "fresh",
+		model: "openai/gpt-5",
+		cwd: "/repo",
+		result: { kind: "text" },
+		...overrides,
+	};
+}
+
+describe("prompt-template delegation bridge", () => {
+	it("emits started/update/response on successful structured request", async () => {
+		const events = new FakeEvents();
+		let executeCalls = 0;
+		const bridge = registerPromptTemplateDelegationBridge({
+			events,
+			getContext: () => ({ cwd: "/repo" }),
+			executeStructured: async (_requestId, _request, _signal, _ctx, onUpdate) => {
+				executeCalls++;
+				onUpdate({
+					details: {
+						results: [{ agent: "worker", model: "openai/gpt-5-mini" }],
+						progress: [{
+							index: 0,
+							agent: "worker",
+							currentTool: "read",
+							currentToolArgs: "src/extension/index.ts",
+							recentOutput: ["line 1"],
+							recentTools: [{ tool: "read", args: '{"path":"src/extension/index.ts"}' }],
+							toolCount: 1,
+							durationMs: 10,
+							tokens: 42,
+						}],
+					},
+				});
+				return {
+					details: {
+						results: [{ agent: "worker", finalOutput: "ok", exitCode: 0 }],
+					},
+				};
+			},
+			execute: async () => { throw new Error("structured request should use executeStructured"); },
+		});
+
+		const startedPromise = once(events, PROMPT_TEMPLATE_SUBAGENT_STARTED_EVENT);
+		const updatePromise = once(events, PROMPT_TEMPLATE_SUBAGENT_UPDATE_EVENT);
+		const responsePromise = once(events, PROMPT_TEMPLATE_SUBAGENT_RESPONSE_EVENT);
+
+		events.emit(PROMPT_TEMPLATE_SUBAGENT_REQUEST_EVENT, structuredRequest());
+
+		const started = await startedPromise as { requestId: string; ownerRunId: string; nodeId: string };
+		assert.deepEqual(started, { requestId: "r1", ownerRunId: "owner-1", nodeId: "node-1" });
+
+		const update = await updatePromise as {
+			requestId: string;
+			ownerRunId: string;
+			nodeId: string;
+			currentTool?: string;
+			toolCount?: number;
+			recentOutputLines?: string[];
+			recentTools?: Array<{ tool: string; args: string }>;
+			model?: string;
+			taskProgress?: Array<{ model?: string }>;
+		};
+		assert.equal(update.requestId, "r1");
+		assert.equal(update.ownerRunId, "owner-1");
+		assert.equal(update.nodeId, "node-1");
+		assert.equal(update.currentTool, "read");
+		assert.equal(update.toolCount, 1);
+		assert.deepEqual(update.recentOutputLines, ["line 1"]);
+		assert.deepEqual(update.recentTools, [{ tool: "read", args: '{"path":"src/extension/index.ts"}' }]);
+
+		const response = await responsePromise as { requestId: string; ownerRunId: string; nodeId: string; status: string; result?: { kind: string; text?: string } };
+		assert.equal(response.requestId, "r1");
+		assert.equal(response.ownerRunId, "owner-1");
+		assert.equal(response.nodeId, "node-1");
+		assert.equal(response.status, "completed");
+		assert.deepEqual(response.result, { kind: "text", text: "ok" });
+		assert.equal(executeCalls, 1);
+
+		bridge.dispose();
+	});
+
+	it("returns structured error when no active context", async () => {
+		const events = new FakeEvents();
+		const bridge = registerPromptTemplateDelegationBridge({
+			events,
+			getContext: () => null,
+			execute: async () => ({ details: { results: [{ messages: [] }] } }),
+		});
+
+		const responsePromise = once(events, PROMPT_TEMPLATE_SUBAGENT_RESPONSE_EVENT);
+		events.emit(PROMPT_TEMPLATE_SUBAGENT_REQUEST_EVENT, structuredRequest({ requestId: "r2" }));
+
+		const response = await responsePromise as { status: string; error?: string };
+		assert.equal(response.status, "unavailable_context");
+		assert.match(response.error ?? "", /No active extension context/);
+
+		bridge.dispose();
+	});
+
+	it("applies pending cancel when cancel arrives before structured request", async () => {
+		const events = new FakeEvents();
+		let executeCalls = 0;
+		const bridge = registerPromptTemplateDelegationBridge({
+			events,
+			getContext: () => ({ cwd: "/repo" }),
+			execute: async () => {
+				executeCalls++;
+				return { details: { results: [{ messages: [] }] } };
+			},
+		});
+
+		events.emit(PROMPT_TEMPLATE_SUBAGENT_CANCEL_EVENT, { requestId: "r4", ownerRunId: "owner-1", nodeId: "node-1" });
+		const responsePromise = once(events, PROMPT_TEMPLATE_SUBAGENT_RESPONSE_EVENT);
+		events.emit(PROMPT_TEMPLATE_SUBAGENT_REQUEST_EVENT, structuredRequest({ requestId: "r4" }));
+
+		const response = await responsePromise as { status: string };
+		assert.equal(response.status, "cancelled");
+		assert.equal(executeCalls, 0);
+
+		bridge.dispose();
+	});
+
+	it("cancels in-flight structured delegated execution", async () => {
+		const events = new FakeEvents();
+		const bridge = registerPromptTemplateDelegationBridge({
+			events,
+			getContext: () => ({ cwd: "/repo" }),
+			execute: async (_requestId, _request, signal) =>
+				await new Promise((_resolve, reject) => {
+					signal.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+				}),
+		});
+
+		const startedPromise = once(events, PROMPT_TEMPLATE_SUBAGENT_STARTED_EVENT);
+		const responsePromise = once(events, PROMPT_TEMPLATE_SUBAGENT_RESPONSE_EVENT);
+
+		events.emit(PROMPT_TEMPLATE_SUBAGENT_REQUEST_EVENT, structuredRequest({ requestId: "r5" }));
+
+		await startedPromise;
+		events.emit(PROMPT_TEMPLATE_SUBAGENT_CANCEL_EVENT, { requestId: "r5", ownerRunId: "owner-1", nodeId: "node-1" });
+
+		const response = await responsePromise as { status: string; error?: string };
+		assert.equal(response.status, "cancelled");
+
+		bridge.dispose();
+	});
+
+	it("rejects legacy direct payloads without executor dispatch", async () => {
+		const events = new FakeEvents();
+		let executeCalls = 0;
+		const bridge = registerPromptTemplateDelegationBridge({
+			events,
+			getContext: () => ({ cwd: "/repo" }),
+			execute: async () => { executeCalls++; return {}; },
+		});
+
+		const responsePromise = once(events, PROMPT_TEMPLATE_SUBAGENT_RESPONSE_EVENT);
+		events.emit(PROMPT_TEMPLATE_SUBAGENT_REQUEST_EVENT, {
+			requestId: "legacy-1",
+			agent: "worker",
+			task: "do work",
+			context: "fresh",
+			model: "openai/gpt-5",
+			cwd: "/repo",
+		});
+
+		const response = await responsePromise as { isError: boolean; errorText?: string };
+		assert.equal(response.isError, true);
+		assert.match(response.errorText ?? "", /Legacy prompt-template direct delegation was removed/);
+		assert.equal(executeCalls, 0);
+		bridge.dispose();
+	});
+
+	it("rejects removed tasks and worktree payloads without executor dispatch", async () => {
+		const events = new FakeEvents();
+		let executeCalls = 0;
+		const bridge = registerPromptTemplateDelegationBridge({
+			events,
+			getContext: () => ({ cwd: "/repo" }),
+			execute: async () => { executeCalls++; return {}; },
+		});
+
+		const tasksResponse = once(events, PROMPT_TEMPLATE_SUBAGENT_RESPONSE_EVENT);
+		events.emit(PROMPT_TEMPLATE_SUBAGENT_REQUEST_EVENT, {
+			requestId: "r6",
+			tasks: [{ agent: "worker-a", task: "A" }],
+			context: "fresh",
+			model: "openai/gpt-5",
+			cwd: "/repo",
+		});
+		const response = await tasksResponse as { isError: boolean; errorText?: string };
+		assert.equal(response.isError, true);
+		assert.match(response.errorText ?? "", /removed.*workflowScript/i);
+		assert.equal(executeCalls, 0);
+		bridge.dispose();
+	});
+});

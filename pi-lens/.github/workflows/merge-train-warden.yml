@@ -1,0 +1,67 @@
+name: Merge-train warden
+
+# Mechanical version of the checks the maintainer ran session-side across
+# the 2026-08-20 release drive: DIRTY PRs sitting invisible until polled,
+# armed auto-merge PRs falling BEHIND with no automatic nudge, and red CI on
+# an armed PR discovered only by manual polling (#1844). This workflow
+# OBSERVES AND ANNOTATES ONLY -- it never resolves a conflict, never merges,
+# and never pushes to a PR branch. Three exceptions, all GitHub-sanctioned
+# buttons a human clicks in the PR UI: the "update branch" call for a PR that
+# already has auto-merge armed, the "re-run workflow" call for a run this
+# sweep classified as STARVED (#2184), at most once per run, and the
+# "cancel workflow" call for a run classified as STALLED (#2203), also at
+# most once per run and only after the sweep has announced it in a comment.
+#
+# The sweep also names a run-health classification for EVERY open PR head:
+# runs-concluded-normally, starved-run, stalled-run, absent-run,
+# runs-in-progress, or run-health-unknown. The 2026-08-26 Actions degradation
+# stalled the train for hours precisely because a starved head looked like
+# "nothing to report", and a run stuck in `queued` looked the same way for as
+# long as it stayed there (#2203).
+#
+# workflow_dispatch is included so this can be smoke-run on demand after
+# merge -- a scheduled trigger cannot be exercised pre-merge (see the PR body
+# for what was and was not testable before this landed).
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch: {}
+
+# A run still going at the 10-minute mark should finish, not race a fresh
+# one over the same PRs (double-comment risk); the next scheduled tick picks
+# up whatever the first run didn't reach.
+concurrency:
+  group: merge-train-warden
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  warden:
+    name: Sweep open PRs
+    runs-on: ubuntu-latest
+    # contents: write is for the PUT pulls/N/update-branch call, not checkout:
+    # that endpoint has GitHub create a merge commit ON the PR branch, which
+    # needs write access to repository contents -- pull-requests: write alone
+    # (which only covers labels/comments/the PR object itself) 403s on it
+    # (#1959).
+    permissions:
+      contents: write # checkout, and the update-branch merge-commit kick
+      pull-requests: write # label + comment on PRs
+      actions: write # read runs/jobs, re-run a starved run once (#2184), cancel a stalled one (#2203)
+      checks: read # check-run conclusions on the head commit (statusCheckRollup)
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GITHUB_REPOSITORY: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
+        with:
+          node-version: "22"
+
+      - name: Sweep open PRs for DIRTY / BEHIND / red-CI / starved / stalled / absent runs
+        run: node scripts/merge-train-warden.mjs

@@ -11,6 +11,7 @@
 import type { ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import type { SubagentScheduler } from "../schedule.js";
 import type { ScheduledSubagent } from "../types.js";
+import { selectItem } from "./select-item.js";
 
 /** Format an ISO timestamp as relative time ("in 4h", "2d ago", "—"). */
 function relTime(iso: string | undefined, now = Date.now()): string {
@@ -85,16 +86,16 @@ export async function showSchedulesMenu(
     return;
   }
 
-  const labels = jobs.map(j => formatJob(j, scheduler));
-  const choice = await ctx.ui.select(
+  // Numbered + item-paired: two jobs whose names agree in the first 18
+  // characters format identically, and matching the returned string back
+  // against a parallel label array cancelled whichever came first.
+  const job = await selectItem(
+    ctx.ui,
     `Scheduled jobs (${jobs.length}) — select to cancel`,
-    labels,
+    jobs,
+    j => formatJob(j, scheduler),
   );
-  if (!choice) return;
-
-  const idx = labels.indexOf(choice);
-  if (idx < 0) return;
-  const job = jobs[idx];
+  if (!job) return;
 
   const ok = await ctx.ui.confirm(`Cancel "${job.name}"?`, formatDetails(job, scheduler));
   if (!ok) return;

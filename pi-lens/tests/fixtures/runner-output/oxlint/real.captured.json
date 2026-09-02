@@ -1,0 +1,20 @@
+{
+	"provenance": {
+		"runner": "oxlint",
+		"tool": "oxlint",
+		"version": "1.61.0",
+		"command": "oxlint --format json bad.js",
+		"argv": [
+			"--format",
+			"json",
+			"bad.js"
+		],
+		"workspace": "tests/fixtures/tool-smoke/js-oxlint-error",
+		"platform": "win32-x64",
+		"capturedAt": "2026-08-21"
+	},
+	"file": "bad.js",
+	"exitCode": 1,
+	"stdout": "{ \"diagnostics\": [{\"message\": \"`debugger` statement is not allowed\",\"code\": \"eslint(no-debugger)\",\"severity\": \"error\",\"causes\": [],\"url\": \"https://oxc.rs/docs/guide/usage/linter/rules/eslint/no-debugger.html\",\"help\": \"Remove the debugger statement\",\"filename\": \"bad.js\",\"labels\": [{\"span\": {\"offset\": 192,\"length\": 9,\"line\": 5,\"column\": 2}}],\"related\": []},\n{\"message\": \"Variable 'unused' is declared but never used. Unused variables should start with a '_'.\",\"code\": \"eslint(no-unused-vars)\",\"severity\": \"error\",\"causes\": [],\"url\": \"https://oxc.rs/docs/guide/usage/linter/rules/eslint/no-unused-vars.html\",\"help\": \"Consider removing this declaration.\",\"filename\": \"bad.js\",\"labels\": [{\"label\": \"'unused' is declared here\",\"span\": {\"offset\": 179,\"length\": 6,\"line\": 4,\"column\": 8}}],\"related\": []}],\n              \"number_of_files\": 1,\n              \"number_of_rules\": 93,\n              \"threads_count\": 16,\n              \"start_time\": 0.0868798\n            }\n            ",
+	"stderr": ""
+}

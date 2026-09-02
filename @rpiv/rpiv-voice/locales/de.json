@@ -1,0 +1,39 @@
+{
+  "command.description": "Text per Sprache diktieren — lokales STT, keine Cloud",
+
+  "error.requires_interactive": "/voice erfordert den interaktiven Modus",
+  "error.model_download_failed": "STT-Modell konnte nicht heruntergeladen werden. Internetverbindung prüfen.",
+  "error.engine_load_failed": "STT-Modell konnte nicht geladen werden.",
+  "error.mic_unavailable": "Mikrofon nicht verfügbar. Prüfe, ob ein Eingabegerät angeschlossen ist und Pi Mikrofonzugriff hat.",
+
+  "splash.preparing": "Modell wird vorbereitet…",
+  "splash.downloading": "Whisper wird geladen…",
+  "splash.extracting": "Modelldateien werden entpackt…",
+  "splash.verifying": "Modelldateien werden geprüft…",
+  "splash.loading_engine": "Sprachmodell wird geladen…",
+  "splash.initializing_mic": "Mikrofon wird initialisiert…",
+
+  "footer.enter_paste": "Enter zum Einfügen",
+  "footer.space_pause": "Leertaste zum Pausieren",
+  "footer.space_resume": "Leertaste zum Fortsetzen",
+  "footer.tab_settings": "Tab für Einstellungen",
+  "footer.esc_cancel": "Esc zum Abbrechen",
+  "footer.esc_back": "Esc zum Zurückgehen",
+  "footer.ctrl_s_save": "Strg-S zum Speichern",
+  "footer.enter_toggle": "Enter zum Umschalten",
+
+  "transcript.placeholder": "Höre zu...",
+
+  "notify.settings_saved": "Spracheinstellungen gespeichert",
+
+  "status.recording": "Aufnahme",
+  "status.paused": "Pausiert",
+
+  "settings.microphone_label": "Mikrofon",
+  "settings.microphone_value_default": "System-Standardmikrofon",
+  "settings.language_label": "Sprache",
+  "settings.language_value_auto": "Automatisch erkennen",
+  "settings.language_hint": "Mit /languages ändern.",
+  "settings.hallucination_filter_label": "Whisper-Rauschen filtern",
+  "settings.hallucination_filter_hint": "Entfernt Stille-Artefakte. Bei Einzelwort-Diktat ausschalten."
+}

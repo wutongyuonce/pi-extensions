@@ -1,0 +1,19 @@
+id: no-server-bind-wildcard
+valid:
+  - "app.run(host='127.0.0.1', port=8000)"
+  - "app.run(host='localhost', port=8000)"
+  - "uvicorn.run(app, host='127.0.0.1', port=8000)"
+  - "uvicorn.run(app, host=HOST, port=PORT)"  # env var is OK
+  - |
+    return Settings.model_construct(
+        gh_proxy_bind_host='0.0.0.0',
+    )
+invalid:
+  - "app.run(host='0.0.0.0', port=8000)"
+  - "uvicorn.run(app, host='0.0.0.0', port=8000)"
+  - 'app.run(host="0.0.0.0", port=8000)'
+  - "server.listen(host='0.0.0.0', port=8000)"
+  - "app.serve(host='0.0.0.0', port=8000)"
+  - "run(host='0.0.0.0', port=8000)"
+  - "config = uvicorn.Config(app, host='0.0.0.0', port=8000)"
+  - "app.run_server(host='0.0.0.0', port=8000)"

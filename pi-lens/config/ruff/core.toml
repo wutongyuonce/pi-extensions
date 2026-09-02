@@ -1,0 +1,67 @@
+# pi-lens bundled ruff config
+# Applied when no project-level ruff config is found.
+# Projects can override everything by adding [tool.ruff] to pyproject.toml
+# or creating ruff.toml / .ruff.toml at the project root.
+
+line-length = 88  # black-compatible default
+
+[lint]
+select = [
+  "E",    # pycodestyle errors
+  "W",    # pycodestyle warnings
+  "F",    # pyflakes (undefined names, unused imports)
+  "I",    # isort (import ordering)
+  "B",    # flake8-bugbear (likely bugs and design issues)
+  "UP",   # pyupgrade (modernize syntax for target Python version)
+  "SIM",  # flake8-simplify (simplifiable constructs)
+  "C4",   # flake8-comprehensions (unnecessary comprehension patterns)
+  "PIE",  # flake8-pie (misc lints)
+  "S",    # flake8-bandit (Bandit-equivalent security checks; refs #1757)
+]
+
+# C90 (mccabe cyclomatic complexity) — considered and NOT enabled (refs #1757).
+# Measured against `requests` (mature, well-styled: 2 hits over the default
+# threshold of 10, both genuinely complex) and `pandas` (379 hits) — the
+# signal is real complexity, not false positives, but the volume on a large
+# pre-existing codebase would drown the security signal `S` adds in the same
+# pass. C90 is a maintainability metric, not a Bandit-equivalent security
+# check, so it stays out of scope for this issue. Revisit as its own opt-in
+# if pi-lens grows a "code health" ruleset.
+
+# S sub-rules excluded below were triaged by running `ruff check --select S`
+# against tests/fixtures/real-bugs/python/silent-and-security.py (this repo's
+# own security fixture — 3/3 true positives: S110, S105, S307) and against the
+# `requests` and `pip` packages installed under a local Python 3.11 (394
+# combined S findings across two mature, widely-audited real-world
+# codebases) — chosen as the "2-3 real fixtures" because pi-lens's own repo
+# only has ~15 Python files, too small to expose over-firing sub-rules.
+ignore = [
+  "E501",   # line too long — formatter handles this
+  "B008",   # function call in default argument — common FastAPI/typer pattern
+  "SIM108", # ternary operator — readability is subjective
+
+  # S101 assert: 354 of 394 S hits (90%) across requests+pip were bare
+  # `assert` statements — the risk `S101` warns about (asserts stripped under
+  # `python -O`) is real only for security-enforcement code, not general
+  # application or test code, where `assert` is idiomatic (pytest). Pure
+  # noise at this volume.
+  "S101",
+  # S311 suspicious-non-cryptographic-random-usage: every hit observed
+  # (e.g. pip/_internal/utils/filesystem.py building a temp-file suffix) was
+  # a non-security use of `random` — file names, jitter, sampling. Ruff
+  # cannot distinguish security-sensitive randomness from ordinary use.
+  "S311",
+  # S603 subprocess-without-shell-equals-true: fires on every list-argument
+  # `subprocess.run(...)`/`Popen(...)` call regardless of whether the
+  # arguments are attacker-controlled — this is the RECOMMENDED safe form
+  # (no shell=True), yet it was the rule's only trigger condition in every
+  # one of the 10 hits observed in pip. Bandit's own docs note this rule's
+  # high false-positive rate; excluded for the same reason upstream projects
+  # commonly disable it.
+  "S603",
+  # S607 start-process-with-partial-path: fires whenever a subprocess call
+  # names its executable by PATH lookup (`["rustc", "--version"]`) instead of
+  # an absolute path — standard practice for any CLI-wrapping code, and both
+  # observed hits in pip were exactly that pattern, not a real vulnerability.
+  "S607",
+]

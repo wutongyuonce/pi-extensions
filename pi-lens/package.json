@@ -1,0 +1,166 @@
+{
+	"name": "pi-lens",
+	"version": "4.1.3",
+	"type": "module",
+	"description": "Real-time code feedback for pi — LSP, linters, formatters, type-checking, structural analysis & booboo",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/apmantza/pi-lens.git"
+	},
+	"main": "./dist/index.js",
+	"bin": {
+		"pi-lens": "dist/mcp/cli.js",
+		"pi-lens-mcp": "dist/mcp/server.js",
+		"pi-lens-analyze": "dist/mcp/analyze-cli.js"
+	},
+	"scripts": {
+		"build": "tsc --project tsconfig.build.json",
+		"build:dist": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\" && npx --yes -p typescript@7.0.2 tsc --project tsconfig.dist.json --noCheck && npm run bundle:dist",
+		"bundle:dist": "node scripts/bundle-dist.mjs",
+		"prepare": "npm run build:dist && node scripts/download-grammars.js --core --dest grammars && node scripts/setup-git-hooks.mjs && node scripts/warm-loader-cache.mjs",
+		"lint": "tsc --project tsconfig.json",
+		"depcruise:check": "depcruise --validate --config .dependency-cruiser.cjs --ignore-known .dependency-cruiser-known-violations.json --output-type err index.ts \"clients/**/*.ts\"",
+		"fmt": "oxfmt",
+		"fmt:check": "oxfmt --check",
+		"watch": "tsc --watch",
+		"test": "node scripts/with-test-lock.mjs -- vitest run",
+		"test:unit": "node scripts/with-test-lock.mjs -- vitest run",
+		"test:integration": "node scripts/with-test-lock.mjs -- vitest run tests/index-integration.test.ts tests/clients/lsp/integration.test.ts",
+		"test:watch": "vitest",
+		"check": "node scripts/check-extensions.mjs",
+		"selftest:install": "node scripts/install-selftest.mjs",
+		"check:lockfile": "node scripts/check-lockfile-sync.mjs",
+		"check:grammars": "node scripts/check-grammar-provenance.mjs",
+		"check:grammar-load": "node scripts/check-grammar-load.mjs",
+		"audit:tree-sitter": "node scripts/audit-tree-sitter-rules.mjs",
+		"audit:rule-catalog": "node scripts/validate-rule-catalog.mjs",
+		"audit:astgrep-rule-pairs": "node scripts/audit-astgrep-rule-pairs.mjs",
+		"astgrep:self-scan": "node scripts/run-astgrep-pi-lens.mjs",
+		"astgrep:self-scan:update-baseline": "node scripts/run-astgrep-pi-lens.mjs --update-baseline",
+		"audit:playground": "node scripts/playground-verify-rule.mjs",
+		"bench:cascade-budget": "node scripts/bench-cascade-budget.mjs",
+		"bench:word-index-replacement": "node scripts/bench-word-index-replacement.mjs",
+		"logs:smells": "node scripts/analyze-pi-lens-logs.mjs",
+		"changelog:check": "node scripts/rollup-changelog.mjs --check",
+		"changelog:release": "node scripts/changelog-release.mjs",
+		"changelog:extract": "node scripts/changelog-extract.mjs",
+		"release:backfill-notes": "node scripts/backfill-github-releases.mjs",
+		"release:backfill-thanks": "node scripts/backfill-release-thanks.mjs",
+		"docs:rule-catalogs": "node scripts/gen-rule-catalogs.mjs",
+		"banner": "npx -y sharp-cli --input banner.svg --output banner.png resize 2200 620",
+		"download-grammars": "node scripts/download-grammars.js",
+		"harness:poc": "node scripts/run-harness.mjs cases/ts/pipeline-dispatch-poc",
+		"harness:python-poc": "node scripts/run-harness.mjs cases/python/pipeline-dispatch-poc",
+		"harness:ts-format-poc": "node scripts/run-harness.mjs cases/ts/format-default-poc",
+		"harness:python-autofix-poc": "node scripts/run-harness.mjs cases/python/autofix-default-poc",
+		"harness:go-poc": "node scripts/run-harness.mjs cases/go/pipeline-dispatch-poc"
+	},
+	"keywords": [
+		"pi",
+		"pi-extension",
+		"pi-package",
+		"linter",
+		"biome",
+		"ast-grep",
+		"ruff",
+		"typescript",
+		"code-quality",
+		"feedback",
+		"type-coverage",
+		"jscpd",
+		"knip"
+	],
+	"author": "Apostolos Mantzaris",
+	"license": "MIT",
+	"files": [
+		"dist/",
+		"docs/",
+		"grammars/",
+		"vendor/grammars/",
+		"config/",
+		"rules/",
+		"skills/",
+		"scripts/download-grammars.js",
+		"scripts/grammars.lock.json",
+		"scripts/analyze-pi-lens-logs.mjs",
+		"scripts/install-selftest.mjs",
+		"scripts/lib/host-provided-deps.mjs",
+		"scripts/lib/warm-loader-cache.mjs",
+		"scripts/warm-loader-cache.mjs",
+		"scripts/rpc-load-check.mjs",
+		"README.md",
+		"CHANGELOG.md",
+		"banner.svg",
+		"banner.png"
+	],
+	"dependencies": {
+		"@ast-grep/cli": "^0.45.0",
+		"@ast-grep/napi": "^0.45.0",
+		"js-yaml": "^5.2.2",
+		"minimatch": "^10.2.6",
+		"pidusage": "^4.0.1",
+		"vscode-jsonrpc": "^9.0.0"
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-coding-agent": "*",
+		"@earendil-works/pi-tui": "^0.84.1",
+		"typebox": "^1.0.0"
+	},
+	"peerDependenciesMeta": {
+		"@earendil-works/pi-coding-agent": {
+			"optional": true
+		},
+		"@earendil-works/pi-tui": {
+			"optional": true
+		},
+		"typebox": {
+			"optional": true
+		}
+	},
+	"optionalDependencies": {
+		"jiti": "^2.7.0",
+		"web-tree-sitter": "0.25.10"
+	},
+	"devDependencies": {
+		"@biomejs/biome": "^2.4.10",
+		"@earendil-works/pi-coding-agent": "^0.84.1",
+		"@earendil-works/pi-tui": "^0.84.1",
+		"@types/node": "^26.0.0",
+		"@types/pidusage": "^2.0.5",
+		"@vitest/coverage-v8": "^4.1.5",
+		"dependency-cruiser": "^18.2.0",
+		"husky": "^9.1.7",
+		"json5": "^2.2.3",
+		"oxfmt": "0.65.0",
+		"oxlint": "1.80.0",
+		"typebox": "^1.0.0",
+		"typescript": "^7.0.2",
+		"typescript-language-server": "^6.0.0",
+		"vitest": "^4.1.1"
+	},
+	"pi": {
+		"extensions": [
+			"./dist/index.js"
+		],
+		"skills": [
+			"../../skills"
+		]
+	},
+	"knip": {
+		"entry": [
+			"index.ts"
+		],
+		"project": [
+			"**/*.ts",
+			"!**/*.test.ts"
+		],
+		"ignore": [
+			"**/*.test.ts"
+		]
+	},
+	"allowScripts": {
+		"@ast-grep/cli@0.45.2": true,
+		"@google/genai@1.52.0": true,
+		"protobufjs@7.6.5": true
+	}
+}

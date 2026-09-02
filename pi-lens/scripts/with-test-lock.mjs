@@ -1,0 +1,237 @@
+#!/usr/bin/env node
+/**
+ * scripts/with-test-lock.mjs (#1101)
+ *
+ * Serializes full-suite test runs across a machine: multiple concurrent
+ * `npm test` invocations (several agents on parallel worktrees, plus an
+ * interactive run) spawn independently-sized fork pools
+ * (`maxWorkers: "50%"`, 4GB/fork — vitest.config.ts) that assume a
+ * dedicated machine. Run more than one at once and they fight over CPU/RAM,
+ * producing vitest worker-crash cascades and timing-budget flakes that look
+ * like real bugs but aren't (see AGENTS.md's testing-discipline section).
+ *
+ * This wrapper acquires ONE lock file before running the wrapped command,
+ * and releases it after — so concurrent full-suite runs queue instead of
+ * stomping on each other.
+ *
+ * Lock scope: MACHINE-WIDE, not per-repo. Worktrees of the same repo (or
+ * entirely different repos) still contend for the same physical CPU/RAM, so
+ * this deliberately does NOT key the lock to the repo root path the way
+ * getProjectDataDir does for project caches — see scripts/lib/suite-lock.mjs.
+ * Default location: `~/.pi-lens/test-suite.lock` (or
+ * `$PI_LENS_HOME/test-suite.lock`).
+ *
+ * Pattern: atomic create (`fs.open(path, "wx")`) + PID-liveness staleness,
+ * mirroring clients/installer/index.ts's `.install.lock` — with one
+ * deliberate divergence (no age-expiry for a lock whose PID still reads as
+ * alive; see scripts/lib/suite-lock.mjs's header for why). Waiting prints a
+ * heartbeat line at least every 15s so a queued run never looks hung.
+ *
+ * Usage:
+ *   node scripts/with-test-lock.mjs -- <command> [args...]
+ *   node scripts/with-test-lock.mjs -- vitest run
+ *
+ * Env:
+ *   PI_LENS_TEST_NO_LOCK=1          Skip locking entirely (CI sets this —
+ *                                   runners are isolated, one job per box).
+ *   PI_LENS_TEST_LOCK_TIMEOUT_MS    Give up waiting after this long
+ *                                   (default: wait forever).
+ */
+
+import { spawn } from "node:child_process";
+import fs from "node:fs";
+import { createRequire } from "node:module";
+import os from "node:os";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+import { acquireTestLock, getLockPath } from "./lib/suite-lock.mjs";
+
+const require = createRequire(import.meta.url);
+
+function parseCommandArgs(argv) {
+	const sepIndex = argv.indexOf("--");
+	const rest = sepIndex === -1 ? argv : argv.slice(sepIndex + 1);
+	return rest;
+}
+
+// Resolve vitest's own JS entry point (its package.json `bin` field) so it
+// can be launched via `node <entry> <args>` — a plain argv array, `shell:
+// false`, no cmd.exe/sh in the loop at all, identical on every OS. This is
+// the ONLY caller-path this wrapper actually needs to support well: every
+// real invocation (npm test / test:unit / test:integration) is
+// `-- vitest run [...]`. Returns null if vitest can't be resolved this way
+// (e.g. some future non-vitest caller), in which case runCommand falls back
+// to the generic (best-effort, NOT injection-safe — see its own comment)
+// shell path below.
+export function resolveVitestEntry() {
+	try {
+		const pkgJsonPath = require.resolve("vitest/package.json");
+		const pkg = JSON.parse(fs.readFileSync(pkgJsonPath, "utf8"));
+		const binField = pkg.bin;
+		const binRel = typeof binField === "string" ? binField : binField?.vitest;
+		if (!binRel) return null;
+		return path.join(path.dirname(pkgJsonPath), binRel);
+	} catch {
+		return null;
+	}
+}
+
+// Fallback ONLY: generic passthrough for a command that isn't `vitest`
+// (there is no such caller today — package.json only ever wraps `vitest
+// run [...]`). Windows CreateProcess cannot exec .cmd/.bat files directly,
+// which is why win32 needs `shell: true` for anything that isn't resolved
+// to a plain .js/.exe the way resolveVitestEntry() does above. `shell:
+// true` + an args ARRAY does NOT quote/escape for you on Windows (Node
+// just space-joins argv into the command line — confirmed experimentally:
+// an arg containing a space silently split into two argv entries), so this
+// builds one CRT-quoted command-line string instead of an args array.
+//
+// This quoting is NOT shell-injection-safe: it defends against space/quote
+// splitting for CRT-style argv parsing, but cmd.exe's OWN metacharacters
+// (`&`, `|`, `%VAR%` expansion) still apply INSIDE a quoted argument on a
+// cmd.exe command line — a quote-containing argument can flip cmd's quote
+// parity and let a later `&`/`|` execute as a separate command, and
+// `%VAR%` still expands regardless of quoting. `clients/safe-spawn.ts`
+// covers that much larger surface for installer subprocess mutations,
+// which this deliberately does not reach for: this fallback path only runs
+// for a hypothetical non-vitest caller, and even then commandArgs comes
+// from this process's own argv (a package.json script definition), never
+// from untrusted external/user input.
+export function quoteForWindowsCmd(arg) {
+	if (arg === "") return '""';
+	if (!/[\s"^&|<>()%!]/.test(arg)) return arg;
+	let result = "";
+	let backslashes = 0;
+	for (const ch of arg) {
+		if (ch === "\\") {
+			backslashes++;
+			continue;
+		}
+		if (ch === '"') {
+			result += "\\".repeat(backslashes * 2 + 1) + '"';
+			backslashes = 0;
+			continue;
+		}
+		result += "\\".repeat(backslashes) + ch;
+		backslashes = 0;
+	}
+	result += "\\".repeat(backslashes * 2);
+	return `"${result}"`;
+}
+
+function runCommand(commandArgs) {
+	return new Promise((resolve, reject) => {
+		const isWin32 = process.platform === "win32";
+		const vitestEntry =
+			commandArgs[0] === "vitest" ? resolveVitestEntry() : null;
+
+		let child;
+		if (vitestEntry) {
+			// Bypasses shell entirely, on every OS: no cmd.exe, no quoting
+			// minefield, identical behavior cross-platform.
+			child = spawn(process.execPath, [vitestEntry, ...commandArgs.slice(1)], {
+				stdio: "inherit",
+				shell: false,
+			});
+		} else if (isWin32) {
+			child = spawn(commandArgs.map(quoteForWindowsCmd).join(" "), {
+				stdio: "inherit",
+				shell: true,
+			});
+		} else {
+			child = spawn(commandArgs[0], commandArgs.slice(1), {
+				stdio: "inherit",
+				shell: false,
+			});
+		}
+
+		const forwardSignal = (signal) => {
+			if (!child.killed) child.kill(signal);
+		};
+		process.once("SIGINT", forwardSignal);
+		process.once("SIGTERM", forwardSignal);
+
+		child.once("error", (error) => {
+			process.removeListener("SIGINT", forwardSignal);
+			process.removeListener("SIGTERM", forwardSignal);
+			reject(error);
+		});
+		child.once("exit", (code, signal) => {
+			process.removeListener("SIGINT", forwardSignal);
+			process.removeListener("SIGTERM", forwardSignal);
+			if (signal) {
+				const signalNumber = os.constants.signals[signal];
+				resolve(typeof signalNumber === "number" ? 128 + signalNumber : 1);
+			} else {
+				resolve(code ?? 1);
+			}
+		});
+	});
+}
+
+async function main() {
+	const commandArgs = parseCommandArgs(process.argv.slice(2));
+	if (commandArgs.length === 0) {
+		console.error(
+			"Usage: node scripts/with-test-lock.mjs -- <command> [args...]",
+		);
+		process.exitCode = 2;
+		return;
+	}
+
+	if (process.env.PI_LENS_TEST_NO_LOCK === "1") {
+		process.exitCode = await runCommand(commandArgs);
+		return;
+	}
+
+	const lockPath = getLockPath();
+	const lock = await acquireTestLock({
+		lockPath,
+		log: (message) => console.error(`[with-test-lock] ${message}`),
+	});
+
+	try {
+		process.exitCode = await runCommand(commandArgs);
+	} finally {
+		await lock.release();
+	}
+}
+
+// Only run the CLI when this file is the entry point — not when a test
+// imports it to exercise `quoteForWindowsCmd`/`resolveVitestEntry` directly.
+// A silent MISMATCH here is a silent-success failure mode: `npm test` would
+// exit 0 having run zero tests, with nothing printed to say why. A plain
+// case-sensitive compare is wrong on win32, whose default filesystems are
+// case-insensitive (a differently-cased invocation path, or an 8.3 short
+// name, both resolve to the same file but wouldn't string-equal it).
+function isEntryPoint() {
+	if (!process.argv[1]) return false;
+	const invoked = path.resolve(process.argv[1]);
+	const self = fileURLToPath(import.meta.url);
+	if (invoked === self) return true;
+	if (process.platform !== "win32") return false;
+	if (invoked.toLowerCase() === self.toLowerCase()) return true;
+	// Casing-fold still misses an 8.3 short-name invocation (e.g.
+	// `WITH-T~1.MJS`), which mangles more than just case. Rather than
+	// silently no-op, fall back to a basename match and warn loudly — a
+	// false positive here (running when we technically shouldn't) is far
+	// safer than the alternative (silently not running at all).
+	if (
+		path.basename(invoked).toLowerCase() === path.basename(self).toLowerCase()
+	) {
+		console.error(
+			"[with-test-lock] warning: argv[1] did not exactly match this file's " +
+				"resolved path (possible Windows 8.3 short-name or casing mismatch) " +
+				"— running anyway based on a basename match",
+		);
+		return true;
+	}
+	return false;
+}
+const isMain = isEntryPoint();
+if (isMain) {
+	main().catch((error) => {
+		console.error(`[with-test-lock] ${error.message}`);
+		process.exitCode = 1;
+	});
+}

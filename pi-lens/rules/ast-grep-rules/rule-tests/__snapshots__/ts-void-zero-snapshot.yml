@@ -1,0 +1,23 @@
+id: ts-void-zero
+snapshots:
+  const x = void 0:
+    fixed: const x = undefined
+    labels:
+    - source: void 0
+      style: primary
+      start: 10
+      end: 16
+  return void 0:
+    fixed: return undefined
+    labels:
+    - source: void 0
+      style: primary
+      start: 7
+      end: 13
+  void 0:
+    fixed: undefined
+    labels:
+    - source: void 0
+      style: primary
+      start: 0
+      end: 6

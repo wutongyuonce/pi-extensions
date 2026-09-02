@@ -1,0 +1,1002 @@
+import { readFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
+
+// Deterministic sanitizer between normalize-claims and verify-claims.
+//
+// This helper does not decide truth. It only keeps verifier fanout focused on
+// source-stated, source-locatable factual claims and preserves demoted material
+// as explicit coverage gaps/backlog rows for final synthesis. The goal is to
+// avoid spending verifier budget on workflow-context metadata, evidence-gap
+// statements, and synthesized recommendations that are better represented as
+// gaps or caveated guidance.
+
+const SCHEMA = "deep-research-verification-candidate-sanitizer-v1";
+const VERIFIER_INPUT_POLICY =
+	"use_sourceRefs_or_sourceUrls_only_do_not_call_workflow_artifact";
+const HELPER_DIR = dirname(fileURLToPath(import.meta.url));
+const SANITIZE_SCHEMA_PATH = join(
+	HELPER_DIR,
+	"..",
+	"schemas",
+	"deep-research-sanitize-claims-control.schema.json",
+);
+const FALLBACK_SCHEMA_CAPS = {
+	verificationCandidates: 48,
+	preservedClaims: 24,
+	factSlotCoverage: 64,
+};
+let schemaCapsCache;
+
+function asArray(value) {
+	return Array.isArray(value) ? value : [];
+}
+
+function asObject(value) {
+	return value && typeof value === "object" && !Array.isArray(value)
+		? value
+		: {};
+}
+
+async function loadSchemaCaps() {
+	if (schemaCapsCache) return schemaCapsCache;
+	try {
+		const schema = JSON.parse(await readFile(SANITIZE_SCHEMA_PATH, "utf8"));
+		const claimInventory = asObject(asObject(schema.properties).claimInventory);
+		const claimProperties = asObject(claimInventory.properties);
+		schemaCapsCache = {
+			verificationCandidates:
+				arrayMaxItems(claimProperties.verificationCandidates) ??
+				FALLBACK_SCHEMA_CAPS.verificationCandidates,
+			preservedClaims:
+				arrayMaxItems(claimProperties.preservedClaims) ??
+				FALLBACK_SCHEMA_CAPS.preservedClaims,
+			factSlotCoverage:
+				arrayMaxItems(asObject(schema.properties).factSlotCoverage) ??
+				FALLBACK_SCHEMA_CAPS.factSlotCoverage,
+		};
+	} catch {
+		schemaCapsCache = { ...FALLBACK_SCHEMA_CAPS };
+	}
+	return schemaCapsCache;
+}
+
+function arrayMaxItems(schema) {
+	const value = asObject(schema).maxItems;
+	return Number.isFinite(value) && value >= 0 ? Math.floor(value) : undefined;
+}
+
+function stringOf(value) {
+	return typeof value === "string" ? value.trim() : "";
+}
+
+function compactStrings(values, limit = 12) {
+	if (!Array.isArray(values)) return [];
+	const seen = new Set();
+	const out = [];
+	for (const value of values) {
+		const text = stringOf(value);
+		if (!text || seen.has(text)) continue;
+		seen.add(text);
+		out.push(text);
+		if (out.length >= limit) break;
+	}
+	return out;
+}
+
+function findSource(sources, stageId) {
+	const matches = Object.entries(sources ?? {}).filter(
+		([specId]) => specId === stageId || specId.startsWith(`${stageId}.`),
+	);
+	if (matches.length > 1) {
+		throw new Error(
+			`deep-research: ambiguous ${stageId} source (${matches.map(([specId]) => specId).join(", ")})`,
+		);
+	}
+	return matches[0]?.[1] ?? null;
+}
+
+function claimText(candidate) {
+	return stringOf(candidate?.claim ?? candidate?.text ?? candidate?.statement);
+}
+
+function candidateId(candidate) {
+	return stringOf(candidate?.id ?? candidate?.claimId);
+}
+
+function diagnosticRowId(row, index) {
+	return (
+		candidateId(row) ||
+		stringOf(row?.originalCandidateId) ||
+		stringOf(row?.slotId ?? row?.id) ||
+		`index-${index}`
+	);
+}
+
+function clampArrayToSchemaCap(value, maxItems, path) {
+	const rows = asArray(value);
+	if (!Number.isFinite(maxItems) || rows.length <= maxItems) {
+		return { rows, drop: null };
+	}
+	const kept = rows.slice(0, maxItems);
+	const dropped = rows.slice(maxItems);
+	return {
+		rows: kept,
+		drop: {
+			path,
+			maxItems,
+			inputCount: rows.length,
+			outputCount: kept.length,
+			droppedCount: dropped.length,
+			droppedIds: compactStrings(
+				dropped.map((row, index) => diagnosticRowId(row, maxItems + index)),
+				24,
+			),
+		},
+	};
+}
+
+function schemaCapGap(drop) {
+	return {
+		id: `sanitizer-cap-${drop.path.replace(/[^a-z0-9]+/gi, "-").toLowerCase()}`,
+		claimId: drop.path,
+		evidenceState: "deterministically_clamped",
+		reason: `${drop.path} exceeded schema maxItems ${drop.maxItems}; ${drop.droppedCount} row(s) omitted from helper output to keep the workflow degradable instead of failed.`,
+		nextStep:
+			"Review sanitizerDiagnostics.schemaCapDrops for omitted ids; increase the schema cap or reduce upstream preserved/demoted rows if these omissions are material.",
+		omittedIds: drop.droppedIds,
+	};
+}
+
+function sourceRefs(candidate) {
+	return compactStrings(candidate?.sourceRefs, 16);
+}
+
+function sourceUrls(candidate) {
+	return compactStrings(candidate?.sourceUrls, 16);
+}
+
+function localEvidenceRefs(candidate) {
+	const refs = [];
+	for (const key of ["file", "path", "repoPath", "localPath"]) {
+		const value = stringOf(candidate?.[key]);
+		if (value) refs.push(value);
+	}
+	for (const row of asArray(candidate?.evidence)) {
+		for (const key of ["file", "path", "source", "sourceRef"]) {
+			const value = stringOf(row?.[key]);
+			if (value && !/^https?:\/\//i.test(value)) refs.push(value);
+		}
+	}
+	return compactStrings(refs, 8);
+}
+
+function hasSourceLocator(candidate) {
+	return (
+		sourceRefs(candidate).length > 0 ||
+		sourceUrls(candidate).length > 0 ||
+		localEvidenceRefs(candidate).length > 0
+	);
+}
+
+function matchesAny(text, patterns) {
+	return patterns.some((pattern) => pattern.test(text));
+}
+
+const WORD_TOKEN_RE =
+	/[\p{Letter}\p{Number}][\p{Letter}\p{Number}\p{Mark}_-]*/gu;
+const ASCII_TOKEN_RE = /^[a-z0-9][a-z0-9_-]{2,}$/iu;
+const ASCII_RUN_RE = /[a-z0-9][a-z0-9_-]{2,}/giu;
+const CJK_RUN_RE =
+	/[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]+/gu;
+const ASCII_CHAR_RE = /[a-z0-9]/iu;
+
+function addCjkRunTokens(tokens, run) {
+	const chars = [...run];
+	if (chars.length === 0) return;
+	if (chars.length === 1) {
+		tokens.add(chars[0]);
+		return;
+	}
+	tokens.add(run);
+	for (const size of [2, 3]) {
+		if (chars.length < size) continue;
+		for (let index = 0; index <= chars.length - size; index += 1) {
+			tokens.add(chars.slice(index, index + size).join(""));
+		}
+	}
+}
+
+function tokenSet(value) {
+	const tokens = new Set();
+	const normalized = String(value ?? "")
+		.normalize("NFKC")
+		.toLocaleLowerCase();
+	for (const match of normalized.matchAll(WORD_TOKEN_RE)) {
+		const token = match[0].replace(/^[_-]+|[_-]+$/gu, "");
+		if (!token) continue;
+		for (const asciiMatch of token.matchAll(ASCII_RUN_RE)) {
+			tokens.add(asciiMatch[0]);
+		}
+		if (ASCII_TOKEN_RE.test(token)) continue;
+		let cjkMatched = false;
+		for (const cjkMatch of token.matchAll(CJK_RUN_RE)) {
+			cjkMatched = true;
+			addCjkRunTokens(tokens, cjkMatch[0]);
+		}
+		if (!cjkMatched && [...token].length >= 3) tokens.add(token);
+	}
+	return tokens;
+}
+
+function hasAsciiToken(tokens) {
+	for (const token of tokens) if (ASCII_CHAR_RE.test(token)) return true;
+	return false;
+}
+
+function setIntersectionCount(left, right) {
+	let count = 0;
+	for (const value of left) if (right.has(value)) count += 1;
+	return count;
+}
+
+function isSyntheticEvidenceText(value) {
+	return /(?:^|[^a-z0-9])(?:synthesis|synthesized|derived|inference)(?:$|[^a-z0-9])/i.test(
+		String(value ?? ""),
+	);
+}
+
+function weakEvidenceHintText(value) {
+	return matchesAny(String(value ?? ""), [
+		/\bexact\b[^.]{0,80}\b(?:quote|wording|text)\b[^.]{0,80}\b(?:not|unavailable|missing|limited|could not|was not)\b/i,
+		/\b(?:quote|wording|text)\b[^.]{0,80}\b(?:not|unavailable|missing|limited|could not|was not)\b/i,
+		/\b(?:cite cautiously|requires? assumptions?|implementation[- ]specific|not direct evidence|not direct support)\b/i,
+		/\b(?:did not|does not|could not|not found|not confirm|not indicate|budget exhausted)\b/i,
+	]);
+}
+
+function sufficientlyQuoteBackedValue(valueTokens, quoteTokens) {
+	if (valueTokens.size === 0) return false;
+	const hits = setIntersectionCount(valueTokens, quoteTokens);
+	return hits >= 4 && hits / valueTokens.size >= 0.55;
+}
+
+function buildEvidenceHintRows(normalizeInputPacket) {
+	const rows = [];
+	const facts = asArray(normalizeInputPacket?.packet?.research?.extractedFacts);
+	for (const fact of facts) {
+		const quote = stringOf(fact?.quote);
+		if (!quote) continue;
+		const refs = sourceRefs(fact);
+		const urls = sourceUrls(fact);
+		if (refs.length === 0 && urls.length === 0) continue;
+		const sourceTitleOrPublisher = stringOf(fact?.sourceTitleOrPublisher);
+		const sourceQuality = stringOf(fact?.sourceQuality);
+		const notes = stringOf(fact?.notes);
+		if (
+			isSyntheticEvidenceText(
+				`${sourceTitleOrPublisher} ${sourceQuality} ${notes}`,
+			)
+		)
+			continue;
+		const value = stringOf(fact?.value);
+		const quoteTokens = tokenSet(quote);
+		const valueTokens = tokenSet(value);
+		const supportedValue =
+			value &&
+			!weakEvidenceHintText(`${value} ${notes}`) &&
+			sufficientlyQuoteBackedValue(valueTokens, quoteTokens)
+				? value
+				: "";
+		rows.push({
+			sourceRef: refs[0],
+			sourceRefs: refs,
+			url: urls[0],
+			sourceUrls: urls,
+			sourceTitleOrPublisher: sourceTitleOrPublisher || undefined,
+			dateOrYear: stringOf(fact?.dateOrYear) || undefined,
+			quote,
+			value: supportedValue || undefined,
+			factSlotIds: compactStrings(
+				[fact?.slotId, ...asArray(fact?.factSlotIds)],
+				8,
+			),
+			sourceQuality: sourceQuality || undefined,
+			relevance: notes || supportedValue || undefined,
+			_tokens: tokenSet(`${supportedValue} ${quote}`),
+		});
+	}
+	return rows;
+}
+
+function canonicalUrl(value) {
+	const raw = stringOf(value).replace(/[.,;:]+$/u, "");
+	if (!/^https?:\/\//i.test(raw)) return "";
+	try {
+		const url = new URL(raw);
+		url.protocol = url.protocol.toLowerCase();
+		url.hostname = url.hostname.toLowerCase();
+		url.hash = "";
+		return url.toString().replace(/\/$/u, "");
+	} catch {
+		return raw;
+	}
+}
+
+function addUrlSourceRef(lookup, url, sourceRef) {
+	const ref = stringOf(sourceRef);
+	if (!/^wsrc_[a-f0-9]{32}$/u.test(ref)) return;
+	const key = canonicalUrl(url);
+	if (key && !lookup.has(key)) lookup.set(key, ref);
+}
+
+async function addWebSourceCacheSourceRefs(lookup, context) {
+	const cwd = stringOf(context?.cwd);
+	const runId = stringOf(context?.runId);
+	if (!cwd || !runId) return;
+	let parsed;
+	try {
+		parsed = JSON.parse(
+			await readFile(
+				join(cwd, ".pi", "workflows", runId, "web-source-cache", "index.json"),
+				"utf8",
+			),
+		);
+	} catch {
+		return;
+	}
+	for (const source of asArray(parsed?.sources)) {
+		const ref = stringOf(source?.sourceRef);
+		addUrlSourceRef(lookup, source?.url, ref);
+		addUrlSourceRef(lookup, source?.redactedUrl, ref);
+	}
+}
+
+async function buildUrlSourceRefLookup(normalizeInputPacket, context) {
+	const lookup = new Map();
+	const sources = asArray(normalizeInputPacket?.packet?.research?.sources);
+	for (const source of sources) {
+		const ref = sourceRefs(source)[0] || stringOf(source?.sourceRef);
+		if (!ref) continue;
+		for (const url of sourceUrls(source).length > 0
+			? sourceUrls(source)
+			: [source?.url]) {
+			addUrlSourceRef(lookup, url, ref);
+		}
+	}
+	await addWebSourceCacheSourceRefs(lookup, context);
+	return lookup;
+}
+
+function backfillSourceRefs(candidate, hints, urlToSourceRef) {
+	const refs = sourceRefs(candidate);
+	for (const hint of hints) {
+		if (hint.sourceRef && !refs.includes(hint.sourceRef))
+			refs.push(hint.sourceRef);
+	}
+	for (const url of sourceUrls(candidate)) {
+		const ref = urlToSourceRef.get(canonicalUrl(url));
+		if (ref && !refs.includes(ref)) refs.push(ref);
+	}
+	return refs.slice(0, 16);
+}
+
+function evidenceHintsForCandidate(candidate, hintRows) {
+	const candidateRefs = new Set(sourceRefs(candidate));
+	const candidateUrls = new Set(sourceUrls(candidate));
+	const candidateSlots = new Set(compactStrings(candidate?.factSlotIds, 12));
+	const candidateTokens = tokenSet(claimText(candidate));
+	const scored = [];
+	for (const row of hintRows) {
+		const refHits = setIntersectionCount(
+			new Set(row.sourceRefs),
+			candidateRefs,
+		);
+		const urlHits = setIntersectionCount(
+			new Set(row.sourceUrls),
+			candidateUrls,
+		);
+		const slotHits = setIntersectionCount(
+			new Set(row.factSlotIds),
+			candidateSlots,
+		);
+		const tokenHits = setIntersectionCount(row._tokens, candidateTokens);
+		const unicodeSlotOnlyFallback =
+			slotHits > 0 &&
+			tokenHits < 2 &&
+			!hasAsciiToken(candidateTokens) &&
+			!hasAsciiToken(row._tokens);
+		if (slotHits === 0 && tokenHits < 2) continue;
+		const score =
+			refHits * 6 + urlHits * 5 + slotHits * 2 + Math.min(tokenHits, 5);
+		if (score < 7 && !unicodeSlotOnlyFallback) continue;
+		scored.push({ score, row });
+	}
+	scored.sort((left, right) => right.score - left.score);
+	return scored.slice(0, 3).map(({ row }) => ({
+		sourceRef: row.sourceRef || undefined,
+		url: row.url || undefined,
+		sourceTitleOrPublisher: row.sourceTitleOrPublisher,
+		dateOrYear: row.dateOrYear,
+		quote: row.quote,
+		value: row.value,
+		factSlotIds: row.factSlotIds,
+		sourceQuality: row.sourceQuality,
+		relevance: row.relevance,
+	}));
+}
+
+function hintEvidenceText(hint) {
+	return `${stringOf(hint?.value)} ${stringOf(hint?.quote)}`.trim();
+}
+
+function hintSupportsCandidate(candidate, hint) {
+	const evidenceTokens = tokenSet(hintEvidenceText(hint));
+	const candidateTokens = tokenSet(claimText(candidate));
+	if (candidateTokens.size === 0 || evidenceTokens.size === 0) return false;
+	const hits = setIntersectionCount(candidateTokens, evidenceTokens);
+	return hits >= 4 && hits / candidateTokens.size >= 0.18;
+}
+
+function isPlaceholderHint(hint) {
+	const text = hintEvidenceText(hint);
+	return matchesAny(text, [
+		/^redirecting(?:\.\.\.)?$/i,
+		/^moved:?(?:\s|$)/i,
+		/\b(?:page|document)\s+(?:moved|redirected|not found|blocked)\b/i,
+		/\b(?:404|403|access denied|forbidden)\b/i,
+	]);
+}
+
+function optionStrings(options, key, limit = 24) {
+	return compactStrings(asArray(asObject(options)?.[key]), limit);
+}
+
+function includesLiteralPhrase(text, phrase) {
+	const haystack = String(text ?? "")
+		.normalize("NFKC")
+		.toLocaleLowerCase();
+	const needle = String(phrase ?? "")
+		.normalize("NFKC")
+		.toLocaleLowerCase()
+		.trim();
+	return needle.length > 0 && haystack.includes(needle);
+}
+
+function hasOverclaimedSourceInference(claim, options) {
+	return optionStrings(options, "overclaimedSourceInferencePhrases").some(
+		(phrase) => includesLiteralPhrase(claim, phrase),
+	);
+}
+
+function combinedHintText(hints) {
+	return hints.map((hint) => hintEvidenceText(hint)).join(" ");
+}
+
+function hasUnsupportedNormativePrerequisite(claim, hints) {
+	if (
+		!matchesAny(claim, [
+			/\bmust\s+pre-?configure\b/i,
+			/\bmust\b[^.]{0,100}\bbefore\b/i,
+			/\bbefore\s+bypassing\b/i,
+		])
+	)
+		return false;
+	return !/\bmust\s+pre-?configure\b/i.test(combinedHintText(hints));
+}
+
+function hasUnquotedNamedMitigation(claim, hints, options) {
+	const evidenceText = combinedHintText(hints);
+	return optionStrings(options, "unquotedNamedMitigationTerms").some(
+		(term) =>
+			includesLiteralPhrase(claim, term) &&
+			!includesLiteralPhrase(evidenceText, term),
+	);
+}
+
+function hasImperativeMultiStepRecommendation(claim) {
+	return matchesAny(claim, [
+		/^(?:enforce|apply|defend|instrument|implement|migrate|pin|layer|require|adopt|configure|validate|verify)\b(?=[\s\S]{48,})(?=[\s\S]*(?:;|\band\b|\bnever\s+rely\b|\bno\s+input\s+filter\b|\bconsider\b))/i,
+	]);
+}
+
+function classifyCandidate(candidate, seenIds, hints = [], options = {}) {
+	const id = candidateId(candidate);
+	const claim = claimText(candidate);
+	const reasons = [];
+
+	if (!id) reasons.push("missing_candidate_id");
+	else if (seenIds.has(id)) reasons.push("duplicate_candidate_id");
+	if (!claim) reasons.push("missing_candidate_text");
+	if (!hasSourceLocator(candidate)) reasons.push("missing_candidate_source");
+
+	if (claim) {
+		if (hints.length > 0 && hints.every(isPlaceholderHint)) {
+			reasons.push("placeholder_source_hint");
+		}
+		if (
+			hints.length > 0 &&
+			hasSourceLocator(candidate) &&
+			!hints.every(isPlaceholderHint) &&
+			!hints.some((hint) => hintSupportsCandidate(candidate, hint))
+		) {
+			reasons.push("source_hint_claim_mismatch");
+		}
+		if (hasOverclaimedSourceInference(claim, options)) {
+			reasons.push("overclaimed_source_inference");
+		}
+		if (hasUnsupportedNormativePrerequisite(claim, hints)) {
+			reasons.push("unsupported_normative_prerequisite");
+		}
+		if (hasUnquotedNamedMitigation(claim, hints, options)) {
+			reasons.push("unquoted_named_mitigation");
+		}
+
+		if (
+			matchesAny(claim, [
+				/\b(?:fetched|retrieved|accessed|inspected|collected|reviewed|cached)\b[^.]{0,80}\b20\d{2}-\d{2}-\d{2}\b/i,
+				/\b20\d{2}-\d{2}-\d{2}\b[^.]{0,80}\b(?:fetched|retrieved|accessed|inspected|collected|reviewed|cached)\b/i,
+			])
+		) {
+			reasons.push("workflow_context_date_claim");
+		}
+
+		if (
+			matchesAny(claim, [
+				/\b(?:sourceRef|workflow[_ -]?artifact|cached source|artifact read|tool call)\b/i,
+				/\b(?:evidence|source|page|doc|documentation)\s+(?:was|were)\s+(?:fetched|retrieved|cached|inspected|reviewed)\b/i,
+			])
+		) {
+			reasons.push("meta_evidence_freshness_claim");
+		}
+
+		if (
+			matchesAny(claim, [
+				/\b(?:no|not|never)\s+(?:direct|exact|primary|source-backed)?\s*(?:evidence|quote|rule|wording|support)\b/i,
+				/\bno\s+(?:retrieved|available|visible|primary|cited|supporting)?\s*sources?\s+(?:found|available|visible|retrieved|confirmed|cited|support(?:s|ing)?)\b/i,
+				/\b(?:evidence|quote|source|rule|wording|support)\s+(?:was|were|is|are)\s+not\s+(?:found|available|visible|present|exposed|retrieved|confirmed|reliably extracted)\b/i,
+				/\b(?:did not|does not|failed to|could not|cannot)\s+(?:find|show|establish|confirm|retrieve|extract|expose|verify|support)\b/i,
+				/\bnot\s+reliably\s+(?:extracted|confirmed|established|verified)\b/i,
+				/\b(?:gap|missing|unavailable|inconclusive)\s+(?:in|for|from)\s+(?:evidence|source|documentation|retrieval)\b/i,
+			])
+		) {
+			reasons.push("evidence_gap_claim");
+		}
+
+		if (
+			hasImperativeMultiStepRecommendation(claim) ||
+			matchesAny(claim, [
+				/\bcan\s+be\s+(?:synthesized|derived|combined)\b/i,
+				/\b(?:feasible|pragmatic|low-overhead|small[- ]team|small[- ]SaaS|baseline|tiering|action plan|implementation plan)\b[^.]{0,120}\b(?:use|combine|adopt|implement|separate|prioriti[sz]e|choose|form)\b/i,
+				/\b(?:practical|feasible)\s+(?:governance\s+)?baseline\b/i,
+				/\b(?:teams|organizations|implementers|small[- ]SaaS)\s+(?:should|can|could|may)\b/i,
+				/\b(?:minimum|defensible|lightweight|reporting architecture|control set|runbook|checklist)\b[^.]{0,160}\b(?:should|can|could|may|use|adopt|define|separate|include|treat|cite|retain|review)\b/i,
+				/\b(?:should|can|could|may)\s+(?:define|separate|include|treat|use|adopt|prefer|document|retain|review|label|choose)\b/i,
+			])
+		) {
+			reasons.push("synthesized_recommendation_claim");
+		}
+
+		if (
+			matchesAny(claim, [
+				/\b(?:all|every|always|never|none|no)\s+(?:major\s+)?(?:vendors?|providers?|tools?|frameworks?|products?|services?)\b/i,
+				/\b(?:vendors?|providers?|tools?|frameworks?|services?)\s+(?:all|always|never|uniformly)\b/i,
+				/\b(?:AI\s+coding\s+agents|coding\s+agents|agents)\s+should\b/i,
+				/\bapplicable\s+to\b[^.]{0,80}\b(?:agent|agents|small\s+team|small\s+teams)\b/i,
+				/\bused\s+for\b[^.]{0,120}\b(?:framing|basis|checklist|guidance|implementation|reporting)\b/i,
+			])
+		) {
+			reasons.push("source_broader_than_evidence_claim");
+		}
+	}
+
+	return [...new Set(reasons)];
+}
+
+function demotionGap(candidate, reasons) {
+	const id = candidateId(candidate);
+	const claim = claimText(candidate);
+	return {
+		claimId: id || undefined,
+		slotId: compactStrings(candidate?.factSlotIds, 1)[0],
+		relatedFactSlotIds: compactStrings(candidate?.factSlotIds, 8),
+		evidenceState: "not_sent_to_verifier",
+		reason: `sanitized from verifier candidates: ${reasons.join(", ")}`,
+		nextStep:
+			"Replace with a narrow source-stated factual atom, or keep as an explicit final-report gap/recommendation caveat.",
+		sourceUrls: sourceUrls(candidate).slice(0, 6),
+		claim: claim || undefined,
+	};
+}
+
+function preservedClaim(candidate, reasons, fallbackIndex) {
+	const id =
+		candidateId(candidate) ||
+		`candidate-${String(fallbackIndex + 1).padStart(3, "0")}`;
+	return {
+		...candidate,
+		id: `preserved-${id}`,
+		originalCandidateId: candidateId(candidate) || undefined,
+		claim: claimText(candidate) || undefined,
+		status: "preserved_not_sent_to_verifier",
+		sanitizerDemotionReasons: reasons,
+		whyItMatters:
+			stringOf(candidate?.whyItMatters) ||
+			stringOf(candidate?.reasonToVerify) ||
+			"Demoted by deterministic pre-verifier sanitizer and preserved for final caveats/gaps.",
+	};
+}
+
+const REWRITEABLE_REASONS = new Set([
+	"synthesized_recommendation_claim",
+	"source_broader_than_evidence_claim",
+	"source_hint_claim_mismatch",
+	"overclaimed_source_inference",
+	"unsupported_normative_prerequisite",
+	"unquoted_named_mitigation",
+]);
+
+function rewriteShouldPreferQuote(reasons) {
+	return reasons.some((reason) =>
+		[
+			"source_hint_claim_mismatch",
+			"overclaimed_source_inference",
+			"unsupported_normative_prerequisite",
+			"unquoted_named_mitigation",
+		].includes(reason),
+	);
+}
+
+function rewriteReplacementFromHint(hint, reasons) {
+	if (rewriteShouldPreferQuote(reasons))
+		return stringOf(hint?.quote) || stringOf(hint?.value);
+	return stringOf(hint?.value) || stringOf(hint?.quote);
+}
+
+function rewriteHintScore(candidate, hint, reasons) {
+	const replacement = rewriteReplacementFromHint(hint, reasons);
+	const replacementTokens = tokenSet(replacement);
+	const candidateTokens = tokenSet(claimText(candidate));
+	const hits = setIntersectionCount(candidateTokens, replacementTokens);
+	return (
+		hits + (stringOf(hint?.quote) ? 2 : 0) + (stringOf(hint?.value) ? 1 : 0)
+	);
+}
+
+function selectRewriteHint(candidate, hints, reasons) {
+	const usableHints = hints.filter(
+		(hint) =>
+			!isPlaceholderHint(hint) && rewriteReplacementFromHint(hint, reasons),
+	);
+	usableHints.sort(
+		(left, right) =>
+			rewriteHintScore(candidate, right, reasons) -
+			rewriteHintScore(candidate, left, reasons),
+	);
+	return usableHints[0] ?? null;
+}
+
+function rewrittenCandidate(candidate, reasons, hints, urlToSourceRef) {
+	const rewriteReasons = reasons.filter((reason) =>
+		REWRITEABLE_REASONS.has(reason),
+	);
+	if (rewriteReasons.length === 0 || rewriteReasons.length !== reasons.length)
+		return null;
+	const hint = selectRewriteHint(candidate, hints, reasons);
+	if (!hint) return null;
+	const replacement = rewriteReplacementFromHint(hint, reasons);
+	if (!replacement || replacement === claimText(candidate)) return null;
+	const refs = backfillSourceRefs(candidate, [hint], urlToSourceRef);
+	if (refs.length === 0 && localEvidenceRefs(candidate).length === 0)
+		return null;
+	return {
+		...candidate,
+		originalClaim: claimText(candidate),
+		claim: replacement,
+		sourceRefs: refs,
+		sourceUrls: hint.url ? [hint.url] : sourceUrls(candidate),
+		sanitizerRewriteReasons: rewriteReasons,
+		reasonToVerify: `Deterministically rewritten to a source-backed atom from ${hint.sourceTitleOrPublisher ?? hint.url ?? hint.sourceRef ?? "source evidence"}.`,
+	};
+}
+
+function sanitizedCandidate(candidate, hints, urlToSourceRef) {
+	return {
+		...candidate,
+		id: candidateId(candidate),
+		claim: claimText(candidate),
+		sourceRefs: backfillSourceRefs(candidate, hints, urlToSourceRef),
+		sourceUrls: sourceUrls(candidate),
+		...(hints.length > 0 ? { sourceEvidenceHints: hints } : {}),
+		verifierInputPolicy: VERIFIER_INPUT_POLICY,
+	};
+}
+
+function withoutSanitizerGapReason(value) {
+	return stringOf(value)
+		.split(";")
+		.map((part) => part.trim())
+		.filter(
+			(part) => part && !part.startsWith("sanitized verifier candidates:"),
+		)
+		.join("; ");
+}
+
+function adjustFactSlotCoverage(rows, demotedBySlot, keptIds) {
+	return asArray(rows).map((row) => {
+		const slot = { ...asObject(row) };
+		const originalIds = compactStrings(slot.verificationCandidateIds, 24);
+		const filteredIds = originalIds.filter((id) => keptIds.has(id));
+		const demotedIds =
+			demotedBySlot.get(stringOf(slot.slotId ?? slot.id)) ?? [];
+		if (originalIds.length > 0 || demotedIds.length > 0) {
+			slot.verificationCandidateIds = filteredIds;
+		}
+		if (demotedIds.length > 0 && filteredIds.length === 0) {
+			if (slot.status === "filled") slot.status = "partial";
+			const prefix = stringOf(slot.gapReason);
+			const note = `sanitized verifier candidates: ${demotedIds.join(", ")}`;
+			slot.gapReason = prefix ? `${prefix}; ${note}` : note;
+		}
+		return slot;
+	});
+}
+
+export default async function sanitizeVerificationCandidates({
+	sources,
+	options = {},
+	context = {},
+}) {
+	const schemaCaps = await loadSchemaCaps();
+	const normalized = asObject(findSource(sources, "normalize-claims"));
+	const normalizeInputPacket = asObject(
+		findSource(sources, "normalize-input-packet"),
+	);
+	const evidenceHintRows = buildEvidenceHintRows(normalizeInputPacket);
+	const urlToSourceRef = await buildUrlSourceRefLookup(
+		normalizeInputPacket,
+		context,
+	);
+	const claimInventory = asObject(normalized.claimInventory);
+	const originalCandidates = asArray(claimInventory.verificationCandidates);
+	const keptCandidates = [];
+	const preservedClaims = [...asArray(claimInventory.preservedClaims)];
+	const coverageGaps = [...asArray(normalized.coverageGaps)];
+	const demotedBySlot = new Map();
+	const demotionReasonCounts = {};
+	const rewriteReasonCounts = {};
+	const demotedCandidateIds = [];
+	const rewrittenCandidateIds = [];
+	const seenIds = new Set();
+
+	for (const [index, candidate] of originalCandidates.entries()) {
+		const id = candidateId(candidate);
+		const hints = evidenceHintsForCandidate(candidate, evidenceHintRows);
+		const reasons = classifyCandidate(candidate, seenIds, hints, options);
+		if (id) seenIds.add(id);
+		if (reasons.length === 0) {
+			keptCandidates.push(sanitizedCandidate(candidate, hints, urlToSourceRef));
+			continue;
+		}
+		const rewrite = rewrittenCandidate(
+			candidate,
+			reasons,
+			hints,
+			urlToSourceRef,
+		);
+		if (rewrite) {
+			for (const reason of rewrite.sanitizerRewriteReasons) {
+				rewriteReasonCounts[reason] = (rewriteReasonCounts[reason] ?? 0) + 1;
+			}
+			rewrittenCandidateIds.push(id || `index-${index}`);
+			preservedClaims.push({
+				...preservedClaim(candidate, reasons, index),
+				status: "preserved_rewritten_before_verification",
+			});
+			keptCandidates.push(sanitizedCandidate(rewrite, hints, urlToSourceRef));
+			continue;
+		}
+		for (const reason of reasons) {
+			demotionReasonCounts[reason] = (demotionReasonCounts[reason] ?? 0) + 1;
+		}
+		demotedCandidateIds.push(id || `index-${index}`);
+		preservedClaims.push(preservedClaim(candidate, reasons, index));
+		coverageGaps.push(demotionGap(candidate, reasons));
+		for (const slotId of compactStrings(candidate?.factSlotIds, 12)) {
+			const list = demotedBySlot.get(slotId) ?? [];
+			list.push(id || `index-${index}`);
+			demotedBySlot.set(slotId, list);
+		}
+	}
+
+	// Web URL-only candidates cannot rejoin the wsrc ledger at audit time
+	// (observed as sourceRefJoinFailures on never-fetched URLs), so route them
+	// to backlog and refill the pool from source-backed preserved claims.
+	const webUrlOnlyDemotedIds = [];
+	const promotedCandidateIds = [];
+	const promotedBySlot = new Map();
+	const promotedPreservedClaims = new Set();
+	const retainedCandidates = [];
+	for (const [index, candidate] of keptCandidates.entries()) {
+		const hasRefs = sourceRefs(candidate).length > 0;
+		const hasLocal = localEvidenceRefs(candidate).length > 0;
+		if (hasRefs || hasLocal || sourceUrls(candidate).length === 0) {
+			retainedCandidates.push(candidate);
+			continue;
+		}
+		const id = candidateId(candidate) || `index-${index}`;
+		const reasons = ["web_url_without_source_ref_after_backfill"];
+		demotionReasonCounts[reasons[0]] =
+			(demotionReasonCounts[reasons[0]] ?? 0) + 1;
+		webUrlOnlyDemotedIds.push(id);
+		demotedCandidateIds.push(id);
+		preservedClaims.push({
+			...preservedClaim(candidate, reasons, index),
+			status: "preserved_missing_source_ref",
+		});
+		coverageGaps.push({
+			...demotionGap(candidate, reasons),
+			nextStep:
+				"Reacquire this claim's source with workflow_web_fetch_source so a wsrc_* sourceRef exists, or keep it as an explicit final-report gap.",
+		});
+		for (const slotId of compactStrings(candidate?.factSlotIds, 12)) {
+			const list = demotedBySlot.get(slotId) ?? [];
+			list.push(id);
+			demotedBySlot.set(slotId, list);
+		}
+	}
+	keptCandidates.length = 0;
+	keptCandidates.push(...retainedCandidates);
+
+	if (webUrlOnlyDemotedIds.length > 0) {
+		const takenIds = new Set(
+			keptCandidates.map((candidate) => candidateId(candidate)),
+		);
+		const promotable = [];
+		for (const [index, preserved] of asArray(
+			claimInventory.preservedClaims,
+		).entries()) {
+			const claim = claimText(preserved);
+			if (!claim) continue;
+			const id =
+				candidateId(preserved) ||
+				`promoted-${String(index + 1).padStart(3, "0")}`;
+			if (takenIds.has(id)) continue;
+			const hints = evidenceHintsForCandidate(preserved, evidenceHintRows);
+			const refs = backfillSourceRefs(preserved, hints, urlToSourceRef);
+			if (refs.length === 0) continue;
+			if (!hints.some((hint) => stringOf(hint.quote))) continue;
+			if (
+				classifyCandidate({ ...preserved, id }, new Set(), hints, options)
+					.length > 0
+			) {
+				continue;
+			}
+			const slots = compactStrings(preserved?.factSlotIds, 12);
+			if (slots.length === 0) continue;
+			const rescuesSlot = slots.some(
+				(slotId) => (demotedBySlot.get(slotId) ?? []).length > 0,
+			);
+			promotable.push({ preserved, id, hints, refs, slots, rescuesSlot });
+		}
+		promotable.sort(
+			(left, right) => Number(right.rescuesSlot) - Number(left.rescuesSlot),
+		);
+		for (const entry of promotable.slice(0, webUrlOnlyDemotedIds.length)) {
+			takenIds.add(entry.id);
+			promotedCandidateIds.push(entry.id);
+			promotedPreservedClaims.add(entry.preserved);
+			for (const slotId of entry.slots) {
+				const list = promotedBySlot.get(slotId) ?? [];
+				list.push(entry.id);
+				promotedBySlot.set(slotId, list);
+			}
+			keptCandidates.push(
+				sanitizedCandidate(
+					{
+						...entry.preserved,
+						id: entry.id,
+						sourceRefs: entry.refs,
+						verificationNeed:
+							stringOf(entry.preserved?.verificationNeed) || "useful",
+						reasonToVerify:
+							stringOf(entry.preserved?.reasonToVerify) ||
+							stringOf(entry.preserved?.whyItMatters) ||
+							"Promoted source-backed preserved claim to replace a URL-only candidate.",
+					},
+					entry.hints,
+					urlToSourceRef,
+				),
+			);
+		}
+	}
+
+	const keptIds = new Set(keptCandidates.map((candidate) => candidate.id));
+	const factSlotCoverageRows = adjustFactSlotCoverage(
+		normalized.factSlotCoverage,
+		demotedBySlot,
+		keptIds,
+	).map((row) => {
+		const slotId = stringOf(row.slotId ?? row.id);
+		const promoted = promotedBySlot.get(slotId) ?? [];
+		if (promoted.length === 0) return row;
+		const verificationCandidateIds = compactStrings(
+			[...asArray(row.verificationCandidateIds), ...promoted],
+			24,
+		);
+		const next = { ...row, verificationCandidateIds };
+		if (verificationCandidateIds.length > 0) {
+			if (next.status === "partial" || next.status === "missing") {
+				next.status = "filled";
+			}
+			const gapReason = withoutSanitizerGapReason(next.gapReason);
+			if (gapReason) next.gapReason = gapReason;
+			else delete next.gapReason;
+		}
+		return next;
+	});
+	const outputPreservedClaims =
+		promotedPreservedClaims.size === 0
+			? preservedClaims
+			: preservedClaims.filter((claim) => !promotedPreservedClaims.has(claim));
+	const cappedVerificationCandidates = clampArrayToSchemaCap(
+		keptCandidates,
+		schemaCaps.verificationCandidates,
+		"claimInventory.verificationCandidates",
+	);
+	const cappedPreservedClaims = clampArrayToSchemaCap(
+		outputPreservedClaims,
+		schemaCaps.preservedClaims,
+		"claimInventory.preservedClaims",
+	);
+	const cappedFactSlotCoverage = clampArrayToSchemaCap(
+		factSlotCoverageRows,
+		schemaCaps.factSlotCoverage,
+		"factSlotCoverage",
+	);
+	const schemaCapDrops = [
+		cappedVerificationCandidates.drop,
+		cappedPreservedClaims.drop,
+		cappedFactSlotCoverage.drop,
+	].filter(Boolean);
+	const outputCoverageGaps =
+		schemaCapDrops.length === 0
+			? coverageGaps
+			: [...coverageGaps, ...schemaCapDrops.map(schemaCapGap)];
+	return {
+		schema: SCHEMA,
+		claimInventory: {
+			verificationCandidates: cappedVerificationCandidates.rows,
+			preservedClaims: cappedPreservedClaims.rows,
+			duplicates: asArray(claimInventory.duplicates),
+		},
+		factSlotCoverage: cappedFactSlotCoverage.rows,
+		coverageGaps: outputCoverageGaps,
+		researchScopeCoverage: asArray(normalized.researchScopeCoverage),
+		normalizationNotes: normalized.normalizationNotes,
+		sanitizerDiagnostics: {
+			inputCandidateCount: originalCandidates.length,
+			keptCandidateCount: keptCandidates.length,
+			demotedCandidateCount: demotedCandidateIds.length,
+			rewrittenCandidateCount: rewrittenCandidateIds.length,
+			webUrlOnlyDemotedCount: webUrlOnlyDemotedIds.length,
+			promotedCandidateCount: promotedCandidateIds.length,
+			demotionReasonCounts,
+			rewriteReasonCounts,
+			keptCandidateIds: keptCandidates.map((candidate) => candidate.id),
+			demotedCandidateIds,
+			webUrlOnlyDemotedIds,
+			promotedCandidateIds,
+			rewrittenCandidateIds,
+			verifierInputPolicy: VERIFIER_INPUT_POLICY,
+			sourceEvidenceHintRows: evidenceHintRows.length,
+			schemaCaps,
+			schemaCapDrops,
+			degraded: schemaCapDrops.length > 0,
+			degradationReasons: schemaCapDrops.map(
+				(drop) =>
+					`${drop.path} exceeded maxItems ${drop.maxItems}; dropped ${drop.droppedCount}`,
+			),
+		},
+	};
+}

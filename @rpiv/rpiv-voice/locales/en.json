@@ -1,0 +1,45 @@
+{
+  "command.description": "Dictate text with your voice — local STT, no cloud",
+
+  "error.requires_interactive": "/voice requires interactive mode",
+  "error.model_download_failed": "Failed to download STT model. Check your internet connection.",
+  "error.model_extract_failed": "Downloaded STT model archive is corrupt. Please retry.",
+  "error.model_verify_failed": "STT model files are incomplete after download. Please retry.",
+  "error.model_stale_install": "STT model files were removed or corrupted. They will be redownloaded on next launch.",
+  "error.engine_load_failed": "Failed to load STT model.",
+  "error.mic_unavailable": "Microphone unavailable. Check that an input device is connected and that Pi has microphone permission.",
+
+  "splash.preparing": "Preparing model…",
+  "splash.downloading": "Downloading Whisper…",
+  "splash.extracting": "Extracting model files…",
+  "splash.verifying": "Verifying model files…",
+  "splash.loading_engine": "Loading speech model…",
+  "splash.initializing_mic": "Initializing microphone…",
+
+  "footer.enter_paste": "Enter to paste",
+  "footer.space_pause": "Space to pause",
+  "footer.space_resume": "Space to resume",
+  "footer.tab_settings": "Tab for settings",
+  "footer.esc_cancel": "Esc to cancel",
+  "footer.esc_back": "Esc to go back",
+  "footer.ctrl_s_save": "Ctrl-S to save",
+  "footer.enter_toggle": "Enter to toggle",
+
+  "transcript.placeholder": "Listening...",
+
+  "notify.settings_saved": "Voice settings saved",
+
+  "status.recording": "Recording",
+  "status.paused": "Paused",
+
+  "settings.microphone_label": "Microphone",
+  "settings.microphone_value_default": "System default input",
+  "settings.language_label": "Language",
+  "settings.language_value_auto": "Auto-detect",
+  "settings.language_hint": "Run /languages to change.",
+  "settings.hallucination_filter_label": "Filter Whisper noise",
+  "settings.hallucination_filter_hint": "Drops silence-segment artifacts. Turn off for single-word dictation.",
+
+  "settings.equalizer_label": "Equalizer",
+  "settings.equalizer_hint": "Show the live audio waveform under the transcript. Off by default."
+}

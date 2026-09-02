@@ -1,0 +1,413 @@
+# Features
+
+### LSP Support
+
+pi-lens includes **45 language server definitions** (including four cross-cutting *auxiliary* scanners that attach alongside the file's language server — Opengrep, ast-grep, zizmor, and typos — see below). LSP is **enabled by default**; use `--no-lsp` to disable it for a session. Servers are auto-discovered from PATH, project `node_modules`, and managed installs. When a server is not installed, pi-lens offers an interactive install prompt.
+
+**LSP Idle Management:** LSP servers shut down after 240 seconds of inactivity (no files modified) to free resources. The timer resets when you resume editing, preventing cold-start penalties during active development.
+
+**Warm files:** For language servers that index lazily (e.g. clangd), configure `warmFiles` in `.pi-lens/lsp.json` to open entry-point files at session start so the server has AST/index context before the first symbol query:
+
+```json
+{ "warmFiles": ["src/main.cpp", "src/lib.cpp"] }
+```
+
+**Agent LSP tools:** `lsp_diagnostics` can check one file, a directory, or an explicit `filePaths` batch with bounded concurrency. `lsp_navigation` provides definitions, references, hover, workspace symbols, call hierarchy, rename edits, and `findSymbol` for filtered document-symbol lookup. Key operations:
+
+- **`rename`** — renames a symbol across all references; `apply: true` writes workspace edits to disk with per-file LSP re-sync.
+- **`rename_file`** — LSP-aware file rename: sends `workspace/willRenameFiles` to collect import-path rewrites, applies them, renames the file on disk, and notifies servers via `workspace/didRenameFiles`. `apply: false` previews the workspace edits without touching the filesystem.
+- **`capabilities`** — shows which operations are supported by the active LSP server(s) for a file, read directly from the cached `initialize` response (no round-trip).
+- **Symbol column resolution** — passing `symbol: "myFunc"` instead of an exact `character` position resolves the correct column automatically. Use `symbol: "foo#2"` for the second occurrence of `foo` on the line.
+
+LSP servers for: TypeScript, Deno, Python (pyright/basedpyright + jedi), Go, Rust, Ruby (ruby-lsp + solargraph), PHP, C# (omnisharp), F#, Java (JDT LS, with Lombok javaagent support when a Lombok jar is available), Kotlin, Swift, Dart, Lua, C/C++, Zig, Haskell, Elixir, Gleam, OCaml, Clojure, CUE (syntax and parse diagnostics; evaluation errors via the cue-vet auxiliary runner), Terraform, Nix, Bash, Docker, YAML, JSON, HTML, TOML, Prisma, Vue, Svelte, CSS.
+
+### Formatters
+
+pi-lens auto-detects and runs **34 formatters** based on project config:
+
+biome, prettier, oxfmt, ruff, black, sqlfluff, gofmt, rustfmt, zig fmt, dart format, shfmt, nixfmt, mix format, ocamlformat, clang-format, ktlint, rubocop, standardrb, gleam format, terraform fmt, php-cs-fixer, csharpier, fantomas, swiftformat, stylua, ormolu, taplo, fish_indent, google-java-format, cljfmt, cmake-format, cue fmt, psscriptanalyzer-format
+
+Detection rules:
+
+- **Config-gated**: only runs when project config indicates usage (e.g. `biome.json`, `.prettierrc`, `ruff.toml`)
+- **Nearest-wins**: when multiple formatter configs exist at different directory levels, the one closest to the edited file wins
+- **Biome-default**: for JS/TS files without Prettier or Biome config, Biome is used as the default formatter
+- **Ruff-default**: for Python files without Black config, Ruff format is used when available
+
+Repositories can disable all immediate and deferred auto-format mutations with
+`format.enabled: false` in `.pi-lens.json`. Likewise,
+`autofix.enabled: false` disables the separate pipeline fixer phase while
+keeping formatter detection, lint dispatch, LSP synchronization, and
+diagnostics available.
+
+**Auto-fix timing depends on the tool.** A `write` (new file, full overwrite,
+or a bash-authored write like `sed -i`/a redirect) still gets pipeline autofix
+immediately, in the same tool result; when it changes the file, the result
+carries the full authoritative post-fix content (capped at 2 MiB per file, one
+shared budget across a multi-file bash write — past that it degrades to a
+re-read warning). An `edit` defers autofix to `agent_end`, where it joins the
+same per-file deferred-mutation queue as deferred formatting — one coalesced
+record per file (`kinds: {autofix, format}`), autofix draining before format
+so the final state is formatter-stable. A `write` immediately followed by an
+`edit` on the same file in the same turn demotes the write's autofix to
+deferred too. See `clients/pipeline.ts`, `clients/runtime-tool-result.ts`, and
+`clients/runtime-agent-end.ts`.
+
+**Bundled fallback lint configs stay conservative.** When a project ships no
+tool config, the package-owned fallback configs set the rules (`config/biome/core.jsonc`,
+`config/ruff/core.toml`, `config/markdownlint/core.json`). The biome fallback
+disables `useImportType`: its safe fix rewrites a value import used only in
+type positions into `import type`, which erases the runtime binding that
+experimental decorator metadata (`emitDecoratorMetadata`) still needs and
+breaks decorator-based dependency injection (refs #2385). Every other
+recommended rule stays on, and an explicit project `biome.json(c)` remains
+authoritative: if you enable `useImportType` there, pi-lens does not override
+it. The ruff fallback selects no flake8-type-checking (TC) rules and applies
+only safe fixes, so it never hoists imports into `TYPE_CHECKING` blocks.
+
+Deferred formatting (the `agent_end` default) runs with **bounded
+concurrency**: at most three formatter subprocesses in flight at once, with
+results applied in admission order and cooperative yields between files, so a
+large batch of queued files can't stall the event loop or the turn-end pass.
+
+### Commit/Push Guard (Experimental)
+
+`--lens-guard` (also `guard.enabled: true` in `~/.pi-lens/config.json`) opts
+into blocking `git commit`/`git push` while unresolved pi-lens blockers exist.
+Detection covers normalized wrapper launchers, shell-escaped and
+keyword/combined-flag verb forms, and shell substitutions, while literal text
+in non-executing contexts remains allowed. Off by default; see
+[docs/agent-guide.md](agent-guide.md) and [docs/settings.md](settings.md) for
+the full behavior and honest limits.
+
+### Review Graph - Cascade Diagnostics
+
+pi-lens builds a review graph (`file → symbol → dependency`) during session and uses it at turn end to render an impact cascade: which files were affected by a change and how diagnostics propagated through the dependency graph. Nodes track kind, language, and export status; edges track contains/imports/calls/references.
+
+### Read-Before-Edit Guard
+
+pi-lens enforces a **read-before-edit** policy on all file writes and edits. Before allowing a `write` or `edit` tool call on an existing file, it verifies that the agent has previously read sufficient context:
+
+- **Zero-read block** — blocks any edit to a file not read in the current session. Agent-created files are exempt: when a `write` tool creates a new file, pi-lens registers the written content as a synthetic read, so an immediate follow-up `edit` is not blocked
+- **File-modified block** — blocks if the file changed on disk since the last read (auto-format, external tool, or a previous edit that was then reformatted)
+- **Out-of-range block** — blocks if the edit target lines fall outside the ranges previously read, ensuring the agent cannot modify code it hasn't seen
+- **Snapshot validation** — covered edit ranges are hash-checked against the lines the agent actually saw at read time; stale-range edits are rejected even when range coverage exists. Hash capture covers reads up to 3 000 lines
+
+Coverage is tracked across multiple reads: two reads of lines 1–100 and 101–200 together satisfy a full-file write. Symbol-expanded reads (small reads silently widened to the enclosing symbol via tree-sitter) count toward coverage at the symbol level. Markdown files generate a warning instead of blocking (edits outside the section-expanded read range are warned, not silently passed). Plain-text (`.txt`) and log (`.log`) files remain fully exempt.
+
+Override for a single edit: `/lens-allow-edit <path>`
+
+Configure behavior with `--no-read-guard` to disable it entirely, or use the
+read-guard configuration to select `warn` instead of `block` where supported.
+
+### Module Report + Read Symbol (Read Substitute)
+
+For "tell me about this file" or "show me one function", prefer the
+`module_report` + `read_symbol` pair over a full `read`. Together they're
+~4× cheaper than reading the whole file (12 k → 4 k tokens on a 42-symbol
+file) and the agent gets a navigable outline plus targeted body fetches
+instead of a flat blob of source. See
+[`module-report-read-symbol.md`](module-report-read-symbol.md)
+for the full design and token-efficiency numbers.
+
+**`module_report(filePath, maxRefsPerSymbol?, focus?, view?, blastRadius?, blastRadiusDepth?)`** —
+returns a structured outline: every symbol's name/kind/startLine/endLine/signature
+(plus a first-line `doc` summary when a doc comment is attached — #512),
+exported vs internal split (with class/interface members nested under their
+container), who-uses-this (`usedBy`), fanout/complexity risk flags, and a
+`recommendedReads` top-3 ranked by usage + complexity. No per-symbol `read`
+block (#512) — `offset`/`limit` are pure derivations of `startLine`/`endLine`
+on the report's own `path`, so build a read call as
+`{path: report.path, offset: startLine, limit: endLine - startLine + 1}`.
+Cross-file entries (`blastRadius.files[].read`, `usedBy[].file`) keep their own
+path since they point at a different file. Pass `blastRadius: true` to also get
+the cross-file **blast radius** — transitive dependents aggregated to ranked
+file `read` args ("if you change this, verify these files"); read-only over
+the cached graph, omitted when cold (this replaced the standalone
+`pilens_impact` tool). `view: "compact"` returns a line-oriented text
+rendering (one line per symbol/callback, roughly a quarter of the JSON cost)
+instead of JSON — same data, opt-in. Tree-sitter extract + cached review-graph
+lookup; never builds the graph, never calls LSP on this path.
+`semantic.source` reports what backed the data (`review-graph` | `none`).
+
+**`read_symbol(filePath, symbol)`** — returns the verbatim body of one
+named symbol plus a one-line header (`<kind> <name>  <basename>:<startLine>-<endLine>`).
+Records the read against the read-guard so a follow-up edit anywhere in
+that symbol's range passes the read-before-edit check (an outline from
+`module_report` deliberately does NOT — an outline is shape, not body).
+
+**When to use which:**
+
+- **Skim an unfamiliar file** → `module_report`, then `read_symbol` on the
+  one symbol you actually need. ~−60% vs a full `read` for the common case.
+- **One giant function in a long file** → skip `module_report`; `read` a
+  line range instead (or `read_symbol` if it's named).
+- **Tiny file (≤ ~10 lines, 0 symbols)** → just `read`; `module_report`'s
+  metadata overhead exceeds the file.
+- **Looking for a textual pattern across files** → use `grep` (not `module_report`).
+- **Need exact LSP cross-file resolution** → use `lsp_navigation({operation: "definition"})`.
+
+**MCP mirror:** `pilens_module_report` and `pilens_read_symbol` in the
+pi-lens MCP server expose the same shape to Claude Code / any MCP client.
+
+### Actionable Warnings
+
+At `turn_end`, pi-lens writes `.pi-lens/cache/actionable-warnings.json` summarizing fixable warnings introduced by the current turn. This powers the optional conservative autofix at `agent_end`.
+
+**Report contents:**
+
+- Warnings are delta-only by default: only diagnostics in lines touched during the current turn are included. Pass `--lens-actionable-warning-all` to report all warnings regardless of location
+- Each warning carries a stable `aw:<hash>` ID derived from file, rule, and message, so suppression state persists across turns in `.pi-lens/cache/actionable-warning-state.json`
+- Sources: pipeline `fixable` diagnostics (always included) and LSP code-action warnings when `--lens-actionable-warning-actions` is set
+- When warnings are present, a concise advisory is injected into the agent context (no blocker language)
+
+**Conservative autofix (`agent_end`):**
+
+When `actionableWarnings.autoFix.enabled` is set in global or project config (or `--lens-actionable-warning-autofix`), pi-lens applies LSP quickfixes from the report at `agent_end`. A project can explicitly disable this mutation with `actionableWarnings.autoFix.enabled: false` without disabling the report. Safety gates:
+
+- Re-fetches code actions from the live LSP server at fix time (stale actions are skipped)
+- Skips any warning with zero or multiple eligible actions (ambiguity is not resolved)
+- Applies only `edit`-kind actions (no command-only or create/delete operations)
+- Hard cap of 5 fixes per `agent_end`
+- Suppressed warnings are never autofixed
+
+**Flags:**
+
+- `--lens-actionable-warnings` — enable the turn_end report
+- `--lens-actionable-warning-actions` — include LSP code-action warnings in the report
+- `--lens-actionable-warning-autofix` — apply conservative fixes at agent_end
+- `--lens-actionable-warning-all` — report all warnings, not just delta
+
+### Bus Events — `pilens:files:touched` (#482)
+
+pi-lens writes files **outside the agent's own tool calls**: dispatch autofix (biome/ruff/eslint/stylelint/sqlfluff/rubocop/ktlint/ktfmt/rust-clippy/dart-fix/golangci-lint/detekt/markdownlint/oxlint --fix) mutates the file immediately for a `write` and at `agent_end` for a deferred `edit` (see "Formatters" above); formatter runs (immediate or deferred-at-`agent_end`) do the same; and the conservative actionable-warnings autofix above applies LSP quickfixes at `agent_end` the same way. Other extensions in the same session that track file mutations are otherwise blind to those writes — this event, published either way, is how they find out.
+
+pi-lens broadcasts them on pi's shared in-process event bus (`pi.events`, exposed to every extension via the `ExtensionAPI`) as a single named event:
+
+```
+event:   pilens:files:touched
+payload: {
+  v: 1,
+  source: "pi-lens",
+  reason: "autofix" | "format",
+  paths: string[],   // absolute, normalized (forward slashes, canonical casing)
+  cwd: string,       // absolute, normalized
+}
+```
+
+One event per logical write batch (not per file) — e.g. a single eslint `--fix` invocation that touches one file emits one event with `paths: [thatFile]`; a deferred-format pass across several queued files emits one event listing all of them.
+
+**Versioning policy: additive-only.** New optional fields may be added under `v: 1`. A breaking change to an existing field's meaning bumps `v`. Consumers should ignore unknown fields.
+
+**Non-goals:** pi-lens does not (yet) consume anyone's bus events, and does not emit for edits the agent makes itself through its own tool calls — the host already knows about those. This is a broadcast-only surface; see `#478` for the planned `pilens:rpc:*` request/response query API that will reuse the same versioning discipline.
+
+**Kill switch:** `PI_LENS_BUS_PUBLISH=0` disables publishing entirely (see `docs/environment-variables.md`). Publishing is fire-and-forget — a disabled/unavailable/throwing bus never affects the write path's own success or latency.
+
+**Fix provenance (#502):** `FilesTouchedPayload` gained an additive, optional `fixes` field so a diff/review consumer can distinguish a pi-lens-mechanical hunk from an agent edit:
+
+```
+fixes?: Array<{
+  path: string,             // absolute, normalized
+  tool: string,              // e.g. "prettier", "ruff", "biome", "lsp-quickfix"
+  ruleId?: string,
+  kind: "autofix" | "format",
+}>
+```
+
+Old consumers that don't know this field ignore it (still frozen-additive, still `v: 1`). Attribution is best-effort at some call sites: a single autofix batch can run several tools across several changed files without the underlying runners reporting a per-file breakdown, so in that case every tool that fired in the batch is attributed to every file the batch changed (documented per call site in `clients/pipeline.ts`). The `reason: "autofix" | "format"` field on the payload continues to work standalone for consumers that only need the coarse signal.
+
+### Bus Events — `pilens:diagnostics` (#502)
+
+Extends the #482 producer family from "which files changed" to "what pi-lens knows about them" — the second `pi.events` broadcast surface, so terminal-native diff/review extensions (e.g. interactive diff review, split/unified diff rendering) can render pi-lens's findings as inline annotations in their own views instead of pi-lens owning a review UI.
+
+```
+event:   pilens:diagnostics
+payload: {
+  v: 1,
+  source: "pi-lens",
+  cwd: string,                    // absolute, normalized
+  seq: number,                    // monotonic per-emission counter (process-lifetime, not persisted)
+  ts: number,                     // emission wall-clock time, ms since epoch
+  files: [{
+    path: string,                 // absolute, normalized
+    diagnostics: [{
+      ruleId?: string,
+      severity: "error" | "warning" | "info" | "hint",
+      line?: number,
+      col?: number,
+      message: string,
+      tool: string,
+      fixable?: boolean,
+    }],
+    truncated?: boolean,          // set when this file's diagnostics exceeded the per-event cap
+  }],
+}
+```
+
+**Emission seam.** One event per write batch, emitted immediately after `recordDiagnostics` (`clients/widget-state.ts`) commits the batch's final per-file diagnostic set — i.e. after auto-format, autofix, and dispatch have all run for that write (see the phase order in `clients/pipeline.ts`). This guarantees the event reflects the LATEST post-batch state, never an intermediate runner result.
+
+**CONSUMER CONTRACT — staleness/replace semantics (load-bearing, follow LSP `publishDiagnostics` conventions):**
+
+1. **Full-replace per file, never a delta.** Every event carries the COMPLETE current diagnostic set for each file it mentions. An event mentioning path P replaces everything a consumer previously held for P — never merge/append across events for the same path.
+2. **Empty array = explicitly clean.** When a file's diagnostics clear, pi-lens emits `{path, diagnostics: []}` for it exactly once, on the transition. Silence never means clean (the same #240 doctrine, applied on the producer side here) — a consumer that stops hearing about a path has learned nothing about its current state.
+3. **Monotonic `seq` + `ts` per emission.** Out-of-order receipt (including a future disk-tail consumer à la #492) resolves deterministically: higher `seq` always wins, lower is discarded.
+4. **`pilens:files:touched` (#482) is an invalidation hint, not new data.** Between an edit landing (a files:touched event) and the next diagnostics batch for that path, a consumer's previously-held diagnostics for that path are PROVISIONAL — the file changed on disk but hasn't been re-analyzed yet. Consumers that want to avoid rendering stale annotations across that window should treat a files:touched path as "diagnostics pending" until the next `pilens:diagnostics` event mentions it.
+
+Late-joiners are a non-problem in-process — extensions activate at `session_start`, before any turn emits — so v1 is push-only (no request/replay).
+
+**Caps:** at most 12 diagnostics per file per event (`MAX_DIAGNOSTICS_PER_FILE_EVENT` in `clients/diagnostics-publish.ts`, aligned with the widget's own per-file storage cap), errors prioritized over other severities when capping; a capped file entry sets `truncated: true`. File contents are never included inline.
+
+**Kill switch:** `PI_LENS_BUS_PUBLISH=0` (same family as #482 — no new env var).
+
+**Versioning policy: additive-only**, same discipline as #482.
+
+**Before/after content:** intentionally omitted from v1 (the size/complexity tradeoff the original issue sketch flagged) — a consumer that needs pre-format text for diff rendering is a follow-up, not part of this event.
+
+**Shared schema with #478 (bound, not merged).** The `PilensDiagnosticsPayload` type (`clients/diagnostics-publish.ts`) is defined once and reused verbatim by #478's future `pilens:rpc:diagnostics` pull response — push (this event) and pull (#478) are two deliveries of the same shape over the same lens-engine seam. #478 stays separately gated on #449 registry dogfooding.
+
+### Opportunistic Read Expansion
+
+When the agent reads a small slice of a file (≤ 60 lines), pi-lens transparently expands the read to the full enclosing symbol (function, method, or class) using the tree-sitter AST. The agent receives the full symbol as context, and the read guard records symbol-level coverage so edits anywhere within that symbol pass without requiring the agent to have read every line individually. Expansion runs within a 200 ms budget and falls back silently on unsupported file types or parse failures.
+
+Supported: TypeScript, TSX, JavaScript, JSX, Python, Go, Rust, Ruby, Java, Kotlin, Dart, Elixir, C, C++, C#, PHP, Swift, Lua, OCaml, Zig, Bash.
+
+### Fact Rules Pipeline
+
+Covers JavaScript/TypeScript, Python, Go, Rust, Ruby, Shell, and CMake. A TypeScript AST-based fact-rule engine extracts function-level metrics and evaluates quality and security rules inline. Blocking rules surface immediately at write time; advisory rules are available via `lens_diagnostics mode=full`.
+
+### AST Search and Replace
+
+`ast_grep_search` and `ast_grep_replace` provide AST-aware pattern matching across 40+ languages via the `sg` CLI. Key capabilities:
+
+- **Metavariable captures** — named captures (`$VAR`, `$$$ARGS`) appear below each match: `$VAR=x  $$$ARGS=a,b,c`.
+- **Strictness modes** — `strictness: "relaxed"` ignores optional punctuation (trailing commas, semicolons) that causes zero matches in `smart` mode. Also supports `ast`, `cst`, `signature`, `template`.
+- **Pagination** — `skip: N` offsets into large result sets; truncated results include a next-page hint.
+- **Stale-preview detection** — `ast_grep_replace` re-validates the pattern before writing; returns a clear error if files changed since the preview instead of applying against wrong content.
+- **`ast_grep_dump`** — dumps the full tree-sitter AST for a source snippet. Use this when a pattern returns zero matches and the correct node kind or field name is unknown.
+
+### Tree-sitter Rules
+
+Structural rules organized by language in `rules/tree-sitter-queries/<language>/`. Rules marked **🔴** block the agent inline at write time (only for lines in the current edit); others are advisory.
+
+**Suppressing a finding:** add `// pi-lens-ignore: rule-id` on the flagged line or the line above (JS/TS), or `# pi-lens-ignore: rule-id` for Python/Ruby/Shell. This suppresses that specific rule at that location only.
+
+**Bring your own rules:** drop YAML query files into `rules/tree-sitter-queries/<language>/` in your project — pi-lens merges them with the built-ins on session start. The schema, predicates (`eq`, `match`, `any-of`), and `inline_tier` (`blocking` | `warning` | `review`) are documented in [`custom-rules.md`](custom-rules.md). A `rules/tree-sitter-queries/rule-schema.json` JSON Schema is bundled for editor autocomplete via `.vscode/settings.json`.
+
+### Ast-Grep Rules
+
+Pattern-based structural rules in `rules/ast-grep-rules/` across JS, TS, and Python — covers security (eval, hardcoded secrets, insecure randomness, dangerous DOM sinks), correctness (strict equality, constant conditions, duplicate keys), code smells (nested ternaries, long parameter lists, redundant state), and agent stubs (unimplemented bodies, raise NotImplementedError).
+
+**Bring your own rules:** drop YAML rule files anywhere under `rules/ast-grep-rules/rules/` in your project — recursive discovery merges them with the built-ins, and the same `id` as a built-in overrides it consistently in raw ast-grep/LSP and NAPI. Duplicate IDs within one source layer are blocking configuration errors. The supported schema is documented in [`custom-rules.md`](custom-rules.md), with a `rules/ast-grep-rules/rule-schema.json` JSON Schema for editor autocomplete.
+
+**Catalog port + playground cross-check:** 11 rules in `rules/ast-grep-rules/rules/` were ported from the official [ast-grep catalog](https://ast-grep.github.io/catalog) (security, correctness, framework-hygiene), and 184 vendored CWE-mapped rules live in `rules/ast-grep-rules/coderabbit/rules/`. To cross-validate a rule against the upstream playground, use `scripts/playground-verify-rule.mjs` (loads the rule into the [upstream playground](https://ast-grep.github.io/playground.html) via headless Chrome and reports the match count the upstream engine produces — a second opinion against the local `ast-grep` binary; see [`astplayground.md`](astplayground.md)).
+
+### Opengrep Security Scanner (Auxiliary LSP, Experimental)
+
+[Opengrep](https://github.com/opengrep/opengrep) (an open, login-free fork of Semgrep) runs as a pi-lens **auxiliary diagnostic LSP** — a cross-cutting, diagnostic-only language server that attaches *alongside* the file's normal language server (TypeScript, Python, …) and contributes findings on the same on-write diagnostics path. Running it as a warm LSP server compiles its ruleset **once per session** rather than on every file, so per-file scans cost ~1–2s (vs ~8s for a cold CLI invocation per file). High-signal security findings become blocking; the rest are advisory.
+
+- **On by default** (it's a registered LSP server) when the `opengrep` binary is available; pi-lens **auto-installs it on demand** — a single GitHub-release binary, **no login, token, or telemetry**. Disable with `--no-opengrep`.
+- **Rules:** a repo `.opengrep.yml`/`.opengrep.yaml` (or a legacy `.semgrep.yml`/`.semgrep.yaml`, whose format Opengrep consumes natively) is used if present; otherwise it falls back to Opengrep's login-free `auto` Community ruleset.
+
+This is the first adopter of pi-lens's **auxiliary-LSP capability** (`role:"auxiliary"` servers + `clients/dispatch/auxiliary-lsp.ts`) — the same path future cross-cutting scanners (spelling, secrets, …) plug into by registration.
+
+Local rules can opt into pi-lens blocking semantics with metadata:
+
+```yaml
+metadata:
+  pi-lens:
+    semantic: blocking
+    defect_class: injection
+    confidence: high
+```
+
+### Dependency &amp; secret session scans
+
+Three external scanners run **once per session in the background** (not on every write — their inputs change at most daily and the scans are whole-tree). Each is **opt-in and auto-installed only when its gate trips**; results surface at turn end, with the highest-severity findings treated as blockers and the rest as advisory.
+
+| Scanner | Finds | Opt-in gate | Auto-install |
+|---|---|---|---|
+| **gitleaks** | Committed secrets (API keys, tokens, certs) — regex + entropy, language-agnostic | `.gitleaks.toml` / `.gitleaksignore`, a `gitleaks` dep, or a pre-commit hook referencing it | GitHub release |
+| **govulncheck** | Go module CVEs **reachable** from the build graph (call-graph filtered) | a `go.mod` at the analysis root | `go install` (needs the Go toolchain) |
+| **trivy** | Dependency CVEs across every ecosystem (npm, PyPI, Maven/Gradle, Go, Cargo, Composer, RubyGems, NuGet, …), **hardcoded secrets**, and **dependency license risk** (copyleft/restricted licenses) — all from one `trivy fs` pass | **`trivy.enabled: true` in `.pi-lens.json`** *and* a dependency manifest at the root | GitHub release |
+
+Secret findings from **gitleaks, trivy, and the ast-grep `*-hardcoded-secret-*` rules** are collapsed **by location** before surfacing: the same credential flagged by several scanners (with different rule ids) is reported **once** with combined provenance (`[gitleaks + trivy + ast-grep]`), not two or three times — the duplicate advisory copy is suppressed. This is the dedup contract that lets multiple secret scanners coexist without the triple-report noise.
+
+Trivy requires an **explicit** opt-in (rather than just a manifest being present) because its first run pulls a 30–200 MB vulnerability database. Enable it per-project — or globally via a `~/.pi-lens.json` — and optionally widen severity:
+
+```jsonc
+// .pi-lens.json
+{
+  "trivy": {
+    "enabled": true,
+    "minSeverity": "MEDIUM" // default "HIGH"; HIGH/CRITICAL are always surfaced
+  }
+}
+```
+
+**IaC misconfiguration (per-edit, not a session scan).** When `trivy.enabled` is set, pi-lens also runs `trivy config` as an on-write dispatch runner (alongside hadolint/tflint) over **Dockerfiles** and **Kubernetes manifests** (YAML with an `apiVersion:` + `kind:` signature) — Trivy's security-policy engine (runs-as-root, no `HEALTHCHECK`, `privileged: true`, missing resource limits, …), a different class from hadolint's lint. On Dockerfiles, trivy-config findings that hadolint already reports at the same line are suppressed, so it only adds the security checks hadolint lacks. Compose/CloudFormation are tracked as follow-ups; Terraform is covered by the same runner, and Helm charts are covered by rendered-manifest validation below.
+
+**Rendered-manifest validation for Helm charts (opt-in).** `helm lint` checks a chart's source; it cannot see what the chart produces. When a project sets
+
+```json
+{ "helm": { "renderValidation": { "enabled": true } } }
+```
+
+pi-lens also renders the nearest chart with `helm template` into a scratch directory under the system temp dir and validates the output:
+
+- a **failed render** (a missing values key, a nil pointer in a template expression, a dependency declared in `Chart.yaml` but absent from `charts/`) is reported as a blocking finding on the template that failed — charts that pass `helm lint` and still cannot be installed;
+- every rendered document must declare `apiVersion` and `kind`, so a conditional that renders a headless fragment is flagged instead of installing as a silent no-op;
+- when `trivy.enabled` is also set, `trivy config` runs over the rendered manifests, which is the only way Trivy's Kubernetes policy checks can see a chart's real output.
+
+It is **off by default** because rendering executes chart-authored template code, and the switch alone is not enough: the render also requires **host project trust**, since `.pi-lens.json` is a tracked file a cloned repository could ship pre-enabled. The switch is read from the chart's own project root, not the current directory. In untrusted mode the refusal is reported rather than silently skipped. Nothing is written to the chart directory, `--dependency-update` is never passed, and the scratch directory is removed on every exit path. Findings map back to the source template through helm's own `# Source:` annotations; rendered line numbers travel in the message, since they do not correspond to template lines. Full OpenAPI schema validation (kubeconform) is not included.
+
+### MCP Server (Experimental)
+
+pi-lens ships an MCP (Model Context Protocol) server so Claude Code — or any MCP client — can drive the same diagnostic + read-substitute surface that the pi agent tools expose, without running pi. The server is a **second host adapter** alongside the pi extension; both call into the same `clients/lens-engine.ts` seam so a single implementation powers both surfaces.
+
+**Why a second host:** the pi extension's tools are registered via the host SDK and run on pi's event loop. Claude Code lives in a different process with no SDK access. The MCP server sits in that gap, speaking JSON-RPC over stdio (or a warm Unix socket / Windows named pipe side-channel for the Claude Code PostToolUse hook). It's the easiest way to live-test, debug, and dogfood pi-lens — including running a **review loop** where Claude commits to pi-lens and re-measures.
+
+**16 tools, grouped by lifecycle layer** (the same three layers the pi agent hooks use):
+
+| Layer | MCP tools | What they expose |
+|---|---|---|
+| **Per-edit** | `pilens_analyze`, `pilens_lsp_diagnostics`, `pilens_lsp_navigation`, `pilens_ast_grep_search`, `pilens_ast_grep_replace`, `pilens_module_report`, `pilens_read_symbol` | The fast pipeline (format → autofix → LSP diagnostics → parallel runners) plus the structured read-substitute pair. `analyze` accepts `mode: warm \| fresh` — `warm` reuses the server's in-process LSP, `fresh` forks a worker that loads freshly-built code from disk so the result reflects the latest commit. |
+| **Per-turn** | `pilens_turn_end` | Drives the **real** `handleTurnEnd` (knip incremental, dep-circular, cascade, tests, actionable+code-quality warnings) — not a re-implementation. Caller-supplied edited files are auto-registered into turn-state via `addModifiedRange`. |
+| **Per-session** | `pilens_session_start` | Drives the **real** `handleSessionStart` — full jscpd/knip/madge/govulncheck/gitleaks/trivy scans + complexity baselines + LSP warm. The error-debt baseline is not currently populated by the production session-start path. |
+| **Project / observability** | `pilens_project_scan`, `pilens_diagnostics`, `pilens_health`, `pilens_latency`, `pilens_symbol_search` | Cheap project-wide scans, cached diagnostic state, latency telemetry, ranked identifier search (BM25 over the persisted word index — see [docs/word-index.md](word-index.md)). Cross-file blast radius now lives in `pilens_module_report`'s `blastRadius` option. `pilens_health` (and its pi-side `/lens-health` counterpart) also reports a bounded, process-local **degradation ledger** — trust refusals, mode suppressions, LSP breaker trips, formatter skips/failures, TypeScript/word-index/review-graph/project-snapshot idle evictions, WASM aborts, and diagnostics-timeout tallies — so silently degraded behavior stays visible instead of vanishing into a log. |
+| **Lifecycle / loop** | `pilens_rebuild` | Runs `npm run build:dist` so `pilens_analyze mode=fresh` reflects the latest commit. Makes the review loop self-contained: commit → `pilens_rebuild` → `pilens_analyze mode=fresh` → `pilens_latency`. |
+
+**Honest limits** (live-tested, documented in `mcp.md`):
+
+- **`fresh` always cold-spawns the LSP**, so it systematically under-reports LSP diagnostics on large TS projects (`typescript-language-server` must index the whole project first). The result carries an explicit `lsp` honesty signal (`ran` / `status` / `diagnosticCount` / `durationMs`) so a cold `0` is never read as "clean" — use `warm` for LSP-complete reviews.
+- **`pilens_analyze` by default surfaces everything** (`blockingOnly=false`); the per-edit fast path in the pi extension is still blocking-first.
+- **The MCP server keeps the LSP warm across calls** within its process; `fresh` is for benchmarking a real cold spawn, not for steady-state usage.
+
+**Transport is hand-rolled JSON-RPC** over stdio — zero new dependencies. The `npm install --omit=dev` constraint means even an "optional" SDK weighs down every pi-lens install; ~200 LOC of plain JSON-RPC beats a dep for a tools-only server. A warm Unix-socket / Windows-named-pipe side-channel (`clients/mcp/ipc.ts`) lets the `pi-lens-analyze` PostToolUse hook reuse the server's warm LSP without touching the stdio transport.
+
+**Install / register in Claude Code:**
+
+```bash
+# Build the bundled dist (or `npm run build` for the in-place dev build)
+npm run build:dist
+
+# User-scope registration with auto session-start on connect
+claude mcp add --scope user pi-lens \
+  -e PI_LENS_MCP_AUTO_SESSION=1 \
+  -- node <repo>/dist/mcp/server.js
+```
+
+**Hooks** (`settings.json`) close the loop: PostToolUse = per-edit, Stop = per-turn.
+
+```json
+{ "hooks": {
+  "PostToolUse": [
+    { "matcher": "Edit|Write",
+      "hooks": [ { "type": "command", "command": "pi-lens-analyze --hook" } ] } ],
+  "Stop": [
+    { "hooks": [ { "type": "command", "command": "pi-lens-analyze --turn-end", "timeout": 60 } ] } ]
+} }
+```
+
+The per-edit hook falls back to a cold local analysis when no server is up; the `Stop` hook is **warm-server-only** because only the server process owns the session state and pending turn work. It skips with a single stderr line when unavailable. Workspace IPC requests are ordered, so a timed-out PostToolUse client cannot let `Stop` overtake analysis still running in the server. `SubagentStop` is deliberately not registered because subagent edits already reach turn-state through PostToolUse.
+
+The full design + tier-by-tier progress (and known limits) lives in [`docs/mcp.md`](docs/mcp.md). Status: **experimental** — the foundation is solid (transport, warm LSP, lifecycle handlers wired), but the surface is still maturing. Use the pi extension for production agent work; reach for the MCP server for debugging, dogfooding, and direct Claude Code access.

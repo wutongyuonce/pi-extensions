@@ -1,0 +1,61 @@
+{
+  "name": "pi-kanban0",
+  "version": "0.3.1",
+  "description": "A zero-service, local-first Kanban board and agent tool for Pi",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/AHGGG/pi-kanban0.git"
+  },
+  "homepage": "https://github.com/AHGGG/pi-kanban0#readme",
+  "bugs": {
+    "url": "https://github.com/AHGGG/pi-kanban0/issues"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "keywords": [
+    "pi-package",
+    "pi",
+    "pi-extension",
+    "kanban",
+    "markdown",
+    "tui"
+  ],
+  "files": [
+    "src",
+    "README.md",
+    "README.zh-CN.md",
+    "LICENSE"
+  ],
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": ">=0.83.0",
+    "@earendil-works/pi-coding-agent": ">=0.83.0",
+    "@earendil-works/pi-tui": ">=0.83.0"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "check": "npm run typecheck && npm test",
+    "prepublishOnly": "npm run check",
+    "verify:board": "tsx scripts/verify-board.ts"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "0.83.0",
+    "@earendil-works/pi-coding-agent": "0.83.0",
+    "@earendil-works/pi-tui": "0.83.0",
+    "@types/node": "^26.1.2",
+    "tsx": "^4.20.0",
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.0"
+  }
+}

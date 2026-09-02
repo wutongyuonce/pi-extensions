@@ -1,0 +1,2861 @@
+// @ts-nocheck
+import { open } from "node:fs/promises";
+import {
+	copyToClipboard,
+	type ExtensionCommandContext,
+} from "@earendil-works/pi-coding-agent";
+
+import {
+	workflowRunPath,
+	fromProjectPath,
+	isWorkflowRunLaunchMetadata,
+	listRunRecords,
+	readIndex,
+	readJson,
+	readRunRecord,
+	readWorkflowLaunchCommandArtifact,
+	supervisorPath,
+} from "./store.js";
+import { detectRunStall, type WorkflowRunStallInfo } from "./engine.js";
+import {
+	diagnoseWorkflowRunHealth,
+	diagnoseWorkflowTaskHealth,
+	type WorkflowProgressHealth,
+} from "./workflow-progress-health.js";
+import { buildWorkflowRunMetrics } from "./workflow-metrics.js";
+import {
+	buildDynamicToolResultBudgetMetrics,
+	type DynamicToolResultBudgetRollup,
+} from "./dynamic-tool-result-budget-metrics.js";
+import {
+	readParentUsage,
+	type WorkflowParentUsageRecord,
+} from "./workflow-parent-usage.js";
+import {
+	type WorkflowIndexRecord,
+	type WorkflowRunRecord,
+	type WorkflowRunStatus,
+	type WorkflowTaskRunRecord,
+	WORKFLOW_RUN_TYPE,
+	type TaskRunStatus,
+	type TaskSummary,
+	type WorkflowSupervisorRecord,
+} from "./types.js";
+
+const REFRESH_INTERVAL_MS = 1_000;
+const MAX_LIST_ROWS = 18;
+const MAX_STAGE_TASK_ROWS = 18;
+const TASK_ARTIFACT_MAX_LINES = 1_000;
+const TASK_ARTIFACT_VIEW_LINES = 16;
+const LAUNCH_COMMAND_VIEW_LINES = 18;
+
+type TaskArtifactView = "output" | "prompt";
+
+type Component = {
+	render(width: number): string[];
+	handleInput?(data: string): void;
+	invalidate(): void;
+	dispose?(): void;
+};
+
+type TUI = {
+	requestRender(force?: boolean): void;
+};
+
+type WorkflowSummary = WorkflowIndexRecord["runs"][number];
+type ViewMode = "runs" | "stages" | "tasks" | "task";
+type Theme = {
+	fg?: (color: string, text: string) => string;
+	bg?: (color: string, text: string) => string;
+	bold?: (text: string) => string;
+};
+
+export async function showWorkflowView(
+	ctx: ExtensionCommandContext,
+	initialRunId?: string,
+	workflowCwd = ctx.cwd,
+): Promise<void> {
+	await ctx.ui.custom<void>((tui, theme, _keybindings, done) => {
+		const view = new WorkflowView(
+			workflowCwd,
+			tui,
+			theme as Theme,
+			done,
+			initialRunId,
+		);
+		view.start();
+		return view;
+	});
+}
+
+export class WorkflowView implements Component {
+	private mode: ViewMode = "runs";
+	private flows: WorkflowSummary[] = [];
+	private supervisors = new Map<string, WorkflowSupervisorRecord>();
+	private selectedFlow = 0;
+	private selectedStage = 0;
+	private selectedTask = 0;
+	private selectedTaskId = "";
+	private detailRun?: WorkflowRunRecord;
+	private parentUsage?: WorkflowParentUsageRecord;
+	private taskArtifactView: TaskArtifactView = "output";
+	private artifactScrollLine = 0;
+	private outputLines: string[] = [];
+	private promptLines: string[] = [];
+	private loadedTaskKey = "";
+	private message = "";
+	private error = "";
+	private loading = true;
+	private reloadActive = false;
+	private closed = false;
+	private launchCommandOpen = false;
+	private launchCommandText = "";
+	private launchCommandScrollLine = 0;
+	private launchLoadGeneration = 0;
+	private launchVerificationFailures = new Map<
+		string,
+		{ identity: string; reason: string }
+	>();
+	private timer?: ReturnType<typeof setInterval>;
+
+	constructor(
+		private readonly cwd: string,
+		private readonly tui: TUI,
+		private readonly theme: Theme,
+		private readonly done: () => void,
+		private readonly initialRunId?: string,
+		private readonly copyLaunchCommand: (
+			text: string,
+		) => Promise<void> = copyToClipboard,
+	) {}
+
+	start(): void {
+		void this.reload(true);
+		this.timer = setInterval(
+			() => void this.reload(false),
+			REFRESH_INTERVAL_MS,
+		);
+		this.timer.unref?.();
+	}
+
+	dispose(): void {
+		if (this.timer) clearInterval(this.timer);
+		this.timer = undefined;
+		this.clearLaunchCommand();
+	}
+
+	invalidate(): void {}
+
+	handleInput(data: string): void {
+		if (this.isCloseInput(data)) {
+			this.close();
+			return;
+		}
+
+		if (this.launchCommandOpen) {
+			this.handleLaunchCommandInput(data);
+			return;
+		}
+
+		if (data === "r" || data === "R") {
+			this.message = "refreshing";
+			void this.reload(true);
+			this.tui.requestRender();
+			return;
+		}
+
+		if (
+			(data === "v" || data === "V") &&
+			(this.mode === "runs" || this.mode === "stages")
+		) {
+			void this.openLaunchCommand();
+			return;
+		}
+
+		if (this.mode === "task") {
+			this.handleTaskInput(data);
+			return;
+		}
+
+		this.handleBoardInput(data);
+	}
+
+	render(width: number): string[] {
+		const viewportWidth = Math.max(1, Math.floor(width || 1));
+		// Leave a small right gutter. Some terminals/container PTYs wrap or leave
+		// stale cells when a custom view writes border glyphs in the final columns,
+		// which makes the right edge of the workflow panel look broken.
+		const contentWidth = Math.max(1, viewportWidth - 2);
+		const selectedTask = this.selectedTaskRecord();
+		let lines: string[];
+		if (this.launchCommandOpen) {
+			lines = this.renderLaunchCommand(contentWidth);
+		} else if (this.mode === "task" && this.detailRun && selectedTask) {
+			lines = this.renderTaskDetail(contentWidth, this.detailRun, selectedTask);
+		} else {
+			lines = this.renderBoard(contentWidth);
+		}
+		// Return full-width lines so Pi clears stale cells to the right, while the
+		// actual border/content remains inside contentWidth and never touches the
+		// terminal's final columns.
+		return lines.map((line) => padAnsi(fit(line, contentWidth), viewportWidth));
+	}
+
+	private handleBoardInput(data: string): void {
+		if (matchesKey(data, "escape") || this.isBackInput(data)) {
+			this.drillUp();
+			return;
+		}
+
+		if (data === "[" || data === "p" || data === "P") {
+			this.moveModeSelection(-1);
+			return;
+		}
+		if (data === "]" || data === "n" || data === "N") {
+			this.moveModeSelection(1);
+			return;
+		}
+
+		if (matchesKey(data, "left") || data === "h" || data === "H") {
+			this.drillUp();
+			return;
+		}
+		if (matchesKey(data, "right") || data === "l" || data === "L") {
+			this.drillDown();
+			return;
+		}
+
+		if (matchesKey(data, "up") || data === "k" || data === "K") {
+			this.moveModeSelection(-1);
+			return;
+		}
+		if (matchesKey(data, "down") || data === "j" || data === "J") {
+			this.moveModeSelection(1);
+			return;
+		}
+
+		if (
+			matchesKey(data, "enter") ||
+			matchesKey(data, "return") ||
+			data === "\r"
+		) {
+			this.drillDown();
+		}
+	}
+
+	private handleTaskInput(data: string): void {
+		if (
+			matchesKey(data, "escape") ||
+			data === "b" ||
+			data === "B" ||
+			matchesKey(data, "backspace")
+		) {
+			this.mode = "tasks";
+			this.message = "";
+			this.tui.requestRender();
+			return;
+		}
+
+		if (matchesKey(data, "left")) {
+			this.switchTaskArtifact(-1);
+			return;
+		}
+		if (matchesKey(data, "right")) {
+			this.switchTaskArtifact(1);
+			return;
+		}
+
+		if (matchesKey(data, "up")) {
+			this.scrollTaskArtifact(-1);
+			return;
+		}
+		if (matchesKey(data, "down")) {
+			this.scrollTaskArtifact(1);
+			return;
+		}
+
+		if (data === "[" || data === "p" || data === "P") {
+			this.moveTask(-1);
+			return;
+		}
+		if (data === "]" || data === "n" || data === "N") {
+			this.moveTask(1);
+		}
+	}
+
+	private async reload(forceDetail: boolean): Promise<void> {
+		if (this.reloadActive) return;
+		this.reloadActive = true;
+		try {
+			const previousRunId = this.detailRun?.runId;
+			const flows = await loadFlowSummaries(this.cwd, this.initialRunId);
+			this.flows = flows;
+			this.supervisors = await loadRunSupervisors(this.cwd, flows);
+			this.selectedFlow = clampIndex(this.selectedFlow, flows.length);
+			const selectedRunId = flows[this.selectedFlow]?.runId;
+			if (previousRunId && previousRunId !== selectedRunId)
+				this.clearLaunchCommand();
+			const initialRunId = this.initialRunId;
+			if (initialRunId && this.loading) {
+				const initialIndex = flows.findIndex(
+					(flow) =>
+						flow.runId === initialRunId || flow.runId.startsWith(initialRunId),
+				);
+				if (initialIndex >= 0) {
+					this.selectedFlow = initialIndex;
+					this.mode = "stages";
+				}
+			}
+
+			if (
+				(this.mode === "runs" ||
+					this.mode === "stages" ||
+					this.mode === "tasks" ||
+					this.mode === "task" ||
+					forceDetail) &&
+				flows.length > 0
+			) {
+				const selected = flows[this.selectedFlow];
+				if (selected) {
+					this.detailRun = await readRunRecord(this.cwd, selected.runId);
+					this.parentUsage = await readParentUsage(
+						this.cwd,
+						selected.runId,
+					).catch(() => undefined);
+					this.clampStageAndTask();
+					await this.updateTaskPreviews();
+				}
+			}
+
+			this.error = "";
+			if (this.message === "refreshing") this.message = "refreshed";
+		} catch (error) {
+			this.error = error instanceof Error ? error.message : String(error);
+		} finally {
+			this.loading = false;
+			this.reloadActive = false;
+			this.tui.requestRender();
+		}
+	}
+
+	private async updateTaskPreviews(): Promise<void> {
+		const task = this.selectedTaskRecord();
+		if (!task) {
+			this.outputLines = [];
+			this.promptLines = [];
+			this.loadedTaskKey = "";
+			this.resetArtifactScroll();
+			return;
+		}
+
+		const taskKey = `${task.taskId}:${task.files.output}:${task.files.taskPrompt}`;
+		if (taskKey !== this.loadedTaskKey) {
+			this.loadedTaskKey = taskKey;
+			this.resetArtifactScroll();
+		}
+
+		const [outputLines, promptLines] = await Promise.all([
+			readFileLinesBounded(
+				this.cwd,
+				task.files.output,
+				TASK_ARTIFACT_MAX_LINES,
+			),
+			readFileLinesBounded(
+				this.cwd,
+				task.files.taskPrompt,
+				TASK_ARTIFACT_MAX_LINES,
+			),
+		]);
+		this.outputLines = outputLines;
+		this.promptLines = promptLines;
+		this.artifactScrollLine = Math.min(
+			this.artifactScrollLine,
+			this.maxArtifactScrollLine(),
+		);
+	}
+
+	private handleLaunchCommandInput(data: string): void {
+		if (matchesKey(data, "escape") || data === "b" || data === "B") {
+			this.clearLaunchCommand();
+			this.message = "";
+			this.tui.requestRender();
+			return;
+		}
+		if (matchesKey(data, "up")) {
+			this.launchCommandScrollLine = Math.max(
+				0,
+				this.launchCommandScrollLine - 1,
+			);
+			this.tui.requestRender();
+			return;
+		}
+		if (matchesKey(data, "down")) {
+			this.launchCommandScrollLine += 1;
+			this.tui.requestRender();
+			return;
+		}
+		if (data === "c" || data === "C") void this.copyLoadedLaunchCommand();
+	}
+
+	private async openLaunchCommand(): Promise<void> {
+		const run = this.detailRun;
+		if (!run?.launch) {
+			this.message = "launch command unavailable: not captured";
+			this.tui.requestRender();
+			return;
+		}
+		if (!isWorkflowRunLaunchMetadata(run.launch)) {
+			this.message = "launch command unavailable: metadata malformed";
+			this.tui.requestRender();
+			return;
+		}
+		if (run.launch.command.state !== "captured") {
+			this.message = "launch command unavailable: tool launch";
+			this.tui.requestRender();
+			return;
+		}
+
+		const identity = this.launchCommandMetadataIdentity(run);
+		if (!identity) return;
+		const generation = ++this.launchLoadGeneration;
+		this.message = "loading launch command";
+		this.tui.requestRender();
+		try {
+			const text = await readWorkflowLaunchCommandArtifact(this.cwd, run);
+			if (
+				this.closed ||
+				generation !== this.launchLoadGeneration ||
+				this.detailRun?.runId !== run.runId ||
+				this.launchCommandMetadataIdentity(this.detailRun) !== identity
+			)
+				return;
+			this.launchVerificationFailures.delete(run.runId);
+			this.launchCommandText = text;
+			this.launchCommandScrollLine = 0;
+			this.launchCommandOpen = true;
+			this.message = "";
+		} catch (error) {
+			if (
+				generation !== this.launchLoadGeneration ||
+				!this.detailRun ||
+				this.launchCommandMetadataIdentity(this.detailRun) !== identity
+			)
+				return;
+			const message = launchCommandUnavailableMessage(error);
+			this.clearLaunchCommand();
+			this.recordLaunchVerificationFailure(run, message);
+			this.message = message;
+		} finally {
+			this.tui.requestRender();
+		}
+	}
+
+	private async copyLoadedLaunchCommand(): Promise<void> {
+		if (!this.launchCommandOpen) return;
+		const text = this.launchCommandText;
+		try {
+			await this.copyLaunchCommand(text);
+			if (!this.launchCommandOpen || this.launchCommandText !== text) return;
+			this.message = "Launch command copied";
+		} catch {
+			if (!this.launchCommandOpen || this.launchCommandText !== text) return;
+			this.message = "Launch command copy failed";
+		} finally {
+			this.tui.requestRender();
+		}
+	}
+
+	private clearLaunchCommand(): void {
+		this.launchLoadGeneration += 1;
+		this.launchCommandOpen = false;
+		this.launchCommandText = "";
+		this.launchCommandScrollLine = 0;
+	}
+
+	private launchCommandMetadataIdentity(
+		run: WorkflowRunRecord,
+	): string | undefined {
+		if (
+			!isWorkflowRunLaunchMetadata(run.launch) ||
+			run.launch.command.state !== "captured"
+		)
+			return undefined;
+		return JSON.stringify([run.runId, run.launch.command]);
+	}
+
+	private launchVerificationFailure(
+		run: WorkflowRunRecord,
+	): string | undefined {
+		const identity = this.launchCommandMetadataIdentity(run);
+		const failure = this.launchVerificationFailures.get(run.runId);
+		return identity && failure?.identity === identity
+			? failure.reason
+			: undefined;
+	}
+
+	private recordLaunchVerificationFailure(
+		run: WorkflowRunRecord,
+		message: string,
+	): void {
+		const identity = this.launchCommandMetadataIdentity(run);
+		if (!identity) return;
+		this.launchVerificationFailures.set(run.runId, {
+			identity,
+			reason: launchCommandUnavailableReason(message),
+		});
+	}
+
+	private renderLaunchCommand(width: number): string[] {
+		const bodyWidth = Math.max(1, width - 4);
+		const wrapped = wrapLaunchCommand(
+			escapeLaunchCommandForDisplay(this.launchCommandText),
+			bodyWidth,
+		);
+		const maxStart = Math.max(0, wrapped.length - LAUNCH_COMMAND_VIEW_LINES);
+		const start = Math.min(this.launchCommandScrollLine, maxStart);
+		this.launchCommandScrollLine = start;
+		const end = Math.min(wrapped.length, start + LAUNCH_COMMAND_VIEW_LINES);
+		const visible = wrapped.slice(start, end);
+		const lines = [
+			warning(this.theme, "Sensitive user input · control characters escaped"),
+			muted(
+				this.theme,
+				"Clipboard retention is controlled by the OS/terminal.",
+			),
+			"",
+			...visible.map((line) => previewText(this.theme, line)),
+			"",
+			scrollIndicator(
+				this.theme,
+				wrapped.length === 0
+					? "0 / 0"
+					: `${start + 1}-${end} / ${wrapped.length}`,
+			),
+		];
+		return [
+			...boxed(this.theme, "Launch Command", width, lines, "borderAccent"),
+			"",
+			this.footer("↑/↓ scroll · c copy exact command · b/Esc back · q close"),
+			...(this.message ? [messageText(this.theme, this.message)] : []),
+		];
+	}
+
+	private renderBoard(width: number): string[] {
+		const lines = [...this.renderDrilldownHeader(width)];
+
+		if (this.loading && this.flows.length === 0) {
+			lines.push(
+				...boxed(this.theme, "Loading", width, [
+					placeholder(this.theme, "loading workflows..."),
+				]),
+			);
+		} else if (this.flows.length === 0) {
+			lines.push(
+				...boxed(this.theme, "Runs", width, [
+					placeholder(this.theme, "no workflow runs found"),
+				]),
+			);
+		} else if (this.mode === "runs") {
+			lines.push(...this.renderRunsScreen(width));
+		} else if (this.mode === "stages" && this.detailRun) {
+			lines.push(...this.renderStagesScreen(width, this.detailRun));
+		} else if (this.mode === "tasks" && this.detailRun) {
+			lines.push(...this.renderTasksScreen(width, this.detailRun));
+		} else if (this.detailRun) {
+			lines.push(...this.renderTasksScreen(width, this.detailRun));
+		}
+
+		lines.push("", this.footer(this.footerText(width)));
+		if (this.message) lines.push(messageText(this.theme, this.message));
+		if (this.error) lines.push(errorText(this.theme, this.error));
+		return lines;
+	}
+
+	private renderDrilldownHeader(width: number): string[] {
+		const taskSummary =
+			this.mode !== "runs" ? this.detailRun?.taskSummary : undefined;
+		const active = taskSummary
+			? taskSummary.running
+			: this.flows.filter((flow) => flow.status === "running").length;
+		const blocked = taskSummary
+			? taskSummary.blocked
+			: this.flows.filter((flow) => flow.status === "blocked").length;
+		const failed = taskSummary
+			? taskSummary.failed + taskSummary.interrupted
+			: this.flows.filter(
+					(flow) => flow.status === "failed" || flow.status === "interrupted",
+				).length;
+		const completed = taskSummary
+			? taskSummary.completed
+			: this.flows.filter((flow) => flow.status === "completed").length;
+		const context =
+			this.mode === "tasks"
+				? ""
+				: ` ${muted(this.theme, "·")} ${metaValue(this.theme, this.breadcrumbText())}`;
+		const lines = [
+			`${chip(this.theme, "mode", this.mode === "task" ? "detail" : this.mode, "accent")} ${chip(this.theme, "running", String(active), "accent")} ${chip(this.theme, "blocked", String(blocked), "warning")} ${chip(this.theme, "failed", String(failed), "error")} ${chip(this.theme, "done", String(completed), "success")}${context}`,
+		];
+		return [
+			...boxed(this.theme, "✦ Flow Board", width, lines, "borderAccent"),
+			"",
+		];
+	}
+
+	private renderRunsScreen(width: number): string[] {
+		const selected = this.flows[this.selectedFlow];
+		const selectedDetail =
+			selected && this.detailRun?.runId === selected.runId
+				? this.detailRun
+				: undefined;
+		const activeRuns = this.flows.filter(
+			(flow) => flow.status === "running",
+		).length;
+		const actionRuns = this.flows.filter((flow) =>
+			["failed", "blocked", "interrupted"].includes(flow.status),
+		).length;
+		const sideLines = [
+			`${metaLabel(this.theme, "all")} ${metaValue(this.theme, String(this.flows.length))} ${muted(this.theme, "·")} ${metaLabel(this.theme, "active")} ${metaValue(this.theme, String(activeRuns))} ${muted(this.theme, "·")} ${metaLabel(this.theme, "action")} ${metaValue(this.theme, String(actionRuns))}`,
+			"",
+			accent(this.theme, "Selected"),
+			...(selected
+				? this.runSummaryLines(selected, selectedDetail)
+				: [placeholder(this.theme, "none")]),
+		];
+		return this.renderTwoPane(
+			width,
+			"Summary",
+			sideLines,
+			"Runs",
+			this.runLines(Math.max(1, this.mainPaneBodyWidth(width))),
+			32,
+		);
+	}
+
+	private renderStagesScreen(width: number, run: WorkflowRunRecord): string[] {
+		const sideLines = this.runDetailSummaryLines(run);
+		return this.renderTwoPane(
+			width,
+			"Run Summary",
+			sideLines,
+			"Stages",
+			this.stageLines(run, Math.max(1, this.mainPaneBodyWidth(width))),
+			34,
+		);
+	}
+
+	private renderTasksScreen(width: number, run: WorkflowRunRecord): string[] {
+		const leftBodyWidth = width < 92 ? Math.max(1, width - 4) : 30;
+		const leftLines = this.compactStageLines(run, leftBodyWidth);
+		const rightBodyWidth = Math.max(1, this.mainPaneBodyWidth(width));
+		return this.renderTwoPane(
+			width,
+			"Stages",
+			leftLines,
+			`${this.currentStageId(run) ?? "Stage"} tasks`,
+			this.taskLines(run, rightBodyWidth),
+			34,
+		);
+	}
+
+	private renderTwoPane(
+		width: number,
+		leftTitle: string,
+		leftLines: string[],
+		rightTitle: string,
+		rightLines: string[],
+		preferredLeftWidth: number,
+	): string[] {
+		if (width < 92) {
+			return [
+				...boxed(this.theme, leftTitle, width, leftLines),
+				"",
+				...boxed(this.theme, rightTitle, width, rightLines, "borderAccent"),
+			];
+		}
+
+		const leftWidth = Math.min(
+			Math.max(28, preferredLeftWidth),
+			Math.max(28, Math.floor(width * 0.32)),
+		);
+		const rightWidth = Math.max(40, width - leftWidth - 1);
+		const left = boxed(this.theme, leftTitle, leftWidth, leftLines);
+		const right = boxed(
+			this.theme,
+			rightTitle,
+			rightWidth,
+			rightLines,
+			"borderAccent",
+		);
+		const maxRows = Math.max(left.length, right.length);
+		const rendered: string[] = [];
+		for (let index = 0; index < maxRows; index += 1) {
+			rendered.push(
+				joinFixedColumns(
+					[left[index] ?? "", right[index] ?? ""],
+					[leftWidth, rightWidth],
+				),
+			);
+		}
+		return rendered;
+	}
+
+	private mainPaneBodyWidth(width: number): number {
+		if (width < 92) return width - 4;
+		const leftWidth = Math.min(34, Math.max(28, Math.floor(width * 0.32)));
+		return width - leftWidth - 5;
+	}
+
+	private renderTaskDetail(
+		width: number,
+		run: WorkflowRunRecord,
+		task: WorkflowTaskRunRecord,
+	): string[] {
+		const taskHealth = diagnoseWorkflowTaskHealth(task, run);
+		const lines = [
+			...boxed(
+				this.theme,
+				"Task Detail",
+				width,
+				[
+					`${statusGlyph(this.theme, task.status)} ${strong(this.theme, task.displayName)} ${statusBadge(this.theme, task.status)} ${healthInline(this.theme, taskHealth)} ${muted(this.theme, this.breadcrumbText())}`,
+					taskMetaLine(this.theme, [
+						["agent", task.agent],
+						["stage", task.stageId ?? "(none)"],
+						["runtime", taskRuntimeSummary(task)],
+						["elapsed", taskElapsed(task)],
+					]),
+				],
+				statusColor(task.status),
+			),
+			"",
+		];
+
+		const validationLines = this.taskValidationStripLines(task, width - 4);
+		if (validationLines.length > 0) {
+			lines.push(
+				...boxed(
+					this.theme,
+					"Validation",
+					width,
+					validationLines,
+					task.outputValidation?.status === "invalid" ||
+						task.outputValidation?.valid === false
+						? "error"
+						: "warning",
+				),
+				"",
+			);
+		}
+
+		if (width >= 118) {
+			const leftWidth = 42;
+			const mainWidth = Math.max(60, width - leftWidth - 1);
+			const widths = [leftWidth, mainWidth];
+			const left = boxed(
+				this.theme,
+				"Task / Runtime",
+				leftWidth,
+				[
+					...this.taskOverviewLines(run, task, leftWidth - 4),
+					"",
+					...this.taskTimelineLines(run, task, leftWidth - 4),
+				],
+				statusColor(task.status),
+			);
+			const main = boxed(
+				this.theme,
+				"Artifact Viewer",
+				mainWidth,
+				this.taskArtifactViewerLines(task, mainWidth - 4),
+				"borderAccent",
+			);
+			const maxRows = Math.max(left.length, main.length);
+			for (let index = 0; index < maxRows; index += 1) {
+				lines.push(
+					joinFixedColumns([left[index] ?? "", main[index] ?? ""], widths),
+				);
+			}
+		} else {
+			lines.push(
+				...boxed(
+					this.theme,
+					"Agent / Timeline",
+					width,
+					this.taskIdentityLines(run, task, width - 4),
+				),
+				"",
+				...boxed(
+					this.theme,
+					"Artifact Viewer",
+					width,
+					this.taskArtifactViewerLines(task, width - 4),
+					"borderAccent",
+				),
+			);
+		}
+
+		lines.push("", this.footer(this.footerText(width)));
+		if (this.message) lines.push(messageText(this.theme, this.message));
+		if (this.error) lines.push(errorText(this.theme, this.error));
+		return lines;
+	}
+
+	private runLines(width: number): string[] {
+		const window = visibleWindow(this.flows, this.selectedFlow, MAX_LIST_ROWS);
+		const lines: string[] = [];
+		if (window.hiddenBefore > 0)
+			lines.push(
+				scrollIndicator(this.theme, `  ${window.hiddenBefore} more runs above`),
+			);
+		const statusWidth = Math.max(
+			7,
+			...window.rows.map(({ item }) =>
+				visibleWidth(statusLabelText(runStatusLabel(item))),
+			),
+		);
+		for (const { item: flow, index } of window.rows) {
+			const selected = index === this.selectedFlow;
+			const prefix = selected ? accent(this.theme, "› ") : "  ";
+			const marker = statusGlyph(this.theme, flow.status);
+			const name = flow.name ?? flow.type;
+			const left = `${prefix}${marker} ${selected ? strong(this.theme, name) : name}`;
+			const detailRun =
+				this.detailRun?.runId === flow.runId ? this.detailRun : undefined;
+			const health = diagnoseWorkflowRunHealth(detailRun ?? flow);
+			const healthText =
+				health.state === "completed"
+					? ""
+					: ` ${muted(this.theme, "·")} ${healthLabel(this.theme, health)}`;
+			const stallBadge = this.stallBadge(flow);
+			const stallText = stallBadge ? ` ${stallBadge}` : "";
+			const baseRight = `${statusColumn(this.theme, flow.status, runStatusLabel(flow), statusWidth)}  ${progressBar(this.theme, flow.taskSummary, 5)}`;
+			const right = `${baseRight}${healthText}${stallText}`;
+			const line = joinColumns(left, right, width, 17);
+			lines.push(selectedLine(this.theme, line, width, selected, true));
+		}
+		if (window.hiddenAfter > 0)
+			lines.push(
+				scrollIndicator(this.theme, `  ${window.hiddenAfter} more runs below`),
+			);
+		return lines;
+	}
+
+	private stageLines(run: WorkflowRunRecord, width: number): string[] {
+		const stages = stageSummaries(run);
+		const currentStage = this.currentStageId(run);
+		return stages.map((stage) => {
+			const selected = stage.id === currentStage;
+			const status = statusForSummary(stage.summary);
+			const prefix = selected ? accent(this.theme, "› ") : "  ";
+			const label = `${prefix}${statusGlyph(this.theme, status)} ${selected ? strong(this.theme, stage.id) : stage.id}`;
+			const right = `${statusBadge(this.theme, status)} ${progressBar(this.theme, stage.summary, 8)}`;
+			const line = joinColumns(
+				label,
+				right,
+				width,
+				Math.max(16, Math.floor(width * 0.52)),
+			);
+			return selectedLine(this.theme, line, width, selected, true);
+		});
+	}
+
+	private compactStageLines(run: WorkflowRunRecord, width: number): string[] {
+		const stages = stageSummaries(run);
+		const currentStage = this.currentStageId(run);
+		return stages.map((stage) => {
+			const selected = stage.id === currentStage;
+			const status = statusForSummary(stage.summary);
+			const prefix = selected ? accent(this.theme, "› ") : "  ";
+			const label = `${prefix}${statusGlyph(this.theme, status)} ${selected ? strong(this.theme, stage.id) : stage.id}`;
+			const line = joinColumns(
+				label,
+				compactStatusLabel(this.theme, status),
+				width,
+				Math.max(12, Math.floor(width * 0.55)),
+			);
+			return selectedLine(this.theme, line, width, selected, true);
+		});
+	}
+
+	private taskLines(run: WorkflowRunRecord, width: number): string[] {
+		const allTasks = this.tasksForSelectedStage(run);
+		const window = visibleWindow(
+			allTasks,
+			this.selectedTask,
+			MAX_STAGE_TASK_ROWS,
+		);
+		const lines: string[] = [];
+		if (window.hiddenBefore > 0)
+			lines.push(
+				scrollIndicator(
+					this.theme,
+					`  ${window.hiddenBefore} more tasks above`,
+				),
+			);
+		for (const { item: task, index } of window.rows) {
+			const selected = index === this.selectedTask;
+			const prefix = selected ? accent(this.theme, "› ") : "  ";
+			const left = `${prefix}${statusGlyph(this.theme, task.status)} ${selected ? strong(this.theme, task.displayName) : task.displayName}`;
+			const right = taskListStatusLabel(
+				this.theme,
+				task,
+				diagnoseWorkflowTaskHealth(task, run),
+			);
+			const line = joinColumns(
+				left,
+				metaByStatus(this.theme, task.status, right),
+				width,
+				Math.max(22, Math.floor(width * 0.45)),
+			);
+			lines.push(selectedLine(this.theme, line, width, selected, true));
+		}
+		if (window.hiddenAfter > 0)
+			lines.push(
+				scrollIndicator(this.theme, `  ${window.hiddenAfter} more tasks below`),
+			);
+		return lines.length > 0
+			? lines
+			: [placeholder(this.theme, "  no tasks in selected stage")];
+	}
+
+	private taskIdentityLines(
+		run: WorkflowRunRecord,
+		task: WorkflowTaskRunRecord,
+		width: number,
+	): string[] {
+		return [
+			...this.taskOverviewLines(run, task, width),
+			"",
+			...this.taskTimelineLines(run, task, width),
+		];
+	}
+
+	private taskOverviewLines(
+		run: WorkflowRunRecord,
+		task: WorkflowTaskRunRecord,
+		width: number,
+	): string[] {
+		const thinkingClamp = taskThinkingClamp(task);
+		const lines = [
+			`${statusGlyph(this.theme, task.status)} ${strong(this.theme, task.displayName)}`,
+			kvRow(this.theme, "status", task.status),
+			kvRow(this.theme, "stage", task.stageId ?? "(none)"),
+			"",
+			accent(this.theme, "Runtime"),
+			kvRow(this.theme, "agent", task.agent, "syntaxType"),
+			kvRow(this.theme, "model", task.runtime.model ?? "(not recorded)"),
+			kvRow(this.theme, "thinking", task.runtime.thinking ?? "(not recorded)"),
+			...(thinkingClamp
+				? [
+						kvRow(
+							this.theme,
+							"Pi clamp",
+							`${thinkingClamp.requested} → ${thinkingClamp.resolved} (unsupported)`,
+							"warning",
+						),
+					]
+				: []),
+			kvRow(
+				this.theme,
+				"logs",
+				`/workflow logs ${run.runId} ${task.specId || task.taskId}`,
+			),
+			...this.taskUsageLines(task),
+			...this.taskToolResultBudgetLines(run, task),
+		];
+		return lines.map((line) => fit(line, width));
+	}
+
+	private taskUsageLines(task: WorkflowTaskRunRecord): string[] {
+		const usage = task.usage?.aggregate ?? task.usage;
+		if (!usage) {
+			const reason =
+				task.agent === "support" || task.kind === "support"
+					? "n/a (support helper)"
+					: "(not reported)";
+			return [
+				"",
+				accent(this.theme, "Usage"),
+				kvRow(this.theme, "tokens", reason),
+			];
+		}
+		const tokens = formatTokenCount(usage.totalTokens);
+		const inputTokens = formatTokenCount(usage.inputTokens);
+		const outputTokens = formatTokenCount(usage.outputTokens);
+		const cacheRead = formatTokenCount(usage.cacheReadInputTokens);
+		const cacheWrite = formatTokenCount(usage.cacheCreationInputTokens);
+		const lines = [
+			"",
+			accent(this.theme, "Usage"),
+			kvRow(this.theme, "tokens", tokens ?? "(not reported)"),
+		];
+		if (inputTokens || outputTokens)
+			lines.push(
+				kvRow(
+					this.theme,
+					"in / out",
+					`${inputTokens ?? "n/a"} / ${outputTokens ?? "n/a"}`,
+				),
+			);
+		if (cacheRead || cacheWrite)
+			lines.push(
+				kvRow(
+					this.theme,
+					"cache r/w",
+					`${cacheRead ?? "n/a"} / ${cacheWrite ?? "n/a"}`,
+				),
+			);
+		const attempts = task.usage?.aggregate?.attempts;
+		if (attempts !== undefined && attempts > 1)
+			lines.push(kvRow(this.theme, "attempts", String(attempts)));
+		return lines;
+	}
+
+	private taskToolResultBudgetLines(
+		run: WorkflowRunRecord,
+		task: WorkflowTaskRunRecord,
+	): string[] {
+		if (task.dynamicGenerated === undefined) return [];
+		const metrics = buildDynamicToolResultBudgetMetrics(run).byTask.find(
+			(candidate) => candidate.taskId === task.taskId,
+		);
+		if (!metrics) return [];
+		const lines = toolResultBudgetMetricLines(this.theme, metrics, false);
+		lines.push(
+			kvRow(
+				this.theme,
+				"coverage",
+				toolResultBudgetCoverageLabel(metrics, false),
+			),
+		);
+		const attemptTotal = metrics.terminalAttempts || metrics.attempts;
+		if (attemptTotal > 0)
+			lines.push(
+				taskMetaLine(this.theme, [
+					["telemetry", `${metrics.reportingAttempts}/${attemptTotal}`],
+					[
+						"counters",
+						`${metrics.evictionCounterReportingAttempts}/${metrics.evictionCounterExpectedAttempts}`,
+					],
+				]),
+			);
+		return lines;
+	}
+
+	private runToolResultBudgetLines(run: WorkflowRunRecord): string[] {
+		const totals = buildDynamicToolResultBudgetMetrics(run).totals;
+		if (totals.tasks === 0 || !hasToolResultBudgetViewSignal(totals)) return [];
+		const lines = [
+			...toolResultBudgetMetricLines(this.theme, totals, true),
+			kvRow(
+				this.theme,
+				"coverage",
+				toolResultBudgetCoverageLabel(totals, true),
+			),
+		];
+		const other = toolResultBudgetOtherCoverageLabel(totals);
+		if (other) lines.push(kvRow(this.theme, "other", other));
+		if (totals.evictionCounterExpectedAttempts > 0)
+			lines.push(
+				kvRow(
+					this.theme,
+					"counters",
+					`${totals.evictionCounterReportingAttempts}/${totals.evictionCounterExpectedAttempts}`,
+				),
+			);
+		return lines;
+	}
+
+	private taskTimelineLines(
+		run: WorkflowRunRecord,
+		task: WorkflowTaskRunRecord,
+		width: number,
+	): string[] {
+		const lines = [timelineLine(this.theme, "created", run.createdAt, "dim")];
+		if (task.startedAt)
+			lines.push(timelineLine(this.theme, "started", task.startedAt, "accent"));
+		if (task.completedAt)
+			lines.push(
+				timelineLine(
+					this.theme,
+					"completed",
+					task.completedAt,
+					statusColor(task.status),
+				),
+			);
+		lines.push(
+			timelineLine(
+				this.theme,
+				"elapsed",
+				taskElapsed(task),
+				statusColor(task.status),
+			),
+		);
+		if (task.lastMessage)
+			lines.push(timelineLine(this.theme, "last", task.lastMessage, "warning"));
+		const validation = taskValidationSummary(task);
+		if (validation)
+			lines.push(
+				timelineLine(
+					this.theme,
+					"contract",
+					validation.status,
+					validation.status === "valid"
+						? "success"
+						: validation.status === "invalid"
+							? "error"
+							: "warning",
+				),
+			);
+		return lines.map((line) => fit(line, width));
+	}
+
+	private taskValidationStripLines(
+		task: WorkflowTaskRunRecord,
+		width: number,
+	): string[] {
+		const summary = taskValidationSummary(task);
+		if (!summary) return [];
+		return [
+			fit(validationLine(this.theme, summary.status, summary.message), width),
+		];
+	}
+
+	private taskArtifactViewerLines(
+		task: WorkflowTaskRunRecord,
+		width: number,
+	): string[] {
+		const selectedLabel =
+			this.taskArtifactView === "output" ? "Output" : "Prompt";
+		const switchHint =
+			this.taskArtifactView === "output" ? "→ Prompt" : "← Output";
+		const sourceLines = this.currentArtifactSourceLines();
+		const total = sourceLines.length;
+		const maxStart = Math.max(0, total - TASK_ARTIFACT_VIEW_LINES);
+		const start = Math.min(this.artifactScrollLine, maxStart);
+		const end =
+			total === 0 ? 0 : Math.min(total, start + TASK_ARTIFACT_VIEW_LINES);
+		const visible =
+			total === 0
+				? [
+						this.taskArtifactView === "output"
+							? "(empty log)"
+							: "(task prompt unavailable)",
+					]
+				: sourceLines.slice(start, end);
+
+		return [
+			`${accent(this.theme, `Viewing: ${selectedLabel}`)}    ${muted(
+				this.theme,
+				switchHint,
+			)}`,
+			`${metaLabel(this.theme, "lines")} ${metaValue(
+				this.theme,
+				total === 0 ? "0-0 / 0" : `${start + 1}-${end} / ${total}`,
+			)}`,
+			"",
+			...visible.map((line) => fit(previewText(this.theme, line), width)),
+		];
+	}
+
+	private currentArtifactSourceLines(): string[] {
+		return this.taskArtifactView === "output"
+			? this.outputLines
+			: this.promptLines;
+	}
+
+	private currentArtifactPath(task: WorkflowTaskRunRecord): string {
+		return this.taskArtifactView === "output"
+			? task.files.output
+			: task.files.taskPrompt;
+	}
+
+	private switchTaskArtifact(delta: number): void {
+		const views: TaskArtifactView[] = ["output", "prompt"];
+		const currentIndex = views.indexOf(this.taskArtifactView);
+		this.taskArtifactView =
+			views[wrapIndex(currentIndex + delta, views.length)] ?? "output";
+		this.resetArtifactScroll();
+		this.message = "";
+		this.tui.requestRender();
+	}
+
+	private scrollTaskArtifact(delta: number): void {
+		const max = this.maxArtifactScrollLine();
+		this.artifactScrollLine = Math.max(
+			0,
+			Math.min(max, this.artifactScrollLine + delta),
+		);
+		this.message = "";
+		this.tui.requestRender();
+	}
+
+	private maxArtifactScrollLine(): number {
+		return Math.max(
+			0,
+			this.currentArtifactSourceLines().length - TASK_ARTIFACT_VIEW_LINES,
+		);
+	}
+
+	private resetArtifactScroll(): void {
+		this.artifactScrollLine = 0;
+	}
+
+	private moveModeSelection(delta: number): void {
+		if (this.mode === "runs") {
+			this.moveRun(delta);
+			return;
+		}
+		if (this.mode === "stages") {
+			this.moveStage(delta);
+			return;
+		}
+		if (this.mode === "tasks") this.moveTask(delta);
+	}
+
+	private drillUp(): void {
+		if (this.mode === "task") {
+			this.mode = "tasks";
+			this.message = "";
+			this.tui.requestRender();
+			return;
+		}
+		if (this.mode === "tasks") {
+			this.mode = "stages";
+			this.message = "";
+			this.tui.requestRender();
+			return;
+		}
+		if (this.mode === "stages") {
+			this.mode = "runs";
+			this.message = "";
+			this.tui.requestRender();
+			return;
+		}
+		this.close();
+	}
+
+	private drillDown(): void {
+		if (this.mode === "runs") {
+			if (this.flows.length === 0) return;
+			this.mode = "stages";
+			this.message = "";
+			void this.reload(true);
+			this.tui.requestRender();
+			return;
+		}
+		if (this.mode === "stages") {
+			if (!this.detailRun) return;
+			this.mode = "tasks";
+			this.message = "";
+			void this.updateTaskPreviews();
+			this.tui.requestRender();
+			return;
+		}
+		if (this.mode === "tasks") {
+			if (!this.selectedTaskRecord()) return;
+			this.mode = "task";
+			this.message = "";
+			this.resetArtifactScroll();
+			void this.updateTaskPreviews();
+			this.tui.requestRender();
+		}
+	}
+
+	private moveRun(delta: number): void {
+		if (this.flows.length <= 0) return;
+		this.clearLaunchCommand();
+		this.selectedFlow = wrapIndex(this.selectedFlow + delta, this.flows.length);
+		this.selectedStage = 0;
+		this.selectedTask = 0;
+		this.selectedTaskId = "";
+		this.resetArtifactScroll();
+		this.message = "";
+		void this.reload(true);
+		this.tui.requestRender();
+	}
+
+	private moveStage(delta: number): void {
+		if (!this.detailRun) return;
+		const stages = stageSummaries(this.detailRun);
+		this.selectedStage = wrapIndex(this.selectedStage + delta, stages.length);
+		this.selectedTask = 0;
+		this.selectedTaskId = "";
+		this.resetArtifactScroll();
+		this.message = "";
+		void this.updateTaskPreviews();
+		this.tui.requestRender();
+	}
+
+	private moveTask(delta: number): void {
+		if (!this.detailRun) return;
+		const tasks = this.tasksForSelectedStage(this.detailRun);
+		this.selectedTask = wrapIndex(this.selectedTask + delta, tasks.length);
+		this.syncSelectedTaskId(tasks);
+		this.resetArtifactScroll();
+		this.message = "";
+		void this.updateTaskPreviews();
+		this.tui.requestRender();
+	}
+
+	private clampStageAndTask(): void {
+		if (!this.detailRun) return;
+		const stages = stageSummaries(this.detailRun);
+		this.selectedStage = clampIndex(this.selectedStage, stages.length);
+		const tasks = this.tasksForSelectedStage(this.detailRun);
+		const selectedTaskIndex = this.selectedTaskId
+			? tasks.findIndex((task) => task.taskId === this.selectedTaskId)
+			: -1;
+		this.selectedTask =
+			selectedTaskIndex >= 0
+				? selectedTaskIndex
+				: clampIndex(this.selectedTask, tasks.length);
+		this.syncSelectedTaskId(tasks);
+	}
+
+	private currentStageId(run: WorkflowRunRecord): string | undefined {
+		const stages = stageSummaries(run);
+		return stages[this.selectedStage]?.id;
+	}
+
+	private tasksForSelectedStage(
+		run: WorkflowRunRecord,
+	): WorkflowTaskRunRecord[] {
+		const stageId = this.currentStageId(run);
+		const tasks =
+			!stageId || run.type !== WORKFLOW_RUN_TYPE
+				? run.tasks
+				: run.tasks.filter((task) => (task.stageId ?? "unknown") === stageId);
+		return tasks
+			.map((task, index) => ({ task, index }))
+			.sort((left, right) => {
+				const priority =
+					taskProblemPriority(left.task.status) -
+					taskProblemPriority(right.task.status);
+				return priority || left.index - right.index;
+			})
+			.map((entry) => entry.task);
+	}
+
+	private selectedTaskRecord(): WorkflowTaskRunRecord | undefined {
+		if (!this.detailRun) return undefined;
+		return this.tasksForSelectedStage(this.detailRun)[this.selectedTask];
+	}
+
+	private syncSelectedTaskId(tasks?: WorkflowTaskRunRecord[]): void {
+		const stageTasks =
+			tasks ??
+			(this.detailRun ? this.tasksForSelectedStage(this.detailRun) : []);
+		this.selectedTaskId = stageTasks[this.selectedTask]?.taskId ?? "";
+	}
+
+	private breadcrumbText(): string {
+		const parts = ["workflow"];
+		const flow = this.flows[this.selectedFlow];
+		if (flow && this.mode !== "runs")
+			parts.push(flow.name ?? shortId(flow.runId));
+		const stageId = this.detailRun
+			? this.currentStageId(this.detailRun)
+			: undefined;
+		if (stageId && (this.mode === "tasks" || this.mode === "task"))
+			parts.push(stageId);
+		const task = this.selectedTaskRecord();
+		if (task && this.mode === "task") parts.push(task.displayName);
+		return parts.join(" › ");
+	}
+
+	private runSummaryLines(
+		flow: WorkflowSummary,
+		detailRun?: WorkflowRunRecord,
+	): string[] {
+		const stallBadge = this.stallBadge(flow);
+		return [
+			`${statusGlyph(this.theme, flow.status)} ${strong(this.theme, flow.name ?? flow.type)} ${statusBadge(this.theme, flow.status, runStatusLabel(flow))}`,
+			...(stallBadge ? [stallBadge] : []),
+			`${progressBar(this.theme, flow.taskSummary, 8)} ${muted(this.theme, `· running ${flow.taskSummary.running}`)}`,
+			taskMetaLine(this.theme, [
+				["run", shortId(flow.runId)],
+				["started", timestampText(flow.createdAt)],
+			]),
+			taskMetaLine(this.theme, [
+				["updated", timestampText(flow.updatedAt)],
+				[
+					"elapsed",
+					elapsedText(
+						flow.createdAt,
+						flow.updatedAt,
+						flow.status === "running",
+					),
+				],
+			]),
+			...(detailRun ? this.runUsageLines(detailRun) : []),
+			...(detailRun ? this.runToolResultBudgetLines(detailRun) : []),
+			...(detailRun ? this.launchSummaryLines(detailRun) : []),
+		];
+	}
+
+	private runUsageLines(run: WorkflowRunRecord): string[] {
+		const observed = buildWorkflowRunMetrics(run).totals.usage.observed;
+		const tokens = formatTokenCount(observed.totalTokens);
+		const parent =
+			this.parentUsage?.runId === run.runId ? this.parentUsage : undefined;
+		if (!tokens && !parent) return [];
+
+		const lines = [""];
+		if (tokens) {
+			lines.push(
+				`${accent(this.theme, "Usage")} ${metaValue(this.theme, tokens)}`,
+			);
+			const inputTokens = formatTokenCount(observed.inputTokens);
+			const outputTokens = formatTokenCount(observed.outputTokens);
+			const cacheRead = formatTokenCount(observed.cacheReadInputTokens);
+			const cacheWrite = formatTokenCount(observed.cacheCreationInputTokens);
+			if (inputTokens || outputTokens)
+				lines.push(
+					taskMetaLine(this.theme, [
+						["in", inputTokens ?? "n/a"],
+						["out", outputTokens ?? "n/a"],
+					]),
+				);
+			const usageDetails: Array<[string, string]> = [];
+			if (cacheRead || cacheWrite)
+				usageDetails.push([
+					"cache",
+					`${cacheRead ?? "n/a"}/${cacheWrite ?? "n/a"}`,
+				]);
+			if (observed.omittedTaskIds.length > 0)
+				usageDetails.push(["gaps", String(observed.omittedTaskIds.length)]);
+			if (usageDetails.length > 0)
+				lines.push(taskMetaLine(this.theme, usageDetails));
+		}
+		if (parent) {
+			lines.push(
+				taskMetaLine(this.theme, [
+					["parent", formatTokenCount(parent.totalTokens) ?? "0"],
+				]),
+			);
+		}
+		return lines;
+	}
+
+	private stallBadge(
+		flow: Pick<WorkflowSummary, "runId" | "status" | "createdAt">,
+	): string {
+		const stall = detectRunStall(flow, this.supervisors.get(flow.runId));
+		if (!stall) return "";
+		return stallBadgeText(this.theme, stall);
+	}
+
+	private launchSummaryLines(run: WorkflowRunRecord): string[] {
+		const launch = run.launch;
+		if (!launch || !isWorkflowRunLaunchMetadata(launch)) {
+			return [
+				"",
+				accent(this.theme, "Launch"),
+				kvRow(this.theme, "source", "unavailable"),
+				kvRow(
+					this.theme,
+					"command",
+					launch
+						? "unavailable (invalid metadata)"
+						: "unavailable (not captured)",
+				),
+			];
+		}
+
+		const source =
+			launch.source.kind === "slash-command"
+				? `slash · /workflow ${launch.source.action}`
+				: `tool · ${launch.source.name}`;
+		const route = launchRouteSummary(launch.routingMode, run.routing);
+		let profile = "n/a";
+		if (launch.profile.kind === "base") profile = "base";
+		if (launch.profile.kind === "named")
+			profile = escapeLaunchCommandForDisplay(launch.profile.name);
+		const chars = `${launch.task.characters} chars`;
+		const lines = `${launch.task.lines} ${launch.task.lines === 1 ? "line" : "lines"}`;
+		const verificationFailure = this.launchVerificationFailure(run);
+		const command =
+			launch.command.state === "captured"
+				? verificationFailure
+					? `unavailable (${verificationFailure})`
+					: "available · v view"
+				: "unavailable (tool launch)";
+		return [
+			"",
+			accent(this.theme, "Launch"),
+			kvRow(this.theme, "source", source),
+			kvRow(this.theme, "route", route),
+			kvRow(this.theme, "profile", profile),
+			kvRow(this.theme, "task", `${chars} · ${lines}`),
+			kvRow(this.theme, "command", command),
+		];
+	}
+
+	private runDetailSummaryLines(run: WorkflowRunRecord): string[] {
+		const stallBadge = this.stallBadge(run);
+		const lines = [
+			`${statusGlyph(this.theme, run.status)} ${strong(this.theme, run.name ?? run.type)} ${statusBadge(this.theme, run.status)}`,
+			...(stallBadge ? [stallBadge] : []),
+			`${progressBar(this.theme, run.taskSummary, 10)} ${muted(this.theme, `· running ${run.taskSummary.running}`)}`,
+			taskMetaLine(this.theme, [
+				["pending", String(run.taskSummary.pending)],
+				[
+					"elapsed",
+					elapsedText(run.createdAt, run.updatedAt, run.status === "running"),
+				],
+			]),
+			taskMetaLine(this.theme, [
+				["started", timestampText(run.createdAt)],
+				["updated", timestampText(run.updatedAt)],
+			]),
+			kvRow(this.theme, "run", shortId(run.runId)),
+			...this.runUsageLines(run),
+			...this.runToolResultBudgetLines(run),
+			...this.launchSummaryLines(run),
+		];
+		if (run.fanout && run.fanout.length > 0) {
+			lines.push("", accent(this.theme, "Fanout"));
+			for (const item of run.fanout.slice(0, 3)) {
+				lines.push(
+					taskMetaLine(this.theme, [
+						[item.stageId, `expanded=${item.expandedCount}`],
+						["max", String(item.maxConcurrency)],
+					]),
+				);
+			}
+		}
+		return lines;
+	}
+
+	private stageContextLines(run: WorkflowRunRecord): string[] {
+		const stageId = this.currentStageId(run);
+		const lines = [kvRow(this.theme, "run", shortId(run.runId))];
+		if (stageId) lines.push(kvRow(this.theme, "stage", stageId));
+		if (run.fanout?.some((item) => item.stageId === stageId))
+			lines.push(warning(this.theme, "fanout stage"));
+		return lines;
+	}
+
+	private selectedRunHasCapturedLaunch(): boolean {
+		const selected = this.flows[this.selectedFlow];
+		const run =
+			selected && this.detailRun?.runId === selected.runId
+				? this.detailRun
+				: undefined;
+		return (
+			isWorkflowRunLaunchMetadata(run?.launch) &&
+			run.launch.command.state === "captured" &&
+			!this.launchVerificationFailure(run)
+		);
+	}
+
+	private footerText(width: number): string {
+		const launchHint = this.selectedRunHasCapturedLaunch() ? " · v launch" : "";
+		if (width < 72) {
+			if (this.mode === "task")
+				return "←/→ artifact · ↑/↓ scroll · Esc back · r refresh · q close";
+			if (this.mode === "tasks")
+				return "Enter detail · ←/→ nav · ↑/↓ move · q close";
+			if (this.mode === "stages")
+				return `Enter tasks · ←/→ nav · ↑/↓ move${launchHint} · q close`;
+			return `Enter stages · ↑/↓ move${launchHint} · q/Esc close`;
+		}
+		if (this.mode === "task")
+			return "←/→ switch Output/Prompt · ↑/↓ scroll artifact · b/Esc back · r refresh · q close";
+		if (this.mode === "tasks")
+			return "Enter/→ detail · b/Esc/← stages · ↑/↓ move · [/]/n/p sibling · r refresh · q close";
+		if (this.mode === "stages")
+			return `Enter/→ tasks · b/Esc/← runs · ↑/↓ move · [/]/n/p sibling · r refresh${launchHint} · q close`;
+		return `Enter/→ stages · ↑/↓ move · [/]/n/p sibling · r refresh${launchHint} · q/Esc close`;
+	}
+
+	private footer(text: string): string {
+		return navHint(this.theme, text);
+	}
+
+	private isCloseInput(data: string): boolean {
+		return (
+			data === "q" ||
+			data === "Q" ||
+			matchesKey(data, "ctrl+c") ||
+			matchesKey(data, "ctrl+d")
+		);
+	}
+
+	private isBackInput(data: string): boolean {
+		return (
+			data === "b" ||
+			data === "B" ||
+			matchesKey(data, "left") ||
+			matchesKey(data, "backspace")
+		);
+	}
+
+	private close(): void {
+		if (this.closed) return;
+		this.closed = true;
+		this.dispose();
+		this.done();
+		// Closing replaces a tall custom panel with the normal editor. Force a full
+		// repaint so terminals do not leave stale workflow-board rows behind.
+		this.tui.requestRender(true);
+	}
+}
+
+function launchRouteSummary(
+	mode: "default-on" | "explicit-on" | "off",
+	routing: WorkflowRunRecord["routing"],
+): string {
+	if (mode === "off") return "off";
+	const intent = mode === "default-on" ? "default" : "explicit";
+	if (
+		!routing ||
+		(routing.decided !== "direct" &&
+			routing.decided !== "dynamic" &&
+			routing.decided !== "workflow") ||
+		(routing.depth !== "quick" &&
+			routing.depth !== "standard" &&
+			routing.depth !== "max") ||
+		typeof routing.confidence !== "number" ||
+		!Number.isFinite(routing.confidence) ||
+		routing.confidence < 0 ||
+		routing.confidence > 1
+	)
+		return `${intent} → unavailable`;
+	return `${intent} → ${routing.decided} · ${routing.depth} · ${Math.round(routing.confidence * 100)}%`;
+}
+
+function launchCommandUnavailableMessage(error: unknown): string {
+	const message = error instanceof Error ? error.message : "";
+	const allowed = [
+		"launch command unavailable: metadata malformed",
+		"launch command unavailable: tool launch",
+		"launch command unavailable: artifact missing",
+		"launch command unavailable: artifact read failed",
+		"launch command unavailable: verification failed",
+	];
+	return allowed.includes(message)
+		? message
+		: "launch command unavailable: verification failed";
+}
+
+function launchCommandUnavailableReason(message: string): string {
+	const prefix = "launch command unavailable: ";
+	return message.startsWith(prefix)
+		? message.slice(prefix.length)
+		: "verification failed";
+}
+
+function escapeLaunchCommandForDisplay(text: string): string {
+	let escaped = "";
+	for (const character of text) {
+		const codePoint = character.codePointAt(0) ?? 0;
+		if (character === "\\") escaped += "\\\\";
+		else if (character === '"') escaped += '\\"';
+		else if (character === "\n") escaped += "\\n";
+		else if (character === "\r") escaped += "\\r";
+		else if (character === "\t") escaped += "\\t";
+		else if (
+			codePoint <= 0x1f ||
+			(codePoint >= 0x7f && codePoint <= 0x9f) ||
+			codePoint === 0x061c ||
+			(codePoint >= 0x200e && codePoint <= 0x200f) ||
+			(codePoint >= 0x2028 && codePoint <= 0x202e) ||
+			(codePoint >= 0x2066 && codePoint <= 0x2069)
+		) {
+			escaped += `\\u${codePoint.toString(16).padStart(4, "0")}`;
+		} else escaped += character;
+	}
+	return escaped;
+}
+
+function wrapLaunchCommand(text: string, width: number): string[] {
+	if (!text) return [""];
+	const lines: string[] = [];
+	let line = "";
+	let lineWidth = 0;
+	for (const character of text) {
+		const characterWidth = visibleWidth(character);
+		if (line && lineWidth + characterWidth > width) {
+			lines.push(line);
+			line = "";
+			lineWidth = 0;
+		}
+		line += character;
+		lineWidth += characterWidth;
+	}
+	lines.push(line);
+	return lines;
+}
+
+async function loadFlowSummaries(
+	cwd: string,
+	initialRunId?: string,
+): Promise<WorkflowSummary[]> {
+	const index = await readIndex(cwd).catch(() => undefined);
+	let flows = index?.runs ?? [];
+	if (flows.length === 0) {
+		const records = await listRunRecords(cwd);
+		flows = records
+			.sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))
+			.map((run) => runToSummary(cwd, run));
+	}
+
+	if (
+		initialRunId &&
+		!flows.some(
+			(flow) =>
+				flow.runId === initialRunId || flow.runId.startsWith(initialRunId),
+		)
+	) {
+		const run = await readRunRecord(cwd, initialRunId).catch(() => undefined);
+		if (run) flows = [runToSummary(cwd, run), ...flows];
+	}
+
+	return flows;
+}
+
+async function loadRunSupervisors(
+	cwd: string,
+	flows: WorkflowSummary[],
+): Promise<Map<string, WorkflowSupervisorRecord>> {
+	const supervisors = new Map<string, WorkflowSupervisorRecord>();
+	await Promise.all(
+		flows
+			.filter((flow) => flow.status === "running")
+			.map(async (flow) => {
+				const record = await readJson<WorkflowSupervisorRecord>(
+					supervisorPath(cwd, flow.runId),
+				).catch(() => undefined);
+				if (record) supervisors.set(flow.runId, record);
+			}),
+	);
+	return supervisors;
+}
+
+function runToSummary(cwd: string, run: WorkflowRunRecord): WorkflowSummary {
+	return {
+		runId: run.runId,
+		name: run.name,
+		type: run.type,
+		status: run.status,
+		taskSummary: run.taskSummary,
+		createdAt: run.createdAt,
+		updatedAt: run.updatedAt,
+		runJson: workflowRunPath(cwd, run.runId),
+		parentRunId: run.parentRunId,
+		rootRunId: run.rootRunId,
+		round: run.round,
+		fanout: run.fanout,
+		tasks: run.tasks.map((task) => ({
+			taskId: task.taskId,
+			displayName: task.displayName,
+			kind: task.kind,
+			stageId: task.stageId,
+			agent: task.agent,
+			status: task.status,
+			statusDetail: task.statusDetail,
+			backendHandle: task.backendHandle,
+			lastMessage: task.lastMessage,
+		})),
+	};
+}
+
+export async function readFileLinesBounded(
+	cwd: string,
+	projectPath: string | undefined,
+	maxLines: number,
+	options: { chunkBytes?: number; onRead?: (bytes: number) => void } = {},
+): Promise<string[]> {
+	if (!projectPath || maxLines <= 0) return [];
+	const file = await open(fromProjectPath(cwd, projectPath), "r").catch(
+		(error) => {
+			if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+			throw error;
+		},
+	);
+	if (!file) return [];
+	try {
+		const { size } = await file.stat();
+		if (size === 0) return [];
+		const chunkBytes = Math.max(1, options.chunkBytes ?? 64 * 1024);
+		const chunks: Buffer[] = [];
+		let position = size;
+		let newlineCount = 0;
+		while (position > 0 && newlineCount <= maxLines) {
+			const length = Math.min(chunkBytes, position);
+			position -= length;
+			const buffer = Buffer.allocUnsafe(length);
+			const result = await file.read(buffer, 0, length, position);
+			const chunk = buffer.subarray(0, result.bytesRead);
+			chunks.unshift(chunk);
+			options.onRead?.(result.bytesRead);
+			for (const byte of chunk) if (byte === 0x0a) newlineCount += 1;
+		}
+		const text = Buffer.concat(chunks).toString("utf8");
+		const lines = text.split(/\r?\n/);
+		if (lines[lines.length - 1] === "") lines.pop();
+		return lines.slice(-maxLines);
+	} finally {
+		await file.close();
+	}
+}
+
+function stageSummaries(
+	run: WorkflowRunRecord,
+): Array<{ id: string; summary: TaskSummary }> {
+	if (run.type !== WORKFLOW_RUN_TYPE)
+		return [{ id: String(run.type), summary: run.taskSummary }];
+	const order: string[] = [];
+	const byStage = new Map<string, WorkflowTaskRunRecord[]>();
+	for (const task of run.tasks) {
+		const stageId = task.stageId ?? "unknown";
+		if (!byStage.has(stageId)) {
+			byStage.set(stageId, []);
+			order.push(stageId);
+		}
+		byStage.get(stageId)?.push(task);
+	}
+	return order.map((id) => ({
+		id,
+		summary: summarizeTasks(byStage.get(id) ?? []),
+	}));
+}
+
+function summarizeTasks(tasks: WorkflowTaskRunRecord[]): TaskSummary {
+	const summary: TaskSummary = {
+		pending: 0,
+		running: 0,
+		blocked: 0,
+		completed: 0,
+		failed: 0,
+		skipped: 0,
+		interrupted: 0,
+		total: 0,
+	};
+	for (const task of tasks) {
+		summary[task.status] += 1;
+		summary.total += 1;
+	}
+	return summary;
+}
+
+function statusForSummary(
+	summary: TaskSummary,
+): WorkflowRunStatus | TaskRunStatus {
+	if (summary.running > 0) return "running";
+	if (summary.blocked > 0) return "blocked";
+	if (summary.failed > 0) return "failed";
+	if (summary.pending > 0) return "pending";
+	if (summary.total > 0 && summary.completed === summary.total)
+		return "completed";
+	if (summary.interrupted > 0) return "interrupted";
+	return "interrupted";
+}
+
+function taskElapsed(task: WorkflowTaskRunRecord): string {
+	if (task.elapsedMs !== undefined) return formatDuration(task.elapsedMs);
+	if (task.startedAt && task.status === "running")
+		return formatDuration(Date.now() - Date.parse(task.startedAt));
+	return task.status;
+}
+
+function taskRuntimeSummary(task: WorkflowTaskRunRecord): string {
+	const model = task.runtime.model
+		? shortModelName(task.runtime.model)
+		: "not-recorded";
+	const thinking = task.runtime.thinking ?? "not-recorded";
+	const clamp = taskThinkingClamp(task);
+	return `${model}/${thinking}${clamp ? ` [${clamp.requested}→${clamp.resolved}]` : ""}`;
+}
+
+function taskThinkingClamp(
+	task: WorkflowTaskRunRecord,
+): { requested: string; resolved: string } | undefined {
+	const resolution = task.runtime.thinkingResolution;
+	if (
+		!resolution?.requested ||
+		!resolution.resolved ||
+		resolution.requested === resolution.resolved
+	) {
+		return undefined;
+	}
+	return {
+		requested: resolution.requested,
+		resolved: resolution.resolved,
+	};
+}
+
+function shortModelName(model: string): string {
+	return model.split("/").pop() || model;
+}
+
+function elapsedText(
+	createdAt: string,
+	updatedAt: string,
+	running: boolean,
+): string {
+	const start = Date.parse(createdAt);
+	const end = running ? Date.now() : Date.parse(updatedAt);
+	if (!Number.isFinite(start) || !Number.isFinite(end)) return "unknown";
+	return formatDuration(Math.max(0, end - start));
+}
+
+function timestampText(value: string): string {
+	const date = new Date(value);
+	if (!Number.isFinite(date.getTime())) return value;
+	const pad = (part: number) => String(part).padStart(2, "0");
+	const currentYear = new Date().getFullYear();
+	const datePart =
+		date.getFullYear() === currentYear
+			? `${pad(date.getMonth() + 1)}/${pad(date.getDate())}`
+			: `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
+	return `${datePart} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+function formatDuration(ms: number): string {
+	const totalSeconds = Math.max(0, Math.floor(ms / 1000));
+	const hours = Math.floor(totalSeconds / 3600);
+	const minutes = Math.floor((totalSeconds % 3600) / 60);
+	const seconds = totalSeconds % 60;
+	if (hours > 0) return `${hours}h ${minutes}m`;
+	if (minutes > 0) return `${minutes}m ${seconds}s`;
+	return `${seconds}s`;
+}
+
+function statusGlyph(
+	theme: Theme,
+	status: WorkflowRunStatus | TaskRunStatus,
+): string {
+	if (status === "completed") return success(theme, "✓");
+	if (status === "running") return accent(theme, "↻");
+	if (status === "blocked") return warning(theme, "◆");
+	if (status === "failed" || status === "interrupted")
+		return errorText(theme, "✕");
+	if (status === "skipped") return muted(theme, "↷");
+	return muted(theme, "•");
+}
+
+function metaByStatus(
+	theme: Theme,
+	status: WorkflowRunStatus | TaskRunStatus,
+	content: string,
+): string {
+	if (status === "running") return accent(theme, content);
+	if (status === "blocked") return warning(theme, content);
+	if (status === "failed" || status === "interrupted")
+		return errorText(theme, content);
+	return content;
+}
+
+function statusBadge(
+	theme: Theme,
+	status: WorkflowRunStatus | TaskRunStatus,
+	label = statusText(status),
+): string {
+	const normalized = statusLabelText(label);
+	const padded = normalized.padEnd(9, " ");
+	const content = ` ${padded} `;
+	const colored = fg(theme, statusColor(status), strong(theme, content));
+	if (status === "pending") return colored;
+	return theme.bg
+		? bgBand(theme, statusBgColor(status), colored)
+		: fg(theme, statusColor(status), strong(theme, `[${padded.trimEnd()}]`));
+}
+
+function statusColumn(
+	theme: Theme,
+	status: WorkflowRunStatus | TaskRunStatus,
+	label: string,
+	width: number,
+): string {
+	const normalized = statusLabelText(label);
+	return padAnsi(
+		fg(theme, statusColor(status), strong(theme, normalized)),
+		width,
+	);
+}
+
+function statusLabelText(label: string): string {
+	return label.toUpperCase().replace(/_/g, " ");
+}
+
+function statusBgColor(status: WorkflowRunStatus | TaskRunStatus): string {
+	if (status === "completed") return "toolSuccessBg";
+	if (status === "failed" || status === "interrupted") return "toolErrorBg";
+	if (status === "running" || status === "blocked") return "toolPendingBg";
+	return "customMessageBg";
+}
+
+function progressBar(
+	theme: Theme,
+	summary: TaskSummary,
+	cells: number,
+): string {
+	const safeCells = Math.max(1, cells);
+	const visibleProgress =
+		summary.running > 0
+			? summary.completed + summary.running
+			: summary.completed;
+	const filled =
+		summary.total <= 0
+			? 0
+			: Math.max(
+					0,
+					Math.min(
+						safeCells,
+						Math.round((visibleProgress / summary.total) * safeCells),
+					),
+				);
+	const bar = `${"▰".repeat(filled)}${"▱".repeat(safeCells - filled)}`;
+	const denominatorWidth = Math.max(2, String(summary.total).length);
+	const totalText = String(summary.total).padStart(denominatorWidth, " ");
+	const progressText = `${String(visibleProgress).padStart(denominatorWidth, " ")}/${totalText}`;
+	return fg(
+		theme,
+		statusColor(statusForSummary(summary)),
+		`${bar} ${progressText}`,
+	);
+}
+
+function statusColor(status: WorkflowRunStatus | TaskRunStatus): string {
+	if (status === "completed") return "success";
+	if (status === "running") return "accent";
+	if (status === "blocked") return "warning";
+	if (status === "failed" || status === "interrupted") return "error";
+	return "dim";
+}
+
+function statusText(status: WorkflowRunStatus | TaskRunStatus): string {
+	return status;
+}
+
+function stallBadgeText(theme: Theme, stall: WorkflowRunStallInfo): string {
+	const label =
+		stall.kind === "heartbeat-lost"
+			? `HB LOST ${stallAgeText(stall.ageMs)}`
+			: `STALL ${stallAgeText(stall.ageMs)}`;
+	return fg(
+		theme,
+		stall.kind === "heartbeat-lost" ? "error" : "warning",
+		strong(theme, label),
+	);
+}
+
+function stallAgeText(ms: number): string {
+	const minutes = Math.floor(ms / 60_000);
+	if (minutes >= 60)
+		return `${Math.floor(minutes / 60)}h${minutes % 60 > 0 ? ` ${minutes % 60}m` : ""}`;
+	if (minutes >= 1) return `${minutes}m`;
+	return `${Math.max(0, Math.floor(ms / 1000))}s`;
+}
+
+function healthColor(health: WorkflowProgressHealth): string {
+	return health.tone;
+}
+
+function healthGlyph(theme: Theme, health: WorkflowProgressHealth): string {
+	if (health.tone === "success") return success(theme, "✓");
+	if (health.tone === "warning") return warning(theme, "●");
+	if (health.tone === "error") return errorText(theme, "●");
+	if (health.tone === "dim") return muted(theme, "•");
+	return accent(theme, "●");
+}
+
+function healthLabel(theme: Theme, health: WorkflowProgressHealth): string {
+	return fg(theme, healthColor(health), strong(theme, health.label));
+}
+
+function healthInline(theme: Theme, health: WorkflowProgressHealth): string {
+	if (health.state === "completed" || health.state === "pending") return "";
+	return `${healthGlyph(theme, health)} ${healthLabel(theme, health)}`;
+}
+
+function taskListStatusLabel(
+	theme: Theme,
+	task: WorkflowTaskRunRecord,
+	health: WorkflowProgressHealth,
+): string {
+	const validation = taskValidationSummary(task);
+	const label =
+		validation?.status === "invalid"
+			? "invalid output"
+			: validation?.status === "valid"
+				? "valid"
+				: task.status === "completed"
+					? "done"
+					: task.status === "running"
+						? health.label
+						: statusText(task.status);
+	const suffix =
+		task.status === "running" && health.currentTask?.elapsedMs !== undefined
+			? ` ${muted(theme, "·")} ${metaValue(theme, formatDuration(health.currentTask.elapsedMs))}`
+			: "";
+	const usage = task.usage?.aggregate ?? task.usage;
+	const usageTokens = formatTokenCount(usage?.totalTokens);
+	const usageSuffix = usageTokens
+		? ` ${muted(theme, "·")} ${metaValue(theme, usageTokens)}`
+		: "";
+	return `${fg(theme, task.status === "running" ? healthColor(health) : statusColor(task.status), strong(theme, label))}${suffix}${usageSuffix}`;
+}
+
+function compactStatusLabel(
+	theme: Theme,
+	status: WorkflowRunStatus | TaskRunStatus,
+): string {
+	const label = status === "completed" ? "done" : statusText(status);
+	return fg(theme, statusColor(status), strong(theme, label));
+}
+
+function runStatusLabel(flow: WorkflowSummary): string {
+	return statusText(flow.status);
+}
+
+function shortId(runId: string): string {
+	return runId.replace(/^workflow_/, "workflow_").slice(0, 24);
+}
+
+function visibleWindow<T>(
+	items: T[],
+	selectedIndex: number,
+	maxRows: number,
+): {
+	rows: Array<{ item: T; index: number }>;
+	hiddenBefore: number;
+	hiddenAfter: number;
+} {
+	const total = items.length;
+	if (total === 0) return { rows: [], hiddenBefore: 0, hiddenAfter: 0 };
+	const safeMaxRows = Math.max(1, maxRows);
+	const selected = clampIndex(selectedIndex, total);
+	const start =
+		total <= safeMaxRows
+			? 0
+			: Math.max(
+					0,
+					Math.min(selected - Math.floor(safeMaxRows / 2), total - safeMaxRows),
+				);
+	const end = Math.min(total, start + safeMaxRows);
+	return {
+		rows: items
+			.slice(start, end)
+			.map((item, offset) => ({ item, index: start + offset })),
+		hiddenBefore: start,
+		hiddenAfter: Math.max(0, total - end),
+	};
+}
+
+function wrapIndex(index: number, length: number): number {
+	if (length <= 0) return 0;
+	return (index + length) % length;
+}
+
+function clampIndex(index: number, length: number): number {
+	if (length <= 0) return 0;
+	return Math.max(0, Math.min(index, length - 1));
+}
+
+function taskProblemPriority(status: TaskRunStatus): number {
+	if (status === "failed" || status === "interrupted") return 0;
+	if (status === "blocked") return 1;
+	if (status === "running") return 2;
+	return 3;
+}
+
+function taskValidationSummary(
+	task: WorkflowTaskRunRecord,
+): { status: string; message: string } | undefined {
+	const validation = task.outputValidation;
+	if (!validation) return undefined;
+	const status =
+		validation.status ??
+		(validation.valid === true
+			? "valid"
+			: validation.valid === false
+				? "invalid"
+				: "warning");
+	const issue = Array.isArray(validation.issues)
+		? validation.issues[0]
+		: undefined;
+	const issueMessage =
+		typeof issue === "string"
+			? issue
+			: (issue?.message ?? issue?.path ?? issue?.code ?? "");
+	const message = validation.message ?? validation.reason ?? issueMessage;
+	if (status === "valid" && !message) return undefined;
+	return { status, message };
+}
+
+const MOD_CTRL = 4;
+const ARROW_CODEPOINTS = { up: -1, down: -2, right: -3, left: -4 } as const;
+const KITTY_FUNCTIONAL_EQUIVALENTS = new Map<number, number>([
+	[57414, 13],
+	[57417, ARROW_CODEPOINTS.left],
+	[57418, ARROW_CODEPOINTS.right],
+	[57419, ARROW_CODEPOINTS.up],
+	[57420, ARROW_CODEPOINTS.down],
+]);
+
+function matchesKey(data: string, key: string): boolean {
+	if (key === "escape")
+		return data === "\u001b" || matchesSpecialKey(data, 27, 0);
+	if (key === "up")
+		return (
+			matchesArrowKey(data, "up") ||
+			matchesSpecialKey(data, ARROW_CODEPOINTS.up, 0)
+		);
+	if (key === "down")
+		return (
+			matchesArrowKey(data, "down") ||
+			matchesSpecialKey(data, ARROW_CODEPOINTS.down, 0)
+		);
+	if (key === "left")
+		return (
+			matchesArrowKey(data, "left") ||
+			matchesSpecialKey(data, ARROW_CODEPOINTS.left, 0)
+		);
+	if (key === "right")
+		return (
+			matchesArrowKey(data, "right") ||
+			matchesSpecialKey(data, ARROW_CODEPOINTS.right, 0)
+		);
+	if (key === "enter" || key === "return")
+		return (
+			data === "\r" ||
+			data === "\n" ||
+			data === "\u001bOM" ||
+			matchesSpecialKey(data, 13, 0)
+		);
+	if (key === "backspace")
+		return (
+			data === "\u007f" || data === "\b" || matchesSpecialKey(data, 127, 0)
+		);
+	if (key === "ctrl+c")
+		return data === "\u0003" || matchesSpecialKey(data, 99, MOD_CTRL);
+	if (key === "ctrl+d")
+		return data === "\u0004" || matchesSpecialKey(data, 100, MOD_CTRL);
+	return data === key || matchesPrintableKey(data, key);
+}
+
+function matchesArrowKey(
+	data: string,
+	key: keyof typeof ARROW_CODEPOINTS,
+): boolean {
+	const legacy = {
+		up: ["\u001b[A", "\u001bOA"],
+		down: ["\u001b[B", "\u001bOB"],
+		left: ["\u001b[D", "\u001bOD"],
+		right: ["\u001b[C", "\u001bOC"],
+	}[key];
+	if (legacy.includes(data)) return true;
+
+	const arrowMatch = /^\u001b\[1;(\d+)(?::(\d+))?([ABCD])$/.exec(data);
+	if (!arrowMatch) return false;
+	const modifier = Number(arrowMatch[1]) - 1;
+	if (modifier !== 0) return false;
+	const codepoint = {
+		A: ARROW_CODEPOINTS.up,
+		B: ARROW_CODEPOINTS.down,
+		C: ARROW_CODEPOINTS.right,
+		D: ARROW_CODEPOINTS.left,
+	}[arrowMatch[3] as "A" | "B" | "C" | "D"];
+	return codepoint === ARROW_CODEPOINTS[key];
+}
+
+function matchesSpecialKey(
+	data: string,
+	expectedCodepoint: number,
+	expectedModifier: number,
+): boolean {
+	const parsed = parseKittySequence(data) ?? parseModifyOtherKeysSequence(data);
+	if (!parsed) return false;
+	const codepoint =
+		KITTY_FUNCTIONAL_EQUIVALENTS.get(parsed.codepoint) ?? parsed.codepoint;
+	return (
+		codepoint === expectedCodepoint && parsed.modifier === expectedModifier
+	);
+}
+
+function matchesPrintableKey(data: string, key: string): boolean {
+	if (key.length !== 1) return false;
+	const parsed = parseKittySequence(data);
+	if (!parsed || parsed.modifier !== 0) return false;
+	return parsed.codepoint === key.charCodeAt(0);
+}
+
+function parseKittySequence(
+	data: string,
+): { codepoint: number; modifier: number } | undefined {
+	const csiUMatch =
+		/^\u001b\[(\d+)(?::(\d*))?(?::(\d+))?(?:;(\d+))?(?::(\d+))?u$/.exec(data);
+	if (csiUMatch) {
+		return {
+			codepoint: Number(csiUMatch[1]),
+			modifier: Number(csiUMatch[4] ?? "1") - 1,
+		};
+	}
+
+	const arrowMatch = /^\u001b\[1;(\d+)(?::(\d+))?([ABCD])$/.exec(data);
+	if (arrowMatch) {
+		const codepoint = {
+			A: ARROW_CODEPOINTS.up,
+			B: ARROW_CODEPOINTS.down,
+			C: ARROW_CODEPOINTS.right,
+			D: ARROW_CODEPOINTS.left,
+		}[arrowMatch[3] as "A" | "B" | "C" | "D"];
+		return { codepoint, modifier: Number(arrowMatch[1]) - 1 };
+	}
+
+	return undefined;
+}
+
+function parseModifyOtherKeysSequence(
+	data: string,
+): { codepoint: number; modifier: number } | undefined {
+	const match = /^\u001b\[27;(\d+);(\d+)~$/.exec(data);
+	if (!match) return undefined;
+	return { modifier: Number(match[1]) - 1, codepoint: Number(match[2]) };
+}
+
+function joinFixedColumns(columns: string[], widths: number[]): string {
+	return columns
+		.map((column, index) =>
+			padAnsi(fit(column, widths[index] ?? 1), widths[index] ?? 1),
+		)
+		.join(" ");
+}
+
+function boxed(
+	theme: Theme,
+	titleText: string,
+	width: number,
+	content: string[],
+	color = "borderMuted",
+): string[] {
+	const safeWidth = Math.max(8, width);
+	const bodyWidth = Math.max(1, safeWidth - 4);
+	const topLabel = `╭─ ${titleText} `;
+	const top = `${topLabel}${"─".repeat(Math.max(0, safeWidth - visibleWidth(topLabel) - 1))}╮`;
+	const bottom = `╰${"─".repeat(Math.max(0, safeWidth - 2))}╯`;
+	const body = content.length > 0 ? content : [""];
+	return [
+		fg(theme, color, top),
+		...body.map(
+			(line) =>
+				`${fg(theme, color, "│")} ${padAnsi(fit(line, bodyWidth), bodyWidth)} ${fg(theme, color, "│")}`,
+		),
+		fg(theme, color, bottom),
+	];
+}
+
+function joinColumns(
+	left: string,
+	right: string,
+	width: number,
+	leftWidth: number,
+): string {
+	const safeLeftWidth = Math.max(1, Math.min(leftWidth, width - 1));
+	const safeRightWidth = Math.max(1, width - safeLeftWidth - 1);
+	const leftText = fit(left, safeLeftWidth);
+	const rightText = fit(right, safeRightWidth);
+	return `${padAnsi(leftText, safeLeftWidth)} ${rightText}`;
+}
+
+function padAnsi(text: string, width: number): string {
+	const visible = visibleWidth(text);
+	return visible >= width ? text : `${text}${" ".repeat(width - visible)}`;
+}
+
+function fit(text: string, width: number): string {
+	return truncateToWidth(text, Math.max(1, width));
+}
+
+const GRAPHEME_SEGMENTER = new Intl.Segmenter(undefined, {
+	granularity: "grapheme",
+});
+
+function visibleWidth(text: string): number {
+	const clean = stripAnsi(text);
+	let width = 0;
+	for (const { segment } of GRAPHEME_SEGMENTER.segment(clean)) {
+		width += graphemeWidth(segment);
+	}
+	return width;
+}
+
+function truncateToWidth(text: string, width: number): string {
+	const safeWidth = Math.max(0, Math.floor(width || 0));
+	if (safeWidth === 0) return "";
+	if (visibleWidth(text) <= safeWidth) return text;
+
+	const hasAnsi =
+		text.includes("\u001b[") ||
+		text.includes("\u001b]") ||
+		text.includes("\u001b_");
+	const ellipsis = "…";
+	const ellipsisWidth = visibleWidth(ellipsis);
+	const limit = Math.max(0, safeWidth - ellipsisWidth);
+	let visible = 0;
+	let output = "";
+	for (let index = 0; index < text.length; ) {
+		const ansi = readAnsi(text, index);
+		if (ansi) {
+			output += ansi.value;
+			index = ansi.nextIndex;
+			continue;
+		}
+
+		const codePoint = text.codePointAt(index);
+		if (codePoint === undefined) break;
+		const char = String.fromCodePoint(codePoint);
+		const charWidth = graphemeWidth(char);
+		if (visible + charWidth > limit) break;
+		output += char;
+		visible += charWidth;
+		index += char.length;
+	}
+	return `${output}${ellipsis}${hasAnsi ? "\u001b[0m" : ""}`;
+}
+
+function stripAnsi(text: string): string {
+	let output = "";
+	for (let index = 0; index < text.length; ) {
+		const ansi = readAnsi(text, index);
+		if (ansi) {
+			index = ansi.nextIndex;
+			continue;
+		}
+		const codePoint = text.codePointAt(index);
+		if (codePoint === undefined) break;
+		const char = String.fromCodePoint(codePoint);
+		output += char;
+		index += char.length;
+	}
+	return output;
+}
+
+function readAnsi(
+	text: string,
+	index: number,
+): { value: string; nextIndex: number } | undefined {
+	if (text.charCodeAt(index) !== 0x1b) return undefined;
+	const next = text[index + 1];
+	if (next === "[") return readCsi(text, index);
+	if (next === "]") return readTerminatedEscape(text, index, 2);
+	if (next === "_") return readTerminatedEscape(text, index, 2);
+	return undefined;
+}
+
+function readCsi(
+	text: string,
+	index: number,
+): { value: string; nextIndex: number } | undefined {
+	let nextIndex = index + 2;
+	while (nextIndex < text.length) {
+		const code = text.charCodeAt(nextIndex);
+		nextIndex += 1;
+		if (code >= 0x40 && code <= 0x7e)
+			return { value: text.slice(index, nextIndex), nextIndex };
+	}
+	return { value: text.slice(index), nextIndex: text.length };
+}
+
+function readTerminatedEscape(
+	text: string,
+	index: number,
+	bodyOffset: number,
+): { value: string; nextIndex: number } | undefined {
+	let nextIndex = index + bodyOffset;
+	while (nextIndex < text.length) {
+		if (text[nextIndex] === "\x07") {
+			const end = nextIndex + 1;
+			return { value: text.slice(index, end), nextIndex: end };
+		}
+		if (text[nextIndex] === "\x1b" && text[nextIndex + 1] === "\\") {
+			const end = nextIndex + 2;
+			return { value: text.slice(index, end), nextIndex: end };
+		}
+		nextIndex += 1;
+	}
+	return { value: text.slice(index), nextIndex: text.length };
+}
+
+function graphemeWidth(segment: string): number {
+	if (segment.length === 0) return 0;
+	if (segment === "\t") return 3;
+	if (/^[\p{Mark}\p{Control}\p{Surrogate}\u200d\ufe0e\ufe0f]+$/u.test(segment))
+		return 0;
+	if (isEmojiLike(segment)) return 2;
+	const base = segment.replace(
+		/^[\p{Mark}\p{Control}\p{Format}\p{Surrogate}]+/u,
+		"",
+	);
+	const codePoint = base.codePointAt(0);
+	if (codePoint === undefined) return 0;
+	return isWideCodePoint(codePoint) ? 2 : 1;
+}
+
+function isEmojiLike(segment: string): boolean {
+	if (/[\ufe0f\u200d]/u.test(segment)) return true;
+	const codePoint = segment.codePointAt(0);
+	if (codePoint === undefined) return false;
+	return (
+		(codePoint >= 0x1f000 && codePoint <= 0x1fbff) ||
+		codePoint === 0x2705 ||
+		(codePoint >= 0x2b50 && codePoint <= 0x2b55)
+	);
+}
+
+function isWideCodePoint(codePoint: number): boolean {
+	return (
+		(codePoint >= 0x1100 && codePoint <= 0x115f) ||
+		codePoint === 0x2329 ||
+		codePoint === 0x232a ||
+		(codePoint >= 0x2e80 && codePoint <= 0xa4cf) ||
+		(codePoint >= 0xac00 && codePoint <= 0xd7a3) ||
+		(codePoint >= 0xf900 && codePoint <= 0xfaff) ||
+		(codePoint >= 0xfe10 && codePoint <= 0xfe19) ||
+		(codePoint >= 0xfe30 && codePoint <= 0xfe6f) ||
+		(codePoint >= 0xff00 && codePoint <= 0xff60) ||
+		(codePoint >= 0xffe0 && codePoint <= 0xffe6)
+	);
+}
+
+function hasToolResultBudgetViewSignal(
+	metrics: DynamicToolResultBudgetRollup,
+): boolean {
+	return (
+		metrics.evictionAttempts > 0 ||
+		metrics.forcedEvictionAttempts > 0 ||
+		metrics.contextRecoveryAttempts > 0 ||
+		metrics.contextLengthExceededAttempts > 0 ||
+		metrics.warningAttempts > 0 ||
+		metrics.incomplete ||
+		metrics.disabledTasks > 0
+	);
+}
+
+function toolResultBudgetMetricLines(
+	theme: Theme,
+	metrics: DynamicToolResultBudgetRollup,
+	compact: boolean,
+): string[] {
+	const lines = [
+		"",
+		accent(theme, "Tool-result budget"),
+		kvRow(theme, "cap chars", toolResultBudgetCapLabel(metrics)),
+	];
+	if (metrics.maxRetainedChars !== null)
+		lines.push(
+			kvRow(
+				theme,
+				compact ? "peak" : "retained chars",
+				toolResultBudgetRetainedLabel(
+					metrics.maxRetainedChars,
+					metrics.maxUtilization,
+				),
+			),
+		);
+	else if (compact) lines.push(kvRow(theme, "peak", "unavailable"));
+
+	const countersComplete =
+		metrics.evictionCounterExpectedAttempts > 0 &&
+		metrics.evictionCounterReportingAttempts ===
+			metrics.evictionCounterExpectedAttempts;
+	const rows: Array<[boolean, string, string, string?]> = [
+		[
+			metrics.evictionAttempts > 0 || (!compact && countersComplete),
+			"evicted",
+			compact
+				? `${metrics.observedEvictedCount} / ${formatCharacterCount(metrics.observedEvictedChars)} chars`
+				: `${metrics.observedEvictedCount} results / ${formatCharacterCount(metrics.observedEvictedChars)} chars`,
+			metrics.evictionAttempts > 0 ? "warning" : "text",
+		],
+		[
+			metrics.forcedEvictionAttempts > 0,
+			"forced",
+			formatAttemptCount(metrics.forcedEvictionAttempts),
+			"warning",
+		],
+		[
+			metrics.contextRecoveryAttempts > 0 || (!compact && countersComplete),
+			"recovery",
+			metrics.contextRecoveryAttempts > 0
+				? compact
+					? formatAttemptCount(metrics.contextRecoveryAttempts)
+					: `${formatAttemptCount(metrics.contextRecoveryAttempts)} (${metrics.contextOverflowRecoveredAttempts} overflow)`
+				: "none observed",
+			metrics.contextRecoveryAttempts > 0 ? "warning" : "text",
+		],
+		[
+			metrics.contextLengthExceededAttempts > 0,
+			"context limit",
+			formatAttemptCount(metrics.contextLengthExceededAttempts),
+			"error",
+		],
+		[
+			metrics.warningAttempts > 0,
+			"warnings",
+			formatAttemptCount(metrics.warningAttempts),
+			"warning",
+		],
+	];
+	for (const [visible, key, value, color] of rows)
+		if (visible) lines.push(kvRow(theme, key, value, color));
+	return lines;
+}
+
+function formatCharacterCount(value: number): string {
+	return Math.round(value).toLocaleString("en-US");
+}
+
+function formatAttemptCount(value: number): string {
+	return `${value} attempt${value === 1 ? "" : "s"}`;
+}
+
+function toolResultBudgetRetainedLabel(
+	retainedChars: number,
+	utilization: number | null,
+): string {
+	const percentage =
+		utilization === null
+			? ""
+			: ` (${(utilization * 100).toFixed(utilization >= 0.1 ? 1 : 2)}%)`;
+	return `${formatCharacterCount(retainedChars)}${percentage}`;
+}
+
+function toolResultBudgetCapLabel(
+	metrics: DynamicToolResultBudgetRollup,
+): string {
+	const values =
+		metrics.backendCapValues.length > 0
+			? metrics.backendCapValues
+			: metrics.configuredCapValues;
+	if (values.length === 0)
+		return metrics.disabledTasks > 0 ? "disabled" : "unavailable";
+	if (values.length === 1) return formatCharacterCount(values[0]!);
+	return `mixed (${values.map(formatCharacterCount).join(", ")})`;
+}
+
+function toolResultBudgetCoverageLabel(
+	metrics: DynamicToolResultBudgetRollup,
+	compact: boolean,
+): string {
+	if (!compact && metrics.disabledTasks > 0) return "disabled";
+	if (!compact && metrics.pendingTelemetryTasks > 0) return "pending";
+	const total = metrics.tasks || 1;
+	if (compact) return `complete ${metrics.fullyReportingTasks}/${total}`;
+	if (metrics.fullyReportingTasks === total)
+		return `complete ${metrics.fullyReportingTasks}/${total} tasks`;
+	if (metrics.partiallyReportingTasks > 0)
+		return `partial ${metrics.partiallyReportingTasks}/${total} tasks`;
+	return `unavailable ${metrics.unavailableTasks}/${total} tasks`;
+}
+
+function toolResultBudgetOtherCoverageLabel(
+	metrics: DynamicToolResultBudgetRollup,
+): string {
+	return [
+		[metrics.partiallyReportingTasks, "partial"],
+		[metrics.unavailableTasks, "unavailable"],
+		[metrics.disabledTasks, "disabled"],
+		[metrics.pendingTelemetryTasks, "pending"],
+	]
+		.filter(([count]) => Number(count) > 0)
+		.map(([count, label]) => `${label} ${count}`)
+		.join(" · ");
+}
+
+function formatTokenCount(
+	value: number | null | undefined,
+): string | undefined {
+	if (typeof value !== "number" || !Number.isFinite(value)) return undefined;
+	if (value >= 1_000_000)
+		return `${(value / 1_000_000).toFixed(value >= 10_000_000 ? 0 : 2)}M`;
+	if (value >= 1_000)
+		return `${(value / 1_000).toFixed(value >= 100_000 ? 0 : 1)}k`;
+	return String(Math.round(value));
+}
+
+function placeholder(theme: Theme, text: string): string {
+	return muted(theme, text);
+}
+
+function messageText(theme: Theme, text: string): string {
+	return accent(theme, text);
+}
+
+function scrollIndicator(theme: Theme, text: string): string {
+	return muted(theme, text);
+}
+
+function metaLabel(theme: Theme, text: string): string {
+	return muted(theme, text);
+}
+
+function metaValue(theme: Theme, text: string): string {
+	return fg(theme, "text", text);
+}
+
+function kvRow(
+	theme: Theme,
+	key: string,
+	value: string,
+	valueColor = "text",
+): string {
+	return `${metaLabel(theme, `${key}:`)} ${fg(theme, valueColor, value)}`;
+}
+
+function taskMetaLine(theme: Theme, pairs: Array<[string, string]>): string {
+	return pairs
+		.map(([key, value]) => kvRow(theme, key, value))
+		.join(` ${muted(theme, "·")} `);
+}
+
+function pathText(theme: Theme, projectPath: string): string {
+	const lastSlash = projectPath.lastIndexOf("/");
+	if (lastSlash < 0) return fg(theme, "mdLinkUrl", projectPath);
+	return `${dim(theme, projectPath.slice(0, lastSlash + 1))}${metaValue(theme, projectPath.slice(lastSlash + 1))}`;
+}
+
+function navHint(theme: Theme, text: string): string {
+	return text
+		.split(" · ")
+		.map((part) => {
+			const firstSpace = part.indexOf(" ");
+			if (firstSpace < 0) return accent(theme, part);
+			return `${accent(theme, part.slice(0, firstSpace))}${muted(theme, part.slice(firstSpace))}`;
+		})
+		.join(` ${muted(theme, "·")} `);
+}
+
+function timelineLine(
+	theme: Theme,
+	label: string,
+	value: string,
+	color: string,
+): string {
+	const glyph = color === "success" ? "✓" : color === "error" ? "✕" : "●";
+	return `${fg(theme, color, glyph)} ${metaLabel(theme, label)} ${metaValue(theme, value)}`;
+}
+
+function validationLine(theme: Theme, status: string, message: string): string {
+	const color =
+		status === "valid" ? "success" : status === "invalid" ? "error" : "warning";
+	const suffix = message
+		? ` ${muted(theme, "·")} ${metaValue(theme, message)}`
+		: "";
+	return `${fg(theme, color, strong(theme, status))}${suffix}`;
+}
+
+function previewText(theme: Theme, line: string): string {
+	if (/^\([^)]*\)$/.test(line)) return placeholder(theme, line);
+	const trimmedStart = line.trimStart();
+	const indent = line.slice(0, line.length - trimmedStart.length);
+	if (/^#{1,6}\s/.test(trimmedStart))
+		return `${indent}${fg(theme, "mdHeading", strong(theme, trimmedStart))}`;
+	if (/^```/.test(trimmedStart)) return fg(theme, "mdCodeBlockBorder", line);
+	if (/^(?:\/\/|<!--)/.test(trimmedStart))
+		return fg(theme, "syntaxComment", line);
+
+	const bullet = /^(\s*)([-*])\s+(.*)$/.exec(line);
+	if (bullet)
+		return `${bullet[1]}${fg(theme, "mdListBullet", bullet[2] ?? "-")} ${inlinePreviewText(theme, bullet[3] ?? "")}`;
+
+	const keyValue = /^(\s*(?:"[^"]+"|[A-Za-z0-9_.-]+)\s*[:=])(\s*)(.*)$/.exec(
+		line,
+	);
+	if (keyValue)
+		return `${fg(theme, "syntaxVariable", keyValue[1] ?? "")}${keyValue[2] ?? ""}${inlinePreviewText(theme, keyValue[3] ?? "")}`;
+
+	return inlinePreviewText(theme, line);
+}
+
+function inlinePreviewText(theme: Theme, text: string): string {
+	return text
+		.split(/(`[^`]*`|[A-Z][A-Z0-9_]{3,}|"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*')/g)
+		.map((part) => {
+			if (!part) return "";
+			if (/^`[^`]*`$/.test(part)) return fg(theme, "mdCode", part);
+			if (/^[A-Z][A-Z0-9_]{3,}$/.test(part)) return fg(theme, "mdCode", part);
+			if (/^"(?:[^"\\]|\\.)*"$/.test(part) || /^'(?:[^'\\]|\\.)*'$/.test(part))
+				return fg(theme, "syntaxString", part);
+			return metaValue(theme, part);
+		})
+		.join("");
+}
+
+function bgBand(theme: Theme, color: string, text: string): string {
+	if (!theme.bg) return text;
+	const marker = "__PI_WORKFLOW_BG_MARKER__";
+	const wrapped = theme.bg(color, marker);
+	const markerIndex = wrapped.indexOf(marker);
+	if (markerIndex < 0) return theme.bg(color, text);
+	const prefix = wrapped.slice(0, markerIndex);
+	const suffix = wrapped.slice(markerIndex + marker.length);
+	return `${prefix}${text.replace(/\u001b\[0m/g, `\u001b[0m${prefix}`)}${suffix}`;
+}
+
+function chip(
+	theme: Theme,
+	label: string,
+	value: string,
+	color: string,
+): string {
+	const content = ` ${label} ${value} `;
+	return fg(theme, color, strong(theme, `●${content}`));
+}
+
+function rule(theme: Theme, width: number): string {
+	return fg(
+		theme,
+		"borderMuted",
+		"─".repeat(Math.max(1, Math.min(width, 160))),
+	);
+}
+
+function selectedLine(
+	theme: Theme,
+	line: string,
+	width: number,
+	selected: boolean,
+	active: boolean,
+): string {
+	if (!selected) return line;
+	const padded = padAnsi(line, width);
+	if (active && theme.bg) return bgBand(theme, "selectedBg", padded);
+	return active ? accent(theme, padded) : muted(theme, padded);
+}
+
+function strong(theme: Theme, text: string): string {
+	return theme.bold ? theme.bold(text) : text;
+}
+
+function fg(theme: Theme, color: string, text: string): string {
+	return theme.fg ? theme.fg(color, text) : text;
+}
+
+function accent(theme: Theme, text: string): string {
+	return fg(theme, "accent", text);
+}
+
+function muted(theme: Theme, text: string): string {
+	return fg(theme, "muted", text);
+}
+
+function dim(theme: Theme, text: string): string {
+	return fg(theme, "dim", text);
+}
+
+function success(theme: Theme, text: string): string {
+	return fg(theme, "success", text);
+}
+
+function warning(theme: Theme, text: string): string {
+	return fg(theme, "warning", text);
+}
+
+function errorText(theme: Theme, text: string): string {
+	return fg(theme, "error", text);
+}

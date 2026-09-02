@@ -1,0 +1,24 @@
+{
+	"provenance": {
+		"runner": "shellcheck",
+		"tool": "shellcheck",
+		"version": "0.11.0",
+		"command": "shellcheck --format json --shell bash --severity info bad.sh",
+		"argv": [
+			"--format",
+			"json",
+			"--shell",
+			"bash",
+			"--severity",
+			"info",
+			"bad.sh"
+		],
+		"workspace": "tests/fixtures/tool-smoke/shell",
+		"platform": "win32-x64",
+		"capturedAt": "2026-08-21"
+	},
+	"file": "bad.sh",
+	"exitCode": 1,
+	"stdout": "[{\"file\":\"bad.sh\",\"line\":6,\"endLine\":6,\"column\":6,\"endColumn\":8,\"level\":\"info\",\"code\":2086,\"message\":\"Double quote to prevent globbing and word splitting.\",\"fix\":{\"replacements\":[{\"column\":6,\"endColumn\":6,\"endLine\":6,\"insertionPoint\":\"afterEnd\",\"line\":6,\"precedence\":10,\"replacement\":\"\\\"\"},{\"column\":8,\"endColumn\":8,\"endLine\":6,\"insertionPoint\":\"beforeStart\",\"line\":6,\"precedence\":10,\"replacement\":\"\\\"\"}]}}]\n",
+	"stderr": ""
+}

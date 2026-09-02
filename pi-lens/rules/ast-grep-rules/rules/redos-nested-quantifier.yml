@@ -1,0 +1,23 @@
+id: redos-nested-quantifier
+language: TypeScript
+severity: warning
+message: "Nested unbounded quantifier in regex — risks catastrophic backtracking (ReDoS)"
+metadata:
+  category: security
+note: |
+  A single quantified atom nested inside another repetition — e.g. (a+)+ , (a*)* ,
+  ([a-z]+)* , (\d+){2,} — can match the same input in exponentially many ways, so a
+  crafted string causes catastrophic backtracking (CWE-1333, ReDoS). This fires
+  only when BOTH the inner and outer quantifier are unbounded (+, *, or {n,}) AND
+  the group body is just that one atom. Bounded quantifiers like {2,3}, and groups
+  with a mandatory prefix that makes the partition unique (e.g. (ba+)+ ,
+  (-[a-z0-9]+){3,} ), are not flagged.
+
+  Fix: use a bounded quantifier ({1,N}), rewrite so the inner group has only one
+  way to match (e.g. (ba+)+ is fine), use a negated character class instead of .
+  ([^_]*_.* instead of .*_.*), or mimic an atomic group: ((?=(a+))\2)+ . For
+  untrusted input, prefer a non-backtracking engine (RE2 / node-re2) or solve it
+  without a regex.
+rule:
+  kind: regex_pattern
+  regex: '\((?:\?:)?(?:\[(?:[^\]\\]|\\.)*\]|\\.|[^\\()\[\]{}*+?|])(?:[*+]|\{\d+,\})\)+(?:[*+]|\{\d+,\})'

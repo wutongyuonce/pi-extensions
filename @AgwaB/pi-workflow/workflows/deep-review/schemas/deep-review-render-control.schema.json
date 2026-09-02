@@ -1,0 +1,161 @@
+{
+  "type": "object",
+  "required": [
+    "schema",
+    "digest",
+    "status",
+    "verdict",
+    "completionSummaryMarkdown",
+    "markdown",
+    "findingSummary",
+    "renderedFindingIds",
+    "renderedNeedsHumanIds",
+    "sourceArtifacts",
+    "gates"
+  ],
+  "properties": {
+    "schema": { "type": "string", "const": "deep-review-render-v1" },
+    "digest": { "type": "string", "minLength": 1 },
+    "status": { "type": "string", "enum": ["passed", "failed", "blocked"] },
+    "verdict": { "type": "string", "enum": ["REVIEW_COMPLETE", "NEEDS_WORK", "PARTIAL_REVIEW"] },
+    "blockers": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+    "completionSummaryMarkdown": { "type": "string" },
+    "markdown": { "type": "string" },
+    "findingSummary": {
+      "type": "object",
+      "required": ["total", "bySeverity"],
+      "properties": {
+        "total": { "type": "number" },
+        "bySeverity": { "type": "object", "additionalProperties": { "type": "number" } }
+      },
+      "additionalProperties": true
+    },
+    "renderedFindingIds": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "renderedNeedsHumanIds": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "expectedFindingCount": { "type": "number" },
+    "expectedMergedFindingCount": { "type": "number" },
+    "mergedFindingCount": { "type": "number" },
+    "needsHumanSummary": {
+      "type": "object",
+      "required": ["actual", "expected", "metadataMissing", "incompleteEvidence"],
+      "properties": {
+        "actual": { "type": "number" },
+        "expected": { "type": "number" },
+        "metadataMissing": { "type": "boolean" },
+        "incompleteEvidence": { "type": "number" }
+      },
+      "additionalProperties": false
+    },
+    "supportNoteSummary": {
+      "type": "object",
+      "required": ["actual", "expected", "metadataMissing", "incompleteEvidence"],
+      "properties": {
+        "actual": { "type": "number" },
+        "expected": { "type": "number" },
+        "metadataMissing": { "type": "boolean" },
+        "incompleteEvidence": { "type": "number" }
+      },
+      "additionalProperties": false
+    },
+    "sourceArtifacts": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "gates": {
+      "type": "object",
+      "required": [
+        "renderedAllFindings",
+        "renderedAllNeedsHuman",
+        "renderedAllSupportNotes",
+        "findingCountMismatch",
+        "needsHumanCountMismatch",
+        "needsHumanMetadataMissing",
+        "needsHumanEvidenceIncomplete",
+        "reportSynthesisAvailable",
+        "reportVerdictConsistent",
+        "supportNoteCountMismatch",
+        "supportNoteMetadataMissing",
+        "supportNoteEvidenceIncomplete",
+        "passed"
+      ],
+      "properties": {
+        "renderedAllFindings": { "type": "boolean" },
+        "renderedAllNeedsHuman": { "type": "boolean" },
+        "renderedAllSupportNotes": { "type": "boolean" },
+        "findingCountMismatch": { "type": "boolean" },
+        "ledgerTopLevelCountMismatch": { "type": "boolean" },
+        "uniqueLedgerIds": { "type": "boolean" },
+        "duplicateLedgerIds": { "type": "array", "items": { "type": "string" } },
+        "mergedFindingCountMismatch": { "type": "boolean" },
+        "renderedAllLineage": { "type": "boolean" },
+        "renderedAllDropped": { "type": "boolean" },
+        "needsHumanCountMismatch": { "type": "boolean" },
+        "needsHumanMetadataMissing": { "type": "boolean" },
+        "needsHumanEvidenceIncomplete": { "type": "boolean" },
+        "reportSynthesisAvailable": { "type": "boolean" },
+        "reportVerdictConsistent": { "type": "boolean" },
+        "supportNoteCountMismatch": { "type": "boolean" },
+        "supportNoteMetadataMissing": { "type": "boolean" },
+        "supportNoteEvidenceIncomplete": { "type": "boolean" },
+        "passed": { "type": "boolean" }
+      },
+      "additionalProperties": true
+    },
+    "sidecarPath": { "type": "string", "const": "final-report.md" }
+  },
+  "oneOf": [
+    {
+      "type": "object",
+      "required": ["status", "verdict", "gates"],
+      "properties": {
+        "status": { "type": "string", "const": "passed" },
+        "verdict": { "type": "string", "enum": ["REVIEW_COMPLETE", "NEEDS_WORK"] },
+        "gates": {
+          "type": "object",
+          "required": ["passed"],
+          "properties": { "passed": { "type": "boolean", "const": true } }
+        },
+        "blockers": false
+      }
+    },
+    {
+      "type": "object",
+      "required": ["status", "verdict", "gates"],
+      "properties": {
+        "status": { "type": "string", "const": "failed" },
+        "verdict": { "type": "string", "const": "PARTIAL_REVIEW" },
+        "gates": {
+          "type": "object",
+          "required": ["passed"],
+          "properties": { "passed": { "type": "boolean", "const": false } }
+        },
+        "blockers": false
+      }
+    },
+    {
+      "type": "object",
+      "required": ["status", "verdict", "gates", "blockers"],
+      "properties": {
+        "status": { "type": "string", "const": "blocked" },
+        "verdict": { "type": "string", "const": "PARTIAL_REVIEW" },
+        "gates": {
+          "type": "object",
+          "required": ["passed"],
+          "properties": { "passed": { "type": "boolean", "const": false } }
+        },
+        "blockers": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "minLength": 1 }
+        }
+      }
+    }
+  ],
+  "additionalProperties": true
+}

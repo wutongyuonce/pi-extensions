@@ -1,0 +1,29 @@
+# taplo config (dogfood activation, refs #1844).
+#
+# Its mere presence gates TWO pi-lens surfaces, not just the taplo lint
+# runner (clients/dispatch/runners/taplo.ts, always on for `.toml` files):
+# `hasTaploConfig` (clients/tool-policy.ts) also turns on the taplo
+# AUTOFIX formatter (clients/formatters.ts's `taploFormatter`, `taplo fmt`).
+# `taplo fmt` reflowed comment spacing in this repo's two existing TOML
+# files on first run (single space before a `#`, not the hand-aligned
+# double space they had); this PR applies that once so activation doesn't
+# leave `taplo fmt --check` red on the next unrelated touch. See the PR body.
+#
+# Forward-looking: pi-lens has almost no TOML today (two files, both
+# reformatted above). The parallel oxfmt PR (#1984, refs #1844) configures
+# via `.oxfmtrc.json`, not TOML, so this lane stays mostly dormant until a
+# real TOML surface shows up — activating it now still exercises the gate.
+
+include = ["**/*.toml"]
+exclude = [
+    "node_modules/**",
+    # Runner fixtures deliberately exercise malformed/unusual TOML.
+    "tests/fixtures/**",
+]
+
+[formatting]
+# Keep formatting minimal and non-opinionated until real TOML content
+# exists to tune against — avoid baking in guesses (#1946 precedent: tune
+# against real captured output, not assumption).
+align_entries = false
+reorder_keys = false

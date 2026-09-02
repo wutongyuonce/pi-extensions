@@ -19,6 +19,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { streamToOutputFile, writeInitialEntry } from "../src/output-file.js";
+import { fauxModelBackend } from "./helpers/faux-model-backend.js";
 import { registerFauxProvider } from "./helpers/pi-ai.js";
 
 const TURNS_BEFORE_COMPACT = 6;
@@ -46,6 +47,7 @@ describe("output-file streaming across a real compaction (#145)", () => {
       models: [{ id: "faux-1", contextWindow: 200_000 }],
     });
     const model = faux.getModel();
+    const backend = fauxModelBackend(model);
     // Context-branching responder: compaction issues a variable number of
     // model calls (summary, plus a turn-prefix summary when the cut point
     // splits a turn), so a fixed FIFO would desync. Decide from the request.
@@ -88,16 +90,9 @@ describe("output-file streaming across a real compaction (#145)", () => {
       cwd,
       agentDir,
       model,
-      modelRegistry: {
-        find: () => model,
-        getAll: () => [model],
-        getAvailable: () => [model],
-        hasConfiguredAuth: () => true,
-        isUsingOAuth: () => false,
-        getApiKeyAndHeaders: async () => ({ ok: true, apiKey: "faux", headers: {} }),
-        registerProvider: () => {},
-        unregisterProvider: () => {},
-      } as never,
+      // Registry for pre-0.80.8 Pi, runtime for post — each ignores the other.
+      modelRegistry: backend.modelRegistry as never,
+      modelRuntime: backend.modelRuntime as never,
       resourceLoader: loader,
       sessionManager: SessionManager.inMemory(cwd),
       settingsManager: SettingsManager.inMemory({

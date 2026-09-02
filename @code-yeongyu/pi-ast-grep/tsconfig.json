@@ -1,0 +1,32 @@
+{
+	"compilerOptions": {
+		"target": "ES2022",
+		"module": "Node16",
+		"moduleResolution": "Node16",
+		"lib": ["ES2022"],
+		"strict": true,
+		"strictFunctionTypes": false,
+		"noUncheckedIndexedAccess": true,
+		"exactOptionalPropertyTypes": true,
+		"noPropertyAccessFromIndexSignature": true,
+		"noImplicitOverride": true,
+		"noImplicitReturns": true,
+		"noFallthroughCasesInSwitch": true,
+		"allowUnreachableCode": false,
+		"allowUnusedLabels": false,
+		"isolatedModules": true,
+		"verbatimModuleSyntax": true,
+		"noUncheckedSideEffectImports": true,
+		"noUnusedLocals": true,
+		"noUnusedParameters": true,
+		"esModuleInterop": true,
+		"skipLibCheck": true,
+		"forceConsistentCasingInFileNames": true,
+		"resolveJsonModule": true,
+		"useDefineForClassFields": false,
+		"types": ["node"],
+		"noEmit": true
+	},
+	"include": ["src/**/*", "test/**/*"],
+	"exclude": ["test/fixtures/**/*"]
+}

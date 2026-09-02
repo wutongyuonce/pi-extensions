@@ -1,0 +1,49 @@
+name: CI infra-kill rerun
+
+# Moves #2042's judged rerun from session-side polling into a bounded
+# workflow. The classifier remains the single source for log interpretation.
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+
+permissions: {}
+
+jobs:
+  classify:
+    name: Classify failed Unit tests
+    # pull_request runs only: a master-push run has an empty pull_requests
+    # array, so the classifier can only throw there and paint a useless red
+    # check beside an already-red master. Master-lane rerun coverage needs a
+    # comment-free path and is tracked separately.
+    # Same-repo runs only: a fork PR's workflow_run carries an empty
+    # pull_requests array, so the classifier can only throw the same
+    # no-associated-PR error the push gate excludes. Fork-lane rerun
+    # coverage needs the comment-free path tracked on #2042's remainder.
+    if: >-
+      github.event.workflow_run.head_repository.full_name == github.repository &&
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.conclusion == 'failure' &&
+      github.event.workflow_run.run_attempt == 1
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: read
+      pull-requests: write
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GITHUB_REPOSITORY: ${{ github.repository }}
+      RUN_ID: ${{ github.event.workflow_run.id }}
+      HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+      PR_NUMBER: ${{ github.event.workflow_run.pull_requests[0].number }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Classify Unit-tests failure and rerun infra-kill once
+        shell: bash
+        run: |
+          args=(--run "$RUN_ID" --sha "$HEAD_SHA" --infra-kill-only --skip-missing-job)
+          if [[ -n "$PR_NUMBER" ]]; then args+=(--pr "$PR_NUMBER"); fi
+          node scripts/classify-ci-failure.mjs "${args[@]}"

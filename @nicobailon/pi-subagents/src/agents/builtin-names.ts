@@ -1,0 +1,15 @@
+export const BUILTIN_AGENT_NAMES = [
+	"advisor",
+	"claude-code",
+	"claude-code-writer",
+	"codex-exec",
+	"codex-exec-writer",
+	"cursor-agent",
+	"cursor-agent-writer",
+	"delegate",
+	"oracle",
+	"researcher",
+	"reviewer",
+	"scout",
+	"worker",
+] as const;

@@ -1,0 +1,11 @@
+id: ts-slice-copy
+language: typescript
+severity: warning
+message: arr.slice() to copy - use [...arr] spread
+metadata:
+  weight: 2
+  category: slop
+rule:
+  pattern: "$ARR.slice()"
+  not:
+    pattern: "$ARR.slice($START)"

@@ -1,0 +1,20 @@
+{
+	"provenance": {
+		"runner": "vale",
+		"tool": "vale",
+		"version": "3.9.6",
+		"command": "vale --output JSON bad.md",
+		"argv": [
+			"--output",
+			"JSON",
+			"bad.md"
+		],
+		"workspace": "tests/fixtures/tool-smoke/vale",
+		"platform": "win32-x64",
+		"capturedAt": "2026-08-21"
+	},
+	"file": "bad.md",
+	"exitCode": 1,
+	"stdout": "{\n  \"bad.md\": [\n    {\n      \"Action\": {\n        \"Name\": \"\",\n        \"Params\": null\n      },\n      \"Span\": [\n        1,\n        6\n      ],\n      \"Check\": \"pi-lens.NoPlease\",\n      \"Description\": \"\",\n      \"Link\": \"\",\n      \"Message\": \"Drop 'please' — state the instruction directly.\",\n      \"Severity\": \"error\",\n      \"Match\": \"Please\",\n      \"Line\": 3\n    },\n    {\n      \"Action\": {\n        \"Name\": \"\",\n        \"Params\": null\n      },\n      \"Span\": [\n        29,\n        34\n      ],\n      \"Check\": \"pi-lens.NoPlease\",\n      \"Description\": \"\",\n      \"Link\": \"\",\n      \"Message\": \"Drop 'please' — state the instruction directly.\",\n      \"Severity\": \"error\",\n      \"Match\": \"please\",\n      \"Line\": 3\n    }\n  ]\n}\n",
+	"stderr": ""
+}

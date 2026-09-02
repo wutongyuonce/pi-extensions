@@ -1,0 +1,1209 @@
+import { constants as fsConstants, type Stats } from "node:fs";
+import {
+	appendFile,
+	lstat,
+	mkdir,
+	open,
+	readFile,
+	realpath,
+	stat,
+	type FileHandle,
+} from "node:fs/promises";
+import { dirname, isAbsolute, relative, resolve } from "node:path";
+
+import {
+	EXPERIMENTAL_TOOL_DEDUP_ENV,
+	workflowExperimentalFlagEnabled,
+} from "./experimental-speed-flags.js";
+import { stringifyPromptJson } from "./prompt-json.js";
+import { isSimpleJsonPath, readSimpleJsonPath } from "./workflow-runtime.js";
+
+export const WORKFLOW_SOURCE_MANIFEST_SCHEMA =
+	"workflow-source-manifest-v1" as const;
+export const WORKFLOW_ARTIFACT_READ_SCHEMA =
+	"workflow-artifact-read-v1" as const;
+
+export const WORKFLOW_TASK_ARTIFACT_KINDS = [
+	"control",
+	"analysis",
+	"refs",
+	"raw",
+] as const;
+export const WORKFLOW_DEBUG_ARTIFACT_KINDS = [
+	"prompt",
+	"system-prompt",
+	"stderr",
+	"result",
+] as const;
+export const WORKFLOW_ARTIFACT_KINDS = [
+	...WORKFLOW_TASK_ARTIFACT_KINDS,
+	...WORKFLOW_DEBUG_ARTIFACT_KINDS,
+] as const;
+
+export type WorkflowArtifactKind = (typeof WORKFLOW_ARTIFACT_KINDS)[number];
+export type WorkflowArtifactAccessMode = "workflow-task" | "human-debug";
+
+export interface WorkflowArtifactRef {
+	path: string;
+	mediaType?: string;
+}
+
+export interface WorkflowSourceManifestSource {
+	source: string;
+	displayName?: string;
+	taskId?: string;
+	specId?: string;
+	stageId?: string;
+	itemIdentity?: string;
+	placeholderSpecId?: string;
+	status?: string;
+	statusDetail?: string;
+	lastMessage?: string;
+	errorType?: string;
+	digest?: string;
+	controlProjection?: unknown;
+	projectionMissingPaths?: string[];
+	projectionTruncated?: boolean;
+	projectionSource?: "partial-ledger";
+	artifacts: Partial<Record<WorkflowArtifactKind, WorkflowArtifactRef>>;
+}
+
+export interface WorkflowSourceManifest {
+	schema: typeof WORKFLOW_SOURCE_MANIFEST_SCHEMA;
+	runId: string;
+	taskId: string;
+	sources: WorkflowSourceManifestSource[];
+	policy?: {
+		accessMode?: WorkflowArtifactAccessMode;
+		debugArtifacts?: boolean;
+	};
+}
+
+export interface WorkflowArtifactReadLedgerRecord {
+	schema: typeof WORKFLOW_ARTIFACT_READ_SCHEMA;
+	runId: string;
+	taskId: string;
+	source: string;
+	artifact: WorkflowArtifactKind;
+	at: string;
+	bytes: number;
+	returnedBytes: number;
+	truncated: boolean;
+	path?: string;
+	maxItems?: number;
+	maxChars?: number;
+}
+
+export interface WorkflowArtifactToolConfig {
+	runId: string;
+	taskId: string;
+	manifestPath: string;
+	ledgerPath: string;
+	accessMode?: WorkflowArtifactAccessMode;
+	runDir?: string;
+	maxBytes?: number;
+	maxLines?: number;
+}
+
+export interface WorkflowArtifactListEntry {
+	source: string;
+	displayName?: string;
+	taskId?: string;
+	specId?: string;
+	stageId?: string;
+	status?: string;
+	statusDetail?: string;
+	lastMessage?: string;
+	errorType?: string;
+	digest?: string;
+	controlProjection?: unknown;
+	projectionMissingPaths?: string[];
+	projectionTruncated?: boolean;
+	projectionSource?: "partial-ledger";
+	artifacts: WorkflowArtifactKind[];
+}
+
+export interface WorkflowArtifactProjectionMetadata {
+	path: string;
+	valueType: string;
+	maxItems?: number;
+	maxChars?: number;
+	totalItems?: number;
+	itemsReturned?: number;
+	itemsTruncated?: boolean;
+	originalChars: number;
+	charsReturned: number;
+	charsTruncated: boolean;
+}
+
+export interface WorkflowArtifactReadResult {
+	source: string;
+	artifact: WorkflowArtifactKind;
+	content: string;
+	bytes: number;
+	returnedBytes: number;
+	truncated: boolean;
+	mediaType?: string;
+	projection?: WorkflowArtifactProjectionMetadata;
+}
+
+export interface WorkflowArtifactToolResult {
+	content: Array<{ type: "text"; text: string }>;
+	details: Record<string, unknown>;
+}
+
+type JsonRecord = Record<string, unknown>;
+
+const WORKFLOW_ARTIFACT_KIND_SET = new Set<string>(WORKFLOW_ARTIFACT_KINDS);
+// This cache is intentionally process-local: workflow workers load this tool
+// inside the subagent task process, so duplicate-read suppression cannot carry
+// across attempts unless the tool host is deliberately hoisted in the future.
+const workflowArtifactReadDedupCache = new Map<
+	string,
+	WorkflowArtifactReadResult
+>();
+const completedWorkflowArtifactReadCache = new Map<
+	string,
+	WorkflowArtifactReadResult
+>();
+const COMPLETED_ARTIFACT_READ_CACHE_MAX = 128;
+const DEFAULT_MAX_BYTES = 50 * 1024;
+const DEFAULT_MAX_LINES = 2000;
+const SOURCE_NAME_PATTERN = /^[A-Za-z0-9_.:-]+$/;
+let artifactValidatedHookForTests: (() => void | Promise<void>) | undefined;
+
+export function setArtifactValidatedHookForTests(
+	hook: (() => void | Promise<void>) | undefined,
+): void {
+	artifactValidatedHookForTests = hook;
+}
+
+export function clearCompletedArtifactReadCacheForTests(): void {
+	completedWorkflowArtifactReadCache.clear();
+}
+const SIMPLE_JSON_PATH_DIAGNOSTIC =
+	"path must be $ or a simple dot JSON path with optional array selectors/slices like $.claims[0], $.claims[0:2], $.claims[*], or $[0:2]";
+const JSON_PATH_SEGMENT_ALIASES: Record<string, string> = {
+	axes: "researchAxes",
+	claimVerdicts: "claimVerdictLedger",
+	factSlot: "factSlots",
+	gaps: "remainingGaps",
+	primarySources: "sourcePolicy",
+	priorities: "verificationPriorities",
+	questions: "researchQuestions",
+	requiredSources: "sourcePolicy",
+	scope: "researchScope",
+	slots: "factSlots",
+	sourceQualityRules: "sourcePolicy",
+	sourceRequirements: "sourcePolicy",
+	verification: "verificationPriorities",
+	verificationPriority: "verificationPriorities",
+	verdicts: "claimVerdictLedger",
+};
+
+export async function loadWorkflowSourceManifest(
+	manifestPath: string,
+	options: { runDir?: string } = {},
+): Promise<WorkflowSourceManifest> {
+	const absoluteManifestPath = resolve(manifestPath);
+	const runDir = resolve(
+		options.runDir ?? inferRunDirFromManifestPath(absoluteManifestPath),
+	);
+	const raw = JSON.parse(
+		await readFile(absoluteManifestPath, "utf8"),
+	) as unknown;
+	return normalizeWorkflowSourceManifest(raw, { runDir });
+}
+
+export function normalizeWorkflowSourceManifest(
+	value: unknown,
+	options: { runDir: string },
+): WorkflowSourceManifest {
+	if (!isRecord(value)) throw new Error("source manifest must be an object");
+	if (value.schema !== WORKFLOW_SOURCE_MANIFEST_SCHEMA)
+		throw new Error(
+			`source manifest schema must be ${WORKFLOW_SOURCE_MANIFEST_SCHEMA}`,
+		);
+	const runId = requiredString(value.runId, "runId");
+	const taskId = requiredString(value.taskId, "taskId");
+	if (!Array.isArray(value.sources))
+		throw new Error("source manifest sources must be an array");
+
+	const seen = new Set<string>();
+	const sources = value.sources.map((sourceValue, index) => {
+		if (!isRecord(sourceValue))
+			throw new Error(`source manifest sources[${index}] must be an object`);
+		const source = requiredString(
+			sourceValue.source,
+			`sources[${index}].source`,
+		);
+		validateSourceName(source, `sources[${index}].source`);
+		if (seen.has(source))
+			throw new Error(`duplicate source in source manifest: ${source}`);
+		seen.add(source);
+
+		const artifactsValue = sourceValue.artifacts;
+		if (!isRecord(artifactsValue))
+			throw new Error(`sources[${index}].artifacts must be an object`);
+
+		const artifacts: Partial<
+			Record<WorkflowArtifactKind, WorkflowArtifactRef>
+		> = {};
+		for (const [artifact, refValue] of Object.entries(artifactsValue)) {
+			assertArtifactKind(artifact, `sources[${index}].artifacts`);
+			if (!isRecord(refValue))
+				throw new Error(
+					`sources[${index}].artifacts.${artifact} must be an object`,
+				);
+			const path = requiredString(
+				refValue.path,
+				`sources[${index}].artifacts.${artifact}.path`,
+			);
+			const absolutePath = resolveArtifactPath(path, options.runDir, {
+				field: `sources[${index}].artifacts.${artifact}.path`,
+			});
+			const mediaType = optionalString(
+				refValue.mediaType,
+				`sources[${index}].artifacts.${artifact}.mediaType`,
+			);
+			artifacts[artifact] = mediaType
+				? { path: absolutePath, mediaType }
+				: { path: absolutePath };
+		}
+
+		return {
+			source,
+			displayName: optionalString(
+				sourceValue.displayName,
+				`sources[${index}].displayName`,
+			),
+			taskId: optionalString(sourceValue.taskId, `sources[${index}].taskId`),
+			specId: optionalString(sourceValue.specId, `sources[${index}].specId`),
+			stageId: optionalString(sourceValue.stageId, `sources[${index}].stageId`),
+			status: optionalString(sourceValue.status, `sources[${index}].status`),
+			statusDetail: optionalString(
+				sourceValue.statusDetail,
+				`sources[${index}].statusDetail`,
+			),
+			lastMessage: optionalString(
+				sourceValue.lastMessage,
+				`sources[${index}].lastMessage`,
+			),
+			errorType: optionalString(
+				sourceValue.errorType,
+				`sources[${index}].errorType`,
+			),
+			digest: optionalString(sourceValue.digest, `sources[${index}].digest`),
+			controlProjection: sourceValue.controlProjection,
+			projectionMissingPaths: optionalStringArray(
+				sourceValue.projectionMissingPaths,
+				`sources[${index}].projectionMissingPaths`,
+			),
+			projectionTruncated: optionalBoolean(
+				sourceValue.projectionTruncated,
+				`sources[${index}].projectionTruncated`,
+			),
+			...(sourceValue.projectionSource === "partial-ledger"
+				? { projectionSource: "partial-ledger" as const }
+				: {}),
+			artifacts,
+		};
+	});
+
+	const policy = normalizePolicy(value.policy);
+	return policy
+		? {
+				schema: WORKFLOW_SOURCE_MANIFEST_SCHEMA,
+				runId,
+				taskId,
+				sources,
+				policy,
+			}
+		: { schema: WORKFLOW_SOURCE_MANIFEST_SCHEMA, runId, taskId, sources };
+}
+
+export function allowedWorkflowArtifactKinds(
+	accessMode: WorkflowArtifactAccessMode = "workflow-task",
+): WorkflowArtifactKind[] {
+	return accessMode === "human-debug"
+		? [...WORKFLOW_ARTIFACT_KINDS]
+		: [...WORKFLOW_TASK_ARTIFACT_KINDS];
+}
+
+export function listWorkflowArtifactSources(
+	manifest: WorkflowSourceManifest,
+	options: { accessMode?: WorkflowArtifactAccessMode } = {},
+): WorkflowArtifactListEntry[] {
+	const allowed = new Set(allowedWorkflowArtifactKinds(options.accessMode));
+	return manifest.sources.map((source) => {
+		const artifacts = Object.keys(source.artifacts).filter(
+			(artifact): artifact is WorkflowArtifactKind =>
+				allowed.has(artifact as WorkflowArtifactKind),
+		);
+		return {
+			source: source.source,
+			displayName: source.displayName,
+			taskId: source.taskId,
+			specId: source.specId,
+			stageId: source.stageId,
+			status: source.status,
+			statusDetail: source.statusDetail,
+			lastMessage: source.lastMessage,
+			errorType: source.errorType,
+			digest: source.digest,
+			controlProjection: source.controlProjection,
+			projectionMissingPaths: source.projectionMissingPaths,
+			projectionTruncated: source.projectionTruncated,
+			projectionSource: source.projectionSource,
+			artifacts,
+		};
+	});
+}
+
+export function resolveWorkflowArtifact(
+	manifest: WorkflowSourceManifest,
+	sourceName: string,
+	artifact: string,
+	options: { accessMode?: WorkflowArtifactAccessMode } = {},
+): {
+	source: WorkflowSourceManifestSource;
+	artifact: WorkflowArtifactKind;
+	ref: WorkflowArtifactRef;
+} {
+	validateSourceName(sourceName, "source");
+	assertArtifactKind(artifact, "artifact");
+	const accessMode =
+		options.accessMode ?? manifest.policy?.accessMode ?? "workflow-task";
+	if (!allowedWorkflowArtifactKinds(accessMode).includes(artifact)) {
+		throw new Error(
+			`artifact ${artifact} is not available in ${accessMode} access mode`,
+		);
+	}
+	const source = manifest.sources.find(
+		(candidate) => candidate.source === sourceName,
+	);
+	if (!source)
+		throw new Error(`unknown workflow artifact source: ${sourceName}`);
+	const ref = source.artifacts[artifact];
+	if (!ref)
+		throw new Error(
+			`source ${sourceName} did not produce artifact ${artifact}`,
+		);
+	return { source, artifact, ref };
+}
+
+export async function readWorkflowArtifact(
+	manifest: WorkflowSourceManifest,
+	sourceName: string,
+	artifact: string,
+	options: {
+		accessMode?: WorkflowArtifactAccessMode;
+		maxBytes?: number;
+		maxLines?: number;
+		runDir?: string;
+		path?: string;
+		maxItems?: number;
+		maxChars?: number;
+	} = {},
+): Promise<WorkflowArtifactReadResult> {
+	const resolved = resolveWorkflowArtifact(
+		manifest,
+		sourceName,
+		artifact,
+		options,
+	);
+	const artifactPath = resolved.ref.path;
+	const opened = await openValidatedArtifactFile({
+		artifactPath,
+		runDir: options.runDir,
+		label: `${sourceName}.${artifact}`,
+	});
+	try {
+		if (options.path !== undefined) {
+			return await readProjectedWorkflowArtifact({
+				source: resolved.source.source,
+				artifact: resolved.artifact,
+				file: opened.file,
+				bytes: opened.fileStat.size,
+				mediaType: resolved.ref.mediaType,
+				path: options.path,
+				maxItems: options.maxItems,
+				maxChars: options.maxChars,
+			});
+		}
+		if (options.maxItems !== undefined || options.maxChars !== undefined) {
+			throw new Error("workflow_artifact maxItems/maxChars require path");
+		}
+		const maxBytes = options.maxBytes ?? DEFAULT_MAX_BYTES;
+		const maxLines = options.maxLines ?? DEFAULT_MAX_LINES;
+		const sizeTruncated = opened.fileStat.size > maxBytes;
+		const text = sizeTruncated
+			? await readUtf8Prefix(opened.file, maxBytes)
+			: await opened.file.readFile({ encoding: "utf8" });
+		const bytes = opened.fileStat.size;
+		const truncated = truncateHead(text, {
+			maxBytes,
+			maxLines,
+		});
+		return {
+			source: resolved.source.source,
+			artifact: resolved.artifact,
+			content: truncated.content,
+			bytes,
+			returnedBytes: Buffer.byteLength(truncated.content, "utf8"),
+			truncated: truncated.truncated || sizeTruncated,
+			mediaType: resolved.ref.mediaType,
+		};
+	} finally {
+		await opened.file.close();
+	}
+}
+
+async function openValidatedArtifactFile(options: {
+	artifactPath: string;
+	runDir?: string;
+	label: string;
+}): Promise<{ file: FileHandle; fileStat: Stats }> {
+	const linkStat = await lstat(options.artifactPath);
+	if (linkStat.isSymbolicLink()) {
+		throw new Error(`workflow artifact must not be a symlink: ${options.label}`);
+	}
+	const validatedStat = await stat(options.artifactPath);
+	if (!validatedStat.isFile()) {
+		throw new Error(
+			`workflow artifact is not a regular file: ${options.label}`,
+		);
+	}
+	if (validatedStat.nlink > 1) {
+		throw new Error(`workflow artifact must not be hard-linked: ${options.label}`);
+	}
+	if (options.runDir) {
+		const [realRunDir, realArtifactPath] = await Promise.all([
+			realpath(resolve(options.runDir)),
+			realpath(options.artifactPath),
+		]);
+		if (!isInsidePath(realRunDir, realArtifactPath)) {
+			throw new Error(
+				`workflow artifact must stay inside the workflow run directory: ${options.label}`,
+			);
+		}
+	}
+	await artifactValidatedHookForTests?.();
+	const file = await open(
+		options.artifactPath,
+		fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW,
+	);
+	try {
+		const fileStat = await file.stat();
+		if (
+			!fileStat.isFile() ||
+			fileStat.dev !== validatedStat.dev ||
+			fileStat.ino !== validatedStat.ino
+		) {
+			throw new Error(
+				`workflow artifact changed during validation: ${options.label}`,
+			);
+		}
+		return { file, fileStat };
+	} catch (error) {
+		await file.close();
+		throw error;
+	}
+}
+
+async function readProjectedWorkflowArtifact(options: {
+	source: string;
+	artifact: WorkflowArtifactKind;
+	file: FileHandle;
+	bytes: number;
+	mediaType?: string;
+	path: string;
+	maxItems?: number;
+	maxChars?: number;
+}): Promise<WorkflowArtifactReadResult> {
+	const parsed = JSON.parse(await options.file.readFile({ encoding: "utf8" }));
+	let effectivePath = options.path;
+	let resolved: unknown;
+	for (const candidatePath of projectionPathCandidates(
+		options.path,
+		options.source,
+		options.artifact,
+	)) {
+		resolved = readSimpleJsonPath(parsed, candidatePath);
+		if (resolved !== undefined) {
+			effectivePath = candidatePath;
+			break;
+		}
+	}
+	if (resolved === undefined) {
+		throw new Error(`workflow_artifact path did not resolve: ${options.path}`);
+	}
+	const sliced = applyProjectionItemLimit(resolved, {
+		...options,
+		path: effectivePath,
+	});
+	const serialized = stringifyPromptJson(sliced.value);
+	const maxChars = options.maxChars ?? DEFAULT_MAX_BYTES;
+	const preview =
+		serialized.length > maxChars ? serialized.slice(0, maxChars) : serialized;
+	const projection: WorkflowArtifactProjectionMetadata = {
+		path: effectivePath,
+		valueType: jsonValueType(resolved),
+		...(options.maxItems === undefined ? {} : { maxItems: options.maxItems }),
+		maxChars,
+		...(sliced.totalItems === undefined
+			? {}
+			: { totalItems: sliced.totalItems }),
+		...(sliced.itemsReturned === undefined
+			? {}
+			: { itemsReturned: sliced.itemsReturned }),
+		...(sliced.itemsTruncated === undefined
+			? {}
+			: { itemsTruncated: sliced.itemsTruncated }),
+		originalChars: serialized.length,
+		charsReturned: preview.length,
+		charsTruncated: preview.length !== serialized.length,
+	};
+	const envelope = projection.charsTruncated
+		? { projection, preview }
+		: { projection, value: sliced.value };
+	const content = stringifyPromptJson(envelope);
+	return {
+		source: options.source,
+		artifact: options.artifact,
+		content,
+		bytes: options.bytes,
+		returnedBytes: Buffer.byteLength(content, "utf8"),
+		truncated: Boolean(projection.charsTruncated || projection.itemsTruncated),
+		mediaType: options.mediaType,
+		projection,
+	};
+}
+
+function projectionPathCandidates(
+	path: string,
+	source: string,
+	artifact: WorkflowArtifactKind,
+): string[] {
+	const candidates: string[] = [];
+	const seen = new Set<string>();
+	const queue = [path];
+	for (let index = 0; index < queue.length && index < 32; index += 1) {
+		const candidate = queue[index];
+		if (seen.has(candidate)) continue;
+		seen.add(candidate);
+		candidates.push(candidate);
+		for (const next of [
+			stripArraySelector(candidate),
+			stripSourcePathPrefix(candidate, source),
+			stripArtifactPathPrefix(candidate, artifact),
+			applyJsonPathSegmentAliases(candidate),
+		]) {
+			if (next !== candidate && !seen.has(next)) queue.push(next);
+		}
+	}
+	return candidates;
+}
+
+function stripArraySelector(path: string): string {
+	return path.replace(/\[(\*|\d+|\d*:\d*)\]/gu, "");
+}
+
+function stripSourcePathPrefix(path: string, source: string): string {
+	const sourcePrefix = `$.${source}.`;
+	if (!path.startsWith(sourcePrefix)) return path;
+	return `$.${path.slice(sourcePrefix.length)}`;
+}
+
+function stripArtifactPathPrefix(
+	path: string,
+	artifact: WorkflowArtifactKind,
+): string {
+	const artifactPath = `$.${artifact}`;
+	if (path === artifactPath) return "$";
+	if (path.startsWith(`${artifactPath}[`)) {
+		return `$${path.slice(artifactPath.length)}`;
+	}
+	const artifactPrefix = `${artifactPath}.`;
+	if (!path.startsWith(artifactPrefix)) return path;
+	return `$.${path.slice(artifactPrefix.length)}`;
+}
+
+function applyJsonPathSegmentAliases(path: string): string {
+	if (path === "$" || !path.startsWith("$.")) return path;
+	const parsedSegments: Array<{ name: string; selectors: string }> = [];
+	for (const segment of path.slice(2).split(".")) {
+		const parsed = parseJsonPathAliasSegment(segment);
+		if (!parsed) return path;
+		parsedSegments.push(parsed);
+	}
+	const aliased = parsedSegments.map((segment) => {
+		const alias = JSON_PATH_SEGMENT_ALIASES[segment.name];
+		return {
+			name: alias ?? segment.name,
+			selectors: segment.selectors,
+			changed: alias !== undefined && alias !== segment.name,
+		};
+	});
+	if (!aliased.some((segment) => segment.changed)) return path;
+	return `$.${aliased
+		.map((segment) => `${segment.name}${segment.selectors}`)
+		.join(".")}`;
+}
+
+function parseJsonPathAliasSegment(
+	segment: string,
+): { name: string; selectors: string } | undefined {
+	const match = /^([A-Za-z0-9_-]+)((?:\[(?:\*|\d+|\d*:\d*)\])*)$/u.exec(
+		segment,
+	);
+	if (!match) return undefined;
+	return { name: match[1]!, selectors: match[2] ?? "" };
+}
+
+function applyProjectionItemLimit(
+	value: unknown,
+	options: { maxItems?: number; path: string },
+): {
+	value: unknown;
+	totalItems?: number;
+	itemsReturned?: number;
+	itemsTruncated?: boolean;
+} {
+	if (options.maxItems === undefined) return { value };
+	if (!Array.isArray(value)) {
+		throw new Error(
+			`workflow_artifact maxItems requires path to resolve to an array: ${options.path}`,
+		);
+	}
+	const itemsReturned = Math.min(value.length, options.maxItems);
+	return {
+		value: value.slice(0, options.maxItems),
+		totalItems: value.length,
+		itemsReturned,
+		itemsTruncated: itemsReturned < value.length,
+	};
+}
+
+function jsonValueType(value: unknown): string {
+	if (Array.isArray(value)) return "array";
+	if (value === null) return "null";
+	return typeof value;
+}
+
+export async function appendWorkflowArtifactReadLedger(
+	ledgerPath: string,
+	record: WorkflowArtifactReadLedgerRecord,
+): Promise<void> {
+	await mkdir(dirname(resolve(ledgerPath)), { recursive: true });
+	await appendFile(resolve(ledgerPath), `${JSON.stringify(record)}\n`, "utf8");
+}
+
+export async function readWorkflowArtifactReadLedger(
+	ledgerPath: string,
+): Promise<WorkflowArtifactReadLedgerRecord[]> {
+	let text: string;
+	try {
+		text = await readFile(resolve(ledgerPath), "utf8");
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+		throw error;
+	}
+	return text
+		.split(/\r?\n/)
+		.filter((line) => line.trim().length > 0)
+		.map((line, index) =>
+			normalizeReadLedgerRecord(JSON.parse(line), index + 1),
+		);
+}
+
+function completedArtifactReadCacheKey(
+	config: WorkflowArtifactToolConfig,
+	accessMode: WorkflowArtifactAccessMode,
+	input: {
+		action: "read";
+		source?: string;
+		artifact?: string;
+		path?: string;
+		maxItems?: number;
+		maxChars?: number;
+	},
+	artifactPath: string,
+): string {
+	return JSON.stringify({
+		base: workflowArtifactReadDedupKey(config, accessMode, input),
+		artifactPath: resolve(artifactPath),
+		maxBytes: config.maxBytes,
+		maxLines: config.maxLines,
+	});
+}
+
+function rememberCompletedArtifactRead(
+	key: string,
+	read: WorkflowArtifactReadResult,
+): void {
+	if (completedWorkflowArtifactReadCache.has(key))
+		completedWorkflowArtifactReadCache.delete(key);
+	completedWorkflowArtifactReadCache.set(key, read);
+	while (
+		completedWorkflowArtifactReadCache.size > COMPLETED_ARTIFACT_READ_CACHE_MAX
+	) {
+		const oldest = completedWorkflowArtifactReadCache.keys().next().value;
+		if (typeof oldest !== "string") break;
+		completedWorkflowArtifactReadCache.delete(oldest);
+	}
+}
+
+function workflowArtifactReadDedupKey(
+	config: WorkflowArtifactToolConfig,
+	accessMode: WorkflowArtifactAccessMode,
+	input: {
+		action: "read";
+		source?: string;
+		artifact?: string;
+		path?: string;
+		maxItems?: number;
+		maxChars?: number;
+	},
+): string {
+	return JSON.stringify({
+		runId: config.runId,
+		taskId: config.taskId,
+		manifestPath: resolve(config.manifestPath),
+		accessMode,
+		source: input.source,
+		artifact: input.artifact,
+		path: input.path,
+		maxItems: input.maxItems,
+		maxChars: input.maxChars,
+	});
+}
+
+export async function handleWorkflowArtifactToolCall(
+	params: unknown,
+	config: WorkflowArtifactToolConfig,
+): Promise<WorkflowArtifactToolResult> {
+	const input = normalizeToolInput(params);
+	const runDir = resolve(
+		config.runDir ?? inferRunDirFromManifestPath(resolve(config.manifestPath)),
+	);
+	const manifest = await loadWorkflowSourceManifest(config.manifestPath, {
+		runDir,
+	});
+	if (manifest.runId !== config.runId)
+		throw new Error(
+			`source manifest runId mismatch: expected ${config.runId}, got ${manifest.runId}`,
+		);
+	if (manifest.taskId !== config.taskId)
+		throw new Error(
+			`source manifest taskId mismatch: expected ${config.taskId}, got ${manifest.taskId}`,
+		);
+	const accessMode =
+		config.accessMode ?? manifest.policy?.accessMode ?? "workflow-task";
+
+	if (input.action === "list") {
+		const result = {
+			runId: manifest.runId,
+			taskId: manifest.taskId,
+			sources: listWorkflowArtifactSources(manifest, { accessMode }),
+		};
+		return {
+			content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+			details: {
+				action: "list",
+				runId: manifest.runId,
+				taskId: manifest.taskId,
+				sourceCount: result.sources.length,
+			},
+		};
+	}
+
+	if (!input.source) throw new Error("workflow_artifact read requires source");
+	if (!input.artifact)
+		throw new Error("workflow_artifact read requires artifact");
+	const dedupKey = workflowArtifactReadDedupKey(config, accessMode, input);
+	const cachedRead = workflowExperimentalFlagEnabled(
+		EXPERIMENTAL_TOOL_DEDUP_ENV,
+	)
+		? workflowArtifactReadDedupCache.get(dedupKey)
+		: undefined;
+	if (cachedRead !== undefined) {
+		await appendWorkflowArtifactReadLedger(config.ledgerPath, {
+			schema: WORKFLOW_ARTIFACT_READ_SCHEMA,
+			runId: config.runId,
+			taskId: config.taskId,
+			source: cachedRead.source,
+			artifact: cachedRead.artifact,
+			at: new Date().toISOString(),
+			bytes: cachedRead.bytes,
+			returnedBytes: 0,
+			truncated: cachedRead.truncated,
+			...(cachedRead.projection?.path === undefined
+				? {}
+				: { path: cachedRead.projection.path }),
+			...(cachedRead.projection?.maxItems === undefined
+				? {}
+				: { maxItems: cachedRead.projection.maxItems }),
+			...(cachedRead.projection?.maxChars === undefined
+				? {}
+				: { maxChars: cachedRead.projection.maxChars }),
+		});
+		const projectionLabel = cachedRead.projection
+			? ` path=${cachedRead.projection.path}`
+			: "";
+		return {
+			content: [
+				{
+					type: "text",
+					text: `# workflow_artifact duplicate read suppressed: ${cachedRead.source}.${cachedRead.artifact}${projectionLabel}\n\n<system-reminder>\nYou repeated the same workflow_artifact read in this task. Reuse the earlier result from this task; do not call this exact workflow_artifact read again unless you need a different source, artifact, path, maxItems, or maxChars.\n</system-reminder>`,
+				},
+			],
+			details: {
+				action: "read",
+				runId: config.runId,
+				taskId: config.taskId,
+				source: cachedRead.source,
+				artifact: cachedRead.artifact,
+				bytes: cachedRead.bytes,
+				returnedBytes: 0,
+				truncated: cachedRead.truncated,
+				mediaType: cachedRead.mediaType,
+				projection: cachedRead.projection,
+				duplicate: true,
+			},
+		};
+	}
+	const resolvedArtifact = resolveWorkflowArtifact(
+		manifest,
+		input.source,
+		input.artifact,
+		{ accessMode },
+	);
+	const completedCacheKey =
+		resolvedArtifact.source.status === "completed"
+			? completedArtifactReadCacheKey(
+					config,
+					accessMode,
+					input,
+					resolvedArtifact.ref.path,
+				)
+			: undefined;
+	let read =
+		completedCacheKey === undefined
+			? undefined
+			: completedWorkflowArtifactReadCache.get(completedCacheKey);
+	if (read === undefined) {
+		read = await readWorkflowArtifact(
+			manifest,
+			input.source,
+			input.artifact,
+			{
+				accessMode,
+				maxBytes: config.maxBytes,
+				maxLines: config.maxLines,
+				runDir,
+				path: input.path,
+				maxItems: input.maxItems,
+				maxChars: input.maxChars,
+			},
+		);
+		if (completedCacheKey !== undefined)
+			rememberCompletedArtifactRead(completedCacheKey, read);
+	}
+	await appendWorkflowArtifactReadLedger(config.ledgerPath, {
+		schema: WORKFLOW_ARTIFACT_READ_SCHEMA,
+		runId: config.runId,
+		taskId: config.taskId,
+		source: read.source,
+		artifact: read.artifact,
+		at: new Date().toISOString(),
+		bytes: read.bytes,
+		returnedBytes: read.returnedBytes,
+		truncated: read.truncated,
+		...(read.projection?.path === undefined
+			? {}
+			: { path: read.projection.path }),
+		...(read.projection?.maxItems === undefined
+			? {}
+			: { maxItems: read.projection.maxItems }),
+		...(read.projection?.maxChars === undefined
+			? {}
+			: { maxChars: read.projection.maxChars }),
+	});
+	if (workflowExperimentalFlagEnabled(EXPERIMENTAL_TOOL_DEDUP_ENV)) {
+		workflowArtifactReadDedupCache.set(dedupKey, read);
+	}
+	const projectionLabel = read.projection
+		? ` path=${read.projection.path}`
+		: "";
+	const truncation = read.truncated
+		? `\n\n[workflow_artifact output truncated: returned ${read.returnedBytes} bytes from ${read.bytes} artifact bytes.]`
+		: "";
+	return {
+		content: [
+			{
+				type: "text",
+				text: `# workflow_artifact: ${read.source}.${read.artifact}${projectionLabel}\n\n${read.content}${truncation}`,
+			},
+		],
+		details: {
+			action: "read",
+			runId: config.runId,
+			taskId: config.taskId,
+			source: read.source,
+			artifact: read.artifact,
+			bytes: read.bytes,
+			returnedBytes: read.returnedBytes,
+			truncated: read.truncated,
+			mediaType: read.mediaType,
+			projection: read.projection,
+		},
+	};
+}
+
+export function inferRunDirFromManifestPath(manifestPath: string): string {
+	return resolve(dirname(resolve(manifestPath)), "..", "..");
+}
+
+function normalizeReadLedgerRecord(
+	value: unknown,
+	lineNumber: number,
+): WorkflowArtifactReadLedgerRecord {
+	if (!isRecord(value))
+		throw new Error(`read ledger line ${lineNumber} must be an object`);
+	if (value.schema !== WORKFLOW_ARTIFACT_READ_SCHEMA)
+		throw new Error(`read ledger line ${lineNumber} has unsupported schema`);
+	const runId = requiredString(value.runId, `line ${lineNumber}.runId`);
+	const taskId = requiredString(value.taskId, `line ${lineNumber}.taskId`);
+	const source = requiredString(value.source, `line ${lineNumber}.source`);
+	validateSourceName(source, `line ${lineNumber}.source`);
+	const artifact = requiredString(
+		value.artifact,
+		`line ${lineNumber}.artifact`,
+	);
+	assertArtifactKind(artifact, `line ${lineNumber}.artifact`);
+	const at = requiredString(value.at, `line ${lineNumber}.at`);
+	const bytes = requiredNumber(value.bytes, `line ${lineNumber}.bytes`);
+	const returnedBytes = requiredNumber(
+		value.returnedBytes,
+		`line ${lineNumber}.returnedBytes`,
+	);
+	const truncated = requiredBoolean(
+		value.truncated,
+		`line ${lineNumber}.truncated`,
+	);
+	const path = normalizeProjectionPath(value.path);
+	const maxItems = optionalNonNegativeInteger(
+		value.maxItems,
+		`line ${lineNumber}.maxItems`,
+	);
+	const maxChars = optionalNonNegativeInteger(
+		value.maxChars,
+		`line ${lineNumber}.maxChars`,
+	);
+	return {
+		schema: WORKFLOW_ARTIFACT_READ_SCHEMA,
+		runId,
+		taskId,
+		source,
+		artifact,
+		at,
+		bytes,
+		returnedBytes,
+		truncated,
+		...(path === undefined ? {} : { path }),
+		...(maxItems === undefined ? {} : { maxItems }),
+		...(maxChars === undefined ? {} : { maxChars }),
+	};
+}
+
+function normalizeToolInput(value: unknown):
+	| { action: "list"; source?: string; artifact?: string }
+	| {
+			action: "read";
+			source?: string;
+			artifact?: string;
+			path?: string;
+			maxItems?: number;
+			maxChars?: number;
+	  } {
+	if (!isRecord(value))
+		throw new Error("workflow_artifact input must be an object");
+	const action = requiredString(value.action, "action");
+	if (action !== "list" && action !== "read")
+		throw new Error("workflow_artifact action must be list or read");
+	const source = optionalString(value.source, "source");
+	const artifact = optionalString(value.artifact, "artifact");
+	const path = normalizeProjectionPath(value.path);
+	const maxItems = optionalNonNegativeInteger(value.maxItems, "maxItems");
+	const maxChars = optionalNonNegativeInteger(value.maxChars, "maxChars");
+	if (source !== undefined) validateSourceName(source, "source");
+	if (artifact !== undefined) assertArtifactKind(artifact, "artifact");
+	if (action === "list") return { action, source, artifact };
+	return { action, source, artifact, path, maxItems, maxChars };
+}
+
+function normalizeProjectionPath(value: unknown): string | undefined {
+	const path = optionalString(value, "path");
+	if (path === undefined) return undefined;
+	if (!isSimpleJsonPath(path)) throw new Error(SIMPLE_JSON_PATH_DIAGNOSTIC);
+	return path;
+}
+
+function normalizePolicy(
+	value: unknown,
+): WorkflowSourceManifest["policy"] | undefined {
+	if (value === undefined) return undefined;
+	if (!isRecord(value))
+		throw new Error("source manifest policy must be an object");
+	const accessMode = optionalString(value.accessMode, "policy.accessMode");
+	if (
+		accessMode !== undefined &&
+		accessMode !== "workflow-task" &&
+		accessMode !== "human-debug"
+	) {
+		throw new Error("policy.accessMode must be workflow-task or human-debug");
+	}
+	const debugArtifacts =
+		value.debugArtifacts === undefined
+			? undefined
+			: requiredBoolean(value.debugArtifacts, "policy.debugArtifacts");
+	return accessMode || debugArtifacts !== undefined
+		? {
+				accessMode: accessMode as WorkflowArtifactAccessMode | undefined,
+				debugArtifacts,
+			}
+		: undefined;
+}
+
+function resolveArtifactPath(
+	path: string,
+	runDir: string,
+	options: { field: string },
+): string {
+	if (!isAbsolute(path)) throw new Error(`${options.field} must be absolute`);
+	const absolutePath = resolve(path);
+	if (!isInsidePath(resolve(runDir), absolutePath))
+		throw new Error(
+			`${options.field} must be inside the workflow run directory`,
+		);
+	return absolutePath;
+}
+
+function validateSourceName(value: string, field: string): void {
+	if (!SOURCE_NAME_PATTERN.test(value) || value.includes(".."))
+		throw new Error(
+			`${field} must be a canonical workflow artifact source name`,
+		);
+}
+
+function assertArtifactKind(
+	value: string,
+	field: string,
+): asserts value is WorkflowArtifactKind {
+	if (!WORKFLOW_ARTIFACT_KIND_SET.has(value))
+		throw new Error(
+			`${field} must be one of: ${WORKFLOW_ARTIFACT_KINDS.join(", ")}`,
+		);
+}
+
+function isInsidePath(parent: string, child: string): boolean {
+	const rel = relative(parent, child);
+	return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+}
+
+async function readUtf8Prefix(
+	file: FileHandle,
+	maxBytes: number,
+): Promise<string> {
+	if (maxBytes <= 0) return "";
+	const buffer = Buffer.alloc(maxBytes);
+	const { bytesRead } = await file.read(buffer, 0, maxBytes, 0);
+	return buffer.subarray(0, bytesRead).toString("utf8");
+}
+
+function truncateHead(
+	text: string,
+	options: { maxBytes: number; maxLines: number },
+): { content: string; truncated: boolean } {
+	const lines = text.split(/\r?\n/);
+	let content =
+		lines.length > options.maxLines
+			? lines.slice(0, options.maxLines).join("\n")
+			: text;
+	let truncated = content !== text;
+	if (Buffer.byteLength(content, "utf8") > options.maxBytes) {
+		content = truncateToUtf8Bytes(content, options.maxBytes);
+		truncated = true;
+	}
+	return { content, truncated };
+}
+
+function truncateToUtf8Bytes(text: string, maxBytes: number): string {
+	if (maxBytes <= 0) return "";
+	let low = 0;
+	let high = text.length;
+	while (low < high) {
+		const mid = Math.ceil((low + high) / 2);
+		if (Buffer.byteLength(text.slice(0, mid), "utf8") <= maxBytes) low = mid;
+		else high = mid - 1;
+	}
+	return text.slice(0, low);
+}
+
+function isRecord(value: unknown): value is JsonRecord {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function requiredString(value: unknown, field: string): string {
+	if (typeof value !== "string" || value.length === 0)
+		throw new Error(`${field} must be a non-empty string`);
+	return value;
+}
+
+function optionalString(value: unknown, field: string): string | undefined {
+	if (value === undefined) return undefined;
+	if (typeof value !== "string") throw new Error(`${field} must be a string`);
+	return value;
+}
+
+function optionalStringArray(
+	value: unknown,
+	field: string,
+): string[] | undefined {
+	if (value === undefined) return undefined;
+	if (!Array.isArray(value)) throw new Error(`${field} must be an array`);
+	for (const [index, item] of value.entries()) {
+		if (typeof item !== "string")
+			throw new Error(`${field}[${index}] must be a string`);
+	}
+	return value;
+}
+
+function optionalBoolean(value: unknown, field: string): boolean | undefined {
+	if (value === undefined) return undefined;
+	if (typeof value !== "boolean") throw new Error(`${field} must be a boolean`);
+	return value;
+}
+
+function requiredNumber(value: unknown, field: string): number {
+	if (typeof value !== "number" || !Number.isFinite(value))
+		throw new Error(`${field} must be a finite number`);
+	return value;
+}
+
+function optionalNonNegativeInteger(
+	value: unknown,
+	field: string,
+): number | undefined {
+	if (value === undefined) return undefined;
+	if (!Number.isInteger(value) || (value as number) < 0) {
+		throw new Error(`${field} must be a non-negative integer`);
+	}
+	return value as number;
+}
+
+function requiredBoolean(value: unknown, field: string): boolean {
+	if (typeof value !== "boolean") throw new Error(`${field} must be a boolean`);
+	return value;
+}

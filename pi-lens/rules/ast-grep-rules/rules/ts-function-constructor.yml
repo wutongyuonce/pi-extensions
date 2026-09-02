@@ -1,0 +1,12 @@
+id: ts-function-constructor
+language: typescript
+severity: warning
+message: new Function() - avoid dynamic code evaluation
+metadata:
+  weight: 4
+  category: slop
+rule:
+  kind: new_expression
+  has:
+    kind: identifier
+    regex: ^Function$

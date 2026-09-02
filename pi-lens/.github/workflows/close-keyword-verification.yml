@@ -1,0 +1,34 @@
+name: Verify merged PR close keywords
+
+on:
+  pull_request:
+    branches: [master]
+    types: [closed]
+
+permissions:
+  contents: read
+  issues: read
+  pull-requests: write
+
+jobs:
+  verify:
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Verify referenced issues closed
+        env:
+          # GH_TOKEN: the gh CLI calls in check-close-keywords.mjs (issue
+          # state lookups, the PR comment). GITHUB_TOKEN: the live-body
+          # fetch this step exists for (#2267 F1) -- check-pr-body.mjs's
+          # resolveLivePrBody/fetchLivePrBody read process.env.GITHUB_TOKEN
+          # specifically, not GH_TOKEN, so without this the live fetch
+          # always throws "GITHUB_TOKEN is not set" and every run silently
+          # falls back to the stale closed-event body -- the exact bug
+          # #2086 was filed to fix, still present under a different name.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: node scripts/check-close-keywords.mjs --verify-merged

@@ -27,6 +27,9 @@ function makePi() {
     registerMessageRenderer: vi.fn(),
     registerTool: vi.fn((t: any) => tools.set(t.name, t)),
     registerCommand: vi.fn(),
+    registerEntryRenderer: vi.fn(),
+    registerFlag: vi.fn(),
+    getFlag: vi.fn(),
     on: vi.fn((event: string, handler: any) => lifecycle.set(event, handler)),
     events: {
       emit: vi.fn(),
@@ -96,11 +99,11 @@ describe("get_subagent_result wait:true on a queued agent", () => {
 
     // Spawn until one lands in the queue (concurrency limit is config-dependent).
     let queuedId: string | undefined;
-    for (let i = 0; i < 10 && !queuedId; i++) {
+    for (let i = 0; i < 20 && !queuedId; i++) {
       const { id, queued } = await spawnBackground(tools);
       if (queued) queuedId = id;
     }
-    expect(queuedId, "expected to hit the concurrency limit within 10 spawns").toBeDefined();
+    expect(queuedId, "expected to hit the concurrency limit within 20 spawns").toBeDefined();
 
     // wait:true on the QUEUED agent — must not return "still running".
     const waitPromise = tools
@@ -187,11 +190,11 @@ describe("get_subagent_result wait:true on a queued agent", () => {
 
     const resolvers = deferredRuns();
     let queuedId: string | undefined;
-    for (let i = 0; i < 10 && !queuedId; i++) {
+    for (let i = 0; i < 20 && !queuedId; i++) {
       const { id, queued } = await spawnBackground(tools);
       if (queued) queuedId = id;
     }
-    expect(queuedId, "expected to hit the concurrency limit within 10 spawns").toBeDefined();
+    expect(queuedId, "expected to hit the concurrency limit within 20 spawns").toBeDefined();
 
     const controller = new AbortController();
     const waitOutcome = tools

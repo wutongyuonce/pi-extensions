@@ -1,0 +1,2156 @@
+import * as fs from "node:fs";
+import * as path from "node:path";
+import { afterEach, describe, expect, it } from "vitest";
+import {
+	buildCallGraph,
+	CALL_GRAPH_CACHE_VERSION,
+	saveCallGraph,
+} from "../../clients/call-graph.js";
+import { FactStore } from "../../clients/dispatch/fact-store.js";
+import {
+	moduleReport,
+	readEnclosing,
+	readSymbol,
+	renderCompactModuleReport,
+	tsLangForFile,
+} from "../../clients/module-report.js";
+import { resolveTreeSitterLanguage } from "../../clients/tree-sitter-shared.js";
+import {
+	buildOrUpdateGraph,
+	clearReviewGraphWorkspaceCache,
+	extractSymbolsAndRefsFromGraph,
+	getReviewGraphCacheIdentity,
+	getCachedReviewGraph,
+	flushReviewGraphPersistsForExitForTests,
+} from "../../clients/review-graph/builder.js";
+import { getProjectDataDir } from "../../clients/file-utils.js";
+import { createTempFile, setupTestEnvironment } from "./test-utils.js";
+
+// module_report consumes the cached review graph read-only (#256) — it never
+// builds and never calls an LSP server. Production warms the cache via the edit
+// pipeline; tests must do the same before asserting graph-derived who-uses-this.
+async function warmGraph(cwd: string) {
+	return buildOrUpdateGraph(cwd, [], new FactStore());
+}
+
+async function warmCallGraph(cwd: string): Promise<void> {
+	const graph = await warmGraph(cwd);
+	const identity = getReviewGraphCacheIdentity(cwd, graph);
+	if (!identity)
+		throw new Error("test graph did not expose a canonical identity");
+	const normalized = extractSymbolsAndRefsFromGraph(graph);
+	const callGraph = buildCallGraph(
+		normalized.allSymbols,
+		normalized.allRefs,
+		normalized.coverage,
+	);
+	saveCallGraph(cwd, callGraph, {
+		reviewGraphVersion: identity.version,
+		reviewGraphSignature: identity.signature,
+	});
+}
+
+const cleanups: Array<() => void> = [];
+afterEach(() => {
+	while (cleanups.length) cleanups.pop()?.();
+	clearReviewGraphWorkspaceCache(); // isolate the module-global graph cache
+});
+
+function makeEnv(prefix = "pi-lens-modreport-") {
+	const env = setupTestEnvironment(prefix);
+	cleanups.push(env.cleanup);
+	return env;
+}
+
+describe("moduleReport — outline + structure", () => {
+	it("extracts a TypeScript outline with signatures, line ranges, and read args", async () => {
+		const env = makeEnv();
+		const file = createTempFile(
+			env.tmpDir,
+			"sample.ts",
+			[
+				"export function add(a: number, b: number): number {",
+				"  return a + b;",
+				"}",
+				"",
+				"function helper(x: string) {",
+				"  return x.trim();",
+				"}",
+			].join("\n"),
+		);
+
+		const report = await moduleReport(file, env.tmpDir);
+
+		expect(report.available).toBe(true);
+		expect(report.language).toBe("jsts");
+		expect(report.staleness).toBe("fresh");
+
+		const add = report.api.find((e) => e.name === "add");
+		expect(add).toBeDefined();
+		expect(add?.exported).toBe(true);
+		expect(add?.kind).toBe("function");
+		expect(add?.signature).toContain("a: number");
+		// endLine must exceed startLine for a multi-line function (the Symbol.endLine
+		// enabler). No per-symbol `read` block (#512) — offset/limit are pure
+		// derivations of startLine/endLine on the report's own `path`.
+		expect(add!.endLine).toBeGreaterThan(add!.startLine);
+		expect((add as { read?: unknown }).read).toBeUndefined();
+
+		// Non-exported symbol is routed to `internal`, not `api`.
+		expect(report.internal.some((e) => e.name === "helper")).toBe(true);
+		expect(report.api.some((e) => e.name === "helper")).toBe(false);
+	});
+
+	it("supports a payload-reducing summary view with section provenance", async () => {
+		const env = makeEnv();
+		const file = createTempFile(
+			env.tmpDir,
+			"summary.ts",
+			[
+				"export function add(a: number, b: number): number {",
+				"  return a + b;",
+				"}",
+				"function helper() {",
+				"  return add(1, 2);",
+				"}",
+			].join("\n"),
+		);
+
+		const report = await moduleReport(file, env.tmpDir, { view: "summary" });
+
+		expect(report.view).toBe("summary");
+		expect(report.api[0]).toMatchObject({
+			name: "add",
+			kind: "function",
+			startLine: 1,
+			endLine: 3,
+		});
+		expect(report.api[0].usedBy).toBeUndefined();
+		expect(report.callbacks).toEqual([]);
+		expect(report.provenance).toMatchObject({
+			symbols: "syntax",
+			callbacks: "none",
+		});
+		expect(report.recommendedReads.length).toBeGreaterThan(0);
+	});
+
+	it("extracts a Python outline (language-uniform, not TS-only)", async () => {
+		const env = makeEnv();
+		const file = createTempFile(
+			env.tmpDir,
+			"sample.py",
+			[
+				"def greet(name):",
+				"    return f'hi {name}'",
+				"",
+				"class Greeter:",
+				"    pass",
+			].join("\n"),
+		);
+
+		const report = await moduleReport(file, env.tmpDir);
+
+		expect(report.available).toBe(true);
+		expect(report.language).toBe("python");
+		const names = [...report.api, ...report.internal].map((e) => e.name);
+		expect(names).toContain("greet");
+		expect(names).toContain("Greeter");
+	});
+
+	it("extracts a .tsx file via the JSX-aware grammar (downloaded-grammar coverage)", async () => {
+		const env = makeEnv();
+		const file = createTempFile(
+			env.tmpDir,
+			"widget.tsx",
+			[
+				"export function Widget(props: { label: string }) {",
+				"  return <div>{props.label}</div>;",
+				"}",
+			].join("\n"),
+		);
+
+		const report = await moduleReport(file, env.tmpDir);
+
+		expect(report.available).toBe(true);
+		expect(report.api.some((e) => e.name === "Widget")).toBe(true);
+	});
+
+	it("surfaces important anonymous callbacks with read handles and risk flags", async () => {
+		const env = makeEnv();
+		const file = createTempFile(
+			env.tmpDir,
+			"callbacks.ts",
+			[
+				"export async function run(ctx: any) {",
+				"  await handleTurnEnd({",
+				"    resetLSPService: () => {",
+				"      ctx.ui.setStatus('x');",
+				"    },",
+				"  });",
+				"}",
+				'pi.on("turn_end", async (_event, ctx) => {',
+				"  ctx.ui.notify('x');",
+				"});",
+				"setTimeout(() => {",
+				"  resetFn();",
+				"}, 240_000);",
+			].join("\n"),
+		);
+
+		const report = await moduleReport(file, env.tmpDir);
+
+		const reset = report.callbacks.find(
+			(callback) => callback.name === "run.resetLSPService@3",
+		);
+		expect(reset).toMatchObject({
+			kind: "object_property_callback",
+			startLine: 3,
+			endLine: 5,
+		});
+		expect((reset as { read?: unknown } | undefined)?.read).toBeUndefined();
+		expect(reset?.flags).toContain("captures ctx.ui");
+
+		const event = report.callbacks.find((callback) =>
+			callback.name.startsWith('pi.on("turn_end")@'),
+		);
+		expect(event?.kind).toBe("event_handler");
+		expect(event?.flags).toEqual(
+			expect.arrayContaining(["async", "captures ctx.ui", "lifecycle"]),
+		);
+
+		const timer = report.callbacks.find((callback) =>
+			callback.name.startsWith("setTimeout@"),
+		);
+		expect(timer?.kind).toBe("timer_callback");
+		expect(timer?.flags).toContain("detached timer");
+	});
+
+	it("extracts inline executable handles across non-TypeScript grammars", async () => {
+		const env = makeEnv();
+		const py = createTempFile(
+			env.tmpDir,
+			"callbacks.py",
+			'def run(ctx):\n    callbacks = {"reset": lambda: ctx.ui.set_status("x")}\n',
+		);
+		const go = createTempFile(
+			env.tmpDir,
+			"callbacks.go",
+			'package main\nfunc run() {\n  cb := func() { println("x") }\n  cb()\n}\n',
+		);
+		const rust = createTempFile(
+			env.tmpDir,
+			"callbacks.rs",
+			'fn run() {\n    let cb = || { println!("x"); };\n}\n',
+		);
+
+		const pyReport = await moduleReport(py, env.tmpDir);
+		expect(pyReport.callbacks).toContainEqual(
+			expect.objectContaining({
+				name: 'run."reset"@2',
+				kind: "object_property_callback",
+				rawKind: "lambda",
+			}),
+		);
+		expect(pyReport.callbacks[0]?.flags).toContain("captures ctx.ui");
+
+		const goReport = await moduleReport(go, env.tmpDir);
+		expect(goReport.callbacks).toContainEqual(
+			expect.objectContaining({
+				name: "run.cb@3",
+				kind: "assigned_callback",
+				rawKind: "func_literal",
+			}),
+		);
+
+		const rustReport = await moduleReport(rust, env.tmpDir);
+		expect(rustReport.callbacks).toContainEqual(
+			expect.objectContaining({
+				name: "run.cb@2",
+				kind: "assigned_callback",
+				rawKind: "closure_expression",
+			}),
+		);
+	});
+
+	it("surfaces Go goroutine and deferred closures via language-tuned rules", async () => {
+		const env = makeEnv();
+		const go = createTempFile(
+			env.tmpDir,
+			"lifecycle.go",
+			[
+				"package main",
+				"",
+				"func run() {",
+				"	go func() {",
+				'		println("async work")',
+				"	}()",
+				"	defer func() {",
+				'		println("cleanup")',
+				"	}()",
+				"}",
+			].join("\n"),
+		);
+
+		const report = await moduleReport(go, env.tmpDir);
+
+		// A bare goroutine closure used to be DROPPED by the generic rules
+		// (classified as a no-name "callback"); the Go rule set now surfaces it.
+		const goroutine = report.callbacks.find((cb) => cb.kind === "goroutine");
+		expect(goroutine).toBeDefined();
+		expect(goroutine?.name).toMatch(/^run\.goroutine@\d+$/);
+		expect(goroutine?.rawKind).toBe("func_literal");
+		expect(goroutine?.flags).toContain("goroutine");
+
+		const deferred = report.callbacks.find(
+			(cb) => cb.kind === "deferred_callback",
+		);
+		expect(deferred).toBeDefined();
+		expect(deferred?.name).toMatch(/^run\.defer@\d+$/);
+		expect(deferred?.flags).toContain("deferred");
+	});
+
+	it("reports callbackSupport honestly per language (tuned vs generic)", async () => {
+		const env = makeEnv();
+		const go = createTempFile(
+			env.tmpDir,
+			"support.go",
+			"package main\nfunc run() {}\n",
+		);
+		const py = createTempFile(
+			env.tmpDir,
+			"support.py",
+			"def run():\n    pass\n",
+		);
+		const rs = createTempFile(env.tmpDir, "support.rs", "fn run() {}\n");
+		const rb = createTempFile(env.tmpDir, "support.rb", "def run\nend\n");
+
+		// Go/Python/Rust have tuned rule sets; Ruby falls back to the generic
+		// JS/TS-shaped heuristics, so the report must say so.
+		expect((await moduleReport(go, env.tmpDir)).callbackSupport).toBe("tuned");
+		expect((await moduleReport(py, env.tmpDir)).callbackSupport).toBe("tuned");
+		expect((await moduleReport(rs, env.tmpDir)).callbackSupport).toBe("tuned");
+		expect((await moduleReport(rb, env.tmpDir)).callbackSupport).toBe(
+			"generic",
+		);
+	});
+
+	it("surfaces Python scheduler/future lambdas via language-tuned rules", async () => {
+		const env = makeEnv();
+		const py = createTempFile(
+			env.tmpDir,
+			"lifecycle.py",
+			[
+				"def schedule(loop, fut, ctx):",
+				"    loop.call_later(5, lambda: ctx.ui.refresh())",
+				"    fut.add_done_callback(lambda r: ctx.done(r))",
+			].join("\n"),
+		);
+
+		const report = await moduleReport(py, env.tmpDir);
+
+		// A bare-arg lambda used to be DROPPED by the generic rules; the Python
+		// rule set classifies scheduler/future lambdas as lifecycle callbacks.
+		const timer = report.callbacks.find((cb) => cb.kind === "timer_callback");
+		expect(timer).toBeDefined();
+		expect(timer?.rawKind).toBe("lambda");
+		expect(timer?.flags).toContain("detached timer");
+		expect(timer?.flags).toContain("captures ctx.ui");
+
+		const future = report.callbacks.find((cb) => cb.kind === "future_callback");
+		expect(future).toBeDefined();
+		expect(future?.flags).toContain("future completion");
+	});
+
+	it("surfaces Rust spawned and move closures via language-tuned rules", async () => {
+		const env = makeEnv();
+		const rs = createTempFile(
+			env.tmpDir,
+			"lifecycle.rs",
+			[
+				"fn run() {",
+				"    std::thread::spawn(move || {",
+				"        handle();",
+				"    });",
+				"}",
+			].join("\n"),
+		);
+
+		const report = await moduleReport(rs, env.tmpDir);
+
+		const task = report.callbacks.find((cb) => cb.kind === "task");
+		expect(task).toBeDefined();
+		expect(task?.rawKind).toBe("closure_expression");
+		expect(task?.flags).toContain("spawned");
+		expect(task?.flags).toContain("move");
+	});
+
+	it("flags Java thread/executor submits and listeners", async () => {
+		// Java rides this file (its grammar is already loaded for the decorators
+		// test); Kotlin/C# are heavy and live in their own file (#255).
+		const env = makeEnv();
+		const java = createTempFile(
+			env.tmpDir,
+			"Lifecycle.java",
+			[
+				"class C {",
+				"  void run() {",
+				"    exec.submit(() -> work());",
+				"    new Thread(() -> go()).start();",
+				"    btn.addActionListener(e -> click());",
+				"  }",
+				"}",
+			].join("\n"),
+		);
+
+		const report = await moduleReport(java, env.tmpDir);
+		expect(report.callbackSupport).toBe("tuned");
+		const kinds = report.callbacks.map((c) => c.kind);
+		expect(kinds).toContain("task"); // submit + new Thread
+		expect(
+			report.callbacks.find((c) => c.flags?.includes("thread")),
+		).toBeDefined();
+		expect(kinds).toContain("event_handler"); // addActionListener
+	});
+
+	it("surfaces decorators/attributes/annotations on symbols across grammars", async () => {
+		const env = makeEnv();
+		const flatten = (
+			entries: Array<{
+				name: string;
+				decorators?: string[];
+				members?: unknown[];
+			}>,
+		): Array<{ name: string; decorators?: string[] }> =>
+			entries.flatMap((e) => [
+				e,
+				...flatten(
+					(e.members ?? []) as Array<{ name: string; decorators?: string[] }>,
+				),
+			]);
+		const find = async (file: string, name: string) => {
+			const r = await moduleReport(file, env.tmpDir);
+			return flatten([...r.api, ...r.internal]).find((s) => s.name === name);
+		};
+
+		// Python: multiple decorators as preceding siblings of a decorated_definition.
+		const py = createTempFile(
+			env.tmpDir,
+			"dec.py",
+			'@app.get("/x")\n@auth\ndef handler():\n    return 1\n',
+		);
+		expect((await find(py, "handler"))?.decorators).toEqual([
+			'@app.get("/x")',
+			"@auth",
+		]);
+
+		// Rust: attribute_item as a preceding sibling.
+		const rs = createTempFile(
+			env.tmpDir,
+			"dec.rs",
+			"#[tokio::main]\nasync fn main() { run(); }\n",
+		);
+		expect((await find(rs, "main"))?.decorators).toEqual(["#[tokio::main]"]);
+
+		// TypeScript: decorator as an own child of the class declaration.
+		const ts = createTempFile(
+			env.tmpDir,
+			"dec.ts",
+			"@Injectable()\nexport class Svc {\n  foo() {}\n}\n",
+		);
+		expect((await find(ts, "Svc"))?.decorators).toEqual(["@Injectable()"]);
+
+		// Java: annotation nested in a `modifiers` container on a nested METHOD member.
+		const java = createTempFile(
+			env.tmpDir,
+			"Dec.java",
+			"public class C {\n  @Override\n  public void run() {}\n}\n",
+		);
+		expect((await find(java, "run"))?.decorators).toEqual(["@Override"]);
+	});
+
+	it("flags async functions/methods on symbol entries", async () => {
+		const env = makeEnv();
+		const flatten = (
+			entries: Array<{ name: string; flags?: string[]; members?: unknown[] }>,
+		): Array<{ name: string; flags?: string[] }> =>
+			entries.flatMap((e) => [
+				e,
+				...flatten(
+					(e.members ?? []) as Array<{ name: string; flags?: string[] }>,
+				),
+			]);
+		const isAsync = async (file: string, name: string) => {
+			const r = await moduleReport(file, env.tmpDir);
+			return flatten([...r.api, ...r.internal])
+				.find((s) => s.name === name)
+				?.flags?.includes("async");
+		};
+
+		const py = createTempFile(
+			env.tmpDir,
+			"async.py",
+			"async def fetch():\n    pass\n\n\ndef plain():\n    pass\n",
+		);
+		expect(await isAsync(py, "fetch")).toBe(true);
+		expect(await isAsync(py, "plain")).toBeFalsy();
+
+		const ts = createTempFile(
+			env.tmpDir,
+			"async.ts",
+			"export async function go() {}\nexport class C {\n  async m() {}\n}\n",
+		);
+		expect(await isAsync(ts, "go")).toBe(true);
+		expect(await isAsync(ts, "m")).toBe(true); // nested async method
+
+		const rs = createTempFile(env.tmpDir, "async.rs", "async fn go() {}\n");
+		expect(await isAsync(rs, "go")).toBe(true);
+	});
+
+	it("read_enclosing resolves a Go goroutine body by line", async () => {
+		const env = makeEnv();
+		const go = createTempFile(
+			env.tmpDir,
+			"enclosing.go",
+			[
+				"package main",
+				"",
+				"func run() {",
+				"	go func() {",
+				'		println("inside goroutine")',
+				"	}()",
+				"}",
+			].join("\n"),
+		);
+
+		// Line 5 is inside the goroutine closure body.
+		const result = await readEnclosing(go, 5, env.tmpDir);
+		expect(result.found).toBe(true);
+		expect(result.kind).toBe("goroutine");
+		expect(result.source).toContain("inside goroutine");
+	});
+
+	it("uses focus only to rank existing recommended reads", async () => {
+		const env = makeEnv();
+		const file = createTempFile(
+			env.tmpDir,
+			"callbacks.ts",
+			[
+				"export function run(ctx: any) {",
+				"  return {",
+				"    resetLSPService: () => {",
+				"      ctx.ui.setStatus('x');",
+				"    },",
+				"  };",
+				"}",
+			].join("\n"),
+		);
+
+		const report = await moduleReport(file, env.tmpDir, {
+			focus: "stale ctx idle reset",
+		});
+
+		expect(report.recommendedReads[0]).toMatchObject({
+			symbol: "run.resetLSPService@3",
+			startLine: 3,
+			endLine: 5,
+		});
+		expect(report.recommendedReads[0]?.reason).toContain("matches focus");
+	});
+
+	it("returns available:false for a non-symbol-bearing file (json)", async () => {
+		const env = makeEnv();
+		const file = createTempFile(env.tmpDir, "data.json", '{"a": 1}\n');
+		const report = await moduleReport(file, env.tmpDir);
+		expect(report.available).toBe(false);
+		expect(report.staleness).toBe("unavailable");
+		expect(report.api).toHaveLength(0);
+	});
+
+	it("returns an unavailable report for a missing file", async () => {
+		const env = makeEnv();
+		const report = await moduleReport("nope.ts", env.tmpDir);
+		expect(report.available).toBe(false);
+		expect(report.staleness).toBe("unavailable");
+	});
+});
+
+describe("moduleReport — doc-comment first line (#512)", () => {
+	it("extracts a JSDoc block comment's first sentence for an exported function", async () => {
+		const env = makeEnv();
+		const file = createTempFile(
+			env.tmpDir,
+			"doc.ts",
+			[
+				"/** Test-only: clear accumulator state between test files/cases. */",
+				"export function reset(): void {",
+				"  return;",
+				"}",
+			].join("\n"),
+		);
+		const report = await moduleReport(file, env.tmpDir);
+		const reset = report.api.find((e) => e.name === "reset");
+		expect(reset?.doc).toBe(
+			"Test-only: clear accumulator state between test files/cases.",
+		);
+	});
+
+	it("extracts a line-comment doc for a non-exported function", async () => {
+		const env = makeEnv();
+		const file = createTempFile(
+			env.tmpDir,
+			"doc2.ts",
+			[
+				"// Simple line comment doc.",
+				"function bar(): void {",
+				"  return;",
+				"}",
+			].join("\n"),
+		);
+		const report = await moduleReport(file, env.tmpDir);
+		const bar = report.internal.find((e) => e.name === "bar");
+		expect(bar?.doc).toBe("Simple line comment doc.");
+	});
+
+	it("takes only the first sentence and caps at ~120 chars", async () => {
+		const env = makeEnv();
+		const longSentence = "A".repeat(150);
+		const file = createTempFile(
+			env.tmpDir,
+			"doc3.ts",
+			[
+				`/** ${longSentence}. Second sentence should be dropped. */`,
+				"export function longDoc(): void {}",
+			].join("\n"),
+		);
+		const report = await moduleReport(file, env.tmpDir);
+		const entry = report.api.find((e) => e.name === "longDoc");
+		expect(entry?.doc).toBeDefined();
+		expect(entry?.doc?.length).toBeLessThanOrEqual(120);
+		expect(entry?.doc).not.toContain("Second sentence");
+	});
+
+	it("omits `doc` when no comment is directly attached (blank-line gap)", async () => {
+		const env = makeEnv();
+		const file = createTempFile(
+			env.tmpDir,
+			"doc4.ts",
+			[
+				"// An unrelated earlier comment.",
+				"",
+				"export function noDoc(): void {}",
+			].join("\n"),
+		);
+		const report = await moduleReport(file, env.tmpDir);
+		const entry = report.api.find((e) => e.name === "noDoc");
+		expect(entry?.doc).toBeUndefined();
+	});
+
+	it("extracts doc comments language-uniformly for Python", async () => {
+		const env = makeEnv();
+		const file = createTempFile(
+			env.tmpDir,
+			"doc.py",
+			[
+				"# Greets a person by name.",
+				"def greet(name):",
+				"    return f'hi {name}'",
+			].join("\n"),
+		);
+		const report = await moduleReport(file, env.tmpDir);
+		const greet = [...report.api, ...report.internal].find(
+			(e) => e.name === "greet",
+		);
+		expect(greet?.doc).toBe("Greets a person by name.");
+	});
+});
+
+describe("moduleReport — compact view rendering (#512)", () => {
+	it("renders a line-oriented text view with symbols, imports header, and doc suffix", async () => {
+		const env = makeEnv();
+		const file = createTempFile(
+			env.tmpDir,
+			"compact.ts",
+			[
+				"/** Adds two numbers. */",
+				"export function add(a: number, b: number): number {",
+				"  return a + b;",
+				"}",
+				"function helper() {",
+				"  return add(1, 2);",
+				"}",
+			].join("\n"),
+		);
+		const report = await moduleReport(file, env.tmpDir, { view: "compact" });
+		expect(report.view).toBe("compact");
+		// "compact" computes full data, unlike "summary" — usedBy/callbacks are
+		// still present; it's a rendering instruction, not a data tier.
+		expect(report.api.length).toBeGreaterThan(0);
+
+		const rendered = renderCompactModuleReport(report);
+		expect(rendered).toContain("API:");
+		expect(rendered).toContain("INTERNAL:");
+		expect(rendered).toContain("add");
+		expect(rendered).toContain("Adds two numbers.");
+		expect(rendered).toContain("2-4"); // add's line range shows up somewhere
+	});
+
+	it("is meaningfully smaller than the default JSON view for the same file", async () => {
+		const env = makeEnv();
+		const file = createTempFile(
+			env.tmpDir,
+			"compact2.ts",
+			[
+				"/** Does the thing. */",
+				"export function foo(): void {",
+				"  return;",
+				"}",
+				"export function bar(): void {",
+				"  return;",
+				"}",
+				"function baz(): void {",
+				"  return;",
+				"}",
+			].join("\n"),
+		);
+		const report = await moduleReport(file, env.tmpDir);
+		const jsonBytes = Buffer.byteLength(JSON.stringify(report), "utf8");
+		const compactBytes = Buffer.byteLength(
+			renderCompactModuleReport(report),
+			"utf8",
+		);
+		expect(compactBytes).toBeLessThan(jsonBytes);
+	});
+
+	it("renders an unavailable report without throwing", async () => {
+		const env = makeEnv();
+		const report = await moduleReport("nope.ts", env.tmpDir);
+		const rendered = renderCompactModuleReport(report);
+		expect(rendered).toContain("unavailable");
+	});
+});
+
+describe("moduleReport — review-graph who-uses-this", () => {
+	it("resolves cross-file callers from the review graph", async () => {
+		const env = makeEnv();
+		createTempFile(
+			env.tmpDir,
+			"a.ts",
+			"export function foo(x: number): number {\n  return x + 1;\n}\n",
+		);
+		createTempFile(
+			env.tmpDir,
+			"b.ts",
+			[
+				'import { foo } from "./a.js";',
+				"export function callsFoo(): number {",
+				"  return foo(41);",
+				"}",
+			].join("\n"),
+		);
+
+		await warmGraph(env.tmpDir);
+		const report = await moduleReport("a.ts", env.tmpDir);
+
+		expect(report.available).toBe(true);
+		expect(report.staleness).toBe("fresh");
+		// Provenance is honest: who-uses-this came from the AST review graph (#256).
+		expect(report.semantic.source).toBe("review-graph");
+		const foo = report.api.find((e) => e.name === "foo");
+		expect(foo).toBeDefined();
+		expect(foo?.usedBy?.some((u) => u.file.endsWith("b.ts"))).toBe(true);
+		// usedBy paths are cwd-relative for scanning (not absolute) (#256).
+		expect(foo?.usedBy?.every((u) => !path.isAbsolute(u.file))).toBe(true);
+		// recommendedReads should surface the referenced, exported symbol.
+		expect(report.recommendedReads.some((r) => r.symbol === "foo")).toBe(true);
+		// refs #655 phase 1: `foo` is the only symbol named "foo" anywhere in the
+		// graph, so the caller edge is provably unambiguous. refs #655 phase 2:
+		// b.ts's own `import { foo } from "./a.js"` also narrows this callee to
+		// a.ts BEFORE the graph-wide uniqueness check runs, which is a strictly
+		// more specific tier than plain global-uniqueness "exact" — so this now
+		// resolves as "import" instead.
+		const fooHit = foo?.usedBy?.find((u) => u.file.endsWith("b.ts"));
+		expect(fooHit?.resolution).toBe("import");
+	});
+
+	it("refs #655: a TS class METHOD still finds its graph node under the new collision-safe ID scheme", async () => {
+		// Regression guard for the jsts idKind mapping: builder.ts's graph node for
+		// a jsts method is stamped symbolKind "function" (dispatch/facts/function-facts.ts
+		// has no method/function distinction), while this file's own outline
+		// extractor (tree-sitter-symbol-extractor) reports `sym.kind === "method"`.
+		// toEntry must still map to the graph's "function" bucket for jsts lookups.
+		// A member-call (`new Service().run()`) isn't resolved to the callee graph
+		// node at all today (function-facts routes any dotted call text to an
+		// "external" node — a pre-existing, separate limitation, not part of this
+		// slice), so this asserts via graph-node METADATA (complexity), which
+		// only surfaces when `toEntry`'s symbolNodeId lookup actually finds the
+		// method's real graph node — the same lookup `usedBy` depends on.
+		const env = makeEnv();
+		createTempFile(
+			env.tmpDir,
+			"service.ts",
+			[
+				"export class Service {",
+				"  run(): number {",
+				"    if (Date.now() > 0) return 1;",
+				"    return 0;",
+				"  }",
+				"}",
+			].join("\n"),
+		);
+
+		await warmGraph(env.tmpDir);
+		const report = await moduleReport("service.ts", env.tmpDir);
+
+		const service = report.api.find((e) => e.name === "Service");
+		const run = service?.members?.find((m) => m.name === "run");
+		expect(run).toBeDefined();
+		// cyclomaticComplexity for the `if` above is 2 — only present when the
+		// graph node for THIS method was actually found by toEntry's lookup.
+		expect(run?.complexity).toBe(2);
+	});
+
+	it("refs #655: an ambiguous same-named callee across two files reports name-only resolution", async () => {
+		// Two functions named `handle` in two different files — a bare-name call
+		// site can't tell them apart. The edge must stay marked "name-only" so a
+		// consumer knows not to over-trust which `handle` it actually reached.
+		const env = makeEnv();
+		createTempFile(
+			env.tmpDir,
+			"a.ts",
+			"export function handle(): number {\n  return 1;\n}\n",
+		);
+		createTempFile(
+			env.tmpDir,
+			"b.ts",
+			"export function handle(): number {\n  return 2;\n}\n",
+		);
+		createTempFile(
+			env.tmpDir,
+			"caller.ts",
+			"export function useIt(): number {\n  return handle();\n}\n",
+		);
+
+		await warmGraph(env.tmpDir);
+		const reportA = await moduleReport("a.ts", env.tmpDir);
+		const handleA = reportA.api.find((e) => e.name === "handle");
+		// Either 0 hits (never resolved off the placeholder) or a hit explicitly
+		// marked "name-only" — never silently reported as "exact".
+		const ambiguousHit = handleA?.usedBy?.find((u) =>
+			u.file.endsWith("caller.ts"),
+		);
+		if (ambiguousHit) {
+			expect(ambiguousHit.resolution).toBe("name-only");
+		}
+	});
+
+	it("#536: carries graphBuiltAt (the cached graph's persisted ISO timestamp) when a graph was consulted", async () => {
+		const env = makeEnv();
+		const file = createTempFile(
+			env.tmpDir,
+			"a.ts",
+			"export function foo(x: number): number {\n  return x + 1;\n}\n",
+		);
+		await warmGraph(env.tmpDir);
+		const report = await moduleReport(file, env.tmpDir);
+		expect(report.graphBuiltAt).toBeDefined();
+		expect(Number.isFinite(Date.parse(report.graphBuiltAt as string))).toBe(
+			true,
+		);
+	});
+
+	it("#536: omits graphBuiltAt on a genuinely cold cache (no graph at all)", async () => {
+		const env = makeEnv();
+		const file = createTempFile(
+			env.tmpDir,
+			"a.ts",
+			"export function foo(x: number): number {\n  return x + 1;\n}\n",
+		);
+		// No warmGraph() — genuinely cold.
+		const report = await moduleReport(file, env.tmpDir);
+		expect(report.graphBuiltAt).toBeUndefined();
+	});
+
+	it("#511: warm graph missing a node for THIS file is reported as an actionable stale gap, not silent none", async () => {
+		const env = makeEnv();
+		createTempFile(
+			env.tmpDir,
+			"a.ts",
+			"export function foo(x: number): number {\n  return x + 1;\n}\n",
+		);
+		// Warm the graph BEFORE the target file exists — mirrors #511: a review
+		// graph was built/persisted, then a new file (e.g. clients/agent-nudge.ts)
+		// was added afterward without a rebuild. The graph is genuinely warm (it has
+		// nodes, e.g. for a.ts) but has no node for the new file.
+		await warmGraph(env.tmpDir);
+		const newFile = createTempFile(
+			env.tmpDir,
+			"new-file.ts",
+			[
+				"export function wireSubscriber(): void {}",
+				"export function consume(): void {}",
+			].join("\n"),
+		);
+
+		const report = await moduleReport(newFile, env.tmpDir);
+
+		expect(report.available).toBe(true);
+		// usedBy/semantic still degrade to none — there's genuinely no graph data
+		// for this file — but the report must say WHY and that a rebuild would fix
+		// it, rather than looking identical to a fully-cold cache.
+		expect(report.provenance?.usedBy).toBe("none");
+		expect(report.semantic.source).toBe("none");
+		expect(report.warnings?.some((w) => /pilens_rebuild/.test(w))).toBe(true);
+		expect(
+			report.warnings?.some((w) => /cached review graph exists/.test(w)),
+		).toBe(true);
+	});
+
+	it("true cold cache (no graph built at all) carries no stale-gap warning", async () => {
+		const env = makeEnv();
+		const file = createTempFile(
+			env.tmpDir,
+			"a.ts",
+			"export function foo(x: number): number {\n  return x + 1;\n}\n",
+		);
+		// No warmGraph() at all — genuinely cold, not "warm but missing this file".
+		const report = await moduleReport(file, env.tmpDir);
+		expect(report.provenance?.usedBy).toBe("none");
+		expect(
+			report.warnings?.some((w) => /cached review graph exists/.test(w)),
+		).toBeFalsy();
+	});
+
+	it("#921: file-cap-disabled graph is machine-readable and warned, not reported as genuinely empty", async () => {
+		const env = makeEnv();
+		const previous = process.env.PI_LENS_REVIEW_GRAPH_MAX_FILES;
+		process.env.PI_LENS_REVIEW_GRAPH_MAX_FILES = "2";
+		try {
+			const file = createTempFile(
+				env.tmpDir,
+				"a.ts",
+				"export function foo(): number { return 1; }\n",
+			);
+			createTempFile(env.tmpDir, "b.ts", "export const b = 2;\n");
+			createTempFile(env.tmpDir, "c.ts", "export const c = 3;\n");
+			await warmGraph(env.tmpDir);
+
+			const report = await moduleReport(file, env.tmpDir, {
+				blastRadius: true,
+			});
+
+			expect(report.provenance?.usedBy).toBe("unavailable:file-cap");
+			expect(report.provenance?.blastRadius).toBe("unavailable:file-cap");
+			expect(report.semantic.source).toBe("unavailable:file-cap");
+			expect(report.warnings).toContain(
+				"who-uses-this is unavailable: review graph disabled because the project " +
+					"has more than 2 files (cap 2) — raise maxProjectFiles in " +
+					".pi-lens.json or set PI_LENS_REVIEW_GRAPH_MAX_FILES; for CI/cron, " +
+					"run npx pi-lens build-graph after configuring the cap",
+			);
+			expect(renderCompactModuleReport(report)).toContain(
+				"WARNING: who-uses-this is unavailable: review graph disabled",
+			);
+		} finally {
+			if (previous === undefined)
+				delete process.env.PI_LENS_REVIEW_GRAPH_MAX_FILES;
+			else process.env.PI_LENS_REVIEW_GRAPH_MAX_FILES = previous;
+		}
+	});
+
+	it("drops a function-local declaration from the outline entirely (#259, supersedes #256 routing)", async () => {
+		const env = makeEnv();
+		const file = createTempFile(
+			env.tmpDir,
+			"nested.ts",
+			[
+				"export function outer(): number {",
+				"  const localHelper = (n: number) => n * 2;",
+				"  return localHelper(21);",
+				"}",
+			].join("\n"),
+		);
+		const report = await moduleReport(file, env.tmpDir);
+		// outer is the module export; localHelper is a function-local → it is no
+		// longer surfaced in EITHER list (it was routed to internal pre-#259).
+		expect(report.api.some((e) => e.name === "outer")).toBe(true);
+		expect(report.api.some((e) => e.name === "localHelper")).toBe(false);
+		expect(report.internal.some((e) => e.name === "localHelper")).toBe(false);
+	});
+
+	it("Tier 3: serves who-uses-this from the persisted disk snapshot when the in-memory cache is cold (cross-process)", async () => {
+		const env = makeEnv();
+		createTempFile(
+			env.tmpDir,
+			"a.ts",
+			"export function foo(x: number): number {\n  return x + 1;\n}\n",
+		);
+		createTempFile(
+			env.tmpDir,
+			"b.ts",
+			[
+				'import { foo } from "./a.js";',
+				"export function callsFoo(): number {",
+				"  return foo(41);",
+				"}",
+			].join("\n"),
+		);
+		await warmGraph(env.tmpDir); // builds + persists to disk (async)
+
+		// Simulate a fresh process (the edit pipeline persisted; module_report runs
+		// elsewhere with an empty in-memory cache). persistGraph writes async, so
+		// clear in-memory and poll until the disk snapshot lands.
+		let foo: { usedBy?: Array<{ file: string }> } | undefined;
+		for (let attempt = 0; attempt < 20; attempt++) {
+			clearReviewGraphWorkspaceCache(); // force the disk (Tier 3) path
+			const report = await moduleReport("a.ts", env.tmpDir);
+			foo = report.api.find((e) => e.name === "foo");
+			if (foo?.usedBy?.length) break;
+			await new Promise((r) => setTimeout(r, 50));
+		}
+		expect(foo?.usedBy?.some((u) => u.file.endsWith("b.ts"))).toBe(true);
+	});
+
+	it("populates imports for a non-jsts language (python) via graph import edges (#249)", async () => {
+		const env = makeEnv();
+		createTempFile(
+			env.tmpDir,
+			"app.py",
+			"import os\nimport requests\nfrom . import helper\n\ndef go():\n    return os.getcwd()\n",
+		);
+		createTempFile(env.tmpDir, "helper.py", "def h():\n    return 1\n");
+
+		await warmGraph(env.tmpDir);
+		const report = await moduleReport("app.py", env.tmpDir);
+
+		expect(report.available).toBe(true);
+		// External package imports come through the new tree-sitter import edges.
+		expect(report.imports.external).toContain("os");
+		expect(report.imports.external).toContain("requests");
+		expect(report.summary.imports).toBeGreaterThan(0);
+	});
+
+	it("LSP disabled (budget 0) → semantic.source is none", async () => {
+		const env = makeEnv();
+		createTempFile(
+			env.tmpDir,
+			"a.ts",
+			"export function foo(x: number): number {\n  return x + 1;\n}\n",
+		);
+		const report = await moduleReport("a.ts", env.tmpDir);
+		expect(report.semantic.source).toBe("none");
+		expect(report.semantic.implementations).toBe(false);
+	});
+
+	it("read-only: no cached graph (cold) → outline only, no build, who-uses-this empty", async () => {
+		const env = makeEnv();
+		createTempFile(
+			env.tmpDir,
+			"a.ts",
+			"export function foo(x: number): number {\n  return x + 1;\n}\n",
+		);
+		createTempFile(
+			env.tmpDir,
+			"b.ts",
+			'import { foo } from "./a.js";\nexport const r = foo(1);\n',
+		);
+		// No warmGraph() → the cache is cold. module_report must NOT build it.
+		const report = await moduleReport("a.ts", env.tmpDir);
+		expect(report.available).toBe(true); // outline still extracts
+		const foo = report.api.find((e) => e.name === "foo");
+		expect(foo).toBeDefined();
+		expect(foo?.usedBy).toBeUndefined(); // cold graph → no who-uses-this
+		expect(report.imports.external).toHaveLength(0);
+	});
+});
+
+describe("moduleReport — call-graph reader surface (#1070)", () => {
+	it("reads available callers and callees from the real warm graph, with bounded output", async () => {
+		const env = makeEnv();
+		createTempFile(
+			env.tmpDir,
+			"a.ts",
+			[
+				'import { helper } from "./c.js";',
+				"export function foo(): number {",
+				"  return helper();",
+				"}",
+			].join("\n"),
+		);
+		createTempFile(
+			env.tmpDir,
+			"b.ts",
+			[
+				'import { foo } from "./a.js";',
+				"export function callsFoo(): number { return foo(); }",
+				"export function callsFooAgain(): number { return foo(); }",
+			].join("\n"),
+		);
+		createTempFile(
+			env.tmpDir,
+			"c.ts",
+			"export function helper(): number { return 1; }\n",
+		);
+
+		await warmCallGraph(env.tmpDir);
+		const report = await moduleReport("a.ts", env.tmpDir, {
+			callGraph: true,
+			maxCallGraphEntries: 1,
+		});
+
+		expect(report.callGraph).toMatchObject({
+			available: true,
+			truncated: true,
+			coverage: {
+				status: expect.any(String),
+				totalEvidence: expect.any(Number),
+			},
+		});
+		expect(report.callGraph?.callers).toHaveLength(1);
+		expect(report.callGraph?.callers[0]).toMatchObject({
+			file: "b.ts",
+			symbol: expect.stringMatching(/^callsFoo/),
+			kind: "function",
+			targetSymbolId: expect.stringContaining("a.ts:foo"),
+		});
+		expect(report.callGraph?.callees[0]).toMatchObject({
+			file: "c.ts",
+			symbol: "helper",
+			targetSymbolId: expect.stringContaining("a.ts:foo"),
+		});
+
+		const callerReport = await moduleReport("b.ts", env.tmpDir, {
+			callGraph: true,
+		});
+		expect(callerReport.callGraph?.available).toBe(true);
+		expect(callerReport.callGraph?.callees).toEqual(
+			expect.arrayContaining([
+				expect.objectContaining({
+					file: "a.ts",
+					symbol: "foo",
+					evidenceKind: expect.any(String),
+				}),
+			]),
+		);
+	});
+
+	it("reports identity mismatch, legacy, and malformed call-graph caches as stale", async () => {
+		const env = makeEnv();
+		createTempFile(
+			env.tmpDir,
+			"a.ts",
+			"export function foo(): number { return 1; }\n",
+		);
+		await warmGraph(env.tmpDir);
+		const graph = getCachedReviewGraph(env.tmpDir);
+		expect(graph).toBeDefined();
+		const identity = getReviewGraphCacheIdentity(env.tmpDir, graph);
+		expect(identity).toBeDefined();
+		const cacheFile = path.join(
+			getProjectDataDir(env.tmpDir),
+			"cache",
+			"call-graph.json",
+		);
+		fs.mkdirSync(path.dirname(cacheFile), { recursive: true });
+
+		const write = (raw: unknown) =>
+			fs.writeFileSync(cacheFile, JSON.stringify(raw), "utf-8");
+		const base = {
+			version: CALL_GRAPH_CACHE_VERSION,
+			builtAt: "2026-08-04T00:00:00.000Z",
+			reviewGraphVersion: identity!.version,
+			reviewGraphSignature: "wrong-signature",
+			edges: [],
+			callees: [],
+			callers: [],
+			inDegree: [],
+			totalRefs: 0,
+			unresolvedRefs: 0,
+			coverage: {
+				totalEvidence: 0,
+				callsEvidence: 0,
+				referencesEvidence: 0,
+				eligibleEvidence: 0,
+				resolvedEvidence: 0,
+				unresolvedEvidence: 0,
+				typeOnlyEvidence: 0,
+				unsupportedEvidence: 0,
+				sameFileEvidence: 0,
+				duplicateEvidence: 0,
+				complete: false,
+			},
+		};
+		write(base);
+		expect(
+			(await moduleReport("a.ts", env.tmpDir, { callGraph: true })).callGraph,
+		).toMatchObject({
+			available: false,
+			reason: "stale",
+		});
+
+		// Deliberately pinned to the literal 4, one below CALL_GRAPH_CACHE_VERSION, to
+		// exercise the legacy-format rejection path itself. If CALL_GRAPH_CACHE_VERSION
+		// is ever bumped to 4 this assertion fails loudly instead of the test
+		// silently testing nothing (the #1082/#1106 vacuous-fixture class).
+		expect(CALL_GRAPH_CACHE_VERSION).not.toBe(4);
+		write({ ...base, version: 4, reviewGraphSignature: identity!.signature });
+		expect(
+			(await moduleReport("a.ts", env.tmpDir, { callGraph: true })).callGraph,
+		).toMatchObject({
+			available: false,
+			reason: "stale",
+		});
+	});
+
+	it("reports partial persisted review graphs and a cold graph as unavailable", async () => {
+		const env = makeEnv();
+		createTempFile(
+			env.tmpDir,
+			"a.ts",
+			"export function foo(): number { return 1; }\n",
+		);
+		const previousCap = process.env.PI_LENS_GRAPH_PERSIST_MAX_ELEMENTS;
+		process.env.PI_LENS_GRAPH_PERSIST_MAX_ELEMENTS = "1";
+		try {
+			await warmGraph(env.tmpDir);
+			flushReviewGraphPersistsForExitForTests();
+			clearReviewGraphWorkspaceCache();
+			const partial = await moduleReport("a.ts", env.tmpDir, {
+				callGraph: true,
+			});
+			expect(partial.callGraph).toMatchObject({
+				available: false,
+				reason: "partial",
+			});
+		} finally {
+			if (previousCap === undefined)
+				delete process.env.PI_LENS_GRAPH_PERSIST_MAX_ELEMENTS;
+			else process.env.PI_LENS_GRAPH_PERSIST_MAX_ELEMENTS = previousCap;
+		}
+
+		const coldEnv = makeEnv();
+		createTempFile(
+			coldEnv.tmpDir,
+			"a.ts",
+			"export function foo(): number { return 1; }\n",
+		);
+		const cold = await moduleReport("a.ts", coldEnv.tmpDir, {
+			callGraph: true,
+		});
+		expect(cold.callGraph).toMatchObject({
+			available: false,
+			reason: "review-graph-missing",
+			coverage: { status: "unavailable", complete: false },
+		});
+	});
+
+	it("is read-only: a cold call-graph request never builds a review graph", async () => {
+		const env = makeEnv();
+		const file = createTempFile(
+			env.tmpDir,
+			"a.ts",
+			"export function foo(): number { return 1; }\n",
+		);
+		clearReviewGraphWorkspaceCache();
+		const report = await moduleReport(file, env.tmpDir, { callGraph: true });
+		expect(report.callGraph?.reason).toBe("review-graph-missing");
+		expect(getCachedReviewGraph(env.tmpDir)).toBeUndefined();
+	});
+
+	it("#921: reports file-cap (never zero calls) when the review graph is disabled over the project file cap", async () => {
+		const env = makeEnv();
+		const previous = process.env.PI_LENS_REVIEW_GRAPH_MAX_FILES;
+		process.env.PI_LENS_REVIEW_GRAPH_MAX_FILES = "2";
+		try {
+			const file = createTempFile(
+				env.tmpDir,
+				"a.ts",
+				"export function foo(): number { return 1; }\n",
+			);
+			createTempFile(env.tmpDir, "b.ts", "export const b = 2;\n");
+			createTempFile(env.tmpDir, "c.ts", "export const c = 3;\n");
+			await warmGraph(env.tmpDir);
+
+			const report = await moduleReport(file, env.tmpDir, { callGraph: true });
+
+			expect(report.callGraph).toMatchObject({
+				available: false,
+				reason: "file-cap",
+			});
+			// The honesty contract in the tool description ("unavailable cache state
+			// is never reported as zero calls") extends to callers/callees staying
+			// empty arrays alongside the explicit reason, not a fabricated shape.
+			expect(report.callGraph?.callers).toEqual([]);
+			expect(report.callGraph?.callees).toEqual([]);
+			expect(report.provenance?.callGraph).toBe("unavailable:file-cap");
+		} finally {
+			if (previous === undefined)
+				delete process.env.PI_LENS_REVIEW_GRAPH_MAX_FILES;
+			else process.env.PI_LENS_REVIEW_GRAPH_MAX_FILES = previous;
+		}
+	});
+
+	it("carries provenance.callGraph across available and unavailable states", async () => {
+		const env = makeEnv();
+		createTempFile(
+			env.tmpDir,
+			"a.ts",
+			"export function foo(): number {\n  return helper();\n}\nfunction helper(): number { return 1; }\n",
+		);
+		await warmCallGraph(env.tmpDir);
+
+		const available = await moduleReport("a.ts", env.tmpDir, {
+			callGraph: true,
+		});
+		expect(available.callGraph?.available).toBe(true);
+		expect(available.provenance?.callGraph).toBe("cached-call-graph");
+
+		// callGraph omitted from the request entirely → provenance.callGraph must
+		// not be reported at all (it's opt-in, like blastRadius).
+		const notRequested = await moduleReport("a.ts", env.tmpDir);
+		expect(notRequested.callGraph).toBeUndefined();
+		expect(notRequested.provenance?.callGraph).toBeUndefined();
+
+		// A cold project (no graph at all) requesting callGraph is unavailable,
+		// with a "none" provenance — not "cached-call-graph" and not silently
+		// indistinguishable from "unavailable:file-cap".
+		const coldEnv = makeEnv();
+		createTempFile(
+			coldEnv.tmpDir,
+			"a.ts",
+			"export function foo(): number { return 1; }\n",
+		);
+		clearReviewGraphWorkspaceCache();
+		const cold = await moduleReport("a.ts", coldEnv.tmpDir, {
+			callGraph: true,
+		});
+		expect(cold.callGraph?.available).toBe(false);
+		expect(cold.callGraph?.reason).toBe("review-graph-missing");
+		expect(cold.provenance?.callGraph).toBe("none");
+	});
+});
+
+describe("moduleReport — cold-cache imports (#301)", () => {
+	it("TS: resolves a relative import to an in-project file and buckets externals", async () => {
+		const env = makeEnv();
+		createTempFile(env.tmpDir, "dep.ts", "export const x = 1;\n");
+		const file = createTempFile(
+			env.tmpDir,
+			"main.ts",
+			[
+				'import { x } from "./dep";',
+				'import { readFileSync } from "node:fs";',
+				'import express from "express";',
+				"export const y = x;",
+			].join("\n"),
+		);
+		// Cold cache: no warmGraph(). Imports must still populate from tree-sitter
+		// (previously zero), resolving the relative import to the real file.
+		const report = await moduleReport(file, env.tmpDir);
+		expect(report.semantic.source).toBe("none"); // proves cold path
+		expect(report.imports.internal).toContain("dep.ts");
+		// Bare specifiers stay external.
+		expect(report.imports.external).toContain("express");
+		expect(report.imports.external).toContain("node:fs");
+		expect(report.summary.imports).toBe(
+			report.imports.internal.length + report.imports.external.length,
+		);
+	});
+
+	it("TS: an unresolvable relative import falls back to the internal bucket by shape", async () => {
+		const env = makeEnv();
+		const file = createTempFile(
+			env.tmpDir,
+			"a.ts",
+			'import { foo } from "./not-created";\nexport const r = 1;\n',
+		);
+		const report = await moduleReport(file, env.tmpDir);
+		// No file on disk to resolve to, but "./" shape ⇒ internal, never external.
+		expect(report.imports.internal).toContain("./not-created");
+		expect(report.imports.external).toHaveLength(0);
+	});
+
+	it("Python: resolves a dotted intra-package import on a cold cache", async () => {
+		const env = makeEnv();
+		createTempFile(env.tmpDir, "pkg/__init__.py", "");
+		createTempFile(env.tmpDir, "pkg/util.py", "def helper():\n    return 1\n");
+		const file = createTempFile(
+			env.tmpDir,
+			"pkg/main.py",
+			["from pkg.util import helper", "import os", "", "helper()"].join("\n"),
+		);
+		const report = await moduleReport(file, env.tmpDir);
+		expect(report.language).toBe("python");
+		expect(report.imports.internal.some((p) => p.endsWith("util.py"))).toBe(
+			true,
+		);
+		expect(report.imports.external).toContain("os");
+	});
+
+	it("C/C++: resolves a local #include, buckets a system header external (#302)", async () => {
+		const env = makeEnv();
+		createTempFile(env.tmpDir, "foo.h", "int foo(void);\n");
+		const file = createTempFile(
+			env.tmpDir,
+			"main.c",
+			[
+				'#include "foo.h"',
+				"#include <stdio.h>",
+				'#include "missing.h"',
+				"int main(void) { return foo(); }",
+			].join("\n"),
+		);
+		const report = await moduleReport(file, env.tmpDir);
+		expect(report.language).toBe("cxx");
+		expect(report.semantic.source).toBe("none"); // cold path
+		// Local include resolves to the real header.
+		expect(report.imports.internal).toContain("foo.h");
+		// An unresolved local include stays internal by C convention (quoted form).
+		expect(report.imports.internal).toContain("missing.h");
+		// System header keeps its <> and is external.
+		expect(report.imports.external).toContain("<stdio.h>");
+	});
+
+	it("warm graph wins: cold extraction does not override a populated graph", async () => {
+		const env = makeEnv();
+		createTempFile(env.tmpDir, "dep.ts", "export const x = 1;\n");
+		const file = createTempFile(
+			env.tmpDir,
+			"main.ts",
+			'import { x } from "./dep";\nexport const y = x;\n',
+		);
+		await warmGraph(env.tmpDir);
+		const report = await moduleReport(file, env.tmpDir);
+		expect(report.semantic.source).toBe("review-graph"); // warm
+		expect(report.imports.internal).toContain("dep.ts");
+	});
+});
+
+describe("moduleReport — member nesting (#301)", () => {
+	it("ranks a hot nested method into recommendedReads via the flat list", async () => {
+		const env = makeEnv();
+		const file = createTempFile(
+			env.tmpDir,
+			"svc.ts",
+			[
+				"export class Svc {",
+				"  hot(): number { return 1; }",
+				"}",
+				"export function caller(): number { return new Svc().hot(); }",
+			].join("\n"),
+		);
+		await warmGraph(env.tmpDir); // so who-uses-this scores the nested method
+		const report = await moduleReport(file, env.tmpDir);
+		// Svc is top-level with hot nested under it.
+		const svc = report.api.find((e) => e.name === "Svc");
+		expect((svc?.members ?? []).some((e) => e.name === "hot")).toBe(true);
+		// recommendedReads ranks over the FLAT list, so a referenced nested method
+		// can still surface as a recommended read.
+		const reads = report.recommendedReads.map((r) => r.symbol);
+		expect(reads).toContain("hot");
+	});
+});
+
+describe("moduleReport — cross-file blast radius (#304)", () => {
+	// dep ← mid ← top, function-wrapped so the review graph captures call edges.
+	function makeChain(env: { tmpDir: string }) {
+		createTempFile(
+			env.tmpDir,
+			"dep.ts",
+			"export function foo(x: number): number {\n  return x + 1;\n}\n",
+		);
+		createTempFile(
+			env.tmpDir,
+			"mid.ts",
+			'import { foo } from "./dep.js";\nexport function bar(): number {\n  return foo(1);\n}\n',
+		);
+		createTempFile(
+			env.tmpDir,
+			"top.ts",
+			'import { bar } from "./mid.js";\nexport function baz(): number {\n  return bar();\n}\n',
+		);
+	}
+
+	it("is omitted unless requested", async () => {
+		const env = makeEnv();
+		makeChain(env);
+		await warmGraph(env.tmpDir);
+		const report = await moduleReport("dep.ts", env.tmpDir);
+		expect(report.blastRadius).toBeUndefined();
+	});
+
+	it("warm + requested: lists transitive dependents as ranked file reads", async () => {
+		const env = makeEnv();
+		makeChain(env);
+		await warmGraph(env.tmpDir);
+		const report = await moduleReport("dep.ts", env.tmpDir, {
+			blastRadius: true,
+		});
+		expect(report.blastRadius).toBeDefined();
+		const files = report.blastRadius?.files ?? [];
+		const names = files.map((f) => f.file);
+		// Direct dependent (mid) at depth 1; transitive dependent (top) deeper.
+		expect(names).toContain("mid.ts");
+		const mid = files.find((f) => f.file === "mid.ts");
+		expect(mid?.minDepth).toBe(1);
+		expect(mid?.dependents).toBeGreaterThanOrEqual(1);
+		expect(mid?.relations.length).toBeGreaterThanOrEqual(1);
+		// Ranked closest-first: the first entry is the shallowest.
+		expect(files[0]?.minDepth).toBeLessThanOrEqual(
+			files[files.length - 1]?.minDepth ?? 99,
+		);
+		// read args point at the dependent file (absolute machine path), offset 1.
+		expect(mid?.read.offset).toBe(1);
+		expect(path.isAbsolute(mid?.read.path ?? "")).toBe(true);
+		// The module itself never appears in its own blast radius.
+		expect(names).not.toContain("dep.ts");
+	});
+
+	it("cold cache + requested: section omitted, no build (read-only #256)", async () => {
+		const env = makeEnv();
+		makeChain(env);
+		// No warmGraph() → cold. Requesting blast radius must NOT build a graph.
+		const report = await moduleReport("dep.ts", env.tmpDir, {
+			blastRadius: true,
+		});
+		expect(report.semantic.source).toBe("none"); // proves cold
+		expect(report.blastRadius).toBeUndefined();
+	});
+
+	it("warm but nothing depends on the file: section omitted", async () => {
+		const env = makeEnv();
+		createTempFile(env.tmpDir, "lonely.ts", "export const solo = 1;\n");
+		await warmGraph(env.tmpDir);
+		const report = await moduleReport("lonely.ts", env.tmpDir, {
+			blastRadius: true,
+		});
+		expect(report.blastRadius).toBeUndefined();
+	});
+});
+
+describe("moduleReport — member visibility (#258) + compact outline (#259)", () => {
+	it("routes private/protected members of an exported class to internal with a visibility tag (#258)", async () => {
+		const env = makeEnv();
+		const file = createTempFile(
+			env.tmpDir,
+			"svc.ts",
+			[
+				"export class Service {",
+				"  run(): number { return 1; }",
+				"  private secret(): number { return 2; }",
+				"  protected guarded(): number { return 3; }",
+				"}",
+			].join("\n"),
+		);
+		const report = await moduleReport(file, env.tmpDir);
+
+		// The exported class is the top-level api entry; its members nest under it
+		// (#301) rather than appearing flat at top level.
+		const svc = report.api.find((e) => e.name === "Service");
+		expect(svc).toBeDefined();
+		expect(report.api.some((e) => e.name === "run")).toBe(false);
+		const members = svc?.members ?? [];
+		const run = members.find((e) => e.name === "run");
+		const secret = members.find((e) => e.name === "secret");
+		const guarded = members.find((e) => e.name === "guarded");
+
+		// Public member: exported, no visibility tag.
+		expect(run?.exported).toBe(true);
+		expect(run?.visibility).toBeUndefined();
+		// Private/protected members are reachable but not public API → tagged,
+		// not exported, even though they nest under an exported class.
+		expect(secret?.visibility).toBe("private");
+		expect(guarded?.visibility).toBe("protected");
+		expect(secret?.exported).toBe(false);
+		expect(secret?.flags ?? []).not.toContain("exported");
+		// summary.exports counts the top-level api split only.
+		expect(report.summary.exports).toBe(report.api.length);
+	});
+
+	it("keeps class members + module-level symbols while dropping function-locals (#259)", async () => {
+		const env = makeEnv();
+		const file = createTempFile(
+			env.tmpDir,
+			"m.ts",
+			[
+				"export class Svc {",
+				"  method(): number {",
+				"    const tmp = (x: number) => x + 1;",
+				"    return tmp(1);",
+				"  }",
+				"}",
+				"export function top(): void {}",
+			].join("\n"),
+		);
+		const report = await moduleReport(file, env.tmpDir);
+		const topLevel = [...report.api, ...report.internal].map((e) => e.name);
+		expect(topLevel).toContain("Svc"); // exported class — top level
+		expect(topLevel).toContain("top"); // module-level fn — top level
+		expect(topLevel).not.toContain("method"); // class member → nested, not top
+		expect(topLevel).not.toContain("tmp"); // function-local dropped entirely
+
+		// The member lives under its container (#301), and the function-local stays
+		// dropped at every level.
+		const svc = [...report.api, ...report.internal].find(
+			(e) => e.name === "Svc",
+		);
+		const memberNames = (svc?.members ?? []).map((e) => e.name);
+		expect(memberNames).toContain("method");
+		expect(memberNames).not.toContain("tmp");
+	});
+});
+
+describe("readEnclosing — search/diagnostic line to exact body", () => {
+	it("returns the smallest callback enclosing a line", async () => {
+		const env = makeEnv();
+		const file = createTempFile(
+			env.tmpDir,
+			"callbacks.ts",
+			[
+				"export function run(ctx: any) {",
+				"  return {",
+				"    resetLSPService: () => {",
+				"      ctx.ui.setStatus('x');",
+				"    },",
+				"  };",
+				"}",
+			].join("\n"),
+		);
+
+		const result = await readEnclosing(file, 4, env.tmpDir);
+
+		expect(result.found).toBe(true);
+		expect(result.name).toBe("run.resetLSPService@3");
+		expect(result.kind).toBe("object_property_callback");
+		expect(result.startLine).toBe(3);
+		expect(result.endLine).toBe(5);
+		expect(result.source).toContain("ctx.ui.setStatus");
+		expect(result.source).not.toContain("return {");
+	});
+
+	it("falls back to a named symbol when no callback encloses the line", async () => {
+		const env = makeEnv();
+		const file = createTempFile(
+			env.tmpDir,
+			"sample.py",
+			"def outer():\n    value = 1\n    return value\n",
+		);
+
+		const result = await readEnclosing(file, 2, env.tmpDir);
+
+		expect(result.found).toBe(true);
+		expect(result.name).toBe("outer");
+		expect(result.kind).toBe("function");
+		expect(result.source).toContain("return value");
+	});
+
+	it("honors maxLines without returning oversized source", async () => {
+		const env = makeEnv();
+		const file = createTempFile(
+			env.tmpDir,
+			"sample.ts",
+			"export function big() {\n  const a = 1;\n  const b = 2;\n  return a + b;\n}\n",
+		);
+
+		const result = await readEnclosing(file, 3, env.tmpDir, { maxLines: 2 });
+
+		expect(result.found).toBe(false);
+		expect(result.name).toBe("big");
+		expect(result.error).toContain("above maxLines 2");
+		expect(result.source).toBeUndefined();
+	});
+
+	it("can return a bounded slice when the enclosing body is oversized", async () => {
+		const env = makeEnv();
+		const file = createTempFile(
+			env.tmpDir,
+			"big-slice.ts",
+			[
+				"export function big() {",
+				"  const a = 1;",
+				"  const b = 2;",
+				"  const c = 3;",
+				"  return a + b + c;",
+				"}",
+			].join("\n"),
+		);
+
+		const result = await readEnclosing(file, 4, env.tmpDir, {
+			maxLines: 2,
+			onOversize: "slice",
+			aroundLine: 3,
+		});
+
+		expect(result.found).toBe(true);
+		expect(result.partial).toBe(true);
+		expect(result.name).toBe("big");
+		expect(result.startLine).toBe(3);
+		expect(result.endLine).toBe(5);
+		expect(result.enclosingStartLine).toBe(1);
+		expect(result.enclosingEndLine).toBe(6);
+		expect(result.selection?.strategy).toBe("oversize-slice");
+		expect(result.source).toContain("const c = 3");
+		expect(result.source).not.toContain("export function big");
+	});
+
+	it("can return a nested outline when the enclosing body is oversized", async () => {
+		const env = makeEnv();
+		const file = createTempFile(
+			env.tmpDir,
+			"big-outline.ts",
+			[
+				"export function big() {",
+				"  function nested() {",
+				"    return 1;",
+				"  }",
+				"  return nested();",
+				"}",
+			].join("\n"),
+		);
+
+		const result = await readEnclosing(file, 5, env.tmpDir, {
+			maxLines: 2,
+			onOversize: "outline",
+		});
+
+		expect(result.found).toBe(false);
+		expect(result.name).toBe("big");
+		expect(result.selection?.strategy).toBe("oversize-outline");
+		expect(result.outline?.map((item) => item.name)).toContain("nested");
+		expect(result.outline?.[0]?.read).toMatchObject({ offset: 2, limit: 3 });
+		expect(result.source).toBeUndefined();
+	});
+});
+
+describe("readSymbol — verbatim body for guard-satisfying reads", () => {
+	it("returns the exact source lines of a named symbol", async () => {
+		const env = makeEnv();
+		createTempFile(
+			env.tmpDir,
+			"sample.ts",
+			[
+				"const noise = 1;",
+				"export function target(n: number): number {",
+				"  const doubled = n * 2;",
+				"  return doubled;",
+				"}",
+			].join("\n"),
+		);
+
+		const result = await readSymbol("sample.ts", "target", env.tmpDir);
+
+		expect(result.found).toBe(true);
+		expect(result.kind).toBe("function");
+		expect(result.startLine).toBe(2);
+		expect(result.endLine).toBe(5);
+		expect(result.source).toContain("export function target");
+		expect(result.source).toContain("return doubled;");
+		// Must not leak lines outside the symbol body.
+		expect(result.source).not.toContain("const noise");
+	});
+
+	it("returns the exact source lines of a module_report callback handle", async () => {
+		const env = makeEnv();
+		const file = createTempFile(
+			env.tmpDir,
+			"callbacks.ts",
+			[
+				"export async function run(ctx: any) {",
+				"  await handleTurnEnd({",
+				"    resetLSPService: () => {",
+				"      ctx.ui.setStatus('x');",
+				"    },",
+				"  });",
+				"}",
+			].join("\n"),
+		);
+		const report = await moduleReport(file, env.tmpDir);
+		const handle = report.callbacks.find(
+			(callback) => callback.name === "run.resetLSPService@3",
+		)?.name;
+		expect(handle).toBeDefined();
+
+		const result = await readSymbol(file, handle!, env.tmpDir);
+
+		expect(result.found).toBe(true);
+		expect(result.kind).toBe("object_property_callback");
+		expect(result.startLine).toBe(3);
+		expect(result.endLine).toBe(5);
+		expect(result.source).toContain("resetLSPService");
+		expect(result.source).toContain("ctx.ui.setStatus");
+		expect(result.source).not.toContain("handleTurnEnd");
+	});
+
+	it("reports not-found for an unknown symbol", async () => {
+		const env = makeEnv();
+		createTempFile(env.tmpDir, "sample.ts", "export const x = 1;\n");
+		const result = await readSymbol("sample.ts", "ghost", env.tmpDir);
+		expect(result.found).toBe(false);
+	});
+});
+
+describe("readSymbol — doc-comment inclusion (#523 item 1)", () => {
+	it("extends the returned body to include an attached doc comment", async () => {
+		const env = makeEnv();
+		createTempFile(
+			env.tmpDir,
+			"sample.ts",
+			[
+				"const noise = 1;", // 1
+				"/**", // 2
+				" * Whether agent nudges are enabled for this session.", // 3
+				" */", // 4
+				"export function isAgentNudgeEnabled(): boolean {", // 5
+				"  return true;", // 6
+				"}", // 7
+			].join("\n"),
+		);
+
+		const result = await readSymbol(
+			"sample.ts",
+			"isAgentNudgeEnabled",
+			env.tmpDir,
+		);
+
+		expect(result.found).toBe(true);
+		expect(result.startLine).toBe(2); // comment start, not the declaration line
+		expect(result.endLine).toBe(7);
+		expect(result.source).toContain("Whether agent nudges are enabled");
+		expect(result.source).toContain("export function isAgentNudgeEnabled");
+		expect(result.source).not.toContain("const noise");
+	});
+
+	it("behaves exactly as today when no doc comment is attached (no regression)", async () => {
+		const env = makeEnv();
+		createTempFile(
+			env.tmpDir,
+			"sample.ts",
+			[
+				"const noise = 1;",
+				"export function target(n: number): number {",
+				"  return n * 2;",
+				"}",
+			].join("\n"),
+		);
+
+		const result = await readSymbol("sample.ts", "target", env.tmpDir);
+
+		expect(result.found).toBe(true);
+		expect(result.startLine).toBe(2);
+		expect(result.endLine).toBe(4);
+		expect(result.source).not.toContain("const noise");
+	});
+
+	it("excludes an unrelated comment separated from the declaration by a blank line", async () => {
+		const env = makeEnv();
+		createTempFile(
+			env.tmpDir,
+			"sample.ts",
+			[
+				"// Unrelated remark about the file, not a doc comment for target.", // 1
+				"", // 2 — blank-line gap breaks attachment
+				"export function target(n: number): number {", // 3
+				"  return n * 2;", // 4
+				"}", // 5
+			].join("\n"),
+		);
+
+		const result = await readSymbol("sample.ts", "target", env.tmpDir);
+
+		expect(result.found).toBe(true);
+		expect(result.startLine).toBe(3); // declaration line, comment NOT attached
+		expect(result.source).not.toContain("Unrelated remark");
+	});
+});
+
+describe("readSymbol — did-you-mean on miss (#523 item 2)", () => {
+	it("returns the correct symbol as a top suggestion for a near-miss typo", async () => {
+		const env = makeEnv();
+		createTempFile(
+			env.tmpDir,
+			"sample.ts",
+			[
+				"export function isAgentNudgeEnabled(): boolean {",
+				"  return true;",
+				"}",
+			].join("\n"),
+		);
+
+		// One character short of the real name.
+		const result = await readSymbol(
+			"sample.ts",
+			"isAgentNudgeEnable",
+			env.tmpDir,
+		);
+
+		expect(result.found).toBe(false);
+		expect(result.suggestions).toBeDefined();
+		expect(result.suggestions?.[0]).toBe("isAgentNudgeEnabled");
+		expect(result.suggestions!.length).toBeLessThanOrEqual(3);
+	});
+
+	it("returns no misleading suggestions for a wildly-wrong name", async () => {
+		const env = makeEnv();
+		createTempFile(
+			env.tmpDir,
+			"sample.ts",
+			[
+				"export function isAgentNudgeEnabled(): boolean {",
+				"  return true;",
+				"}",
+			].join("\n"),
+		);
+
+		const result = await readSymbol(
+			"sample.ts",
+			"zzzzzzzzzzzzzzzz",
+			env.tmpDir,
+		);
+
+		expect(result.found).toBe(false);
+		expect(result.suggestions ?? []).toHaveLength(0);
+	});
+});
+
+describe("readSymbol — Class.method qualification (#523 item 3)", () => {
+	it("resolves a dotted name to disambiguate a same-named member across two classes", async () => {
+		const env = makeEnv();
+		createTempFile(
+			env.tmpDir,
+			"sample.ts",
+			[
+				"export class Foo {", // 1
+				"  bar(): number {", // 2
+				"    return 1;", // 3
+				"  }", // 4
+				"}", // 5
+				"", // 6
+				"export class Baz {", // 7
+				"  bar(): number {", // 8
+				"    return 2;", // 9
+				"  }", // 10
+				"}", // 11
+			].join("\n"),
+		);
+
+		const fooBar = await readSymbol("sample.ts", "Foo.bar", env.tmpDir);
+		expect(fooBar.found).toBe(true);
+		expect(fooBar.source).toContain("return 1;");
+		expect(fooBar.source).not.toContain("return 2;");
+
+		const bazBar = await readSymbol("sample.ts", "Baz.bar", env.tmpDir);
+		expect(bazBar.found).toBe(true);
+		expect(bazBar.source).toContain("return 2;");
+		expect(bazBar.source).not.toContain("return 1;");
+	});
+
+	it("leaves unqualified lookup unaffected", async () => {
+		const env = makeEnv();
+		createTempFile(
+			env.tmpDir,
+			"sample.ts",
+			[
+				"export function target(n: number): number {",
+				"  return n * 2;",
+				"}",
+			].join("\n"),
+		);
+
+		const result = await readSymbol("sample.ts", "target", env.tmpDir);
+		expect(result.found).toBe(true);
+	});
+
+	it("falls through to the did-you-mean miss path when the qualifier's parent doesn't exist", async () => {
+		const env = makeEnv();
+		createTempFile(
+			env.tmpDir,
+			"sample.ts",
+			[
+				"export class Foo {",
+				"  bar(): number {",
+				"    return 1;",
+				"  }",
+				"}",
+			].join("\n"),
+		);
+
+		const result = await readSymbol("sample.ts", "Ghost.bar", env.tmpDir);
+		expect(result.found).toBe(false);
+		expect(result.error).toBeUndefined();
+	});
+});
+
+describe("readSymbol — duplicate-name disambiguation (#523 item 4)", () => {
+	it("notes the ambiguity and returns the first match when kind is omitted", async () => {
+		const env = makeEnv();
+		createTempFile(
+			env.tmpDir,
+			"sample.ts",
+			[
+				"export interface Foo {", // 1
+				"  id: number;", // 2
+				"}", // 3
+				"", // 4
+				"export function Foo(): void {}", // 5
+			].join("\n"),
+		);
+
+		const result = await readSymbol("sample.ts", "Foo", env.tmpDir);
+
+		expect(result.found).toBe(true);
+		expect(result.ambiguous).toBeDefined();
+		expect(result.ambiguous?.count).toBe(2);
+		expect(result.ambiguous?.kinds.sort()).toEqual(
+			["function", "interface"].sort(),
+		);
+		// First match wins — source order (the interface, declared first).
+		expect(result.kind).toBe("interface");
+	});
+
+	it("resolves a specific match when kind is passed", async () => {
+		const env = makeEnv();
+		createTempFile(
+			env.tmpDir,
+			"sample.ts",
+			[
+				"export interface Foo {",
+				"  id: number;",
+				"}",
+				"",
+				"export function Foo(): void {}",
+			].join("\n"),
+		);
+
+		const result = await readSymbol("sample.ts", "Foo", env.tmpDir, {
+			kind: "function",
+		});
+
+		expect(result.found).toBe(true);
+		expect(result.kind).toBe("function");
+		expect(result.ambiguous).toBeUndefined();
+	});
+
+	it("has no ambiguity note for a single unambiguous match", async () => {
+		const env = makeEnv();
+		createTempFile(
+			env.tmpDir,
+			"sample.ts",
+			["export function target(): number {", "  return 1;", "}"].join("\n"),
+		);
+
+		const result = await readSymbol("sample.ts", "target", env.tmpDir);
+
+		expect(result.found).toBe(true);
+		expect(result.ambiguous).toBeUndefined();
+	});
+});
+
+describe("tsLangForFile — shared grammar resolution (#887)", () => {
+	// module-report must agree with the shared ext→grammar resolver
+	// (tree-sitter-shared.ts EXT_TO_LANG) — the single authority every other
+	// tree-sitter consumer uses — so a file is parsed and TreeCache-keyed under
+	// exactly one grammar process-wide. Pre-#887 it hand-rolled a local map
+	// that sent .js/.mjs/.cjs to the typescript grammar and .jsx to tsx.
+	it.each([
+		["app.js", "javascript"],
+		["app.mjs", "javascript"],
+		["app.cjs", "javascript"],
+		["app.jsx", "javascript"],
+		["app.ts", "typescript"],
+		["app.mts", "typescript"],
+		["app.cts", "typescript"],
+		["app.tsx", "tsx"],
+	])(
+		"resolves jsts %s to %s — identical to the shared resolver",
+		(file, expected) => {
+			expect(tsLangForFile(file, "jsts")).toBe(expected);
+			expect(tsLangForFile(file, "jsts")).toBe(resolveTreeSitterLanguage(file));
+		},
+	);
+
+	it("keeps the historical kind default for jsts extensions the shared map does not cover", () => {
+		expect(resolveTreeSitterLanguage("App.vue")).toBeUndefined();
+		expect(tsLangForFile("App.vue", "jsts")).toBe("typescript");
+		expect(tsLangForFile("App.svelte", "jsts")).toBe("typescript");
+	});
+
+	it("routes cxx through the shared resolver with a cpp fallback", () => {
+		expect(tsLangForFile("a.c", "cxx")).toBe("c");
+		expect(tsLangForFile("a.h", "cxx")).toBe("c");
+		expect(tsLangForFile("a.cpp", "cxx")).toBe("cpp");
+		expect(tsLangForFile("a.hpp", "cxx")).toBe("cpp");
+		// Not in the shared map — keeps the historical cpp default.
+		expect(resolveTreeSitterLanguage("a.mm")).toBeUndefined();
+		expect(tsLangForFile("a.mm", "cxx")).toBe("cpp");
+	});
+
+	it("keeps kind-based resolution for non-extension-split kinds", () => {
+		expect(tsLangForFile("a.py", "python")).toBe("python");
+		expect(tsLangForFile("a.go", "go")).toBe("go");
+		expect(tsLangForFile("a.sh", "shell")).toBe("bash");
+		expect(tsLangForFile("a.unknown", undefined)).toBeUndefined();
+	});
+});
+
+describe("moduleReport — JavaScript files parse under the javascript grammar (#887)", () => {
+	it("extracts a .js outline + cold-cache imports via the javascript grammar", async () => {
+		const env = makeEnv();
+		createTempFile(env.tmpDir, "dep.js", "export const d = 1;\n");
+		const file = createTempFile(
+			env.tmpDir,
+			"widget.js",
+			[
+				'import { d } from "./dep.js";',
+				'import { readFileSync } from "node:fs";',
+				"export function add(a, b) {",
+				"  return a + b;",
+				"}",
+				"export const mul = (a, b) => a * b;",
+				"export class Widget {",
+				"  render() { return d; }",
+				"}",
+			].join("\n"),
+		);
+
+		// Cold cache: no warmGraph(). Symbols + imports must come from the
+		// tree-sitter javascript path (pre-#887 this file parsed under the
+		// typescript grammar instead).
+		const report = await moduleReport(file, env.tmpDir);
+		expect(report.available).toBe(true);
+		expect(report.language).toBe("jsts");
+		expect(report.provenance?.symbols).toBe("syntax");
+
+		const names = [...report.api, ...report.internal].map((e) => e.name);
+		expect(names).toContain("add");
+		expect(names).toContain("mul");
+		expect(names).toContain("Widget");
+		const widget = [...report.api, ...report.internal].find(
+			(e) => e.name === "Widget",
+		);
+		expect(widget?.members?.map((m) => m.name)).toContain("render");
+
+		expect(report.imports.internal).toContain("dep.js");
+		expect(report.imports.external).toContain("node:fs");
+	});
+
+	it("extracts symbols from a .jsx file under the javascript grammar", async () => {
+		const env = makeEnv();
+		const file = createTempFile(
+			env.tmpDir,
+			"component.jsx",
+			[
+				"export function greet(name) {",
+				"  return `hi ${name}`;",
+				"}",
+				"export class Panel {",
+				"  show() { return true; }",
+				"}",
+			].join("\n"),
+		);
+
+		const report = await moduleReport(file, env.tmpDir);
+		expect(report.available).toBe(true);
+		const names = [...report.api, ...report.internal].map((e) => e.name);
+		expect(names).toContain("greet");
+		expect(names).toContain("Panel");
+	});
+});

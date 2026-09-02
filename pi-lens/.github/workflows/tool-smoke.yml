@@ -1,0 +1,170 @@
+name: Tool smoke (nightly)
+
+# Live tool + LSP smoke harness (#209). Unlike CI (push/PR, deterministic), this
+# installs and SPAWNS real tools/LSP servers and drives pi-lens's real dispatch
+# path against per-language fixtures — so it's slow and network-dependent, hence
+# nightly + manual only, never a per-PR gate.
+#
+# The harness exits nonzero only on genuine infra failures (timeout / exception
+# / server_error). A tool that's merely unavailable (couldn't install on the
+# runner) reports ⚠ and does NOT fail the run, so transient install/network
+# flakiness doesn't produce false alarms — the printed report still shows the
+# ⚠ counts for review.
+
+on:
+  schedule:
+    - cron: '0 6 * * *' # daily 06:00 UTC
+  workflow_dispatch:
+
+jobs:
+  tool-smoke:
+    name: Live tool + LSP smoke
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # commit-back branch for the LSP-docs refresh PR (#390)
+      pull-requests: write # open/update the auto-refresh PR (#390)
+      issues: write # file/update/close the silentOnClean drift tracking issue (#529/#594)
+    # The installer hits the GitHub REST API to resolve release assets.
+    # Unauthenticated = 60 req/hr per IP, exhausted on shared-IP runners.
+    # The auto-provided token raises this to 5000 req/hr; the installer sends it
+    # ONLY to api.github.com, never the asset CDN.
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
+        with:
+          node-version: '22'
+
+      # Python provides pip for the pip-distributed tools (ruff, yamllint,
+      # sqlfluff, mypy). GitHub-release tools (shellcheck/shfmt/hadolint/taplo/
+      # tflint/terraform-ls/rust-analyzer) are fetched by the harness's own
+      # --install; ubuntu-latest ships rustup/cargo so rust-analyzer can load.
+      # yamllint disable-line rule:line-length
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+
+      # Toolchain-gated languages. go/rust(rustup)/pwsh/.NET ship on Ubuntu;
+      # these set up the rest. All best-effort: a setup failure must NOT red the
+      # nightly (the harness already treats an unavailable tool as ⚠, not a
+      # failure), so each is continue-on-error.
+      # yamllint disable-line rule:line-length
+      - uses: actions/setup-java@dd06d9cba3e5552c54d9f8ea23572deb30010f7c # v6.0.0
+        continue-on-error: true
+        with:
+          distribution: temurin
+          java-version: '21'
+      - uses: ruby/setup-ruby@95ef2b042f9d7a56d8268cba8559e2842e2ad01b # v1
+        continue-on-error: true
+        with:
+          ruby-version: '3.3'
+      - uses: dart-lang/setup-dart@6afc89df92d6eb3834022f73cd65adc8cdfcb92d # v1.8.1
+        continue-on-error: true
+      - uses: shivammathur/setup-php@f3e473d116dcccaddc5834248c87452386958240
+        continue-on-error: true
+        with:
+          php-version: '8.3'
+      - uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
+        continue-on-error: true
+      - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1
+        continue-on-error: true
+        with:
+          otp-version: '27'
+          elixir-version: '1.18'
+          gleam-version: '1'
+
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Build dist
+        run: npm run build:dist
+
+      - name: Tool layer (install + run each tool through real dispatch)
+        run: node scripts/smoke-tools.mjs --install --verbose
+
+      - name: LSP handshake layer (install + spawn + initialize each server)
+        run: node scripts/smoke-tools.mjs --lsp --install --verbose
+
+      # Diagnostic-mode matrix (#240): spawn each server and record its
+      # advertised mode (pull vs push) — the first cut of the affirmative-clean
+      # -signal classification (docs/lsp-capability-matrix.md). Best-effort: the
+      # script always exits 0 and a server whose toolchain is absent reports
+      # "unavailable", so this never reds the nightly. MERGES into the doc — a
+      # server this ubuntu host couldn't spawn keeps its prior (dev-box) row (#390).
+      - name: LSP capability matrix (characterize diagnostic mode per server)
+        continue-on-error: true
+        run: node scripts/characterize-lsp.mjs --install
+
+      # Clean-signal probe (#460): among PUSH-mode servers, split Tier 2
+      # (publishes a versioned set on a clean scan — free affirmative signal) from
+      # Tier 3 (version-less/silent — the budget-wait case, #458). Merges into the
+      # same matrix's clean-behavior column (same dev/ci src + merge-guard as
+      # characterize). Best-effort: always exits 0, per-server hard timeouts.
+      # #529: also compares each observed clean-behavior against wait-policy
+      # /strategies.ts's hand-set `silentOnClean` marker and logs any mismatch to this step's
+      # output + a "## silentOnClean drift" footnote in the matrix doc — telemetry
+      # only, NEVER a build/CI gate (this step's own continue-on-error covers the
+      # probe already; the drift check can't fail the job either way).
+      - name: LSP clean-signal probe (Tier 2 vs 3 among push servers) + silentOnClean drift check
+        continue-on-error: true
+        run: node scripts/probe-clean-signal.mjs --install
+
+      # #594: make a genuine #529 drift finding ACTIONABLE instead of it only
+      # living in the step above's stdout + the docs-diff footnote, where
+      # nobody has a reason to look. Reads the JSON summary the probe step just
+      # wrote and files/updates a SINGLE persistent tracking issue (fixed
+      # `nightly-drift` label + title, never a new issue per night) when there
+      # IS a finding, or closes a prior open one when the drift has resolved.
+      # Reuses the job's existing GITHUB_TOKEN (same one the docs-refresh PR
+      # step below already uses) via `gh` — no new auth plumbing. Best-effort:
+      # never fails the job either way (continue-on-error, plus the script's
+      # own internal try/catch — same "always exit 0, telemetry only" contract
+      # as the probe itself).
+      - name: Notify on silentOnClean drift (file/update/close tracking issue)
+        continue-on-error: true
+        run: node scripts/notify-clean-signal-drift.mjs
+
+      # Server capability inventory (#390 item 1): regenerate
+      # docs/servercapabilities.md (mode + ws-pull + nav/edit ops + raw caps) —
+      # previously never run anywhere, so its ws-pull column (#389) stayed stale.
+      # Merges over the prior doc (keeps servers absent on this host).
+      - name: LSP server capability inventory (regenerate docs/servercapabilities.md)
+        continue-on-error: true
+        run: node scripts/server-capabilities.mjs --install
+
+      # Commit-back (#390 item 2): the three steps above regenerate the LSP docs
+      # in-place. master has required checks the schedule's GITHUB_TOKEN can't
+      # bypass, so we open/UPDATE a single auto-PR (fixed branch, force-pushed each
+      # run) instead of pushing to master. Docs change rarely (only when a server's
+      # caps/tier change), so this is low-noise. No-ops when nothing changed.
+      - name: Open/update LSP-docs refresh PR
+        continue-on-error: true
+        uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          branch: bot/lsp-docs-refresh
+          base: master
+          add-paths: |
+            docs/lsp-capability-matrix.md
+            docs/servercapabilities.md
+          commit-message: 'docs(nightly): refresh LSP capability docs'
+          title: 'docs(nightly): refresh LSP capability docs'
+          body: |
+            Automated refresh of the LSP capability docs from the nightly tool-smoke run.
+
+            - `docs/lsp-capability-matrix.md` — `mode` (characterize-lsp) + `clean-behavior` (probe-clean-signal, Tier 2 vs 3) columns (#460) + a `## silentOnClean drift` footnote (#529, telemetry only — never a gate)
+            - `docs/servercapabilities.md` — advertised capability inventory incl. ws-pull (#389)
+
+            Rows are **merged**, never blind-overwritten: a server this ubuntu host
+            couldn't spawn keeps its prior (dev-box) classification, so the nightly
+            can't regress a richer run (#390).
+
+            Refs #460, #390, #529.
+          delete-branch: false
+
+      - name: Format layer (select + reformat through formatter pipeline)
+        run: node scripts/smoke-tools.mjs --format --install --verbose

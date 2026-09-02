@@ -6,6 +6,18 @@
  * - "on_list_complete": countdown starts when ALL tasks are completed, cleared as a batch
  *
  * Both use the same turn delay (REMINDER_INTERVAL) for consistency.
+ *
+ * Both countdowns are measured in turns and only tick at `turn_start`, so they stop
+ * the moment the agent does. That is fine while the conversation continues — the
+ * turns keep coming — but a run that ends right after its last completion, which is
+ * the usual shape, leaves the finished list sitting there with its countdown frozen,
+ * and the next batch of work is then added to it.
+ *
+ * `startNewBatch()` covers that case. It has to tell a new batch from the same batch
+ * still being built, and the store cannot: an agent adding its next task to a list it
+ * has just finished looks identical either way. The run boundary is what separates
+ * them — work added within the run that completed the list belongs to it, work added
+ * after that run ended does not — so the sweep is armed by `onRunEnded()`.
  */
 
 import type { TaskStore } from "./task-store.js";
@@ -17,6 +29,8 @@ export class AutoClearManager {
   private completedAtTurn = new Map<string, number>();
   /** Turn when ALL tasks became completed ("on_list_complete" mode). */
   private allCompletedAtTurn: number | null = null;
+  /** An agent run has ended since the current list was last added to. */
+  private runEnded = false;
 
   constructor(
     private getStore: () => TaskStore,
@@ -52,10 +66,39 @@ export class AutoClearManager {
     this.allCompletedAtTurn = null;
   }
 
+  /** No automatic retry, compaction or queued continuation is coming, so the list as
+   *  it stands is this run's final one. Also true of a list carried into a resumed or
+   *  forked session: the run that produced it ended with the session before. */
+  onRunEnded(): void {
+    this.runEnded = true;
+  }
+
+  /** A task is about to be created. If a run has ended since this list was last added
+   *  to and there is nothing left to do on it, the list belongs to the batch before
+   *  this one — retire it, so the new task starts on a clean list instead of being
+   *  appended to rows the user already saw finished.
+   *
+   *  Left alone otherwise: a list with unfinished work in it, and a list the agent is
+   *  still building inside the same run (create, complete, create again), which would
+   *  otherwise lose every step as soon as the next one was added. */
+  startNewBatch(): void {
+    this.allCompletedAtTurn = null;
+    const afterFinishedRun = this.runEnded;
+    this.runEnded = false;
+    // Cheap-first: list() re-reads the file on a file-backed store.
+    if (!afterFinishedRun || this.getMode() === "never") return;
+    const tasks = this.getStore().list();
+    if (tasks.length > 0 && tasks.every(t => t.status === "completed")) {
+      this.getStore().clearCompleted();
+      this.completedAtTurn.clear();
+    }
+  }
+
   /** Reset all tracking state (e.g., on new session). */
   reset(): void {
     this.completedAtTurn.clear();
     this.allCompletedAtTurn = null;
+    this.runEnded = false;
   }
 
   /**

@@ -1,0 +1,6 @@
+if [ -n "$PI_LENS_SKIP_HOOKS" ]; then
+  echo "[pre-commit] skipped (PI_LENS_SKIP_HOOKS is set)."
+  exit 0
+fi
+
+npm run check:lockfile && npm run changelog:check && npm run lint

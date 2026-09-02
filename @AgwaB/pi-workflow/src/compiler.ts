@@ -1,0 +1,2708 @@
+import { readFile } from "node:fs/promises";
+import { dirname, resolve } from "node:path";
+
+import { loadAgentByName } from "./agents.js";
+import { DYNAMIC_OUTPUT_PROFILES } from "./dynamic-profiles.js";
+import { stringifyPromptJson } from "./prompt-json.js";
+import { compileRole } from "./roles.js";
+import { EXECUTION_PROFILE_FOREACH_BATCH } from "./execution-profile.js";
+import {
+	classifyToolCapability,
+	effectiveToolClassification,
+	providersForSelectedTools,
+	resolveToolSelection,
+	TOOL_NAME_PATTERN,
+	toolAllowedByAuthorityCeiling,
+	toolNameForSpec,
+	type ToolSelection,
+} from "./tool-metadata.js";
+import {
+	type AgentDefinition,
+	type ApprovalMode,
+	type ArtifactGraphRequiredRead,
+	type ArtifactGraphStageSpec,
+	type ArtifactGraphWorkflowSpec,
+	type CompiledTask,
+	type CompiledTaskSafety,
+	type CompiledToolProvider,
+	type ExecutionProfileForeachBatch,
+	WorkflowValidationError,
+	type PermissionPreview,
+	type RequiredWorkflowArtifactReadPolicy,
+	WORKFLOW_RUN_TYPE,
+	type TaskCapability,
+	type ThinkingLevel,
+	type ValidationIssue,
+	type WorkflowFailurePolicy,
+	type WorkflowToolObjectSpec,
+	type WorkflowToolSpec,
+	type WorktreePolicy,
+} from "./types.js";
+import {
+	resolveWorkflowRuntime,
+	selectWorkflowRuntime,
+	type WorkflowModelInfo,
+	type WorkflowRuntimeDefaults,
+	type WorkflowRuntimeResolutionInput,
+} from "./workflow-runtime.js";
+
+const DELEGATION_TOOLS = new Set([
+	"skill_test_subagent",
+	"workflow",
+	"/workflow",
+]);
+const TOOL_CLASSIFICATION_VALUES = new Set([
+	"read-only",
+	"write-capable",
+	"mutation-capable",
+]);
+const DEFAULT_MAX_RUNTIME_MS = 30 * 60 * 1000;
+const DEFAULT_MAX_CONCURRENCY = 16;
+const DEFAULT_DYNAMIC_MAX_AGENTS = 1000;
+const DEFAULT_DYNAMIC_MAX_CONCURRENCY = 16;
+const DEFAULT_DYNAMIC_MAX_RUNTIME_MS = 14_400_000;
+const DEFAULT_DYNAMIC_MAX_NESTED_WORKFLOW_DEPTH = 3;
+const DEFAULT_DYNAMIC_MAX_GRAPH_MUTATIONS = 5000;
+const DEFAULT_DYNAMIC_MAX_HELPER_RUNS = 1000;
+const DEFAULT_DYNAMIC_DECISION_LOOP_MAX_ROUNDS = 4;
+const DEFAULT_DYNAMIC_DECISION_LOOP_MAX_ACTIONS = 6;
+const DEFAULT_DYNAMIC_DECISION_LOOP_MAX_STALLS = 3;
+
+interface CompileOptions {
+	cwd: string;
+	specPath?: string;
+	availableModels?: WorkflowModelInfo[];
+}
+
+interface ArtifactGraphCompilePlanBuildResult {
+	plan: any;
+	stageMetadata: Map<string, NonNullable<CompiledTask["artifactGraph"]>>;
+}
+
+function compileWorkflowFailurePolicy(
+	policy: WorkflowFailurePolicy | undefined,
+): Required<WorkflowFailurePolicy> | undefined {
+	if (
+		policy?.failFast === undefined &&
+		policy?.cancelSiblingsOnFailure === undefined &&
+		policy?.cancelDescendantsOnParentFailure === undefined
+	) {
+		return undefined;
+	}
+	return {
+		failFast: policy.failFast === true,
+		cancelSiblingsOnFailure: policy.cancelSiblingsOnFailure === true,
+		cancelDescendantsOnParentFailure:
+			policy.cancelDescendantsOnParentFailure === true,
+	};
+}
+
+function buildArtifactGraphCompilePlan(
+	spec: ArtifactGraphWorkflowSpec,
+	options: CompileOptions,
+): ArtifactGraphCompilePlanBuildResult {
+	const stageMetadata = new Map<
+		string,
+		NonNullable<CompiledTask["artifactGraph"]>
+	>();
+	const specDir = options.specPath
+		? dirname(resolve(options.cwd, options.specPath))
+		: options.cwd;
+	const defaults =
+		spec.artifactGraph.maxConcurrency === undefined
+			? spec.defaults
+			: {
+					...(spec.defaults ?? {}),
+					maxConcurrency: spec.artifactGraph.maxConcurrency,
+				};
+	return {
+		plan: {
+			schemaVersion: spec.schemaVersion,
+			name: spec.name,
+			description: spec.description,
+			input: spec.input,
+			roles: spec.roles,
+			defaults,
+			stages: lowerArtifactGraphStages(spec.artifactGraph.stages, {
+				metadata: stageMetadata,
+				specDir,
+			}),
+		},
+		stageMetadata,
+	};
+}
+
+function lowerArtifactGraphStages(
+	stages: readonly ArtifactGraphStageSpec[],
+	context: {
+		metadata: Map<string, NonNullable<CompiledTask["artifactGraph"]>>;
+		specDir: string;
+		namespace?: string;
+	},
+): any[] {
+	return stages.map((stage) => lowerArtifactGraphStage(stage, context));
+}
+
+function lowerArtifactGraphStage(
+	stage: ArtifactGraphStageSpec,
+	context: {
+		metadata: Map<string, NonNullable<CompiledTask["artifactGraph"]>>;
+		specDir: string;
+		namespace?: string;
+	},
+): any {
+	const stageId = context.namespace
+		? `${context.namespace}.${stage.id}`
+		: stage.id;
+	const lowered: any = {
+		...stage,
+		from: lowerArtifactGraphFrom(stage.from),
+		prompt: lowerArtifactGraphPrompt(stage),
+		artifactGraphOutput: stage.output,
+	};
+	delete lowered.inputPolicy;
+	delete lowered.sourceProjection;
+	delete lowered.artifactGraph;
+	if (stage.output !== undefined) delete lowered.output;
+	if (stage.stages) {
+		lowered.stages = lowerArtifactGraphStages(stage.stages, {
+			metadata: context.metadata,
+			specDir: context.specDir,
+			namespace: stageId,
+		});
+	}
+	if (stage.each && typeof stage.each === "object") {
+		lowered.each = {
+			...stage.each,
+			prompt: appendWorkflowOutputInstructions(stage.each.prompt, stage),
+		};
+	}
+	if (stage.onExhausted) {
+		lowered.onExhausted = lowerArtifactGraphStage(stage.onExhausted, {
+			metadata: context.metadata,
+			specDir: context.specDir,
+			namespace: stageId,
+		});
+	}
+	if (runtimeStageKindFor(stage) !== "dag") {
+		context.metadata.set(
+			stageId,
+			artifactGraphTaskMetadata(stage, context.specDir, context.namespace),
+		);
+	}
+	return lowered;
+}
+
+function lowerArtifactGraphFrom(from: ArtifactGraphStageSpec["from"]): unknown {
+	if (
+		from &&
+		typeof from === "object" &&
+		!Array.isArray(from) &&
+		typeof from.source === "string"
+	) {
+		return {
+			stage: from.source,
+			path: from.path,
+			...((from as { streaming?: unknown }).streaming !== undefined
+				? { streaming: (from as { streaming?: unknown }).streaming }
+				: {}),
+		};
+	}
+	return from;
+}
+
+function lowerArtifactGraphPrompt(
+	stage: ArtifactGraphStageSpec,
+): string | undefined {
+	if (stage.type === "dag" || isSupportStage(stage)) return stage.prompt;
+	return appendWorkflowOutputInstructions(stage.prompt ?? "", stage);
+}
+
+function appendWorkflowOutputInstructions(
+	prompt: string,
+	stage: ArtifactGraphStageSpec,
+): string {
+	const controlSchema = stage.output?.controlSchema;
+	return [
+		prompt,
+		"# Workflow Output Protocol",
+		"Return your final answer exactly as these three sections, in this order, with no prose outside the tags:",
+		"<control>{...}</control>",
+		"<analysis>...</analysis>",
+		"<refs>[]</refs>",
+		"The <control> section must be valid JSON object data for the workflow control plane.",
+		"The control object must include a non-empty string `schema` and a concise non-empty string `digest`.",
+		...controlSchemaOutputInstructions(controlSchema, "stage-control-v1"),
+		"Put detailed prose, reasoning, and evidence discussion in <analysis> only.",
+		"Put structured evidence pointers in <refs> as a JSON array; use [] if none.",
+		...partialOutputInstructions(stage.output?.partial?.paths),
+	]
+		.filter(Boolean)
+		.join("\n\n");
+}
+
+function controlSchemaOutputInstructions(
+	controlSchema: string | undefined,
+	defaultSchema: string,
+): string[] {
+	if (!controlSchema) {
+		return [
+			`Use schema \`${defaultSchema}\` unless the workflow asks for a more specific control schema.`,
+		];
+	}
+	return [
+		`Validate the control object against the workflow-local control schema file: ${controlSchema}`,
+		"That file path identifies the validation contract only. Never emit the file path or file name as the value of `control.schema`.",
+		`Use the exact \`control.schema\` value required by the stage prompt or example. If none is specified, use \`${defaultSchema}\`; do not derive a value from the schema file name.`,
+	];
+}
+
+function partialOutputInstructions(
+	paths: readonly string[] | undefined,
+): string[] {
+	if (!paths || paths.length === 0) return [];
+	return [
+		"# Workflow Partial Output Protocol (optional)",
+		`If a complete stable array item is ready before your final answer for one of these control paths (${paths.join(", ")}), you may emit a partial-control section before the final output:`,
+		'<partial-control>{"schema":"workflow-partial-output-v1","path":"$.items","items":[{"id":"stable-id","...":"..."}]}</partial-control>',
+		"Use the actual declared path, not the example path, and include only items that are final/stable enough to appear unchanged in your final <control> at that path.",
+		"Every partial item must be the exact JSON object that will appear in the final array and must include a stable non-empty string `id`; never revise or withdraw a published partial item.",
+		"If an item might change, do not publish it partially; wait for the final workflow output. The final answer must still include the normal <control>, <analysis>, and <refs> sections exactly once.",
+	];
+}
+
+function artifactGraphTaskMetadata(
+	stage: ArtifactGraphStageSpec,
+	specDir: string,
+	sourceNamespace?: string,
+): NonNullable<CompiledTask["artifactGraph"]> {
+	const controlSchema = stage.output?.controlSchema;
+	const inputPolicy = stage.inputPolicy;
+	let compiledInputPolicy: NonNullable<
+		CompiledTask["artifactGraph"]
+	>["inputPolicy"];
+	if (
+		inputPolicy &&
+		(inputPolicy.terminalBarrier !== undefined ||
+			inputPolicy.invalidateOnDependencyResume !== undefined ||
+			inputPolicy.maxCompiledPromptChars !== undefined)
+	) {
+		compiledInputPolicy = {
+			...(inputPolicy.terminalBarrier !== undefined
+				? { terminalBarrier: inputPolicy.terminalBarrier }
+				: {}),
+			...(inputPolicy.invalidateOnDependencyResume !== undefined
+				? {
+						invalidateOnDependencyResume:
+							inputPolicy.invalidateOnDependencyResume,
+					}
+				: {}),
+			...(inputPolicy.maxCompiledPromptChars !== undefined
+				? { maxCompiledPromptChars: inputPolicy.maxCompiledPromptChars }
+				: {}),
+		};
+	}
+	return {
+		enabled: true,
+		output: {
+			analysisRequired: stage.output?.analysis?.required ?? true,
+			refsRequired: stage.output?.refs?.required ?? true,
+			refsMinItems: stage.output?.refs?.minItems,
+			controlSchema,
+			controlSchemaPath: controlSchema
+				? resolve(specDir, controlSchema)
+				: undefined,
+			maxDigestChars: stage.output?.maxDigestChars,
+			partial: stage.output?.partial
+				? { paths: [...stage.output.partial.paths] }
+				: undefined,
+		},
+		requiredReads: namespaceRequiredReads(
+			stage.inputPolicy?.requiredReads ?? [],
+			sourceNamespace,
+		),
+		requiredReadPolicy: namespaceRequiredReadPolicy(
+			stage.inputPolicy?.requiredReadPolicy,
+			sourceNamespace,
+		),
+		artifactAccess: stage.inputPolicy?.artifactAccess ?? "enabled",
+		...(compiledInputPolicy ? { inputPolicy: compiledInputPolicy } : {}),
+		sourceProjection: stage.sourceProjection,
+	};
+}
+
+function namespaceRequiredReads(
+	reads: readonly ArtifactGraphRequiredRead[],
+	namespace: string | undefined,
+): ArtifactGraphRequiredRead[] {
+	if (!namespace) return [...reads];
+	return reads.map((read) => namespaceRequiredRead(read, namespace));
+}
+
+function namespaceRequiredRead(
+	read: ArtifactGraphRequiredRead,
+	namespace: string,
+): ArtifactGraphRequiredRead {
+	if (typeof read !== "string")
+		return { ...read, source: `${namespace}.${read.source}` };
+	const match = read.match(/^([A-Za-z0-9_.-]+)\.(control|analysis|refs|raw)$/);
+	if (!match) return read;
+	return `${namespace}.${match[1]}.${match[2]}`;
+}
+
+function namespaceRequiredReadPolicy(
+	policy: readonly RequiredWorkflowArtifactReadPolicy[] | undefined,
+	namespace: string | undefined,
+): RequiredWorkflowArtifactReadPolicy[] | undefined {
+	if (!policy) return undefined;
+	if (!namespace) return [...policy];
+	return policy.map((entry) => ({
+		...entry,
+		source: `${namespace}.${entry.source}`,
+	}));
+}
+
+function annotateArtifactGraphCompiledWorkflow(
+	compiled: any,
+	metadata: ReadonlyMap<string, NonNullable<CompiledTask["artifactGraph"]>>,
+): void {
+	compiled.artifactGraph = { enabled: true };
+	for (const task of compiled.tasks ?? []) {
+		annotateArtifactGraphTask(task, metadata);
+	}
+	for (const stage of compiled.stages ?? []) {
+		if (stage?.type !== "loop" || typeof stage.id !== "string") continue;
+		for (const template of stage.childTemplates ?? []) {
+			const stageId = taskStageId(template);
+			annotateArtifactGraphTask(
+				template,
+				metadata,
+				stageId ? [`${stage.id}.${stageId}`] : [],
+			);
+		}
+		const exhaustedTemplate = stage.onExhausted?.template;
+		if (exhaustedTemplate) {
+			const stageId = taskStageId(exhaustedTemplate);
+			annotateArtifactGraphTask(
+				exhaustedTemplate,
+				metadata,
+				stageId ? [`${stage.id}.${stageId}`] : [],
+			);
+		}
+	}
+}
+
+function annotateArtifactGraphTask(
+	task: any,
+	metadata: ReadonlyMap<string, NonNullable<CompiledTask["artifactGraph"]>>,
+	aliases: readonly string[] = [],
+): void {
+	const ids = [...aliases];
+	const stageId = taskStageId(task);
+	if (stageId) ids.push(stageId);
+	for (const id of ids) {
+		const graph = metadata.get(id);
+		if (!graph) continue;
+		task.artifactGraph = graph;
+		return;
+	}
+}
+
+function taskStageId(task: any): string | undefined {
+	return typeof task?.stageId === "string"
+		? task.stageId
+		: typeof task?.id === "string"
+			? task.id
+			: undefined;
+}
+
+function validateStaticCompiledPromptCaps(compiled: any): void {
+	const issues: ValidationIssue[] = [];
+	const validateTask = (task: any) => {
+		const maxChars = task?.artifactGraph?.inputPolicy?.maxCompiledPromptChars;
+		if (!Number.isSafeInteger(maxChars) || maxChars < 1) return;
+		const actualChars = Array.from(String(task.compiledPrompt ?? "")).length;
+		if (actualChars <= maxChars) return;
+		const stageId = taskStageId(task) ?? "unknown";
+		issues.push({
+			path: `$.artifactGraph.stages.${jsonKey(stageId)}.inputPolicy.maxCompiledPromptChars`,
+			message: `must be at least ${actualChars} to accommodate the statically compiled prompt (Unicode code points)`,
+		});
+	};
+
+	for (const task of compiled.tasks ?? []) validateTask(task);
+	for (const stage of compiled.stages ?? []) {
+		if (stage?.type !== "loop") continue;
+		for (const template of stage.childTemplates ?? []) validateTask(template);
+		if (stage.onExhausted?.template) validateTask(stage.onExhausted.template);
+	}
+	if (issues.length > 0) throw new WorkflowValidationError(issues);
+}
+
+function validateAgentRuntime(
+	agent: AgentDefinition,
+	issues: ValidationIssue[],
+	path: string,
+): void {
+	if (agent.maxSubagentDepth > 0) {
+		issues.push({
+			path,
+			message: `agent ${agent.displayName} declares maxSubagentDepth > 0, which is invalid in MVP`,
+		});
+	}
+
+	validateDelegationBoundary(agent.tools, issues, path);
+}
+
+function validateToolSubset(
+	requestedTools: string[] | undefined,
+	agent: AgentDefinition,
+	issues: ValidationIssue[],
+	path: string,
+): void {
+	if (!requestedTools) return;
+	if (!agent.tools) {
+		issues.push({
+			path,
+			message: `agent ${agent.displayName} does not declare a tools authority ceiling`,
+		});
+		return;
+	}
+
+	const allowed = new Set(agent.tools);
+	for (const tool of requestedTools) {
+		if (!toolAllowedByAuthorityCeiling(tool, allowed)) {
+			issues.push({
+				path,
+				message: `tool "${tool}" expands agent ${agent.displayName}; allowed tools: ${agent.tools.join(", ")}`,
+			});
+		}
+	}
+}
+
+function validateToolSpecs(
+	tools: WorkflowToolSpec[] | undefined,
+	issues: ValidationIssue[],
+	path: string,
+): void {
+	if (tools === undefined) return;
+	if (!Array.isArray(tools)) {
+		issues.push({ path, message: "must be an array" });
+		return;
+	}
+
+	const seen = new Set<string>();
+	for (const [index, tool] of tools.entries()) {
+		const itemPath = `${path}[${index}]`;
+		const name = toolNameForSpec(tool);
+		if (name === undefined) {
+			issues.push({
+				path: itemPath,
+				message: "must be a tool name string or object with a name",
+			});
+			continue;
+		}
+		validateToolName(
+			name,
+			typeof tool === "string" ? itemPath : `${itemPath}.name`,
+			issues,
+		);
+		if (seen.has(name))
+			issues.push({ path: itemPath, message: `duplicate value "${name}"` });
+		seen.add(name);
+
+		if (typeof tool !== "string")
+			validateToolObjectMetadata(tool, itemPath, issues);
+	}
+}
+
+function validateToolObjectMetadata(
+	tool: WorkflowToolObjectSpec,
+	path: string,
+	issues: ValidationIssue[],
+): void {
+	if (tool.extensions !== undefined)
+		validateStringArrayValue(tool.extensions, `${path}.extensions`, issues, {
+			validateToolNames: false,
+		});
+	if (
+		tool.classification !== undefined &&
+		!TOOL_CLASSIFICATION_VALUES.has(tool.classification)
+	) {
+		issues.push({
+			path: `${path}.classification`,
+			message: "must be one of: read-only, write-capable, mutation-capable",
+		});
+	}
+	if (tool.optional !== undefined && typeof tool.optional !== "boolean") {
+		issues.push({ path: `${path}.optional`, message: "must be a boolean" });
+	}
+	if (tool.fallbackTools !== undefined)
+		validateStringArrayValue(
+			tool.fallbackTools,
+			`${path}.fallbackTools`,
+			issues,
+			{ validateToolNames: true },
+		);
+}
+
+function validateStringArrayValue(
+	value: unknown,
+	path: string,
+	issues: ValidationIssue[],
+	options: { validateToolNames: boolean },
+): void {
+	if (!Array.isArray(value)) {
+		issues.push({ path, message: "must be an array" });
+		return;
+	}
+
+	const seen = new Set<string>();
+	for (const [index, item] of value.entries()) {
+		const itemPath = `${path}[${index}]`;
+		if (typeof item !== "string" || item.trim() === "") {
+			issues.push({ path: itemPath, message: "must be a non-empty string" });
+			continue;
+		}
+		if (options.validateToolNames) validateToolName(item, itemPath, issues);
+		if (seen.has(item))
+			issues.push({ path: itemPath, message: `duplicate value "${item}"` });
+		seen.add(item);
+	}
+}
+
+function validateToolName(
+	tool: string,
+	path: string,
+	issues: ValidationIssue[],
+): void {
+	if (tool.trim() === "") {
+		issues.push({ path, message: "must be a non-empty string" });
+		return;
+	}
+	if (!TOOL_NAME_PATTERN.test(tool))
+		issues.push({ path, message: `invalid tool name "${tool}"` });
+}
+
+function filterToolSelection(selection: ToolSelection): ToolSelection {
+	const tools = filterDelegationTools(selection.tools);
+	return {
+		tools,
+		toolProviders: providersForSelectedTools(
+			tools,
+			new Map(Object.entries(selection.toolProviders ?? {})),
+		),
+	};
+}
+
+function validateDelegationBoundary(
+	tools: string[] | undefined,
+	issues: ValidationIssue[],
+	path: string,
+): void {
+	if (!tools) return;
+	for (const tool of tools) {
+		if (DELEGATION_TOOLS.has(tool)) {
+			issues.push({
+				path,
+				message: `delegation/orchestration tool "${tool}" is invalid in MVP`,
+			});
+		}
+	}
+}
+
+function filterDelegationTools(
+	tools: string[] | undefined,
+): string[] | undefined {
+	if (!tools) return undefined;
+	return tools.filter((tool) => !DELEGATION_TOOLS.has(tool));
+}
+
+function classifySafety(
+	tools: string[] | undefined,
+	toolProviders: Record<string, CompiledToolProvider> | undefined,
+	readOnlyDeclared: boolean,
+	worktreePolicy: WorktreePolicy,
+	approvalMode: ApprovalMode,
+): CompiledTaskSafety {
+	const capability = classifyToolCapability(
+		tools,
+		toolProviders,
+		readOnlyDeclared,
+		{ emptyToolsCapability: "read-only" },
+	);
+	const sharedCwdSafe = Boolean(
+		readOnlyDeclared &&
+			tools &&
+			tools.every(
+				(tool) =>
+					effectiveToolClassification(tool, toolProviders) === "read-only",
+			),
+	);
+	const requiresWorktree =
+		worktreePolicy === "on" || (worktreePolicy === "auto" && !sharedCwdSafe);
+
+	return {
+		readOnlyDeclared,
+		capability,
+		sharedCwdSafe,
+		worktreePolicy,
+		requiresWorktree,
+		permission: permissionPreview(
+			tools,
+			toolProviders,
+			capability,
+			approvalMode,
+		),
+	};
+}
+
+function permissionPreview(
+	tools: string[] | undefined,
+	toolProviders: Record<string, CompiledToolProvider> | undefined,
+	capability: TaskCapability,
+	approvalMode: ApprovalMode,
+): PermissionPreview {
+	if (!tools) {
+		return {
+			status: "blocked",
+			statusDetail: "needs_attention",
+			reason:
+				"effective tools are unspecified; background permission surface is unknown",
+		};
+	}
+	if (tools.length === 0) return { status: "pending" };
+
+	const unknownTools = tools.filter(
+		(tool) => effectiveToolClassification(tool, toolProviders) === undefined,
+	);
+	if (unknownTools.length > 0) {
+		return {
+			status: "blocked",
+			statusDetail: "needs_attention",
+			reason: `unknown/custom tools require explicit review: ${unknownTools.join(", ")}`,
+		};
+	}
+
+	if (approvalMode === "on-request" && capability !== "read-only") {
+		return {
+			status: "blocked",
+			statusDetail: "pending_approval",
+			reason: "mutation-capable background task uses on-request approval mode",
+		};
+	}
+
+	return { status: "pending" };
+}
+
+function jsonKey(key: string): string {
+	return /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(key) ? key : JSON.stringify(key);
+}
+
+export async function compileWorkflow(
+	spec: ArtifactGraphWorkflowSpec,
+	options: CompileOptions & {
+		task?: string;
+		runtimeOverrides?: WorkflowRuntimeDefaults;
+		runtimeDefaults?: WorkflowRuntimeDefaults;
+	},
+): Promise<any> {
+	const compilePlan = buildArtifactGraphCompilePlan(spec, options);
+	const compiled = await compileArtifactGraphPlan(compilePlan.plan, options);
+	annotateArtifactGraphCompiledWorkflow(compiled, compilePlan.stageMetadata);
+	validateStaticCompiledPromptCaps(compiled);
+	const foreachSpecDir = options.specPath
+		? dirname(resolve(options.cwd, options.specPath))
+		: options.cwd;
+	compiled.warnings.push(
+		...(await collectForeachPathWarnings(
+			spec.artifactGraph?.stages ?? [],
+			foreachSpecDir,
+		)),
+		...(await collectSourceProjectionWarnings(
+			spec.artifactGraph?.stages ?? [],
+			foreachSpecDir,
+		)),
+		...(await collectWorkflowQualityWarnings(
+			spec.artifactGraph?.stages ?? [],
+			foreachSpecDir,
+		)),
+	);
+	const failurePolicy = compileWorkflowFailurePolicy(spec.artifactGraph);
+	if (failurePolicy) compiled.failurePolicy = failurePolicy;
+	return compiled;
+}
+
+// Static checks for foreach paths. When a direct source declares a loadable
+// control schema, verify both the selected array path and optional item
+// identity/payload projections. Schemas that cannot establish the relevant
+// shape are skipped to avoid false positives.
+async function collectForeachPathWarnings(
+	stages: any[],
+	specDir: string,
+): Promise<string[]> {
+	const warnings: string[] = [];
+	const stageById = new Map<string, any>();
+	const schemaCache = new Map<string, any | undefined>();
+	for (const stage of stages) {
+		if (stage && typeof stage.id === "string") stageById.set(stage.id, stage);
+	}
+	const loadSchema = async (source: any): Promise<any | undefined> => {
+		const controlSchema = source?.output?.controlSchema;
+		if (typeof controlSchema !== "string") return undefined;
+		if (schemaCache.has(controlSchema)) return schemaCache.get(controlSchema);
+		let schema: any;
+		try {
+			schema = JSON.parse(
+				await readFile(resolve(specDir, controlSchema), "utf8"),
+			);
+		} catch {
+			schema = undefined;
+		}
+		schemaCache.set(controlSchema, schema);
+		return schema;
+	};
+
+	for (const stage of stages) {
+		if (stage?.type !== "foreach") continue;
+		const from = stage.from;
+		if (!from || typeof from !== "object") continue;
+		const sourceId = (from as any).source ?? (from as any).stage;
+		const path = (from as any).path;
+		if (typeof sourceId !== "string" || typeof path !== "string") continue;
+		const source = stageById.get(sourceId);
+		// Skip dag containers: the relevant schema is on the outputFrom child.
+		if (!source || source.type === "dag") continue;
+		const controlSchema = source.output?.controlSchema;
+		if (typeof controlSchema !== "string") continue;
+		const schema = await loadSchema(source);
+		if (!schema) continue;
+
+		const selectedArraySchema = schemaAtSimpleJsonPath(schema, path);
+		if (!selectedArraySchema) {
+			const topKey = path.replace(/^\$\./, "").split(/[.[]/)[0];
+			const properties = schema.properties;
+			if (
+				topKey &&
+				isPlainRecord(properties) &&
+				!Object.hasOwn(properties, topKey)
+			) {
+				warnings.push(
+					`foreach stage "${stage.id}" reads "${path}" from "${sourceId}", but "${topKey}" is not a property of ${sourceId}'s control schema (${controlSchema}). This will fan out over an empty list at runtime if the path is wrong.`,
+				);
+			}
+			continue;
+		}
+
+		if (
+			!isPlainRecord(selectedArraySchema) ||
+			(selectedArraySchema.type !== undefined &&
+				selectedArraySchema.type !== "array")
+		) {
+			continue;
+		}
+		const itemSchema = selectedArraySchema.items;
+		if (!isPlainRecord(itemSchema) || !isPlainRecord(itemSchema.properties)) {
+			continue;
+		}
+		collectForeachItemPathWarnings(
+			warnings,
+			stage.id,
+			sourceId,
+			path,
+			controlSchema,
+			itemSchema.properties,
+			stage.each?.itemIdentityPath,
+			"itemIdentityPath",
+			"string",
+		);
+		collectForeachItemPathWarnings(
+			warnings,
+			stage.id,
+			sourceId,
+			path,
+			controlSchema,
+			itemSchema.properties,
+			stage.each?.itemPayloadPath,
+			"itemPayloadPath",
+			"object",
+		);
+	}
+	return warnings;
+}
+
+function schemaAtSimpleJsonPath(schema: any, path: string): any | undefined {
+	if (!isPlainRecord(schema) || !path.startsWith("$")) return undefined;
+	let current: any = schema;
+	let remainder = path.slice(1);
+	while (remainder !== "") {
+		const property = /^\.([A-Za-z_][A-Za-z0-9_]*)/.exec(remainder);
+		if (property) {
+			if (!isPlainRecord(current.properties)) return undefined;
+			const key = property[1]!;
+			if (!Object.hasOwn(current.properties, key)) return undefined;
+			current = current.properties[key];
+			remainder = remainder.slice(property[0].length);
+			continue;
+		}
+		const selector = /^\[(?:\*|\d+|\d*:\d*)\]/.exec(remainder);
+		if (!selector || !isPlainRecord(current.items)) return undefined;
+		current = current.items;
+		remainder = remainder.slice(selector[0].length);
+	}
+	return current;
+}
+
+function collectForeachItemPathWarnings(
+	warnings: string[],
+	stageId: string,
+	sourceId: string,
+	fromPath: string,
+	controlSchema: string,
+	itemProperties: Record<string, unknown>,
+	authoredPath: unknown,
+	field: "itemIdentityPath" | "itemPayloadPath",
+	expectedType: "string" | "object",
+): void {
+	if (typeof authoredPath !== "string") return;
+	const property = /^\$\.([A-Za-z_][A-Za-z0-9_]*)$/.exec(authoredPath)?.[1];
+	if (!property) return;
+	if (!Object.hasOwn(itemProperties, property)) {
+		warnings.push(
+			`foreach stage "${stageId}" ${field} "${authoredPath}" is not a property of items selected by "${fromPath}" from ${sourceId}'s control schema (${controlSchema}).`,
+		);
+		return;
+	}
+	const propertySchema = itemProperties[property];
+	if (!schemaDeclaresExactType(propertySchema, expectedType)) {
+		const requirement =
+			expectedType === "string"
+				? "a string, the only stable scalar supported for foreach identities"
+				: "an object";
+		warnings.push(
+			`foreach stage "${stageId}" ${field} "${authoredPath}" must declare ${requirement} in ${sourceId}'s control schema (${controlSchema}).`,
+		);
+	}
+}
+
+function schemaDeclaresExactType(
+	schema: unknown,
+	expectedType: "string" | "object",
+): boolean {
+	if (!isPlainRecord(schema)) return false;
+	if (schema.type === expectedType) return true;
+	return (
+		Array.isArray(schema.type) &&
+		schema.type.length === 1 &&
+		schema.type[0] === expectedType
+	);
+}
+
+// Static check for `sourceProjection.include` paths: when a projecting stage's
+// sources declare object control schemas, warn if a path resolves in none of
+// them (a likely typo that would silently project nothing at runtime — the
+// stage then runs on an empty projection and only survives via requiredReads
+// or model improvisation). Conservative by design: bracketed/complex segments,
+// dag-container sources, schemas without a `properties` map at the failing
+// level, explicit `additionalProperties`, and unreadable files are skipped.
+async function collectSourceProjectionWarnings(
+	stages: any[],
+	specDir: string,
+): Promise<string[]> {
+	const warnings: string[] = [];
+	const stageById = new Map<string, any>();
+	for (const stage of stages) {
+		if (stage && typeof stage.id === "string") stageById.set(stage.id, stage);
+	}
+	const schemaCache = new Map<string, any | undefined>();
+	const loadSchema = async (source: any): Promise<any | undefined> => {
+		const controlSchema = source?.output?.controlSchema;
+		if (typeof controlSchema !== "string") return undefined;
+		if (schemaCache.has(controlSchema)) return schemaCache.get(controlSchema);
+		let schema: any;
+		try {
+			schema = JSON.parse(
+				await readFile(resolve(specDir, controlSchema), "utf8"),
+			);
+		} catch {
+			schema = undefined;
+		}
+		schemaCache.set(controlSchema, schema);
+		return schema;
+	};
+	for (const stage of stages) {
+		const include = stage?.sourceProjection?.include;
+		if (!Array.isArray(include) || include.length === 0) continue;
+		const sourceIds: string[] = [];
+		const from = stage.from ?? stage.foreach?.from;
+		if (typeof from === "string") sourceIds.push(from);
+		else if (Array.isArray(from)) {
+			for (const ref of from) if (typeof ref === "string") sourceIds.push(ref);
+		} else if (from && typeof from === "object") {
+			const sourceId = (from as any).source ?? (from as any).stage;
+			if (typeof sourceId === "string") sourceIds.push(sourceId);
+		}
+		if (
+			stage.type === "foreach" &&
+			stage.from &&
+			typeof stage.from === "object"
+		) {
+			const sourceId = (stage.from as any).source ?? (stage.from as any).stage;
+			if (typeof sourceId === "string" && !sourceIds.includes(sourceId))
+				sourceIds.push(sourceId);
+		}
+		const schemas: Array<{ id: string; schema: any }> = [];
+		for (const sourceId of sourceIds) {
+			const source = stageById.get(sourceId);
+			if (!source || source.type === "dag") continue;
+			const schema = await loadSchema(source);
+			if (schema?.properties && typeof schema.properties === "object")
+				schemas.push({ id: sourceId, schema });
+		}
+		if (schemas.length === 0) continue;
+		for (const path of include) {
+			if (typeof path !== "string" || !path.startsWith("$.")) continue;
+			const segments = path.slice(2).split(".");
+			if (segments.some((segment) => !/^[A-Za-z0-9_-]+$/.test(segment)))
+				continue;
+			const resolvable = schemas.some(({ schema }) =>
+				projectionPathResolvable(schema, segments),
+			);
+			if (!resolvable) {
+				warnings.push(
+					`stage "${stage.id}" projects "${path}" via sourceProjection, but it does not match any declared control schema of its sources (${schemas.map((entry) => entry.id).join(", ")}). The projection will silently be empty at runtime if the path is wrong.`,
+				);
+			}
+		}
+	}
+	return warnings;
+}
+
+function projectionPathResolvable(schema: any, segments: string[]): boolean {
+	let node: any = schema;
+	for (const segment of segments) {
+		while (
+			node &&
+			typeof node === "object" &&
+			node.type === "array" &&
+			node.items &&
+			!Array.isArray(node.items)
+		) {
+			node = node.items;
+		}
+		if (!node || typeof node !== "object") return true;
+		const properties = node.properties;
+		if (!properties || typeof properties !== "object") return true;
+		if (Object.hasOwn(properties, segment)) {
+			node = properties[segment];
+			continue;
+		}
+		if (
+			node.additionalProperties === true ||
+			(node.additionalProperties &&
+				typeof node.additionalProperties === "object")
+		) {
+			return true;
+		}
+		return false;
+	}
+	return true;
+}
+
+async function collectWorkflowQualityWarnings(
+	stages: any[],
+	specDir: string,
+): Promise<string[]> {
+	const warnings: string[] = [];
+	const stageById = new Map<string, any>();
+	const schemaByStageId = new Map<string, any>();
+	for (const stage of stages) {
+		if (stage && typeof stage.id === "string") stageById.set(stage.id, stage);
+	}
+
+	for (const stage of stages) {
+		if (!stage || typeof stage.id !== "string") continue;
+		const controlSchema = stage.output?.controlSchema;
+		if (typeof controlSchema !== "string") continue;
+		let schema: any;
+		try {
+			schema = JSON.parse(
+				await readFile(resolve(specDir, controlSchema), "utf8"),
+			);
+		} catch {
+			continue;
+		}
+		schemaByStageId.set(stage.id, schema);
+		if (stage.support && typeof stage.support === "object") continue;
+		const prompt = stagePromptText(stage);
+
+		if (
+			hasStringArrayProperty(schema, ["coverage", "anyPathsSkipped"]) &&
+			/array\s+with\s+reason|with\s+reason/i.test(prompt)
+		) {
+			warnings.push(
+				`stage "${stage.id}" prompt asks for anyPathsSkipped as an array with reason, but ${controlSchema} defines coverage.anyPathsSkipped as string[]. Align the prompt/schema (for example string messages, or object items with path/reason) before running.`,
+			);
+		}
+
+		for (const field of fragileRequiredItemFields(schema)) {
+			if (!promptMentionsJsonKey(prompt, field.key)) {
+				warnings.push(
+					`stage "${stage.id}" requires ${field.path} but the prompt does not show the exact JSON key "${field.key}". Add a small <control> JSON skeleton or few-shot example using that key to avoid model drift to aliases such as name/claim/title.`,
+				);
+			}
+		}
+
+		for (const field of complexControlShapeFields(schema, prompt)) {
+			if (!promptShowsJsonKeyShape(prompt, field.key, field.expectedShape)) {
+				const example = field.expectedShape === "object" ? "{}" : "[]";
+				const source = field.required
+					? `requires ${field.path}`
+					: `defines ${field.path}`;
+				warnings.push(
+					`stage "${stage.id}" ${source} as a JSON ${field.expectedShape}, but the prompt does not show an exact "${field.key}": ${example} control shape. Add a small schema-valid <control> JSON skeleton so model output does not drift to the wrong type or alias nested fields.`,
+				);
+			}
+		}
+	}
+
+	for (const stage of stages) {
+		if (stage?.type !== "reduce" || typeof stage.id !== "string") continue;
+		const sourceIds = normalizeStageRefs(stage.from);
+		if (
+			!sourceIds.some((sourceId) => stageById.get(sourceId)?.type === "foreach")
+		) {
+			continue;
+		}
+		const schema = schemaByStageId.get(stage.id);
+		if (!schema) continue;
+		const arrayFields = topLevelArrayPropertyNames(schema);
+		const includeCount = Array.isArray(stage.sourceProjection?.include)
+			? stage.sourceProjection.include.length
+			: 0;
+		const maxChars =
+			typeof stage.sourceProjection?.maxChars === "number"
+				? stage.sourceProjection.maxChars
+				: 0;
+		if (includeCount >= 5 && maxChars >= 50000 && arrayFields.length >= 5) {
+			warnings.push(
+				`reduce stage "${stage.id}" fans in foreach outputs with ${includeCount} projected paths (maxChars ${maxChars}) and a large control schema (${arrayFields.length} top-level arrays: ${arrayFields.slice(0, 6).join(", ")}). High length-cutoff/control-bloat risk: split into intermediate reducers/support helpers, cap evidence indexes, and keep large narrative in <analysis>.`,
+			);
+		}
+	}
+
+	return warnings;
+}
+
+function stagePromptText(stage: any): string {
+	const parts: string[] = [];
+	if (typeof stage.prompt === "string") parts.push(stage.prompt);
+	if (typeof stage.each?.prompt === "string") parts.push(stage.each.prompt);
+	return parts.join("\n");
+}
+
+function promptMentionsJsonKey(prompt: string, key: string): boolean {
+	return prompt.includes(`"${key}":`) || prompt.includes(`"${key}" :`);
+}
+
+function promptMentionsControlKey(prompt: string, key: string): boolean {
+	return prompt.includes(key);
+}
+
+function promptShowsJsonKeyShape(
+	prompt: string,
+	key: string,
+	expectedShape: "array" | "object",
+): boolean {
+	const quotedKey = `"${key}"`;
+	const expectedOpener = expectedShape === "object" ? "{" : "[";
+	let offset = 0;
+	while (offset < prompt.length) {
+		const keyIndex = prompt.indexOf(quotedKey, offset);
+		if (keyIndex === -1) return false;
+		let cursor = keyIndex + quotedKey.length;
+		while (/\s/.test(prompt[cursor] ?? "")) cursor += 1;
+		if (prompt[cursor] !== ":") {
+			offset = cursor + 1;
+			continue;
+		}
+		cursor += 1;
+		while (/\s/.test(prompt[cursor] ?? "")) cursor += 1;
+		if (prompt[cursor] === expectedOpener) return true;
+		offset = cursor + 1;
+	}
+	return false;
+}
+
+function hasStringArrayProperty(schema: any, path: string[]): boolean {
+	let node = schema;
+	for (const segment of path) {
+		node = node?.properties?.[segment];
+		if (!node) return false;
+	}
+	return node?.type === "array" && node.items?.type === "string";
+}
+
+type ComplexControlShapeField = {
+	path: string;
+	key: string;
+	expectedShape: "array" | "object";
+	required: boolean;
+};
+
+function complexControlShapeFields(
+	schema: any,
+	prompt: string,
+	parentPath = "$",
+): ComplexControlShapeField[] {
+	const properties = schema?.properties;
+	if (!properties || typeof properties !== "object") return [];
+	const findings: ComplexControlShapeField[] = [];
+	const required = requiredStringSet(schema);
+	for (const [key, value] of Object.entries(properties)) {
+		const child: any = value;
+		const childPath = `${parentPath}.${key}`;
+		const isRequired = required.has(key);
+		const expectedShape = expectedJsonContainerShape(child);
+		if (
+			expectedShape &&
+			shouldWarnForControlShape({
+				parentPath,
+				key,
+				isRequired,
+				expectedShape,
+				prompt,
+			})
+		) {
+			findings.push({
+				path: childPath,
+				key,
+				expectedShape,
+				required: isRequired,
+			});
+		}
+		if (isRequired) {
+			findings.push(
+				...nestedComplexControlShapeFields(child, prompt, childPath),
+			);
+		}
+	}
+	return findings;
+}
+
+function requiredStringSet(schema: any): Set<string> {
+	return new Set(
+		Array.isArray(schema?.required)
+			? schema.required.filter((item: unknown) => typeof item === "string")
+			: [],
+	);
+}
+
+function shouldWarnForControlShape(input: {
+	parentPath: string;
+	key: string;
+	isRequired: boolean;
+	expectedShape: "array" | "object" | undefined;
+	prompt: string;
+}): input is typeof input & { expectedShape: "array" | "object" } {
+	if (!input.expectedShape) return false;
+	if (isProtocolControlKey(input.parentPath, input.key)) return false;
+	if (input.isRequired) return true;
+	return (
+		input.parentPath === "$" &&
+		input.expectedShape === "object" &&
+		promptMentionsControlKey(input.prompt, input.key)
+	);
+}
+
+function nestedComplexControlShapeFields(
+	schema: any,
+	prompt: string,
+	parentPath: string,
+): ComplexControlShapeField[] {
+	if (schema?.type === "object") {
+		return complexControlShapeFields(schema, prompt, parentPath);
+	}
+	if (isObjectArraySchema(schema)) {
+		return complexControlShapeFields(schema.items, prompt, `${parentPath}[]`);
+	}
+	return [];
+}
+
+function expectedJsonContainerShape(
+	schema: any,
+): "array" | "object" | undefined {
+	if (schema?.type === "object") return "object";
+	if (schema?.type === "array") return "array";
+	return undefined;
+}
+
+function isObjectArraySchema(schema: any): boolean {
+	return (
+		schema?.type === "array" &&
+		schema.items &&
+		!Array.isArray(schema.items) &&
+		schema.items.type === "object"
+	);
+}
+
+function isProtocolControlKey(parentPath: string, key: string): boolean {
+	return parentPath === "$" && (key === "schema" || key === "digest");
+}
+
+function fragileRequiredItemFields(
+	schema: any,
+	parentPath = "$",
+): Array<{ path: string; key: string }> {
+	const findings: Array<{ path: string; key: string }> = [];
+	const properties = schema?.properties;
+	if (!properties || typeof properties !== "object") return findings;
+	for (const [key, value] of Object.entries(properties)) {
+		const child: any = value;
+		const childPath = `${parentPath}.${key}`;
+		if (child?.type === "array" && child.items?.type === "object") {
+			const required = Array.isArray(child.items.required)
+				? child.items.required.filter(
+						(item: unknown) => typeof item === "string",
+					)
+				: [];
+			for (const requiredKey of required) {
+				if (isDriftProneRequiredItemKey(String(key), requiredKey)) {
+					findings.push({
+						path: `${childPath}[].${requiredKey}`,
+						key: requiredKey,
+					});
+				}
+			}
+			findings.push(
+				...fragileRequiredItemFields(child.items, `${childPath}[]`),
+			);
+		} else if (child?.type === "object") {
+			findings.push(...fragileRequiredItemFields(child, childPath));
+		}
+	}
+	return findings;
+}
+
+function isDriftProneRequiredItemKey(
+	parentKey: string,
+	requiredKey: string,
+): boolean {
+	const lowerParent = parentKey.toLowerCase();
+	const lowerRequired = requiredKey.toLowerCase();
+	if (["name", "title", "id", "claim"].includes(lowerRequired)) return false;
+	if (lowerParent === `${lowerRequired}s`) return true;
+	if (
+		lowerParent.endsWith("ies") &&
+		`${lowerRequired.slice(0, -1)}ies` === lowerParent
+	)
+		return true;
+	return ["mechanism", "decision"].includes(lowerRequired);
+}
+
+function topLevelArrayPropertyNames(schema: any): string[] {
+	const properties = schema?.properties;
+	if (!properties || typeof properties !== "object") return [];
+	return Object.entries(properties)
+		.filter(([, value]: [string, any]) => value?.type === "array")
+		.map(([key]) => key);
+}
+
+function normalizeStageRefs(value: unknown): string[] {
+	if (typeof value === "string") return [value];
+	if (Array.isArray(value))
+		return value.filter((item): item is string => typeof item === "string");
+	if (value && typeof value === "object") {
+		const source = (value as any).source ?? (value as any).stage;
+		return typeof source === "string" ? [source] : [];
+	}
+	return [];
+}
+
+function runtimeSettings(value: unknown): WorkflowRuntimeDefaults | undefined {
+	if (!isPlainRecord(value)) return undefined;
+	const model =
+		typeof value.model === "string" && value.model.trim()
+			? value.model.trim()
+			: undefined;
+	const thinking =
+		typeof value.thinking === "string" && value.thinking.trim()
+			? (value.thinking.trim() as ThinkingLevel)
+			: undefined;
+	return model || thinking ? { model, thinking } : undefined;
+}
+
+function formatRoleText(
+	selectedRoles: readonly { name: string; content: string }[],
+): string {
+	return selectedRoles.length
+		? `# Role Context\n\n${selectedRoles.map((role) => `## Role: ${role.name}\n${role.content}`).join("\n\n")}`
+		: "";
+}
+
+function roleSelection(value: unknown): string[] | undefined {
+	if (typeof value === "string") return [value];
+	if (Array.isArray(value))
+		return value.filter((name): name is string => typeof name === "string");
+	return undefined;
+}
+
+function selectRoles(
+	roles: readonly { name: string; content: string }[],
+	selection: unknown,
+	path: string,
+	issues: ValidationIssue[],
+): { selected: typeof roles; names: string[] } {
+	const names = roleSelection(selection);
+	if (names === undefined) return { selected: roles, names: roles.map((role) => role.name) };
+	const byName = new Map(roles.map((role) => [role.name, role]));
+	const selected: typeof roles[number][] = [];
+	for (const name of names) {
+		const role = byName.get(name);
+		if (!role) {
+			issues.push({ path, message: `unknown workflow role "${name}"` });
+			continue;
+		}
+		selected.push(role);
+	}
+	return { selected, names: selected.map((role) => role.name) };
+}
+
+async function compileArtifactGraphPlan(
+	spec: any,
+	options: CompileOptions & {
+		task?: string;
+		runtimeOverrides?: WorkflowRuntimeDefaults;
+		runtimeDefaults?: WorkflowRuntimeDefaults;
+	},
+): Promise<any> {
+	const stages = spec.stages;
+	if (!Array.isArray(stages)) {
+		throw new WorkflowValidationError([
+			{ path: "$.artifactGraph.stages", message: "must be an array" },
+		]);
+	}
+
+	const specDir = options.specPath
+		? dirname(resolve(options.cwd, options.specPath))
+		: options.cwd;
+	const agentName = spec.defaults?.agent ?? "scout";
+	const agentCache = new Map<string, AgentDefinition>();
+	let defaultAgent: AgentDefinition | undefined;
+	const getDefaultAgent = async (): Promise<AgentDefinition> => {
+		defaultAgent ??= await loadWorkflowAgent(
+			agentName,
+			options.cwd,
+			agentCache,
+			"$.defaults.agent",
+		);
+		return defaultAgent;
+	};
+	const roleEntries = Object.entries(spec.roles ?? {});
+	const roles = await Promise.all(
+		roleEntries.map(async ([name, role]: [string, any]) => {
+			const sourceAgent = role.fromAgent
+				? await loadWorkflowAgent(
+						role.fromAgent,
+						options.cwd,
+						agentCache,
+						`$.roles.${name}.fromAgent`,
+					)
+				: undefined;
+			return compileRole(name, role, sourceAgent);
+		}),
+	);
+	const allRoleText = formatRoleText(roles);
+	const workflowInput = (spec as any).input;
+	const workflowInputText =
+		workflowInput &&
+		typeof workflowInput === "object" &&
+		!Array.isArray(workflowInput) &&
+		Object.keys(workflowInput).length > 0
+			? `# Workflow Input\n\n${stringifyPromptJson(workflowInput)}`
+			: "";
+	const runtimeOverrides = options.runtimeOverrides;
+	const runtimeDefaults = options.runtimeDefaults;
+	const specRuntimeDefaults = runtimeSettings(spec.defaults);
+	const workflowCwd = resolve(options.cwd, spec.defaults?.cwd ?? ".");
+	const tasks: any[] = [];
+	const stageRecords: any[] = [];
+	const issues: ValidationIssue[] = [];
+	const warnings: string[] = [];
+	const validatedAgentPaths = new Set<string>();
+	validateToolSpecs(spec.defaults?.tools, issues, "$.defaults.tools");
+	let previousStageTaskKeys: string[] = [];
+	const stageTaskKeys = new Map<string, string[]>();
+
+	const buildTask = async (
+		stage: any,
+		taskId: string,
+		prompt: string,
+		dependencyKeys: string[],
+		overrides: Partial<CompiledTask> & Record<string, unknown> = {},
+	): Promise<any> => {
+		const key = `${stage.id}.${taskId}`;
+		const runtimeStageKind = runtimeStageKindFor(stage) ?? "single";
+		const each =
+			runtimeStageKind === "foreach" && isPlainRecord(stage.each)
+				? stage.each
+				: undefined;
+		const taskCwd = resolve(workflowCwd, stage.cwd ?? ".");
+		if (isSupportStage(stage)) {
+			return buildSupportTask(
+				stage,
+				taskId,
+				key,
+				prompt,
+				dependencyKeys,
+				taskCwd,
+				workflowInputText,
+				overrides,
+			);
+		}
+		if (isDynamicStage(stage)) {
+			validateToolSpecs(
+				stage.tools,
+				issues,
+				`$.artifactGraph.stages.${jsonKey(stage.id)}.tools`,
+			);
+			const rawDynamicToolSelection = resolveToolSelection(
+				[spec.defaults?.tools, stage.tools],
+				undefined,
+			);
+			const dynamicToolPath =
+				stage.tools !== undefined
+					? `$.artifactGraph.stages.${jsonKey(stage.id)}.tools`
+					: spec.defaults?.tools !== undefined
+						? "$.defaults.tools"
+						: `$.artifactGraph.stages.${jsonKey(stage.id)}.dynamic`;
+			validateDelegationBoundary(
+				rawDynamicToolSelection.tools,
+				issues,
+				dynamicToolPath,
+			);
+			const dynamicToolSelection = filterToolSelection(rawDynamicToolSelection);
+			const requestedRuntime = selectWorkflowRuntime(
+				runtimeOverrides,
+				runtimeSettings(stage),
+				runtimeDefaults,
+				specRuntimeDefaults,
+			);
+			const resolvedDynamicRuntime = await resolveWorkflowRuntime(
+				requestedRuntime,
+				{
+					taskKey: key,
+					stageId: stage.id,
+					taskId,
+					agent: "dynamic",
+				},
+				{ availableModels: options.availableModels },
+			);
+			const dynamicTask = buildDynamicTask(
+				stage,
+				taskId,
+				key,
+				prompt,
+				dependencyKeys,
+				taskCwd,
+				specDir,
+				workflowInputText,
+				options.task,
+				resolvedDynamicRuntime,
+				{
+					runtimeOverrides,
+					runtimeDefaults,
+					specRuntimeDefaults,
+					stageRuntime: runtimeSettings(stage),
+				},
+				overrides,
+			);
+			dynamicTask.runtime = {
+				...dynamicTask.runtime,
+				...resolvedDynamicRuntime,
+			};
+			if (options.availableModels?.length) {
+				dynamicTask.dynamic.availableModels = options.availableModels;
+			}
+			if (dynamicToolSelection.tools || dynamicToolSelection.toolProviders) {
+				dynamicTask.runtime = {
+					...dynamicTask.runtime,
+					...(dynamicToolSelection.tools
+						? { tools: dynamicToolSelection.tools }
+						: {}),
+					...(dynamicToolSelection.toolProviders
+						? { toolProviders: dynamicToolSelection.toolProviders }
+						: {}),
+				};
+			}
+			return dynamicTask;
+		}
+
+		const stageAgentName = each?.agent ?? stage.agent ?? agentName;
+		const stageAgent =
+			stageAgentName === agentName
+				? await getDefaultAgent()
+				: await loadWorkflowAgent(
+						stageAgentName,
+						options.cwd,
+						agentCache,
+						`$.artifactGraph.stages.${jsonKey(stage.id)}.${each?.agent !== undefined ? "each.agent" : "agent"}`,
+					);
+		if (!validatedAgentPaths.has(stageAgent.sourcePath)) {
+			validateAgentRuntime(
+				stageAgent,
+				issues,
+				`$.artifactGraph.stages.${jsonKey(stage.id)}.${each?.agent !== undefined ? "each.agent" : "agent"}`,
+			);
+			validatedAgentPaths.add(stageAgent.sourcePath);
+		}
+		const selectedRoles = selectRoles(
+			roles,
+			each?.role !== undefined ? each.role : stage.role,
+			`$.artifactGraph.stages.${jsonKey(stage.id)}.${each?.role !== undefined ? "each.role" : "role"}`,
+			issues,
+		);
+		const selectedRoleText = formatRoleText(selectedRoles.selected);
+		const authoredTools = each?.tools ?? stage.tools;
+		validateToolSpecs(
+			authoredTools,
+			issues,
+			`$.artifactGraph.stages.${jsonKey(stage.id)}.${each?.tools !== undefined ? "each.tools" : "tools"}`,
+		);
+		// By default only `single` stages receive the runtime task body; foreach
+		// and reduce stages operate on upstream item/Source Context instead. A
+		// stage may opt in with `injectRuntimeTask: true` when a cross-cutting user
+		// constraint (e.g. "review the diff on its own terms") must reach every
+		// stage, not just the entry stage.
+		const optInInjectRuntimeTask = stage.injectRuntimeTask === true;
+		const injectTask = runtimeStageKind === "single" || optInInjectRuntimeTask;
+		const injectRuntimeTaskInPrompt =
+			(runtimeStageKind !== "foreach" && injectTask) ||
+			(runtimeStageKind === "foreach" && optInInjectRuntimeTask);
+		const normalizedPrompt = String(prompt ?? "").replace(
+			/\$\{item\}/g,
+			"the relevant item from the dependency context",
+		);
+		const instructionText = `# Instructions\n\n${normalizedPrompt}`;
+		const stageText = `# Workflow Stage\n\nstage=${stage.id}\ntype=${runtimeStageKind}`;
+		const taskText =
+			injectRuntimeTaskInPrompt && options.task
+				? `# Task\n\n${options.task}`
+				: undefined;
+		const compiledPrompt = (
+			runtimeStageKind === "foreach"
+				? [
+						taskText,
+						workflowInputText || undefined,
+						stageText,
+						selectedRoleText || undefined,
+						instructionText,
+					]
+				: [
+						taskText,
+						workflowInputText || undefined,
+						stageText,
+						instructionText,
+						selectedRoleText || undefined,
+					]
+		)
+			.filter(Boolean)
+			.join("\n\n");
+		const toolSelection = resolveToolSelection(
+			[spec.defaults?.tools, authoredTools],
+			stageAgent.tools,
+		);
+		const toolPath =
+			authoredTools !== undefined
+				? `$.artifactGraph.stages.${jsonKey(stage.id)}.${each?.tools !== undefined ? "each.tools" : "tools"}`
+				: spec.defaults?.tools !== undefined
+					? "$.defaults.tools"
+					: `$.artifactGraph.stages.${jsonKey(stage.id)}.agent`;
+		validateToolSubset(toolSelection.tools, stageAgent, issues, toolPath);
+		validateDelegationBoundary(toolSelection.tools, issues, toolPath);
+		const filteredToolSelection = filterToolSelection(toolSelection);
+		const requestedRuntime = selectWorkflowRuntime(
+			runtimeOverrides,
+			runtimeSettings(
+				each
+					? {
+							...stage,
+							model: each.model ?? stage.model,
+							thinking: each.thinking ?? stage.thinking,
+						}
+					: stage,
+			),
+			runtimeDefaults,
+			specRuntimeDefaults,
+		);
+		const resolvedRuntime = await resolveWorkflowRuntime(
+			requestedRuntime,
+			{
+				taskKey: key,
+				stageId: stage.id,
+				taskId,
+				agent: stageAgentName,
+			},
+			{
+				availableModels: options.availableModels,
+			},
+		);
+		const runtime = {
+			approvalMode:
+				stage.approvalMode ?? spec.defaults?.approvalMode ?? "non-interactive",
+			...resolvedRuntime,
+			tools: filteredToolSelection.tools,
+			...(filteredToolSelection.toolProviders
+				? { toolProviders: filteredToolSelection.toolProviders }
+				: {}),
+			maxRuntimeMs:
+				each?.maxRuntimeMs ??
+				stage.maxRuntimeMs ??
+				spec.defaults?.maxRuntimeMs ??
+				DEFAULT_MAX_RUNTIME_MS,
+		};
+		const readOnlyDeclared =
+			each?.readOnly ??
+			stage.readOnly ??
+			spec.defaults?.readOnly ??
+			spec.readOnly ??
+			stageAgent.readOnly ??
+			false;
+		const worktreePolicy =
+			each?.worktreePolicy ??
+			stage.worktreePolicy ??
+			spec.defaults?.worktreePolicy ??
+			spec.worktreePolicy ??
+			"auto";
+		const safety = classifySafety(
+			runtime.tools,
+			runtime.toolProviders,
+			readOnlyDeclared,
+			worktreePolicy,
+			runtime.approvalMode,
+		);
+		// Warn when a stage declares readOnly: true but its effective tools are
+		// still mutation/write-capable (e.g. bash). readOnly only filters tools;
+		// it does not isolate the filesystem, so such a stage can still mutate.
+		if (readOnlyDeclared && safety.capability !== "read-only") {
+			const mutatingTools = (runtime.tools ?? []).filter(
+				(tool: string) =>
+					effectiveToolClassification(tool, runtime.toolProviders) !==
+					"read-only",
+			);
+			warnings.push(
+				`stage "${stage.id}" declares readOnly: true but has ${safety.capability} tools (${mutatingTools.join(", ") || "unknown"}); readOnly filters tools but does not prevent these from mutating. Remove the tool or rely on worktree isolation.`,
+			);
+		}
+		const itemIdentityPath =
+			typeof stage.each?.itemIdentityPath === "string"
+				? stage.each.itemIdentityPath
+				: undefined;
+		const itemPayloadPath =
+			typeof stage.each?.itemPayloadPath === "string"
+				? stage.each.itemPayloadPath
+				: undefined;
+		const profileForeachBatch = (
+			stage as {
+				[EXECUTION_PROFILE_FOREACH_BATCH]?: ExecutionProfileForeachBatch;
+			}
+		)[EXECUTION_PROFILE_FOREACH_BATCH];
+
+		return {
+			key,
+			id: key,
+			specId: key,
+			taskId,
+			stageId: stage.id,
+			agent: stageAgentName,
+			agentPath: stageAgent.sourcePath,
+			agentDescription: stageAgent.description,
+			agentSystemPrompt: stageAgent.body,
+			systemPromptMode: stageAgent.systemPromptMode,
+			inheritProjectContext: stageAgent.inheritProjectContext,
+			inheritSkills: stageAgent.inheritSkills,
+			roleNames: selectedRoles.names,
+			task: normalizedPrompt,
+			cwd: taskCwd,
+			explicitCwd: stage.cwd !== undefined,
+			explicitWorktreePolicy:
+				each?.worktreePolicy !== undefined || stage.worktreePolicy !== undefined,
+			runtime,
+			safety,
+			outputContract: stage.outputContract,
+			sourceContext: stage.sourceContext,
+			compiledPrompt,
+			injectTask,
+			kind: runtimeStageKind,
+			stageMaxConcurrency: stage.maxConcurrency,
+			dependsOn: [...dependencyKeys],
+			foreach:
+				runtimeStageKind === "foreach"
+					? {
+							from: stage.from,
+							prompt: String(stage.each?.prompt ?? ""),
+							maxItems: stage.maxItems,
+							...(profileForeachBatch === undefined
+								? {}
+								: {
+										batch: {
+											maxItems: 2 as const,
+											...(profileForeachBatch.groupBy === undefined
+												? {}
+												: {
+														groupBy: Array.isArray(profileForeachBatch.groupBy)
+															? [...profileForeachBatch.groupBy]
+															: profileForeachBatch.groupBy,
+													}),
+										},
+									}),
+							...(itemIdentityPath !== undefined ? { itemIdentityPath } : {}),
+							...(itemPayloadPath !== undefined ? { itemPayloadPath } : {}),
+							injectRuntimeTask: injectTask,
+							roleText: selectedRoleText,
+						}
+					: undefined,
+			...overrides,
+		};
+	};
+
+	const topLevelSourceStageIds = new Map<string, string>();
+
+	const compileDagContainerStage = async (
+		containerStage: any,
+		containerDependencyKeys: string[],
+		containerContextDependsOn: string[] | undefined,
+	): Promise<string[]> => {
+		const scopedStageTaskKeys = new Map<string, string[]>();
+		const scopedSourceStageIds = new Map<string, string>();
+
+		for (const childStage of containerStage.stages ?? []) {
+			const currentChildTaskKeys: string[] = [];
+			const childFromDependencyKeys = dependencyKeysForStage(
+				childStage,
+				scopedStageTaskKeys,
+			);
+			const childAfterDependencyKeys = afterDependencyKeysForStage(
+				childStage,
+				scopedStageTaskKeys,
+			);
+			const siblingDependencyKeys = uniqueDependencyKeys([
+				...childFromDependencyKeys,
+				...childAfterDependencyKeys,
+			]);
+			const isRootChild = siblingDependencyKeys.length === 0;
+			const childDependencyKeys = isRootChild
+				? containerDependencyKeys
+				: siblingDependencyKeys;
+			const childContextDependsOn = isRootChild
+				? containerContextDependsOn
+				: childStage.after !== undefined
+					? childFromDependencyKeys
+					: undefined;
+			const childDependencyOverrides: Partial<CompiledTask> =
+				childContextDependsOn !== undefined
+					? { contextDependsOn: [...childContextDependsOn] }
+					: {};
+			const namespacedChildStage = rewriteForeachFromStageRefs(
+				namespacedDagChildStage(containerStage, childStage),
+				scopedSourceStageIds,
+			);
+			const childStageKind = runtimeStageKindFor(namespacedChildStage);
+
+			if (childStageKind === "dag") {
+				currentChildTaskKeys.push(
+					...(await compileDagContainerStage(
+						namespacedChildStage,
+						childDependencyKeys,
+						childContextDependsOn,
+					)),
+				);
+				scopedStageTaskKeys.set(childStage.id, currentChildTaskKeys);
+				const outputStageId = resolveDagOutputStageId(namespacedChildStage);
+				if (outputStageId)
+					scopedSourceStageIds.set(childStage.id, outputStageId);
+				continue;
+			}
+
+			stageRecords.push({
+				id: namespacedChildStage.id,
+				type: childStageKind,
+				sourcePolicy: namespacedChildStage.sourcePolicy ?? "require-success",
+			});
+			const addChildTask = async (taskId: string, prompt: string) => {
+				const task = await buildTask(
+					namespacedChildStage,
+					taskId,
+					prompt,
+					childDependencyKeys,
+					childDependencyOverrides,
+				);
+				tasks.push(task);
+				currentChildTaskKeys.push(task.id);
+			};
+
+			if (childStageKind === "foreach") {
+				await addChildTask("item", namespacedChildStage.each?.prompt ?? "");
+			} else if (childStageKind === "support") {
+				await addChildTask(
+					"main",
+					`Run support helper ${namespacedChildStage.support.uses}.`,
+				);
+			} else if (childStageKind === "dynamic") {
+				await addChildTask(
+					"controller",
+					`Run dynamic controller ${namespacedChildStage.dynamic.uses}.`,
+				);
+			} else {
+				await addChildTask("main", namespacedChildStage.prompt ?? "");
+			}
+
+			scopedStageTaskKeys.set(childStage.id, currentChildTaskKeys);
+			scopedSourceStageIds.set(childStage.id, namespacedChildStage.id);
+		}
+
+		const outputChildId = resolveDagOutputChildId(containerStage);
+		return outputChildId ? (scopedStageTaskKeys.get(outputChildId) ?? []) : [];
+	};
+
+	for (const stage of stages) {
+		const currentStageTaskKeys: string[] = [];
+		const fromDependencyKeys = dependencyKeysForStage(stage, stageTaskKeys);
+		const afterDependencyKeys = afterDependencyKeysForStage(
+			stage,
+			stageTaskKeys,
+		);
+		const explicitDependencyKeys = uniqueDependencyKeys([
+			...fromDependencyKeys,
+			...afterDependencyKeys,
+		]);
+		const hasExplicitDependencyIntent =
+			stage.from !== undefined || stage.after !== undefined;
+		const dependencyKeys = hasExplicitDependencyIntent
+			? explicitDependencyKeys
+			: previousStageTaskKeys;
+		const contextDependencyOverrides: Partial<CompiledTask> =
+			stage.after !== undefined
+				? { contextDependsOn: [...fromDependencyKeys] }
+				: {};
+
+		const stageKind = runtimeStageKindFor(stage);
+
+		if (stageKind === "dag") {
+			currentStageTaskKeys.push(
+				...(await compileDagContainerStage(
+					stage,
+					dependencyKeys,
+					stage.after !== undefined ? fromDependencyKeys : undefined,
+				)),
+			);
+			previousStageTaskKeys = currentStageTaskKeys;
+			stageTaskKeys.set(stage.id, currentStageTaskKeys);
+			const outputStageId = resolveDagOutputStageId(stage);
+			if (outputStageId) topLevelSourceStageIds.set(stage.id, outputStageId);
+			continue;
+		}
+
+		if (stageKind === "loop") {
+			const placeholderKey = `${stage.id}.loop`;
+			const loopTemplates = await compileLoopChildTemplates(stage, buildTask);
+			stageRecords.push({
+				id: stage.id,
+				type: "loop",
+				sourcePolicy: stage.sourcePolicy ?? "require-success",
+				maxRounds: stage.maxRounds,
+				until: stage.until,
+				childStageIds: loopTemplates.childStageIds,
+				childTemplates: loopTemplates.childTemplates,
+				childStageRecords: loopTemplates.childStageRecords,
+				onExhausted: loopTemplates.onExhausted,
+				progressPath: stage.progressPath,
+			});
+			const loopRoleNames = roleSelection(stage.role);
+			const loopRoleText =
+				loopRoleNames === undefined
+					? allRoleText
+					: formatRoleText(
+							roles.filter((role) => loopRoleNames.includes(role.name)),
+						);
+			tasks.push(
+				await buildTask(
+					stage,
+					"loop",
+					stage.prompt ?? "Loop controller placeholder.",
+					dependencyKeys,
+					{
+						...contextDependencyOverrides,
+						key: placeholderKey,
+						id: placeholderKey,
+						specId: placeholderKey,
+						taskId: "loop",
+						kind: "loop",
+						loopPlaceholder: { loopId: stage.id },
+						foreach: undefined,
+						safety: {
+							readOnlyDeclared: true,
+							capability: "read-only",
+							sharedCwdSafe: true,
+							worktreePolicy: "off",
+							requiresWorktree: false,
+							permission: { status: "pending" },
+						},
+						compiledPrompt: [
+							workflowInputText || undefined,
+							`# Workflow Stage\n\nstage=${stage.id}\ntype=loop`,
+							"# Instructions\n\nLoop controller placeholder. Child stages are materialized by the workflow engine at runtime.",
+							loopRoleText || undefined,
+						]
+							.filter(Boolean)
+							.join("\n\n"),
+					},
+				),
+			);
+			currentStageTaskKeys.push(placeholderKey);
+			previousStageTaskKeys = currentStageTaskKeys;
+			stageTaskKeys.set(stage.id, currentStageTaskKeys);
+			continue;
+		}
+
+		const runtimeStage = rewriteForeachFromStageRefs(
+			stage,
+			topLevelSourceStageIds,
+		);
+		stageRecords.push({
+			id: runtimeStage.id,
+			type: stageKind,
+			sourcePolicy: runtimeStage.sourcePolicy ?? "require-success",
+		});
+		const addTask = async (taskId: string, prompt: string) => {
+			const task = await buildTask(
+				runtimeStage,
+				taskId,
+				prompt,
+				dependencyKeys,
+				contextDependencyOverrides,
+			);
+			tasks.push(task);
+			currentStageTaskKeys.push(task.id);
+		};
+		if (stageKind === "foreach") {
+			await addTask("item", runtimeStage.each?.prompt ?? "");
+		} else if (stageKind === "support") {
+			await addTask("main", `Run support helper ${runtimeStage.support.uses}.`);
+		} else if (stageKind === "dynamic") {
+			await addTask(
+				"controller",
+				`Run dynamic controller ${runtimeStage.dynamic.uses}.`,
+			);
+		} else {
+			await addTask("main", runtimeStage.prompt ?? "");
+		}
+		previousStageTaskKeys = currentStageTaskKeys;
+		stageTaskKeys.set(stage.id, currentStageTaskKeys);
+		topLevelSourceStageIds.set(stage.id, runtimeStage.id);
+	}
+
+	const backendOptions = spec.defaults?.backend ?? {};
+	if (backendOptions.type !== undefined && backendOptions.type !== "local-pi")
+		issues.push({
+			path: "$.defaults.backend.type",
+			message: 'must be "local-pi"',
+		});
+	if (backendOptions.mode !== undefined && backendOptions.mode !== "headless")
+		issues.push({
+			path: "$.defaults.backend.mode",
+			message: 'must be "headless"',
+		});
+	if (spec.fast === "on")
+		issues.push({ path: "$.fast", message: "fast:on is not supported" });
+	if (spec.defaults?.fast === "on")
+		issues.push({
+			path: "$.defaults.fast",
+			message: "fast:on is not supported",
+		});
+	for (const [index, stage] of stages.entries()) {
+		if (stage?.fast === "on")
+			issues.push({
+				path: `$.artifactGraph.stages[${index}].fast`,
+				message: "fast:on is not supported",
+			});
+	}
+	if (issues.length > 0) throw new WorkflowValidationError(issues);
+
+	const failurePolicy = compileWorkflowFailurePolicy(spec.artifactGraph);
+	return {
+		schemaVersion: 1,
+		name: spec.name,
+		description: spec.description,
+		type: WORKFLOW_RUN_TYPE,
+		task: options.task,
+		cwd: options.cwd,
+		backend: { type: "local-pi", mode: "headless" },
+		maxConcurrency: spec.defaults?.maxConcurrency ?? DEFAULT_MAX_CONCURRENCY,
+		...(failurePolicy ? { failurePolicy } : {}),
+		roles,
+		stages: stageRecords,
+		tasks,
+		warnings,
+		budget: {
+			models: budgetModelRows(tasks),
+			unratedModels: [],
+		},
+	};
+}
+
+function budgetModelRows(tasks: any[]): Array<{ model: string }> {
+	const models = new Set<string>();
+	for (const task of tasks) {
+		if (typeof task?.runtime?.model === "string" && task.runtime.model.trim()) {
+			models.add(task.runtime.model.trim());
+		}
+		const loop = task?.dynamic?.decisionLoop;
+		if (!loop || typeof loop !== "object") continue;
+		for (const profile of [
+			loop.planner,
+			loop.workerDefaults,
+			loop.verifier,
+			loop.synthesis,
+		]) {
+			if (typeof profile?.model === "string" && profile.model.trim()) {
+				models.add(profile.model.trim());
+			}
+		}
+	}
+	return [...models].sort().map((model) => ({ model }));
+}
+
+function isSupportStage(stage: any): boolean {
+	return stage?.support !== undefined && stage?.type === undefined;
+}
+
+function isDynamicStage(stage: any): boolean {
+	return stage?.type === "dynamic" && stage?.dynamic !== undefined;
+}
+
+function runtimeStageKindFor(stage: any): string | undefined {
+	return isSupportStage(stage) ? "support" : stage.type;
+}
+
+function buildSupportTask(
+	stage: any,
+	taskId: string,
+	key: string,
+	prompt: string,
+	dependencyKeys: string[],
+	cwd: string,
+	workflowInputText: string,
+	overrides: Partial<CompiledTask> & Record<string, unknown>,
+): any {
+	const support = stage.support ?? {};
+	const uses = String(support.uses);
+	const options =
+		support.options &&
+		typeof support.options === "object" &&
+		!Array.isArray(support.options)
+			? (support.options as Record<string, unknown>)
+			: undefined;
+	const normalizedPrompt = String(prompt ?? "").replace(
+		/\$\{item\}/g,
+		"the relevant item from the dependency context",
+	);
+	const compiledPrompt = [
+		workflowInputText || undefined,
+		`# Workflow Stage\n\nstage=${stage.id}\nkind=support`,
+		`# Support Helper\n\nuses=${uses}`,
+		normalizedPrompt ? `# Instructions\n\n${normalizedPrompt}` : undefined,
+	]
+		.filter(Boolean)
+		.join("\n\n");
+
+	return {
+		key,
+		id: key,
+		specId: key,
+		taskId,
+		stageId: stage.id,
+		agent: "support",
+		agentPath: uses,
+		agentDescription: "Workflow-local support helper",
+		agentSystemPrompt: "",
+		roleNames: [],
+		task: normalizedPrompt,
+		cwd,
+		explicitCwd: stage.cwd !== undefined,
+		explicitWorktreePolicy: false,
+		runtime: { approvalMode: "non-interactive" },
+		safety: {
+			readOnlyDeclared: false,
+			capability: "mutation-capable",
+			sharedCwdSafe: false,
+			worktreePolicy: "off",
+			requiresWorktree: false,
+			permission: { status: "pending" },
+		},
+		compiledPrompt,
+		injectTask: false,
+		kind: "support",
+		stageMaxConcurrency: stage.maxConcurrency,
+		dependsOn: [...dependencyKeys],
+		support: { uses, options },
+		...overrides,
+	};
+}
+
+function buildDynamicTask(
+	stage: any,
+	taskId: string,
+	key: string,
+	prompt: string,
+	dependencyKeys: string[],
+	cwd: string,
+	specDir: string,
+	workflowInputText: string,
+	runtimeTask: string | undefined,
+	controllerRuntime: WorkflowRuntimeResolutionInput,
+	runtimePriority: {
+		runtimeOverrides?: WorkflowRuntimeDefaults;
+		runtimeDefaults?: WorkflowRuntimeDefaults;
+		specRuntimeDefaults?: WorkflowRuntimeDefaults;
+		stageRuntime?: WorkflowRuntimeDefaults;
+	},
+	overrides: Partial<CompiledTask> & Record<string, unknown>,
+): any {
+	const dynamic = stage.dynamic ?? {};
+	const uses = String(dynamic.uses);
+	const normalizedPrompt = String(prompt ?? "").replace(
+		/\$\{item\}/g,
+		"the relevant item from the dependency context",
+	);
+	const controlSchema =
+		stage.artifactGraphOutput?.controlSchema ?? stage.output?.controlSchema;
+	const compiledPrompt = [
+		workflowInputText || undefined,
+		runtimeTask?.trim() ? `# Runtime Task\n\n${runtimeTask.trim()}` : undefined,
+		`# Workflow Stage\n\nstage=${stage.id}\nkind=dynamic`,
+		`# Dynamic Controller\n\nuses=${uses}\nmode=${dynamic.mode ?? "graph-splice"}`,
+		[
+			"# Workflow Output Protocol",
+			"Dynamic controller return values are normalized into workflow artifact sections: <control>{...}</control>, <analysis>...</analysis>, and <refs>[]</refs>.",
+			"The control object must include a non-empty `schema` string and concise `digest`/`summary`.",
+			...controlSchemaOutputInstructions(
+				controlSchema,
+				"dynamic-controller-result-v1",
+			),
+		].join("\n\n"),
+		normalizedPrompt ? `# Instructions\n\n${normalizedPrompt}` : undefined,
+	]
+		.filter(Boolean)
+		.join("\n\n");
+	const helpers: Record<string, any> = {};
+	for (const [helperId, helper] of Object.entries(
+		isPlainRecord(dynamic.helpers) ? dynamic.helpers : {},
+	)) {
+		if (!isPlainRecord(helper)) continue;
+		helpers[helperId] = {
+			uses: String(helper.uses),
+			usesPath: resolve(specDir, String(helper.uses)),
+			...(helper.idempotent === true ? { idempotent: true } : {}),
+			...(typeof helper.inputSchema === "string"
+				? {
+						inputSchema: helper.inputSchema,
+						inputSchemaPath: resolve(specDir, helper.inputSchema),
+					}
+				: {}),
+			...(typeof helper.outputSchema === "string"
+				? {
+						outputSchema: helper.outputSchema,
+						outputSchemaPath: resolve(specDir, helper.outputSchema),
+					}
+				: {}),
+		};
+	}
+	const workflows: Record<string, any> = {};
+	for (const [workflowId, workflow] of Object.entries(
+		isPlainRecord(dynamic.workflows) ? dynamic.workflows : {},
+	)) {
+		if (!isPlainRecord(workflow)) continue;
+		workflows[workflowId] = {
+			uses: String(workflow.uses),
+			usesPath: resolve(specDir, String(workflow.uses)),
+		};
+	}
+	const decisionLoop = compileDynamicDecisionLoop(
+		dynamic.decisionLoop,
+		runtimePriority,
+	);
+
+	return {
+		key,
+		id: key,
+		specId: key,
+		taskId,
+		stageId: stage.id,
+		agent: "dynamic",
+		agentPath: uses,
+		agentDescription: "Workflow dynamic controller",
+		agentSystemPrompt: "",
+		roleNames: [],
+		task: normalizedPrompt,
+		cwd,
+		explicitCwd: stage.cwd !== undefined,
+		explicitWorktreePolicy: false,
+		runtime: {
+			approvalMode: "non-interactive",
+			...controllerRuntime,
+			maxRuntimeMs:
+				dynamic.budget?.maxRuntimeMs ?? DEFAULT_DYNAMIC_MAX_RUNTIME_MS,
+		},
+		safety: {
+			readOnlyDeclared: false,
+			capability: "mutation-capable",
+			sharedCwdSafe: false,
+			worktreePolicy: "off",
+			requiresWorktree: false,
+			permission: { status: "pending" },
+		},
+		compiledPrompt,
+		injectTask: false,
+		kind: "dynamic",
+		stageMaxConcurrency: stage.maxConcurrency,
+		dependsOn: [...dependencyKeys],
+		dynamic: {
+			uses,
+			usesPath: resolve(specDir, uses),
+			mode: dynamic.mode ?? "graph-splice",
+			budget: {
+				maxAgents: dynamic.budget?.maxAgents ?? DEFAULT_DYNAMIC_MAX_AGENTS,
+				maxConcurrency:
+					dynamic.budget?.maxConcurrency ?? DEFAULT_DYNAMIC_MAX_CONCURRENCY,
+				maxRuntimeMs:
+					dynamic.budget?.maxRuntimeMs ?? DEFAULT_DYNAMIC_MAX_RUNTIME_MS,
+				maxNestedWorkflowDepth:
+					dynamic.budget?.maxNestedWorkflowDepth ??
+					DEFAULT_DYNAMIC_MAX_NESTED_WORKFLOW_DEPTH,
+				maxGraphMutations:
+					dynamic.budget?.maxGraphMutations ??
+					DEFAULT_DYNAMIC_MAX_GRAPH_MUTATIONS,
+				maxHelperRuns:
+					dynamic.budget?.maxHelperRuns ?? DEFAULT_DYNAMIC_MAX_HELPER_RUNS,
+			},
+			permissions: {
+				approval: dynamic.permissions?.approval ?? "auto",
+				allowDynamicRoles: dynamic.permissions?.allowDynamicRoles ?? true,
+				allowDynamicTools: dynamic.permissions?.allowDynamicTools ?? true,
+			},
+			helpers,
+			workflows,
+			...(decisionLoop ? { decisionLoop } : {}),
+			...(runtimePriority.runtimeOverrides
+				? { runtimeOverrides: runtimePriority.runtimeOverrides }
+				: {}),
+		},
+		...overrides,
+	};
+}
+
+function compileDynamicDecisionLoop(
+	value: unknown,
+	runtimePriority: {
+		runtimeOverrides?: WorkflowRuntimeDefaults;
+		runtimeDefaults?: WorkflowRuntimeDefaults;
+		specRuntimeDefaults?: WorkflowRuntimeDefaults;
+		stageRuntime?: WorkflowRuntimeDefaults;
+	},
+): any | undefined {
+	if (!isPlainRecord(value)) return undefined;
+	const allowedToolSelection = filterToolSelection(
+		resolveToolSelection(
+			[Array.isArray(value.allowedTools) ? value.allowedTools : undefined],
+			undefined,
+		),
+	);
+	const maxFindings = positiveInteger(
+		recordValue(value.stateIndex, "maxFindings"),
+	);
+	const deprecatedRequiredFindingIds = stringArray(
+		recordValue(value.stateIndex, "requiredFindingIds"),
+	);
+	return {
+		planner: compileDynamicDecisionLoopProfile(value.planner, runtimePriority),
+		workerDefaults: compileDynamicDecisionLoopProfile(
+			value.workerDefaults,
+			runtimePriority,
+		),
+		verifier: compileDynamicDecisionLoopProfile(
+			value.verifier,
+			runtimePriority,
+		),
+		synthesis: compileDynamicDecisionLoopProfile(
+			value.synthesis,
+			runtimePriority,
+		),
+		allowedAgents: stringArray(value.allowedAgents),
+		...(allowedToolSelection.tools
+			? { allowedTools: allowedToolSelection.tools }
+			: {}),
+		...(allowedToolSelection.toolProviders
+			? { allowedToolProviders: allowedToolSelection.toolProviders }
+			: {}),
+		allowedOutputProfiles:
+			stringArray(value.allowedOutputProfiles).length > 0
+				? stringArray(value.allowedOutputProfiles)
+				: [...DYNAMIC_OUTPUT_PROFILES],
+		maxDecisionRounds:
+			positiveInteger(value.maxDecisionRounds) ??
+			DEFAULT_DYNAMIC_DECISION_LOOP_MAX_ROUNDS,
+		maxActionsPerRound:
+			positiveInteger(value.maxActionsPerRound) ??
+			DEFAULT_DYNAMIC_DECISION_LOOP_MAX_ACTIONS,
+		repair: {
+			maxAttempts:
+				positiveInteger(recordValue(value.repair, "maxAttempts")) ?? 2,
+		},
+		stateIndex: {
+			...(maxFindings !== undefined ? { maxFindings } : {}),
+			// Deprecated/no-op compatibility field: compile it for the public
+			// authoring contract, but the Phase 1 runtime intentionally ignores it.
+			...(deprecatedRequiredFindingIds.length > 0
+				? { requiredFindingIds: deprecatedRequiredFindingIds }
+				: {}),
+		},
+		stopPolicy: {
+			// Deprecated/no-op compatibility field: synthesize action shape is
+			// enforced by validateDynamicDecision(), not this flag.
+			requireSynthesisAction:
+				booleanValue(recordValue(value.stopPolicy, "requireSynthesisAction")) ??
+				false,
+			failOnInvalidDecision:
+				booleanValue(recordValue(value.stopPolicy, "failOnInvalidDecision")) ??
+				true,
+			maxStalls:
+				positiveInteger(recordValue(value.stopPolicy, "maxStalls")) ??
+				DEFAULT_DYNAMIC_DECISION_LOOP_MAX_STALLS,
+			// Deprecated/no-op compatibility field: dropped-branch enforcement is
+			// deferred; the runtime surfaces blockers/omissions instead.
+			failOnDroppedRequiredBranch:
+				booleanValue(
+					recordValue(value.stopPolicy, "failOnDroppedRequiredBranch"),
+				) ?? true,
+		},
+	};
+}
+
+function compileDynamicDecisionLoopProfile(
+	value: unknown,
+	runtimePriority: {
+		runtimeOverrides?: WorkflowRuntimeDefaults;
+		runtimeDefaults?: WorkflowRuntimeDefaults;
+		specRuntimeDefaults?: WorkflowRuntimeDefaults;
+		stageRuntime?: WorkflowRuntimeDefaults;
+	},
+): any | undefined {
+	if (!isPlainRecord(value)) return undefined;
+	const toolSelection = filterToolSelection(
+		resolveToolSelection(
+			[Array.isArray(value.tools) ? value.tools : undefined],
+			undefined,
+		),
+	);
+	const runtime = selectWorkflowRuntime(
+		runtimePriority.runtimeOverrides,
+		runtimeSettings(value),
+		runtimePriority.stageRuntime,
+		runtimePriority.runtimeDefaults,
+		runtimePriority.specRuntimeDefaults,
+	);
+	return {
+		...(typeof value.agent === "string" && value.agent.trim()
+			? { agent: value.agent.trim() }
+			: {}),
+		...runtime,
+		...(toolSelection.tools ? { tools: toolSelection.tools } : {}),
+		...(toolSelection.toolProviders
+			? { toolProviders: toolSelection.toolProviders }
+			: {}),
+		...(typeof value.outputProfile === "string" && value.outputProfile.trim()
+			? { outputProfile: value.outputProfile.trim() }
+			: {}),
+		...(positiveInteger(value.maxRuntimeMs) !== undefined
+			? { maxRuntimeMs: positiveInteger(value.maxRuntimeMs) }
+			: {}),
+	};
+}
+
+function stringArray(value: unknown): string[] {
+	return Array.isArray(value)
+		? value.filter((item): item is string => typeof item === "string")
+		: [];
+}
+
+function positiveInteger(value: unknown): number | undefined {
+	return typeof value === "number" && Number.isInteger(value) && value > 0
+		? value
+		: undefined;
+}
+
+function booleanValue(value: unknown): boolean | undefined {
+	return typeof value === "boolean" ? value : undefined;
+}
+
+function recordValue(value: unknown, key: string): unknown {
+	return isPlainRecord(value) ? value[key] : undefined;
+}
+
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+	return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+async function loadWorkflowAgent(
+	name: string,
+	cwd: string,
+	cache: Map<string, AgentDefinition>,
+	path: string,
+): Promise<AgentDefinition> {
+	const cached = cache.get(name);
+	if (cached) return cached;
+	const agent = await loadAgentByName(name, cwd).catch(() => undefined);
+	if (!agent)
+		throw new WorkflowValidationError([
+			{ path, message: `unknown agent "${name}"` },
+		]);
+	cache.set(name, agent);
+	for (const alias of agent.aliases) cache.set(alias, agent);
+	return agent;
+}
+
+async function compileLoopChildTemplates(
+	loopStage: any,
+	buildTask: (
+		stage: any,
+		taskId: string,
+		prompt: string,
+		dependencyKeys: string[],
+		overrides?: Partial<CompiledTask> & Record<string, unknown>,
+	) => Promise<any>,
+): Promise<{
+	childStageIds: string[];
+	childTemplates: any[];
+	childStageRecords: Array<{
+		id: string;
+		type?: string;
+		sourcePolicy?: string;
+	}>;
+	onExhausted?: { stageId: string; template: any };
+}> {
+	const childStageIds: string[] = [];
+	const childTemplates: any[] = [];
+	const childStageRecords: Array<{
+		id: string;
+		type?: string;
+		sourcePolicy?: string;
+	}> = [];
+	let previousChildTaskKeys: string[] = [];
+	const childTaskKeys = new Map<string, string[]>();
+
+	for (const childStage of loopStage.stages ?? []) {
+		childStageIds.push(childStage.id);
+		childStageRecords.push({
+			id: childStage.id,
+			type: childStage.type,
+			sourcePolicy: childStage.sourcePolicy ?? "require-success",
+		});
+		const currentChildTaskKeys: string[] = [];
+		const explicitDependencyKeys = dependencyKeysForStage(
+			childStage,
+			childTaskKeys,
+		);
+		const dependencyKeys =
+			explicitDependencyKeys.length > 0
+				? explicitDependencyKeys
+				: previousChildTaskKeys;
+		const addChildTask = async (taskId: string, prompt: string) => {
+			const template = await buildTask(
+				childStage,
+				taskId,
+				prompt,
+				dependencyKeys,
+			);
+			childTemplates.push(template);
+			currentChildTaskKeys.push(template.id);
+		};
+
+		await addChildTask("main", childStage.prompt ?? "");
+
+		previousChildTaskKeys = currentChildTaskKeys;
+		childTaskKeys.set(childStage.id, currentChildTaskKeys);
+	}
+
+	const onExhaustedStage = loopStage.onExhausted;
+	const onExhausted = onExhaustedStage
+		? {
+				stageId: onExhaustedStage.id ?? "onExhausted",
+				template: await buildTask(
+					onExhaustedStage,
+					"main",
+					onExhaustedStage.prompt ?? "",
+					[],
+				),
+			}
+		: undefined;
+
+	return { childStageIds, childTemplates, childStageRecords, onExhausted };
+}
+
+function rewriteForeachFromStageRefs(
+	stage: any,
+	sourceStageIds: Map<string, string>,
+): any {
+	if (stage?.type !== "foreach") return stage;
+	const rewrittenFrom = rewriteFromStageRefs(stage.from, sourceStageIds);
+	return rewrittenFrom === stage.from
+		? stage
+		: { ...stage, from: rewrittenFrom };
+}
+
+function rewriteFromStageRefs(
+	value: any,
+	sourceStageIds: Map<string, string>,
+): any {
+	if (typeof value === "string") return sourceStageIds.get(value) ?? value;
+	if (Array.isArray(value))
+		return value.map((item) =>
+			typeof item === "string" ? (sourceStageIds.get(item) ?? item) : item,
+		);
+	if (value && typeof value === "object") {
+		return typeof value.stage === "string"
+			? { ...value, stage: sourceStageIds.get(value.stage) ?? value.stage }
+			: value;
+	}
+	return value;
+}
+
+function resolveDagOutputStageId(stage: any): string | undefined {
+	const outputChildId = resolveDagOutputChildId(stage);
+	if (!outputChildId) return undefined;
+	const outputChild = (stage.stages ?? []).find(
+		(childStage: any) => childStage?.id === outputChildId,
+	);
+	if (!outputChild) return undefined;
+	const namespacedOutputChild = namespacedDagChildStage(stage, outputChild);
+	return runtimeStageKindFor(outputChild) === "dag"
+		? resolveDagOutputStageId(namespacedOutputChild)
+		: namespacedOutputChild.id;
+}
+
+function namespacedDagChildStage(containerStage: any, childStage: any): any {
+	const namespacedStage = {
+		...childStage,
+		id: `${containerStage.id}.${childStage.id}`,
+	};
+	if (
+		namespacedStage.sourcePolicy === undefined &&
+		containerStage.sourcePolicy !== undefined
+	) {
+		namespacedStage.sourcePolicy = containerStage.sourcePolicy;
+	}
+	if (
+		namespacedStage.maxConcurrency === undefined &&
+		containerStage.maxConcurrency !== undefined
+	) {
+		namespacedStage.maxConcurrency = containerStage.maxConcurrency;
+	}
+	if (namespacedStage.type === "foreach") {
+		namespacedStage.from = namespaceDagStageRefs(
+			childStage.from,
+			containerStage.id,
+		);
+	}
+	return namespacedStage;
+}
+
+function namespaceDagStageRefs(value: any, namespace: string): any {
+	if (typeof value === "string") return `${namespace}.${value}`;
+	if (Array.isArray(value))
+		return value.map((item) =>
+			typeof item === "string" ? `${namespace}.${item}` : item,
+		);
+	if (value && typeof value === "object") {
+		return typeof value.stage === "string"
+			? { ...value, stage: `${namespace}.${value.stage}` }
+			: value;
+	}
+	return value;
+}
+
+function resolveDagOutputChildId(stage: any): string | undefined {
+	if (typeof stage.outputFrom === "string" && stage.outputFrom.trim() !== "")
+		return stage.outputFrom;
+	const sinkIds = dagSinkStageIds(stage.stages ?? []);
+	return sinkIds.length === 1 ? sinkIds[0] : undefined;
+}
+
+function dagSinkStageIds(stages: any[]): string[] {
+	const childStageIds = new Set<string>();
+	for (const childStage of stages) {
+		if (typeof childStage?.id === "string" && childStage.id.trim() !== "")
+			childStageIds.add(childStage.id);
+	}
+	const dependedOnStageIds = new Set<string>();
+	for (const childStage of stages) {
+		for (const stageId of [
+			...stageIdsFromFrom(childStage?.from),
+			...stageIdsFromAfter(childStage?.after),
+		]) {
+			if (childStageIds.has(stageId)) dependedOnStageIds.add(stageId);
+		}
+	}
+	return [...childStageIds].filter((id) => !dependedOnStageIds.has(id));
+}
+
+function dependencyKeysForStage(
+	stage: any,
+	stageTaskKeys: Map<string, string[]>,
+): string[] {
+	return dependencyKeysForStageIds(stageIdsFromFrom(stage.from), stageTaskKeys);
+}
+
+function afterDependencyKeysForStage(
+	stage: any,
+	stageTaskKeys: Map<string, string[]>,
+): string[] {
+	return dependencyKeysForStageIds(
+		stageIdsFromAfter(stage.after),
+		stageTaskKeys,
+	);
+}
+
+function dependencyKeysForStageIds(
+	stageIds: string[],
+	stageTaskKeys: Map<string, string[]>,
+): string[] {
+	const keys: string[] = [];
+	for (const stageId of stageIds)
+		keys.push(...(stageTaskKeys.get(stageId) ?? []));
+	return uniqueDependencyKeys(keys);
+}
+
+function stageIdsFromFrom(from: any): string[] {
+	if (!from) return [];
+	if (Array.isArray(from))
+		return from.filter(
+			(stageId): stageId is string => typeof stageId === "string",
+		);
+	if (typeof from === "string") return [from];
+	if (typeof from.stage === "string") return [from.stage];
+	return [];
+}
+
+function stageIdsFromAfter(after: any): string[] {
+	if (after === undefined) return [];
+	if (Array.isArray(after))
+		return after.filter(
+			(stageId): stageId is string => typeof stageId === "string",
+		);
+	return typeof after === "string" ? [after] : [];
+}
+
+function uniqueDependencyKeys(keys: string[]): string[] {
+	return [...new Set(keys)];
+}

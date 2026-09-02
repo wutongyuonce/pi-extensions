@@ -1,9 +1,16 @@
 import { Editor, visibleWidth } from "@earendil-works/pi-tui";
 import { describe, expect, it, vi } from "vitest";
 import type { AgentManager } from "../src/agent-manager.js";
-import type { AgentRecord } from "../src/types.js";
-import { getDisplayName } from "../src/ui/agent-widget.js";
-import { FleetList, type FleetUICtx, formatFleetElapsed, formatFleetTokens } from "../src/ui/fleet-list.js";
+import { registerAgents } from "../src/agent-types.js";
+import type { AgentConfig, AgentRecord, ViewerMarkdownMode } from "../src/types.js";
+import { type AgentActivity, getDisplayName } from "../src/ui/agent-widget.js";
+import {
+  FleetList,
+  type FleetUICtx,
+  type FleetWorkflow,
+  formatFleetElapsed,
+  formatFleetTokens,
+} from "../src/ui/fleet-list.js";
 
 // ---- Key sequences (see node_modules/@earendil-works/pi-tui/dist/keys.js) ----
 const DOWN = "\x1b[B";
@@ -16,6 +23,28 @@ const ENTER = "\r";
 const DOWN_RELEASE = "\x1b[1;1:3B";
 
 const theme = { fg: (c: string, s: string) => `<${c}>${s}</${c}>`, bold: (s: string) => `*${s}*` };
+
+/** An agent that renders as a badge — no default agent configures a color. */
+const BADGED_TYPE = "colored-reviewer";
+const PURPLE_BACKGROUND = "\u001b[48;2;130;125;189m";
+const BADGED_CONFIG: AgentConfig = {
+  name: BADGED_TYPE,
+  displayName: "Code Reviewer",
+  color: "purple",
+  description: "Reviews code",
+  extensions: false,
+  skills: false,
+  systemPrompt: "Review code.",
+  promptMode: "replace",
+};
+
+/**
+ * Visible text of a rendered row: ANSI stripped, along with this theme's fake
+ * `<color>` / `*bold*` markers — all three stand in for zero-width escapes.
+ */
+function plain(row: string): string {
+  return row.replace(/\u001b\[[0-9;]*m/g, "").replace(/<\/?[a-zA-Z]+>|\*/g, "");
+}
 
 /** A no-op session so a record is "openable" by default (the list hides session-less agents). */
 const FAKE_SESSION = { subscribe: () => () => {}, messages: [] };
@@ -48,6 +77,12 @@ interface Harness {
   fleet: FleetList;
   ui: FleetUICtx;
   manager: AgentManager;
+  /** Replace the workflow runs the list sees, and re-render. */
+  setWorkflows: (list: FleetWorkflow[]) => void;
+  /** Ids the list asked the extension to open, in order. */
+  openedWorkflows: () => string[];
+  /** Settle the workflow dialog the list last opened; flushes the close microtask. */
+  closeWorkflowDialog: () => Promise<void>;
   /** The overlay component (a real ConversationViewer) once one is opened. */
   overlayComponent: () => { handleInput(data: string): void } | undefined;
   /** Feed a key to the registered input handler; returns the consume result. */
@@ -65,7 +100,26 @@ interface Harness {
   widgetTui: { requestRender(): void; focusedComponent?: unknown };
 }
 
-function harness(agents: AgentRecord[]): Harness {
+function makeWorkflow(over: Partial<FleetWorkflow> = {}): FleetWorkflow {
+  return {
+    id: "wf_abc123",
+    name: "audit-src",
+    status: "running",
+    doneCount: 1,
+    totalCount: 3,
+    startedAt: Date.now() - 32_000,
+    tokens: 26_400,
+    ...over,
+  };
+}
+
+function harness(
+  agents: AgentRecord[],
+  opts: {
+    viewerMarkdown?: () => ViewerMarkdownMode;
+    onViewerMarkdown?: (mode: ViewerMarkdownMode) => void;
+  } = {},
+): Harness {
   let inputHandler: ((data: string) => { consume?: boolean } | undefined) | undefined;
   let widgetFactory: ((tui: any, theme: any) => { render(w: number): string[] }) | undefined;
   let editorText = "";
@@ -93,12 +147,24 @@ function harness(agents: AgentRecord[]): Harness {
   };
 
   const manager = fakeManager(agents);
-  const fleet = new FleetList(manager, new Map());
+  const fleet = new FleetList(manager, new Map(), undefined, opts.viewerMarkdown, opts.onViewerMarkdown);
   fleet.setUICtx(ui);
+  let workflows: FleetWorkflow[] = [];
+  const openedWorkflows: string[] = [];
+  let closeWorkflowDialog: (() => void) | undefined;
+  fleet.setWorkflowSource(() => workflows, id => {
+    openedWorkflows.push(id);
+    // The real opener hands back the dialog's promise, so the list can put the
+    // cursor back when it closes. Held open here until a test resolves it.
+    return new Promise<void>(resolve => { closeWorkflowDialog = () => resolve(); });
+  });
   fleet.update();
 
   return {
     fleet,
+    setWorkflows: (list: FleetWorkflow[]) => { workflows = list; fleet.update(); },
+    openedWorkflows: () => openedWorkflows,
+    closeWorkflowDialog: async () => { closeWorkflowDialog?.(); await Promise.resolve(); },
     ui,
     manager,
     overlayComponent: () => overlayComponent,
@@ -138,6 +204,16 @@ describe("FleetList navigation", () => {
     expect(h.render()).toEqual([]);
   });
 
+  it("hides nested child records from the coordinator fleet", () => {
+    const h = harness([
+      makeRecord({ id: "top", description: "top-level" }),
+      makeRecord({ id: "nested", description: "nested-child", parentAgentId: "top" }),
+    ]);
+    const output = h.render().join("\n");
+    expect(output).toContain("top-level");
+    expect(output).not.toContain("nested-child");
+  });
+
   it("activates on ↓ at an empty prompt, consuming the key", () => {
     const h = harness([makeRecord()]);
     const res = h.press(DOWN);
@@ -169,6 +245,52 @@ describe("FleetList navigation", () => {
     h.press(DOWN_RELEASE);
     expect(h.render().find(l => l.includes("one"))).toContain("●");
     expect(h.render().find(l => l.includes("two"))).toContain("○");
+  });
+
+  it("renders the whole selected row in the theme's primary text color (#230)", () => {
+    const h = harness([
+      makeRecord({ id: "a1", description: "one" }),
+      makeRecord({ id: "a2", description: "two" }),
+    ]);
+    h.press(DOWN); // activate → main
+    h.press(DOWN); // → a1
+    const selected = h.render().find(l => l.includes("one"))!;
+    // Selection marker keeps accent color; row content uses primary text color.
+    expect(selected).toContain("<accent>●</accent>");
+    expect(selected).toContain("<text>one</text>");
+    expect(selected).toMatch(/<text>\d+s · ↓ [\d.]+k? tokens<\/text>/);
+    // Agent display name rendered with the text token too (this type has no badge).
+    expect(selected).toContain(`<text>${getDisplayName("general-purpose")}</text>`);
+    // Inactive rows keep the muted/dim treatment.
+    const unselected = h.render().find(l => l.includes("two"))!;
+    expect(unselected).toContain("<dim>○</dim>");
+    expect(unselected).toMatch(/<dim>\d+s · ↓ [\d.]+k? tokens<\/dim>/);
+    expect(unselected).not.toContain("<text>");
+  });
+
+  it("keeps a color badge on the selected row, bolded, without shifting it (#230)", () => {
+    registerAgents(new Map([[BADGED_TYPE, BADGED_CONFIG]]));
+    try {
+      const h = harness([
+        makeRecord({ id: "a1", type: BADGED_TYPE, description: "one" }),
+        makeRecord({ id: "a2", type: BADGED_TYPE, description: "two" }),
+      ]);
+      h.press(DOWN); // activate → main
+      const before = h.render().find(l => l.includes("one"))!;
+      expect(before).toContain(`${PURPLE_BACKGROUND}`);
+      expect(before).toContain(` ${BADGED_CONFIG.displayName} `);
+
+      h.press(DOWN); // → a1
+      const selected = h.render().find(l => l.includes("one"))!;
+      // Selection bolds the badge rather than repainting it (Claude Code's FleetView) …
+      expect(selected).toContain(PURPLE_BACKGROUND);
+      expect(selected).toContain(`* ${BADGED_CONFIG.displayName} *`);
+      expect(selected).not.toContain(`<text>${BADGED_CONFIG.displayName}`);
+      // … so the description stays in the same column as when unselected.
+      expect(plain(selected).indexOf("one")).toBe(plain(before).indexOf("one"));
+    } finally {
+      registerAgents(new Map());
+    }
   });
 
   it("moves selection down/up and clamps at the ends", () => {
@@ -405,6 +527,24 @@ describe("FleetList overlay lifecycle", () => {
     expect(h.manager.steer).toHaveBeenCalledWith("live", "go left");
   });
 
+  it("hands the viewer the user's markdown setting, and persists a mode chosen with m", () => {
+    const persisted: ViewerMarkdownMode[] = [];
+    const h = harness([makeRecord({ id: "live", description: "the one" })], {
+      viewerMarkdown: () => "all",
+      onViewerMarkdown: (mode) => persisted.push(mode),
+    });
+    h.press(DOWN);  // activate (main)
+    h.press(DOWN);  // → the agent
+    h.press(ENTER); // open the conversation viewer
+
+    h.overlayComponent()!.handleInput("m");
+
+    // "all" → "off" proves the cycle started from the *setting*; the viewer's own
+    // fallback would have started at "assistant" and landed on "all". A recorded
+    // value at all proves the persist hook is wired, as it is from /agents.
+    expect(persisted).toEqual(["off"]);
+  });
+
   it("does NOT auto-close when the viewed agent finishes (final output stays readable)", () => {
     const agents = [makeRecord({ id: "live", description: "the one" })];
     const h = harness(agents);
@@ -424,5 +564,248 @@ describe("FleetList overlay lifecycle", () => {
     expect(harness([recent]).render().some(l => l.includes("recent done"))).toBe(true);
     const old = makeRecord({ id: "o", description: "old done", status: "completed", completedAt: Date.now() - 60_000 });
     expect(harness([old]).render().some(l => l.includes("old done"))).toBe(false);
+  });
+});
+
+describe("FleetList cost display", () => {
+  const theme = { fg: (_c: string, s: string) => s, bold: (s: string) => s };
+
+  function row(showCost: boolean, cost: number, activity?: Map<string, AgentActivity>): string {
+    const record = makeRecord({ lifetimeUsage: { input: 13100, output: 0, cacheWrite: 0, cost } });
+    const fleet = new FleetList(fakeManager([record]), activity ?? new Map(), () => showCost);
+    let factory: any;
+    fleet.setUICtx({
+      setWidget: (_k: string, c: any) => { factory = c; },
+      onTerminalInput: () => () => {},
+      getEditorText: () => "",
+      notify: () => {},
+      custom: (() => new Promise(() => {})) as any,
+    } as any);
+    fleet.update();
+    return factory({ requestRender: () => {}, terminal: { columns: 120, rows: 40 } }, theme).render(120).join("\n");
+  }
+
+  it("appends the cost after the token count when enabled", () => {
+    const out = row(true, 0.0042);
+    expect(out).toContain("13.1k tokens");
+    expect(out).toContain("~$0.0042");
+  });
+
+  it("shows no cost when disabled, and none for an unpriced model", () => {
+    expect(row(false, 0.0042)).not.toContain("$");
+    expect(row(true, 0)).not.toContain("$");
+  });
+
+  it("reads the record, so the figures do not change when the agent finishes", () => {
+    // Spend used to come from the live activity tracker while an agent ran and
+    // from its record once the tracker was deleted. The two disagree: only the
+    // record carries a nested child's spend (nested-tools folds it into every
+    // ancestor), so the number jumped upward at completion.
+    // The stale shape on purpose: an activity entry carrying figures of its own
+    // is what the old fallback preferred, so a row that still renders the
+    // record's numbers proves the tracker is no longer consulted for spend.
+    const tracked = new Map<string, AgentActivity>([["a1", {
+      activeTools: new Map(), toolUses: 0, responseText: "", turnCount: 1,
+      lifetimeUsage: { input: 1, output: 1, cacheWrite: 0, cost: 0.9 },
+    } as unknown as AgentActivity]]);
+
+    expect(row(true, 0.0042, tracked)).toBe(row(true, 0.0042));
+  });
+});
+
+/* ------------------------------------------------------------------------- *
+ * Workflow runs
+ * ------------------------------------------------------------------------- */
+
+describe("FleetList workflow rows", () => {
+  it("renders identically with no workflow source and an empty one", () => {
+    // The contract: a session without workflows behaves exactly as it did
+    // before they existed. Asserted as an equality rather than an absence, so
+    // a future change to the roster cannot quietly alter the agents-only path.
+    const withNone = harness([makeRecord({ id: "a1", description: "one" })]);
+    const before = withNone.render().join("\n");
+    expect(before).not.toContain("workflow");
+
+    const withEmpty = harness([makeRecord({ id: "a1", description: "one" })]);
+    withEmpty.setWorkflows([]);
+    expect(withEmpty.render().join("\n")).toBe(before);
+  });
+
+  it("navigates agents exactly as before when no run is present", () => {
+    const h = harness([
+      makeRecord({ id: "a1", description: "one" }),
+      makeRecord({ id: "a2", description: "two" }),
+    ]);
+    h.setWorkflows([]);
+
+    expect(h.press(DOWN)?.consume).toBe(true);
+    h.press(DOWN);
+    h.press(DOWN);
+    h.press(ENTER);
+
+    // The second agent, not a run and not `main`.
+    expect(h.overlayOpened()).toBe(true);
+    expect(h.openedWorkflows()).toEqual([]);
+  });
+
+  it("clears the widget when the last run and the last agent both go", () => {
+    const h = harness([]);
+    h.setWorkflows([makeWorkflow()]);
+    expect(h.render().length).toBeGreaterThan(0);
+
+    h.setWorkflows([]);
+    expect(h.render()).toEqual([]);
+  });
+
+  it("lists a run above the agents, with its counts and stats", () => {
+    const h = harness([makeRecord({ id: "a1", description: "one" })]);
+    h.setWorkflows([makeWorkflow()]);
+
+    const rows = h.render().map(plain).filter(row => row.trim() !== "");
+    const run = rows.find(row => row.includes("audit-src"))!;
+    const agent = rows.findIndex(row => row.includes("one"));
+    expect(run).toContain("workflow");
+    expect(run).toContain("1/3 agents");
+    expect(run).toContain("26.4k tokens");
+    // A run owns most of the agents under it, so the container comes first.
+    expect(rows.findIndex(row => row.includes("audit-src"))).toBeLessThan(agent);
+  });
+
+  it("agrees with itself about a single-agent run", () => {
+    const h = harness([]);
+    h.setWorkflows([makeWorkflow({ doneCount: 1, totalCount: 1 })]);
+    expect(h.render().map(plain).join("\n")).toContain("1/1 agent ");
+  });
+
+  it("hides the run's own agents — the run is the row that represents them", () => {
+    // A 40-agent fan-out would otherwise push every other agent off the list,
+    // and each child is already reachable inside the workflow dialog.
+    const h = harness([
+      makeRecord({ id: "a1", description: "mine" }),
+      makeRecord({ id: "w1", description: "the workflow's", workflowId: "wf_abc123" }),
+    ]);
+    h.setWorkflows([makeWorkflow()]);
+
+    const rendered = h.render().map(plain).join("\n");
+    expect(rendered).toContain("mine");
+    expect(rendered).toContain("audit-src");
+    expect(rendered).not.toContain("the workflow's");
+  });
+
+  it("moves into the list when the only row is a run", () => {
+    // The regression this guards: activation counted agents, so a session
+    // running nothing but a workflow rendered the row and then refused to
+    // move into it.
+    const h = harness([]);
+    h.setWorkflows([makeWorkflow({ id: "wf_only" })]);
+
+    // The first ↓ moves focus into the list and lands on `main`, as it always
+    // has; the second reaches the only other row.
+    expect(h.press(DOWN)?.consume, "↓ at an empty prompt has somewhere to go").toBe(true);
+    h.press(DOWN);
+    h.press(ENTER);
+
+    expect(h.openedWorkflows()).toEqual(["wf_only"]);
+  });
+
+  it("still does nothing at an empty prompt with no rows at all", () => {
+    const h = harness([]);
+    expect(h.press(DOWN)?.consume).toBeFalsy();
+  });
+
+  it("opens the selected run rather than a conversation viewer", () => {
+    const h = harness([makeRecord({ id: "a1", description: "one" })]);
+    h.setWorkflows([makeWorkflow({ id: "wf_pick" })]);
+
+    h.press(LEFT);
+    h.press(DOWN);
+    h.press(ENTER);
+
+    expect(h.openedWorkflows()).toEqual(["wf_pick"]);
+    // The workflow dialog owns its own overlay; the list must not open one.
+    expect(h.overlayOpened()).toBe(false);
+  });
+
+  const NOW = Date.now();
+
+  /** Open the second of two runs, leaving the inspector up. */
+  function openSecondRun() {
+    const h = harness([makeRecord({ id: "a1", description: "one" })]);
+    h.setWorkflows([
+      makeWorkflow({ id: "wf_a", name: "audit-src", startedAt: NOW - 30_000 }),
+      makeWorkflow({ id: "wf_b", name: "review-changes", startedAt: NOW - 20_000 }),
+    ]);
+    h.render();
+    h.press(LEFT);
+    h.press(DOWN);
+    h.press(DOWN);
+    expect(h.openedWorkflows()).toEqual([]);
+    h.press(ENTER);
+    expect(h.openedWorkflows()).toEqual(["wf_b"]);
+    return h;
+  }
+
+  it("keeps its hands off the keyboard while the inspector is up", () => {
+    // The list only stays out of an overlay's keys when it knows one is open.
+    // Focus alone is not enough: `editorHasFocus` reads unknowable focus as
+    // the editor's, which is exactly the state a fresh overlay leaves behind,
+    // and the list would then eat the arrow keys the dialog is waiting for.
+    const h = openSecondRun();
+
+    expect(h.press(DOWN)?.consume, "the dialog's keys are not the list's").toBeFalsy();
+    expect(h.press(ENTER)?.consume).toBeFalsy();
+    // And nothing moved behind it — one ENTER opened one run.
+    expect(h.openedWorkflows()).toEqual(["wf_b"]);
+  });
+
+  it("comes back to the same run when the inspector closes", async () => {
+    // Runs settle and start while the dialog is open, so the row the reader
+    // came from is not reliably where it was. The agent path re-finds its row
+    // by id for the same reason; a run has to be findable the same way.
+    const h = openSecondRun();
+
+    h.setWorkflows([
+      makeWorkflow({ id: "wf_a", name: "audit-src", startedAt: NOW - 30_000 }),
+      makeWorkflow({ id: "wf_new", name: "started-meanwhile", startedAt: NOW - 25_000 }),
+      makeWorkflow({ id: "wf_b", name: "review-changes", startedAt: NOW - 20_000 }),
+    ]);
+    await h.closeWorkflowDialog();
+
+    expect(h.render().find(l => l.includes("review-changes"))).toContain("●");
+    expect(h.render().find(l => l.includes("started-meanwhile"))).not.toContain("●");
+  });
+
+  it("still opens an agent's viewer when the selection is past the runs", () => {
+    const h = harness([makeRecord({ id: "a1", description: "one" })]);
+    h.setWorkflows([makeWorkflow()]);
+
+    h.press(LEFT);
+    h.press(DOWN);
+    h.press(DOWN);
+    h.press(ENTER);
+
+    expect(h.openedWorkflows()).toEqual([]);
+    expect(h.overlayOpened()).toBe(true);
+  });
+
+  it("drops a settled run once it stops lingering, and keeps a live one", () => {
+    const h = harness([]);
+    h.setWorkflows([
+      makeWorkflow({ id: "wf_old", name: "old", status: "completed", completedAt: Date.now() - 60 * 60_000 }),
+      makeWorkflow({ id: "wf_now", name: "now" }),
+    ]);
+
+    const rendered = h.render().map(plain).join("\n");
+    expect(rendered).toContain("now");
+    expect(rendered).not.toContain("old");
+  });
+
+  it("freezes a finished run's clock the way an agent's is frozen", () => {
+    const h = harness([]);
+    // Inside FINISHED_LINGER_MS, or the row would be gone before it could be read.
+    const completedAt = Date.now() - 1_000;
+    h.setWorkflows([makeWorkflow({ status: "completed", startedAt: completedAt - 12_000, completedAt })]);
+
+    expect(h.render().map(plain).join("\n")).toContain("12s");
   });
 });

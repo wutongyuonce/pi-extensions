@@ -1,0 +1,9 @@
+id: no-reflect-get
+valid:
+  - 'obj.prop'
+  - 'obj[key]'
+  - 'const proxy = new Proxy(api, { get(target, prop, receiver) { return Reflect.get(target, prop, receiver); } });'
+invalid:
+  - 'Reflect.get(obj, "key")'
+  - 'const v = Reflect.get(target, prop);'
+  - 'const ordinary = { get(target, prop, receiver) { return Reflect.get(target, prop, receiver); } };'

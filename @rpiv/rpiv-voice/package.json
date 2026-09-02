@@ -1,0 +1,100 @@
+{
+	"name": "@juicesharp/rpiv-voice",
+	"version": "2.9.0",
+	"private": false,
+	"description": "Pi extension. Voice dictation via /voice — local on-device STT with sherpa-onnx Whisper (base multilingual int8), microphone capture via decibri.",
+	"keywords": [
+		"pi-package",
+		"pi-extension",
+		"rpiv",
+		"voice",
+		"dictation",
+		"stt",
+		"sherpa-onnx",
+		"overlay"
+	],
+	"type": "module",
+	"license": "MIT",
+	"author": "juicesharp",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/juicesharp/rpiv-mono.git",
+		"directory": "packages/rpiv-voice"
+	},
+	"homepage": "https://github.com/juicesharp/rpiv-mono/tree/main/packages/rpiv-voice#readme",
+	"bugs": {
+		"url": "https://github.com/juicesharp/rpiv-mono/issues"
+	},
+	"publishConfig": {
+		"access": "public"
+	},
+	"scripts": {
+		"test": "vitest run"
+	},
+	"files": [
+		"index.ts",
+		"audio/error-log.ts",
+		"audio/hallucination-filter.ts",
+		"audio/mic-source.ts",
+		"audio/model-download.ts",
+		"audio/pcm.ts",
+		"audio/resampler.ts",
+		"audio/sherpa-onnx-node.d.ts",
+		"audio/stt-engine.ts",
+		"command/pipeline-runner.ts",
+		"command/splash-runner.ts",
+		"command/voice-command.ts",
+		"config/voice-config.ts",
+		"state/i18n-bridge.ts",
+		"state/key-router.ts",
+		"state/screen-intent.ts",
+		"state/selectors/contract.ts",
+		"state/selectors/derivations.ts",
+		"state/selectors/focus.ts",
+		"state/selectors/projections.ts",
+		"state/state-reducer.ts",
+		"state/state.ts",
+		"state/status-intent.ts",
+		"state/voice-session.ts",
+		"view/component-binding.ts",
+		"view/components/equalizer-view.ts",
+		"view/components/settings-field-view.ts",
+		"view/components/settings-form-view.ts",
+		"view/components/splash-view.ts",
+		"view/components/status-bar-view.ts",
+		"view/components/transcript-view.ts",
+		"view/overlay-view.ts",
+		"view/props-adapter.ts",
+		"view/screen-content-strategy.ts",
+		"view/stateful-view.ts",
+		"locales/",
+		"docs/",
+		"!docs/*.png",
+		"!docs/*.jpg",
+		"!docs/*.svg",
+		"README.md",
+		"CHANGELOG.md",
+		"LICENSE"
+	],
+	"pi": {
+		"image": "https://raw.githubusercontent.com/juicesharp/rpiv-mono/main/packages/rpiv-voice/docs/cover.png",
+		"extensions": [
+			"./index.ts"
+		]
+	},
+	"dependencies": {
+		"@juicesharp/rpiv-config": "^2.9.0",
+		"sherpa-onnx-node": "^1.13.0",
+		"decibri": "^3.4.0"
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-coding-agent": "*",
+		"@earendil-works/pi-tui": "*",
+		"@juicesharp/rpiv-i18n": "*"
+	},
+	"peerDependenciesMeta": {
+		"@juicesharp/rpiv-i18n": {
+			"optional": true
+		}
+	}
+}

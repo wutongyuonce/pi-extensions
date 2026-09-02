@@ -1,0 +1,48 @@
+# Control-flow jump in a finally block
+# A return/break/continue/throw in finally overrides the try/catch outcome.
+id: no-jump-in-finally
+name: Control-flow jump in finally block
+severity: warning
+category: bug
+defect_class: silent-error
+inline_tier: warning
+language: typescript
+
+message: "return/break/continue/throw in finally overrides the try/catch result and silently swallows exceptions"
+
+description: |
+  A return, break, continue, or throw inside a finally block replaces any value
+  or exception propagating from the try/catch — so thrown errors disappear and
+  returned values are overwritten, often silently.
+
+  ❌  try { return compute(); } finally { return cleanup(); }  // always returns cleanup()
+  ✅  try { return compute(); } finally { cleanup(); }
+
+  Move the control-flow statement out of finally. (Matches jumps written
+  directly in the finally block; jumps buried inside nested blocks are not
+  flagged to keep this check false-positive-free.)
+
+query: |
+  (finally_clause
+    (statement_block
+      [
+        (return_statement)
+        (break_statement)
+        (continue_statement)
+        (throw_statement)
+      ] @JUMP))
+
+metavars:
+  - JUMP
+
+has_fix: false
+
+tags:
+  - bug
+  - error-handling
+
+examples:
+  bad: |
+    try { return doWork(); } finally { return cleanup(); }
+  good: |
+    try { return doWork(); } finally { cleanup(); }

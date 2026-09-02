@@ -1,0 +1,9 @@
+id: no-reflect-apply-js
+valid:
+  - 'fn.apply(obj, args)'
+  - 'fn(...args)'
+  - 'const proxy = new Proxy(target, { apply(target, thisArg, args) { return Reflect.apply(target, thisArg, args); } });'
+invalid:
+  - 'Reflect.apply(fn, obj, args)'
+  - 'const r = Reflect.apply(target[method], target, argumentsList);'
+  - 'const ordinary = { apply(target, thisArg, args) { return Reflect.apply(target, thisArg, args); } };'

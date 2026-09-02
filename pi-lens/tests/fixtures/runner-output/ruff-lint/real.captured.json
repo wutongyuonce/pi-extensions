@@ -1,0 +1,21 @@
+{
+	"provenance": {
+		"runner": "ruff-lint",
+		"tool": "ruff",
+		"version": "0.16.3",
+		"command": "ruff check --output-format json bad.py",
+		"argv": [
+			"check",
+			"--output-format",
+			"json",
+			"bad.py"
+		],
+		"workspace": "tests/fixtures/tool-smoke/python",
+		"platform": "win32-x64",
+		"capturedAt": "2026-08-21"
+	},
+	"file": "bad.py",
+	"exitCode": 1,
+	"stdout": "[\n  {\n    \"cell\": null,\n    \"code\": \"F401\",\n    \"end_location\": {\n      \"column\": 10,\n      \"row\": 3\n    },\n    \"filename\": \"__WORKSPACE__\\\\bad.py\",\n    \"fix\": {\n      \"applicability\": \"safe\",\n      \"edits\": [\n        {\n          \"content\": \"\",\n          \"end_location\": {\n            \"column\": 1,\n            \"row\": 4\n          },\n          \"location\": {\n            \"column\": 1,\n            \"row\": 3\n          }\n        }\n      ],\n      \"message\": \"Remove unused import: `os`\"\n    },\n    \"location\": {\n      \"column\": 8,\n      \"row\": 3\n    },\n    \"message\": \"`os` imported but unused\",\n    \"name\": \"unused-import\",\n    \"noqa_row\": 3,\n    \"severity\": \"error\",\n    \"url\": \"https://docs.astral.sh/ruff/rules/unused-import\"\n  }\n]",
+	"stderr": ""
+}

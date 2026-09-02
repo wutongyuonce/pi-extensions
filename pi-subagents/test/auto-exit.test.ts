@@ -1,0 +1,206 @@
+import {
+	findLatestAssistantError,
+	isOperatorInput,
+	shouldDeferErrorForPiRecovery,
+	shouldRecoverProviderErrorMessage,
+} from "../src/auto-exit.ts";
+import { assert, describe, it } from "./support/index.ts";
+
+describe("findLatestAssistantError", () => {
+	it("returns error info when last assistant has stopReason=error with errorMessage", () => {
+		const messages = [
+			{
+				role: "assistant",
+				stopReason: "stop",
+				content: [{ type: "text", text: "ok" }],
+			},
+			{ role: "toolResult", content: [] },
+			{
+				role: "assistant",
+				stopReason: "error",
+				errorMessage: "Anthropic 529 Overloaded",
+			},
+		];
+		assert.deepEqual(findLatestAssistantError(messages), {
+			errorMessage: "Anthropic 529 Overloaded",
+			isRetryable: true,
+			recoveryKind: "provider",
+			stopReason: "error",
+		});
+	});
+
+	it("returns null when the latest assistant completed normally", () => {
+		const messages = [
+			{ role: "assistant", stopReason: "error", errorMessage: "old failure" },
+			{ role: "user", content: [] },
+			{
+				role: "assistant",
+				stopReason: "stop",
+				content: [{ type: "text", text: "done" }],
+			},
+		];
+		assert.equal(findLatestAssistantError(messages), null);
+	});
+
+	it("returns null when the latest assistant was aborted", () => {
+		const messages = [{ role: "assistant", stopReason: "aborted" }];
+		assert.equal(findLatestAssistantError(messages), null);
+	});
+
+	it("falls back to a placeholder when stopReason=error has no errorMessage", () => {
+		const messages = [{ role: "assistant", stopReason: "error" }];
+		const info = findLatestAssistantError(messages);
+		assert.ok(info);
+		assert.equal(info!.stopReason, "error");
+		assert.equal(info!.isRetryable, false);
+		assert.equal(info!.recoveryKind, "none");
+		assert.match(info!.errorMessage, /stopReason=error/);
+	});
+
+	it("stops scanning at the first assistant message (newest)", () => {
+		const messages = [
+			{ role: "assistant", stopReason: "error", errorMessage: "first" },
+			{ role: "assistant", stopReason: "error", errorMessage: "second" },
+		];
+		const info = findLatestAssistantError(messages);
+		assert.ok(info);
+		assert.equal(info!.errorMessage, "second");
+	});
+
+	it("returns null when messages is undefined or empty", () => {
+		assert.equal(findLatestAssistantError(undefined), null);
+		assert.equal(findLatestAssistantError([]), null);
+	});
+
+	it("returns null when there are no assistant messages", () => {
+		const messages = [
+			{ role: "user", content: [] },
+			{ role: "toolResult", content: [] },
+		];
+		assert.equal(findLatestAssistantError(messages), null);
+	});
+
+	it("marks context overflow errors for Pi-native recovery only", () => {
+		const messages = [
+			{
+				role: "assistant",
+				provider: "openai",
+				model: "gpt-test",
+				stopReason: "error",
+				errorMessage: "Your input exceeds the context window of this model",
+			},
+		];
+
+		assert.deepEqual(findLatestAssistantError(messages), {
+			errorMessage: "Your input exceeds the context window of this model",
+			isRetryable: true,
+			recoveryKind: "pi",
+			stopReason: "error",
+		});
+	});
+});
+
+describe("shouldRecoverProviderErrorMessage", () => {
+	it("recovers an unfamiliar HTTP 400 provider failure", () => {
+		assert.equal(
+			shouldRecoverProviderErrorMessage(
+				'400: {"type":"invalid_request_error","message":"Error from provider: Upstream request failed: Invalid request: text content is empty"}',
+			),
+			true,
+		);
+	});
+
+	it("recovers an unfamiliar provider failure without an HTTP status", () => {
+		assert.equal(shouldRecoverProviderErrorMessage("Provider adapter rejected the upstream response"), true);
+	});
+
+	it("recognizes transient provider and transport failures", () => {
+		assert.equal(shouldRecoverProviderErrorMessage("Connection error."), true);
+		assert.equal(shouldRecoverProviderErrorMessage("HTTP 429 rate limit"), true);
+		assert.equal(shouldRecoverProviderErrorMessage("service unavailable"), true);
+		assert.equal(shouldRecoverProviderErrorMessage("stream ended before message_stop"), true);
+		assert.equal(
+			shouldRecoverProviderErrorMessage(
+				"Codex error: An error occurred while processing your request. You can retry your request, or contact us through our help center at help.openai.com.",
+			),
+			true,
+		);
+	});
+
+	it("rejects permanent quota, billing, and auth failures", () => {
+		assert.equal(shouldRecoverProviderErrorMessage("insufficient_quota"), false);
+		assert.equal(shouldRecoverProviderErrorMessage("Monthly usage limit reached"), false);
+		assert.equal(shouldRecoverProviderErrorMessage("invalid API key"), false);
+		assert.equal(shouldRecoverProviderErrorMessage("invalid_api_key"), false);
+		assert.equal(shouldRecoverProviderErrorMessage("Authentication failed"), false);
+		assert.equal(shouldRecoverProviderErrorMessage("access token expired"), false);
+		assert.equal(shouldRecoverProviderErrorMessage("HTTP 401 Unauthorized"), false);
+		assert.equal(shouldRecoverProviderErrorMessage("403 forbidden"), false);
+	});
+
+	it("rejects an explicitly missing model", () => {
+		assert.equal(
+			shouldRecoverProviderErrorMessage("The requested model does not exist or you do not have access to it"),
+			false,
+		);
+		assert.equal(shouldRecoverProviderErrorMessage("Unknown Model, please check the model code."), false);
+	});
+
+	it("rejects common permanent provider error formats", () => {
+		const permanentErrors = [
+			"No API key for provider: anthropic",
+			"No API key provided for provider openai",
+			"API key missing",
+			"OpenAI: Incorrect API key provided: sk-...xyz",
+			"Google: API key not valid. Please pass a valid API key.",
+			"Anthropic: api_key_invalid",
+			"Bedrock: AccessDeniedException: You don't have access to the model",
+			"Token is invalid or has expired",
+			"Cohere: invalid api token",
+			"Anthropic: credit_balance_too_low",
+			"model_not_found: The model `gpt-5` does not exist",
+			"Account suspended",
+			"Payment method required",
+			"HTTP 404 Not Found",
+			"HTTP 422 Unprocessable Entity",
+			"content filter triggered",
+		];
+
+		for (const errorMessage of permanentErrors) {
+			assert.equal(
+				shouldRecoverProviderErrorMessage(errorMessage),
+				false,
+				`expected permanent failure: ${errorMessage}`,
+			);
+		}
+	});
+
+	it("does not treat every balance-related transport failure as permanent", () => {
+		assert.equal(shouldRecoverProviderErrorMessage("Available balance service temporarily unavailable"), true);
+	});
+});
+
+describe("shouldDeferErrorForPiRecovery", () => {
+	it("recognizes Pi context-overflow messages that should reach compaction", () => {
+		assert.equal(
+			shouldDeferErrorForPiRecovery({
+				role: "assistant",
+				stopReason: "error",
+				errorMessage: "Requested token count exceeds the model's maximum context length of 131072 tokens",
+			}),
+			true,
+		);
+	});
+});
+
+describe("isOperatorInput", () => {
+	it("treats interactive and rpc input as operator steering", () => {
+		assert.equal(isOperatorInput("interactive"), true);
+		assert.equal(isOperatorInput("rpc"), true);
+		assert.equal(isOperatorInput(undefined), true);
+	});
+
+	it("ignores extension-originated input so recovery nudges do not loop", () => {
+		assert.equal(isOperatorInput("extension"), false);
+	});
+});

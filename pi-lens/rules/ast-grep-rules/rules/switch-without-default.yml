@@ -1,0 +1,19 @@
+id: switch-without-default
+language: TypeScript
+severity: warning
+message: "switch has no default clause — values matching no case are silently ignored; add a default (even one that throws)"
+metadata:
+  category: code-smell
+note: |
+  Without a default clause, a value that matches no case falls through with no
+  handling. Add a default branch to deal with unexpected values explicitly (log,
+  throw, or a safe fallback). For an exhaustive enum/union switch, a default that
+  throws documents the invariant and catches future additions.
+rule:
+  kind: switch_statement
+  not:
+    has:
+      kind: switch_default
+      # switch_default lives under switch_body, not directly under the switch —
+      # search all descendants or this never matches and every switch is flagged.
+      stopBy: end

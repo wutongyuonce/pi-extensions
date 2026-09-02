@@ -1,0 +1,37 @@
+id: no-raw-json-store-write
+language: TypeScript
+severity: warning
+metadata:
+  category: pi-lens-self-scan
+message: "Use the atomic write seam for JSON stores instead of writeFileSync"
+note: |
+  JSON-backed durable state must be committed through clients/durable-store.ts
+  when read-modify-write isolation is required; that seam publishes through
+  clients/atomic-write.ts. This rule covers the direct
+  writeFileSync(path, JSON.stringify(data)) shape. Build scripts and the
+  installer's wx lock writes are intentionally outside this rule's scope.
+  Test fixtures that write throwaway JSON files for a test's own setup are
+  not durable production state either (#1718 self-scan triage: 200 hits,
+  all in tests/, none carrying read-modify-write isolation requirements) --
+  excluded the same way build scripts already are.
+ignores:
+  - "**/clients/atomic-write.ts"
+  - "**/clients/installer/index.ts"
+  - "**/scripts/**"
+  - "**/tests/**"
+rule:
+  any:
+    - pattern: writeFileSync($PATH, JSON.stringify($$$ARGS))
+    - pattern: $FS.writeFileSync($PATH, JSON.stringify($$$ARGS))
+    - pattern: writeFileSync($PATH, JSON.stringify($$$ARGS), $OPTS)
+    - pattern: $FS.writeFileSync($PATH, JSON.stringify($$$ARGS), $OPTS)
+    - kind: expression_statement
+      has:
+        pattern: writeFileSync($PATH, $PAYLOAD)
+      follows:
+        pattern: const $PAYLOAD = JSON.stringify($DATA)
+    - kind: expression_statement
+      has:
+        pattern: $FS.writeFileSync($PATH, $PAYLOAD)
+      follows:
+        pattern: const $PAYLOAD = JSON.stringify($DATA)

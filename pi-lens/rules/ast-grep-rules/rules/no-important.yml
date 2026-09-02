@@ -1,0 +1,21 @@
+id: no-important
+language: Css
+severity: warning
+message: "Avoid `!important` — increase selector specificity instead"
+note: |
+  Ported from VTCode (https://github.com/vinhnx/VTCode/tree/main/rules/css,
+  Apache-2.0 license) per #2199 / #2195.
+
+  `!important` overrides normal cascade order and makes CSS harder to
+  maintain: once one declaration reaches for it, overriding it later
+  requires either another `!important` or a `style` attribute, and the
+  arms race compounds. Prefer raising selector specificity or restructuring
+  the cascade so the intended rule already wins.
+
+  Detection-only: a safe fix would need to know which selector should win
+  and why, which this rule cannot infer from the declaration alone. Ported
+  as-is from upstream (no fix upstream either).
+rule:
+  pattern: "!important"
+files:
+  - "**/*.css"

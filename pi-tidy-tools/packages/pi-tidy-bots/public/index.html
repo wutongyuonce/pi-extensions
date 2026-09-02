@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>pi-tidy-bots — fleet console</title>
+    <link rel="stylesheet" href="/style.css?v=30" />
+  </head>
+  <body>
+    <div id="conn-banner" hidden>Reconnecting to fleet…</div>
+    <div id="app">
+      <aside id="roster" aria-label="Bot roster">
+        <header>
+          <div class="brand">
+            <span class="brand-mark">π</span> pi-tidy-bots
+          </div>
+          <div class="brand-sub">FLEET CONSOLE</div>
+        </header>
+        <div class="roster-head">
+          <span>BOTS <span id="bot-count">0</span></span>
+        </div>
+        <ul id="bot-list"></ul>
+        <div id="presence-strip"></div>
+      </aside>
+      <main id="chat-pane">
+        <header id="chat-header">
+          <button id="header-avatar" class="avatar-btn" aria-label="Switch bot">
+            <span class="blob" id="header-avatar-blob"></span>
+          </button>
+          <div class="bot-identity">
+            <div class="bot-name" id="header-name">Chat</div>
+            <div class="bot-title" id="header-title"></div>
+          </div>
+          <span id="header-presence" class="presence-dot" hidden></span>
+          <span id="header-queue" class="queue-pill" hidden></span>
+          <button id="routines-btn" class="ghost-btn" aria-label="Routines">
+            ↻
+          </button>
+          <button id="settings-btn" class="ghost-btn" aria-label="Settings">
+            ⚙
+          </button>
+        </header>
+        <div
+          id="transcript"
+          role="log"
+          aria-live="polite"
+          aria-relevant="additions text"
+        ></div>
+        <div id="routines-panel" hidden></div>
+        <div id="settings-panel" hidden></div>
+        <form id="composer">
+          <div class="composer-top">
+            <button
+              type="button"
+              id="composer-target"
+              aria-label="Choose target bot"
+            >
+              <span class="composer-target-label">To:</span>
+              <span id="composer-target-dot" class="online-dot"></span>
+              <span id="composer-target-name">Agent</span>
+              <span class="composer-target-caret" aria-hidden="true">▾</span>
+            </button>
+          </div>
+          <div id="composer-attachment" class="composer-attachment" hidden>
+            <img id="composer-attach-thumb" alt="" />
+            <div class="composer-attach-meta">
+              <span id="composer-attach-name"></span>
+              <span id="composer-attach-size"></span>
+            </div>
+            <button
+              type="button"
+              id="composer-attach-remove"
+              aria-label="Remove attachment"
+            >
+              ✕
+            </button>
+          </div>
+          <div class="composer-bottom">
+            <input type="file" id="composer-image" accept="image/*" hidden />
+            <button
+              id="composer-attach"
+              type="button"
+              aria-label="Attach image"
+              title="Attach image"
+            >
+              ⊞
+            </button>
+            <textarea
+              id="composer-input"
+              rows="1"
+              enterkeyhint="send"
+              autocapitalize="sentences"
+              placeholder="Type a message…"
+              aria-label="Message the selected bot"
+            ></textarea>
+            <button id="send" type="submit" aria-label="Send">↑</button>
+          </div>
+        </form>
+        <footer id="console-footer" hidden></footer>
+      </main>
+    </div>
+    <script src="/md.js?v=30"></script>
+    <script src="/parts.js?v=30"></script>
+    <script src="/app.js?v=30"></script>
+  </body>
+</html>

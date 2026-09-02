@@ -1,6 +1,6 @@
 {
   "name": "@tintinweb/pi-tasks",
-  "version": "0.7.2",
+  "version": "0.9.0",
   "description": "A pi extension that brings Claude Code-style task tracking and coordination to pi.",
   "author": "tintinweb",
   "license": "MIT",
@@ -12,6 +12,9 @@
   "bugs": {
     "url": "https://github.com/tintinweb/pi-tasks/issues"
   },
+  "publishConfig": {
+    "access": "public"
+  },
   "keywords": [
     "pi-package",
     "pi",
@@ -22,14 +25,14 @@
     "coordination"
   ],
   "peerDependencies": {
-    "@earendil-works/pi-coding-agent": ">=0.80.0",
-    "@earendil-works/pi-tui": ">=0.80.0"
+    "@earendil-works/pi-coding-agent": ">=0.80.5",
+    "@earendil-works/pi-tui": ">=0.80.5"
   },
   "dependencies": {
     "typebox": "^1.1.34"
   },
   "scripts": {
-    "build": "tsc",
+    "build": "node -e \"require('fs').rmSync('dist',{recursive:true,force:true})\" && tsc",
     "prepublishOnly": "npm run lint && npm run typecheck && npm run test && npm run build",
     "test": "vitest run",
     "test:watch": "vitest",
@@ -38,9 +41,11 @@
     "lint:fix": "biome check --fix src/ test/"
   },
   "devDependencies": {
+    "@biomejs/biome": "^2.4.13",
+    "@earendil-works/pi-coding-agent": "0.84.2",
+    "@earendil-works/pi-tui": "0.84.2",
     "@types/node": "^25.0.0",
     "typescript": "^6.0.0",
-    "@biomejs/biome": "^2.4.13",
     "vitest": "^4.1.5"
   },
   "pi": {

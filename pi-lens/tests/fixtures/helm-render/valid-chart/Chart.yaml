@@ -1,0 +1,4 @@
+apiVersion: v2
+name: pi-lens-render-valid
+description: Minimal chart that renders one well-formed Deployment.
+version: 0.1.0

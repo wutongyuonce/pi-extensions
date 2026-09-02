@@ -1,0 +1,87 @@
+# Dynamic compile() call
+# Detects compile() called with a non-string-literal first arg.
+# autoaudit PY003 (CWE-78).
+id: no-compile-call
+language: Python
+severity: error
+message: "compile() called with dynamic input — arbitrary code execution risk"
+note: |
+  `compile(source, ...)` with non-literal source compiles arbitrary code
+  that may be executed later. If `source` is user-controlled, this is
+  a code injection vulnerability.
+
+  Static/trusted source is suppressed (the rule's original ship still
+  described this design in prose but the shipped pattern matched every
+  compile() call unconditionally — #1806 audit: 3 FP hits, all in an
+  eval runner's `ast.parse` → `compile` pipeline). A source is trusted
+  when it is:
+    - a string literal (`compile('print(1)', ...)`);
+    - the direct result of an `ast.<method>(...)` call
+      (`compile(ast.parse(source), ...)`); or
+    - a variable of the SAME name assigned from `ast.<method>(...)`
+      SOMEWHERE in the nearest enclosing function
+      (`module = ast.parse(source); compile(module, ...)`).
+  The third case covers the common "parse once, compile the tree"
+  idiom (including intermediate `ast.Module`/`ast.Expression`
+  reconstructions built from an already-parsed tree) without full
+  dataflow analysis. It is honestly a same-scope, same-name,
+  ANY-ORDER heuristic, not real reaching-definitions: it does not
+  check that the `ast.<method>(...)` assignment happens BEFORE the
+  `compile()` call, so a later reassignment to untrusted input
+  (`module = ast.parse(source); module = user_input;
+  compile(module, ...)`) is a known, accepted miss (fixture pins it
+  under `valid:` with an explanatory comment — ast-grep's relational
+  rules can't express statement ordering, only ancestor/descendant/
+  sibling-existence). Anything else (a bare identifier with no such
+  assignment anywhere in scope, string concatenation, a call to
+  something other than `ast.*`) is still flagged.
+
+  2026-08-20 (review round, refs #1806): two follow-up fixes.
+  (1) The "same function" scope was `inside: {stopBy: end, kind:
+  function_definition}`, which climbs the WHOLE ancestor chain and
+  matches the first function_definition ANYWHERE above — including an
+  outer function, past a nested one. A nested function whose own
+  parameter happens to share a name with an outer function's
+  `ast.parse`-derived variable (shadowing, not the same binding) was
+  wrongly trusted. Bounded to the NEAREST enclosing function with
+  `stopBy: {kind: function_definition}` on the `inside` ascent itself
+  (same boundary-rule shape used to scope `no-return-value-in-generator`
+  in this PR's first round) — it stops climbing at the first
+  function_definition found instead of continuing past it.
+  (2) `pattern: compile($SRC, $$$REST)` has a literal comma in its
+  source text, so it never matched the single-argument form
+  `compile(user_input)` — a silent arity regression from the original
+  `compile($$$ARGS)` (any arity). Restored via an explicit `compile($SRC)`
+  alternative, mirroring the `$DB.query($SQL)` / `$DB.query($SQL, $$$REST)`
+  two-arity shape already used in `no-sql-in-code`.
+rule:
+  any:
+    - pattern: compile($SRC)
+    - pattern: compile($SRC, $$$REST)
+constraints:
+  SRC:
+    not:
+      any:
+        - kind: string
+        - pattern: ast.$METHOD($$$A)
+        - all:
+            - kind: identifier
+            - inside:
+                stopBy:
+                  kind: function_definition
+                kind: function_definition
+                has:
+                  stopBy: end
+                  pattern: $SRC = ast.$METHOD($$$A)
+has_fix: false
+tags:
+  - python
+  - security
+  - code-injection
+  - cwe-78
+examples:
+  bad: |
+    code = compile(user_input, "<user>", "exec")
+    exec(code)
+  good: |
+    tree = ast.parse(static_source)

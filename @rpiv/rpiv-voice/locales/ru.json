@@ -1,0 +1,39 @@
+{
+  "command.description": "Диктуйте текст голосом — локальное распознавание, без облака",
+
+  "error.requires_interactive": "/voice требует интерактивного режима",
+  "error.model_download_failed": "Не удалось скачать модель STT. Проверьте подключение к интернету.",
+  "error.engine_load_failed": "Не удалось загрузить модель STT.",
+  "error.mic_unavailable": "Микрофон недоступен. Проверьте, что устройство ввода подключено и у Pi есть разрешение на микрофон.",
+
+  "splash.preparing": "Подготовка модели…",
+  "splash.downloading": "Загрузка Whisper…",
+  "splash.extracting": "Распаковка файлов модели…",
+  "splash.verifying": "Проверка файлов модели…",
+  "splash.loading_engine": "Загрузка речевой модели…",
+  "splash.initializing_mic": "Инициализация микрофона…",
+
+  "footer.enter_paste": "Enter — вставить",
+  "footer.space_pause": "Пробел — пауза",
+  "footer.space_resume": "Пробел — продолжить",
+  "footer.tab_settings": "Tab — настройки",
+  "footer.esc_cancel": "Esc — отменить",
+  "footer.esc_back": "Esc — назад",
+  "footer.ctrl_s_save": "Ctrl-S — сохранить",
+  "footer.enter_toggle": "Enter — переключить",
+
+  "transcript.placeholder": "Слушаю...",
+
+  "notify.settings_saved": "Настройки голоса сохранены",
+
+  "status.recording": "Запись",
+  "status.paused": "Пауза",
+
+  "settings.microphone_label": "Микрофон",
+  "settings.microphone_value_default": "Устройство ввода по умолчанию",
+  "settings.language_label": "Язык",
+  "settings.language_value_auto": "Автоопределение",
+  "settings.language_hint": "Используйте /languages для смены.",
+  "settings.hallucination_filter_label": "Фильтр шумов Whisper",
+  "settings.hallucination_filter_hint": "Убирает артефакты тишины. Выключите для диктовки одного слова."
+}

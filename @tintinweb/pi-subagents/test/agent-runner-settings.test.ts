@@ -67,7 +67,10 @@ describe("setGraceTurns / getGraceTurns", () => {
     setGraceTurns(5);
   });
 
-  it("defaults to 5", () => {
+  it("round-trips the value this suite set up", () => {
+    // NOT a default assertion — the beforeEach above sets 5, so this only
+    // proves the setter/getter pair agree. The real module default is asserted
+    // against a freshly-imported module in test/documented-defaults.test.ts.
     expect(getGraceTurns()).toBe(5);
   });
 

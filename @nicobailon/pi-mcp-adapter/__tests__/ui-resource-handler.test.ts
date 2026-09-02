@@ -1,0 +1,619 @@
+import { describe, it, expect, vi, beforeEach } from "vitest";
+import { UiResourceHandler } from "../ui-resource-handler.ts";
+import { buildCspMetaContent } from "../host-html-template.ts";
+import { SdkErrorCode, SdkHttpError, UrlElicitationRequiredError } from "@modelcontextprotocol/client";
+import type { McpServerManager } from "../server-manager.ts";
+
+function httpError(status: number, message: string): SdkHttpError {
+  return new SdkHttpError(SdkErrorCode.ClientHttpNotImplemented, message, { status });
+}
+
+// Mock the manager
+function createMockManager(overrides: Partial<McpServerManager> = {}): McpServerManager {
+  return {
+    readResource: vi.fn(),
+    getConnection: vi.fn().mockReturnValue(null),
+    ...overrides,
+  } as unknown as McpServerManager;
+}
+
+describe("UiResourceHandler", () => {
+  describe("readUiResource", () => {
+    it("throws for non-ui:// URIs", async () => {
+      const manager = createMockManager();
+      const handler = new UiResourceHandler(manager);
+
+      await expect(handler.readUiResource("server", "https://example.com")).rejects.toThrow(
+        /URI must start with ui:\/\//
+      );
+    });
+
+    it("preserves URL-required errors for the outer tool adapter", async () => {
+      const error = new UrlElicitationRequiredError([{
+        mode: "url",
+        message: "Connect",
+        elicitationId: "connect-1",
+        url: "https://example.com/connect",
+      }]);
+      const manager = createMockManager({ readResource: vi.fn().mockRejectedValue(error) });
+      const handler = new UiResourceHandler(manager);
+
+      await expect(handler.readUiResource("server", "ui://test/widget")).rejects.toBe(error);
+    });
+
+    it("recovers a terminated HTTP session while loading a UI resource", async () => {
+
+      const stale = {
+        status: "connected" as const,
+        transport: { sessionId: "session-1" },
+        client: {
+          readResource: vi.fn().mockRejectedValueOnce(httpError(404, "Session not found")),
+        },
+        resources: [],
+      };
+      const fresh = {
+        status: "connected" as const,
+        transport: { sessionId: "session-2" },
+        client: {
+          readResource: vi.fn().mockResolvedValue({
+            contents: [{ uri: "ui://test/widget", mimeType: "text/html", text: "<h1>Recovered</h1>" }],
+          }),
+        },
+        resources: [],
+      };
+      const manager = createMockManager({
+        getConnection: vi.fn().mockReturnValue(stale),
+        reconnect: vi.fn().mockResolvedValue(fresh),
+        getRequestOptions: vi.fn().mockReturnValue(undefined),
+        touch: vi.fn(),
+        incrementInFlight: vi.fn(),
+        decrementInFlight: vi.fn(),
+      });
+      const config = { mcpServers: { server: { url: "https://example.test/mcp" } } };
+      const handler = new UiResourceHandler(manager);
+
+      const result = await handler.readUiResource("server", "ui://test/widget", { config });
+
+      expect(result.html).toBe("<h1>Recovered</h1>");
+      expect(stale.client.readResource).toHaveBeenCalledTimes(1);
+      expect(fresh.client.readResource).toHaveBeenCalledTimes(1);
+      expect(manager.reconnect).toHaveBeenCalledWith("server", config.mcpServers.server, stale);
+      expect(manager.incrementInFlight).toHaveBeenCalledWith("server");
+      expect(manager.decrementInFlight).toHaveBeenCalledWith("server");
+    });
+
+    it("reads and returns HTML from text content", async () => {
+      const manager = createMockManager({
+        readResource: vi.fn().mockResolvedValue({
+          contents: [
+            {
+              uri: "ui://test/widget",
+              mimeType: "text/html",
+              text: "<h1>Hello</h1>",
+            },
+          ],
+        }),
+      });
+      const handler = new UiResourceHandler(manager);
+
+      const result = await handler.readUiResource("server", "ui://test/widget");
+
+      expect(result.uri).toBe("ui://test/widget");
+      expect(result.html).toBe("<h1>Hello</h1>");
+      expect(result.mimeType).toBe("text/html");
+    });
+
+    it("reads and decodes blob content", async () => {
+      const htmlContent = "<div>Blob content</div>";
+      const base64Content = Buffer.from(htmlContent).toString("base64");
+
+      const manager = createMockManager({
+        readResource: vi.fn().mockResolvedValue({
+          contents: [
+            {
+              uri: "ui://test/widget",
+              mimeType: "text/html",
+              blob: base64Content,
+            },
+          ],
+        }),
+      });
+      const handler = new UiResourceHandler(manager);
+
+      const result = await handler.readUiResource("server", "ui://test/widget");
+
+      expect(result.html).toBe(htmlContent);
+    });
+
+    it("throws for empty content", async () => {
+      const manager = createMockManager({
+        readResource: vi.fn().mockResolvedValue({
+          contents: [
+            {
+              uri: "ui://test/widget",
+              mimeType: "text/html",
+              text: "   ",
+            },
+          ],
+        }),
+      });
+      const handler = new UiResourceHandler(manager);
+
+      await expect(handler.readUiResource("server", "ui://test/widget")).rejects.toThrow(
+        /content is empty/
+      );
+    });
+
+    it("throws for unsupported MIME type", async () => {
+      const manager = createMockManager({
+        readResource: vi.fn().mockResolvedValue({
+          contents: [
+            {
+              uri: "ui://test/widget",
+              mimeType: "application/json",
+              text: '{"key": "value"}',
+            },
+          ],
+        }),
+      });
+      const handler = new UiResourceHandler(manager);
+
+      await expect(handler.readUiResource("server", "ui://test/widget")).rejects.toThrow(
+        /unsupported MIME type/
+      );
+    });
+
+    it("accepts text/html;profile=mcp-app MIME type", async () => {
+      const manager = createMockManager({
+        readResource: vi.fn().mockResolvedValue({
+          contents: [
+            {
+              uri: "ui://test/widget",
+              mimeType: "text/html;profile=mcp-app",
+              text: "<app>content</app>",
+            },
+          ],
+        }),
+      });
+      const handler = new UiResourceHandler(manager);
+
+      const result = await handler.readUiResource("server", "ui://test/widget");
+
+      expect(result.html).toBe("<app>content</app>");
+    });
+
+    it("throws when no contents returned", async () => {
+      const manager = createMockManager({
+        readResource: vi.fn().mockResolvedValue({
+          contents: [],
+        }),
+      });
+      const handler = new UiResourceHandler(manager);
+
+      await expect(handler.readUiResource("server", "ui://test/widget")).rejects.toThrow(
+        "No contents returned for UI resource: ui://test/widget"
+      );
+    });
+
+    it("prefers content with matching URI", async () => {
+      const manager = createMockManager({
+        readResource: vi.fn().mockResolvedValue({
+          contents: [
+            {
+              uri: "ui://other/widget",
+              mimeType: "text/html",
+              text: "<h1>Wrong</h1>",
+            },
+            {
+              uri: "ui://test/widget",
+              mimeType: "text/html",
+              text: "<h1>Correct</h1>",
+            },
+          ],
+        }),
+      });
+      const handler = new UiResourceHandler(manager);
+
+      const result = await handler.readUiResource("server", "ui://test/widget");
+
+      expect(result.html).toBe("<h1>Correct</h1>");
+    });
+
+    it("falls back to first HTML content if no URI match", async () => {
+      const manager = createMockManager({
+        readResource: vi.fn().mockResolvedValue({
+          contents: [
+            {
+              mimeType: "application/json",
+              text: "{}",
+            },
+            {
+              mimeType: "text/html",
+              text: "<h1>HTML</h1>",
+            },
+          ],
+        }),
+      });
+      const handler = new UiResourceHandler(manager);
+
+      const result = await handler.readUiResource("server", "ui://test/widget");
+
+      expect(result.html).toBe("<h1>HTML</h1>");
+    });
+
+    it("extracts standard resourceDomains CSP metadata", async () => {
+      const manager = createMockManager({
+        readResource: vi.fn().mockResolvedValue({
+          contents: [
+            {
+              uri: "ui://test/widget",
+              mimeType: "text/html",
+              text: "<h1>Content</h1>",
+              _meta: {
+                ui: {
+                  csp: {
+                    resourceDomains: ["https://esm.sh"],
+                    connectDomains: ["https://esm.sh"],
+                  },
+                },
+              },
+            },
+          ],
+        }),
+      });
+      const handler = new UiResourceHandler(manager);
+
+      const result = await handler.readUiResource("server", "ui://test/widget");
+
+      expect(result.meta.csp).toEqual({
+        resourceDomains: ["https://esm.sh"],
+        connectDomains: ["https://esm.sh"],
+      });
+    });
+
+    it("normalizes OpenAI widget CSP metadata from resource content", async () => {
+      const manager = createMockManager({
+        readResource: vi.fn().mockResolvedValue({
+          contents: [{
+            uri: "ui://test/widget",
+            mimeType: "text/html",
+            text: "<h1>Content</h1>",
+            _meta: {
+              "openai/widgetCSP": {
+                resource_domains: ["https://cdn.example.com"],
+                connect_domains: ["https://api.example.com"],
+                frame_domains: ["https://frames.example.com"],
+              },
+            },
+          }],
+        }),
+      });
+      const handler = new UiResourceHandler(manager);
+
+      const result = await handler.readUiResource("server", "ui://test/widget");
+
+      expect(result.meta.csp).toEqual({
+        resourceDomains: ["https://cdn.example.com"],
+        connectDomains: ["https://api.example.com"],
+        frameDomains: ["https://frames.example.com"],
+      });
+    });
+
+    it("normalizes OpenAI widget CSP metadata from resources/list", async () => {
+      const manager = createMockManager({
+        readResource: vi.fn().mockResolvedValue({
+          contents: [{
+            uri: "ui://test/widget",
+            mimeType: "text/html",
+            text: "<h1>Content</h1>",
+          }],
+        }),
+        getConnection: vi.fn().mockReturnValue({
+          resources: [{
+            uri: "ui://test/widget",
+            _meta: {
+              "openai/widgetCSP": {
+                resource_domains: ["https://cdn.example.com"],
+                connect_domains: ["https://api.example.com"],
+              },
+            },
+          }],
+        }),
+      });
+      const handler = new UiResourceHandler(manager);
+
+      const result = await handler.readUiResource("server", "ui://test/widget");
+
+      expect(result.meta.csp).toEqual({
+        resourceDomains: ["https://cdn.example.com"],
+        connectDomains: ["https://api.example.com"],
+      });
+    });
+
+    it("lets standard CSP fields override equivalent OpenAI compatibility fields", async () => {
+      const manager = createMockManager({
+        readResource: vi.fn().mockResolvedValue({
+          contents: [{
+            uri: "ui://test/widget",
+            mimeType: "text/html",
+            text: "<h1>Content</h1>",
+            _meta: {
+              ui: {
+                csp: {
+                  resourceDomains: ["https://standard.example.com"],
+                },
+              },
+              "openai/widgetCSP": {
+                resource_domains: ["https://openai.example.com"],
+                connect_domains: ["https://api.example.com"],
+              },
+            },
+          }],
+        }),
+      });
+      const handler = new UiResourceHandler(manager);
+
+      const result = await handler.readUiResource("server", "ui://test/widget");
+
+      expect(result.meta.csp).toEqual({
+        resourceDomains: ["https://standard.example.com"],
+        connectDomains: ["https://api.example.com"],
+      });
+    });
+
+    it("copies only string arrays from standard and OpenAI CSP metadata", async () => {
+      const standardResourceDomains = ["https://standard.example.com"];
+      const standardBaseUriDomains = ["https://base.example.com"];
+      const manager = createMockManager({
+        readResource: vi.fn().mockResolvedValue({
+          contents: [{
+            uri: "ui://test/widget",
+            mimeType: "text/html",
+            text: "<h1>Content</h1>",
+            _meta: {
+              ui: {
+                csp: {
+                  resourceDomains: standardResourceDomains,
+                  connectDomains: ["https://mixed.example.com", 42],
+                  frameDomains: "https://scalar.example.com",
+                  baseUriDomains: standardBaseUriDomains,
+                },
+              },
+              "openai/widgetCSP": {
+                resource_domains: ["https://mixed-openai.example.com", null],
+                connect_domains: ["https://api.example.com"],
+                frame_domains: ["https://frames.example.com"],
+              },
+            },
+          }],
+        }),
+      });
+      const handler = new UiResourceHandler(manager);
+
+      const result = await handler.readUiResource("server", "ui://test/widget");
+
+      expect(result.meta.csp).toEqual({
+        resourceDomains: standardResourceDomains,
+        baseUriDomains: standardBaseUriDomains,
+      });
+      expect(result.meta.csp?.resourceDomains).not.toBe(standardResourceDomains);
+    });
+
+    it.each([
+      ["standard array", { ui: { csp: [] } }],
+      ["standard scalar", { ui: { csp: "invalid" } }],
+      ["standard null", { ui: { csp: null } }],
+      ["OpenAI array", { "openai/widgetCSP": [] }],
+      ["OpenAI scalar", { "openai/widgetCSP": "invalid" }],
+      ["OpenAI null", { "openai/widgetCSP": null }],
+    ])("normalizes a declared malformed %s CSP container to an empty policy", async (_description, meta) => {
+      const manager = createMockManager({
+        readResource: vi.fn().mockResolvedValue({
+          contents: [{
+            uri: "ui://test/widget",
+            mimeType: "text/html",
+            text: "<h1>Content</h1>",
+            _meta: meta,
+          }],
+        }),
+      });
+      const handler = new UiResourceHandler(manager);
+
+      const result = await handler.readUiResource("server", "ui://test/widget");
+
+      expect(result.meta.csp).toEqual({});
+    });
+
+    it("fails closed when a null standard CSP is combined with valid OpenAI widget CSP", async () => {
+      const manager = createMockManager({
+        readResource: vi.fn().mockResolvedValue({
+          contents: [{
+            uri: "ui://test/widget",
+            mimeType: "text/html",
+            text: "<h1>Content</h1>",
+            _meta: {
+              ui: { csp: null },
+              "openai/widgetCSP": {
+                resource_domains: ["https://attacker.example"],
+                connect_domains: ["https://attacker.example"],
+                frame_domains: ["https://attacker.example"],
+              },
+            },
+          }],
+        }),
+      });
+      const handler = new UiResourceHandler(manager);
+
+      const result = await handler.readUiResource("server", "ui://test/widget");
+
+      expect(result.meta.csp).toEqual({});
+      expect(buildCspMetaContent(result.meta.csp)).toBe(
+        "default-src 'none'; sandbox allow-scripts allow-forms allow-modals allow-popups allow-downloads; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; font-src 'self'; img-src 'self' data:; media-src 'self' data:; connect-src 'none'; frame-src 'none'; worker-src 'none'; object-src 'none'; base-uri 'self'",
+      );
+    });
+
+    it("does not fall back to an OpenAI field when its standard equivalent is malformed", async () => {
+      const manager = createMockManager({
+        readResource: vi.fn().mockResolvedValue({
+          contents: [{
+            uri: "ui://test/widget",
+            mimeType: "text/html",
+            text: "<h1>Content</h1>",
+            _meta: {
+              ui: { csp: { resourceDomains: "not-an-array" } },
+              "openai/widgetCSP": {
+                resource_domains: ["https://attacker.example"],
+                connect_domains: ["https://api.example.com"],
+              },
+            },
+          }],
+        }),
+      });
+      const handler = new UiResourceHandler(manager);
+
+      const result = await handler.readUiResource("server", "ui://test/widget");
+
+      expect(result.meta.csp).toEqual({ connectDomains: ["https://api.example.com"] });
+      expect(buildCspMetaContent(result.meta.csp)).not.toContain("https://attacker.example");
+    });
+
+    it("prefers a declared malformed content CSP over resource-list CSP", async () => {
+      const manager = createMockManager({
+        readResource: vi.fn().mockResolvedValue({
+          contents: [{
+            uri: "ui://test/widget",
+            mimeType: "text/html",
+            text: "<h1>Content</h1>",
+            _meta: { ui: { csp: null } },
+          }],
+        }),
+        getConnection: vi.fn().mockReturnValue({
+          resources: [{
+            uri: "ui://test/widget",
+            _meta: {
+              "openai/widgetCSP": {
+                resource_domains: ["https://list.example.com"],
+              },
+            },
+          }],
+        }),
+      });
+      const handler = new UiResourceHandler(manager);
+
+      const result = await handler.readUiResource("server", "ui://test/widget");
+
+      expect(result.meta.csp).toEqual({});
+    });
+
+    it("prefers conflicting content CSP over resource-list CSP", async () => {
+      const manager = createMockManager({
+        readResource: vi.fn().mockResolvedValue({
+          contents: [{
+            uri: "ui://test/widget",
+            mimeType: "text/html",
+            text: "<h1>Content</h1>",
+            _meta: {
+              ui: {
+                csp: {
+                  resourceDomains: ["https://content.example.com"],
+                },
+              },
+            },
+          }],
+        }),
+        getConnection: vi.fn().mockReturnValue({
+          resources: [{
+            uri: "ui://test/widget",
+            _meta: {
+              "openai/widgetCSP": {
+                resource_domains: ["https://list.example.com"],
+              },
+            },
+          }],
+        }),
+      });
+      const handler = new UiResourceHandler(manager);
+
+      const result = await handler.readUiResource("server", "ui://test/widget");
+
+      expect(result.meta.csp).toEqual({
+        resourceDomains: ["https://content.example.com"],
+      });
+    });
+
+    it("extracts permissions meta", async () => {
+      const manager = createMockManager({
+        readResource: vi.fn().mockResolvedValue({
+          contents: [
+            {
+              uri: "ui://test/widget",
+              mimeType: "text/html",
+              text: "<h1>Content</h1>",
+              _meta: {
+                ui: {
+                  permissions: {
+                    camera: {},
+                    microphone: {},
+                  },
+                },
+              },
+            },
+          ],
+        }),
+      });
+      const handler = new UiResourceHandler(manager);
+
+      const result = await handler.readUiResource("server", "ui://test/widget");
+
+      expect(result.meta.permissions).toEqual({
+        camera: {},
+        microphone: {},
+      });
+    });
+
+    it("extracts domain and prefersBorder meta", async () => {
+      const manager = createMockManager({
+        readResource: vi.fn().mockResolvedValue({
+          contents: [
+            {
+              uri: "ui://test/widget",
+              mimeType: "text/html",
+              text: "<h1>Content</h1>",
+              _meta: {
+                ui: {
+                  domain: "example.com",
+                  prefersBorder: true,
+                },
+              },
+            },
+          ],
+        }),
+      });
+      const handler = new UiResourceHandler(manager);
+
+      const result = await handler.readUiResource("server", "ui://test/widget");
+
+      expect(result.meta.domain).toBe("example.com");
+      expect(result.meta.prefersBorder).toBe(true);
+    });
+
+    it("throws when content has no text or blob", async () => {
+      const manager = createMockManager({
+        readResource: vi.fn().mockResolvedValue({
+          contents: [
+            {
+              uri: "ui://test/widget",
+              mimeType: "text/html",
+              // No text or blob
+            },
+          ],
+        }),
+      });
+      const handler = new UiResourceHandler(manager);
+
+      await expect(handler.readUiResource("server", "ui://test/widget")).rejects.toThrow(
+        "did not include text or blob content"
+      );
+    });
+  });
+});

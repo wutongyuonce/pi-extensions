@@ -1,0 +1,37 @@
+# Kotlin No lateinit
+# Detects `lateinit var` property declarations.
+# Ported from vinhnx/VTCode rules/kotlin/no-lateinit.yml (#2198, refs #2195).
+id: kotlin-no-lateinit
+language: kotlin
+severity: warning
+message: "Avoid lateinit var; prefer a nullable type or constructor injection"
+note: |
+  lateinit defers initialization past the constructor and throws
+  UninitializedPropertyAccessException on an unguarded read before the
+  property is set. A nullable type, a lazy delegate, or constructor/DI-based
+  initialization all make the missing-value case visible to the type system
+  instead of a runtime crash.
+  Detection-only: the correct replacement depends on the property's
+  lifecycle (Android view binding, DI-managed fields, test fixtures) and on
+  whether callers can tolerate a nullable read, both of which this rule
+  cannot verify.
+rule:
+  kind: property_declaration
+  has:
+    kind: modifiers
+    has:
+      kind: member_modifier
+      regex: "^lateinit$"
+files:
+  - "**/*.kt"
+tags:
+  - kotlin
+  - idiom
+  - null-safety
+examples:
+  bad: |
+    class UserRepository {
+        lateinit var apiClient: ApiClient
+    }
+  good: |
+    class UserRepository(private val apiClient: ApiClient)

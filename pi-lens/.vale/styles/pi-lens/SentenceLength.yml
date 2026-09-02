@@ -1,0 +1,15 @@
+extends: existence
+message: "This sentence is long. Split it into shorter sentences (about 20-25 words per idea, per Google dev-docs style)."
+link: "https://developers.google.com/style/sentence-case"
+level: suggestion
+scope: sentence
+nonword: true
+# The Google package ships no sentence-length check. Approximation: counts
+# whitespace-delimited runs rather than true word tokens, so it over-counts
+# a sentence with hyphenated compounds or under-counts one with multi-space
+# artifacts. Threshold of 45 (well above the 20-25 target) flags genuine
+# outliers only -- this repo's docs favor dense, single-sentence technical
+# explanations, and a 30-word threshold made this rule the single noisiest
+# check in the whole config (160 of ~420 total findings).
+tokens:
+  - '^(?:\S+\s+){45,}\S+\s*$'

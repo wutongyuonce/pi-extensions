@@ -1,0 +1,35 @@
+# Go No Underscore in Function Names
+# Detects snake_case Go function names, which violate Go's camelCase
+# naming convention.
+# Ported from vinhnx/VTCode rules/go/no-underscore-func-name.yml
+# (#2200, refs #2195).
+id: go-no-underscore-func-name
+language: go
+severity: hint
+message: "Use camelCase for Go function names, not snake_case"
+note: |
+  Go convention uses camelCase for function names (e.g. getUserName, not
+  get_user_name). Detection-only, with no autofix: renaming a function
+  requires updating every call site, and an exported (capitalized) name
+  change also breaks API compatibility for downstream importers. Scoped to
+  non-test Go files.
+rule:
+  pattern: func $NAME($$$) $$$ { $$$ }
+constraints:
+  NAME:
+    regex: "^[a-z_]*_[a-z]"
+ignores:
+  - "**/*_test.go"
+tags:
+  - go
+  - idiom
+  - naming-convention
+examples:
+  bad: |
+    func get_user_name(id int) string {
+        return ""
+    }
+  good: |
+    func getUserName(id int) string {
+        return ""
+    }

@@ -2,7 +2,8 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { loadTasksConfig, saveTasksConfig } from "../src/tasks-config.js";
+import type { TaskSortOrder } from "../src/task-sort.js";
+import { loadGlobalTasksConfig, loadTasksConfig, saveTasksConfig } from "../src/tasks-config.js";
 
 function writeJson(path: string, value: unknown): void {
   mkdirSync(dirname(path), { recursive: true });
@@ -37,6 +38,7 @@ describe("tasks config", () => {
   it("loads global defaults from the agent directory", () => {
     writeJson(globalConfigPath, { autoCascade: true, maxVisible: 20 });
 
+    expect(loadGlobalTasksConfig(agentDir)).toEqual({ autoCascade: true, maxVisible: 20 });
     expect(loadTasksConfig(cwd, agentDir)).toEqual({ autoCascade: true, maxVisible: 20 });
   });
 
@@ -99,6 +101,34 @@ describe("tasks config", () => {
     expect(JSON.parse(readFileSync(projectConfigPath, "utf-8"))).toEqual({ autoCascade: false, maxVisible: 30 });
   });
 
+  it("round-trips a custom sortOrder spec", () => {
+    const sortOrder: TaskSortOrder = [
+      { field: "status", rank: ["in_progress", "pending", "completed"] },
+      { field: "id" },
+    ];
+    writeJson(projectConfigPath, { sortOrder });
+
+    expect(loadTasksConfig(cwd, agentDir)).toEqual({ sortOrder });
+  });
+
+  it("does not copy a global sortOrder spec into the project override", () => {
+    const sortOrder: TaskSortOrder = [{ field: "updatedAt", direction: "desc" }];
+    writeJson(globalConfigPath, { sortOrder });
+
+    saveTasksConfig(loadTasksConfig(cwd, agentDir), cwd, agentDir);
+
+    expect(JSON.parse(readFileSync(projectConfigPath, "utf-8"))).toEqual({});
+  });
+
+  it("writes a sortOrder spec that differs from the global default", () => {
+    writeJson(globalConfigPath, { sortOrder: "status" });
+    const sortOrder: TaskSortOrder = [{ field: "id", direction: "desc" }];
+
+    saveTasksConfig({ sortOrder }, cwd, agentDir);
+
+    expect(JSON.parse(readFileSync(projectConfigPath, "utf-8"))).toEqual({ sortOrder });
+  });
+
   it("writes an empty project override object when effective settings match global defaults", () => {
     writeJson(globalConfigPath, { autoCascade: true });
 
@@ -106,5 +136,50 @@ describe("tasks config", () => {
 
     expect(existsSync(projectConfigPath)).toBe(true);
     expect(JSON.parse(readFileSync(projectConfigPath, "utf-8"))).toEqual({});
+  });
+
+  it("merges glyphs one by one rather than replacing the whole set", () => {
+    writeJson(globalConfigPath, { glyphs: { pending: "[ ]", spinner: ["|", "/"] } });
+    writeJson(projectConfigPath, { glyphs: { completed: "[x]", spinner: ["-", "\\"] } });
+
+    expect(loadTasksConfig(cwd, agentDir)).toEqual({
+      glyphs: { pending: "[ ]", completed: "[x]", spinner: ["-", "\\"] },
+    });
+  });
+
+  it("leaves glyphs absent when neither config sets any", () => {
+    writeJson(globalConfigPath, { autoCascade: true });
+
+    expect(loadTasksConfig(cwd, agentDir)).toEqual({ autoCascade: true });
+  });
+
+  it("does not copy global glyphs into the project override", () => {
+    writeJson(globalConfigPath, { glyphs: { pending: "[ ]", completed: "[x]" } });
+    const config = loadTasksConfig(cwd, agentDir);
+
+    config.maxVisible = 5;
+    saveTasksConfig(config, cwd, agentDir);
+
+    expect(JSON.parse(readFileSync(projectConfigPath, "utf-8"))).toEqual({ maxVisible: 5 });
+  });
+
+  it("writes only the glyphs that differ from the global ones", () => {
+    writeJson(globalConfigPath, { glyphs: { pending: "[ ]", completed: "[x]" } });
+
+    saveTasksConfig({ glyphs: { pending: "[ ]", completed: "done", inProgress: "[>]" } }, cwd, agentDir);
+
+    expect(JSON.parse(readFileSync(projectConfigPath, "utf-8"))).toEqual({
+      glyphs: { completed: "done", inProgress: "[>]" },
+    });
+  });
+
+  it("preserves a project glyph override across save and reload cycles", () => {
+    writeJson(globalConfigPath, { glyphs: { pending: "[ ]" } });
+    writeJson(projectConfigPath, { glyphs: { completed: "[x]" } });
+
+    saveTasksConfig(loadTasksConfig(cwd, agentDir), cwd, agentDir);
+
+    expect(JSON.parse(readFileSync(projectConfigPath, "utf-8"))).toEqual({ glyphs: { completed: "[x]" } });
+    expect(loadTasksConfig(cwd, agentDir)).toEqual({ glyphs: { pending: "[ ]", completed: "[x]" } });
   });
 });

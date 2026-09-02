@@ -1,0 +1,140 @@
+name: Lifecycle smoke (nightly)
+
+# Three lanes from the #1605 retrospective umbrella (lanes 1/2/4 of 6; 3/5/6
+# tracked separately). Every existing smoke workflow (tool-smoke,
+# install-smoke, compat-smoke, grammar-health) answers "does the tool run?" —
+# nearly every shipped defect in the #1531-#1604 arc was a LIFECYCLE or SCOPE
+# failure invisible to that question: a classifier built against a synthetic
+# stderr sample that a real host's tool never produces, a transient failure
+# latched as durable for the rest of the session, or an external directory
+# scanner walking straight past pi-lens's own scratch-tree exclusions. These
+# jobs drive the REAL production code path (no mocks) against a real spawned
+# process, and are proven capable of failing (see each script's own header
+# comment + the PR that introduced this workflow for the red-proof).
+#
+# Unlike tool-smoke/compat-smoke's "alert, never red" contract, these jobs are
+# NOT continue-on-error: a real classification/lifecycle/scope regression is
+# exactly the signal this workflow exists to raise. Nightly + manual only
+# (never a per-PR gate) because lane 1 spawns real PowerShell processes under
+# a forced execution-policy override and lane 2's cooldown-recovery phase
+# waits out a real ~30s timer — too slow and host-shape-dependent for the
+# serialized per-PR unit suite (#1112).
+
+on:
+  schedule:
+    - cron: "30 6 * * *" # nightly 06:30 UTC, offset from the 06:00/10:00 band
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  # Lane 1 (#1605): real-host PSScriptAnalyzer -File classification.
+  # Windows-only — the defect (#1540/#1604) is a PowerShell execution-policy
+  # stderr-parsing question that only a real Windows host can answer.
+  psscriptanalyzer-classification:
+    name: Lane 1 — PSScriptAnalyzer real-host classification
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
+        with:
+          node-version: "22"
+      # --ignore-scripts is safe here (unlike install-smoke.yml's tarball-pack
+      # case, S6505's noted exception): this job runs `npm run build:dist`
+      # itself as an explicit next step and never needs the `prepare` script's
+      # grammar download. `npm ci` (not `npm install`) locks to package-lock.json
+      # (S8543).
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund --ignore-scripts
+      - name: Build dist
+        run: npm run build:dist
+      # F1: both interpreters need the module installed SEPARATELY -- pwsh and
+      # Windows PowerShell 5.1 resolve `Install-Module`'s CurrentUser scope
+      # under different module paths, so one interpreter having the module
+      # says nothing about the other. The script's own preflight fails
+      # distinctly (INFRA) if either is missing, but installing it here is
+      # what keeps the lane meaningful instead of exiting 2 every run.
+      - name: Install PSScriptAnalyzer module (pwsh)
+        shell: pwsh
+        run: Install-Module -Name PSScriptAnalyzer -Force -Scope CurrentUser -Confirm:$false
+      - name: Install PSScriptAnalyzer module (Windows PowerShell 5.1)
+        shell: powershell
+        run: Install-Module -Name PSScriptAnalyzer -Force -Scope CurrentUser -Confirm:$false
+      # F3: one-line toggle for #1604 -- flip to `expected-fail` if the pwsh
+      # leg reds by reproducing ConciseView's stderr evasion, so the nightly
+      # doesn't stay permanently red while #1604 is open. See the script's own
+      # header comment for the full contract.
+      - name: Real-host classification smoke (pwsh + powershell legs)
+        env:
+          PI_LENS_SMOKE_PSA_PWSH_MODE: required
+        run: node scripts/smoke-psscriptanalyzer-classification.mjs
+
+  # Lane 2 (#1605): availability-lifecycle — the latch class
+  # (#1490/#1494/#1495/#1496/#1537/#1535, #1556-F1). Cross-platform logic
+  # (the gh-token latch), run once on ubuntu-latest.
+  availability-lifecycle:
+    name: Lane 2 — availability lifecycle (latch + degradation + recovery)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
+        with:
+          node-version: "22"
+      # --ignore-scripts is safe here (unlike install-smoke.yml's tarball-pack
+      # case, S6505's noted exception): this job runs `npm run build:dist`
+      # itself as an explicit next step and never needs the `prepare` script's
+      # grammar download. `npm ci` (not `npm install`) locks to package-lock.json
+      # (S8543).
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund --ignore-scripts
+      - name: Build dist
+        run: npm run build:dist
+      - name: Availability lifecycle smoke (fixture gh shim, real cooldown wait)
+        run: node scripts/smoke-availability-lifecycle.mjs
+
+  # Lane 4 (#1605): exclusion scope — would have caught #1562/#1574. Real
+  # gitleaks binary over a real fixture repo with a planted secret in a
+  # tracked file and another under a gitignored secrets-lane scratch dir.
+  gitleaks-scratch-exclusion:
+    name: Lane 4 — gitleaks exclusion scope (tracked visible, scratch demoted)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
+        with:
+          node-version: "22"
+      # --ignore-scripts is safe here (unlike install-smoke.yml's tarball-pack
+      # case, S6505's noted exception): this job runs `npm run build:dist`
+      # itself as an explicit next step and never needs the `prepare` script's
+      # grammar download. `npm ci` (not `npm install`) locks to package-lock.json
+      # (S8543).
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund --ignore-scripts
+      - name: Build dist
+        run: npm run build:dist
+      # Pinned deliberately (bump by hand after checking
+      # https://github.com/gitleaks/gitleaks/releases and recomputing the
+      # sha256 below — see #731): avoids an unpinned, unverified binary
+      # download in a job that scans real (if fixture) directory trees.
+      - name: Install gitleaks (pinned + checksum-verified)
+        env:
+          GITLEAKS_VERSION: v8.30.1
+          GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+        run: |
+          set -uxo pipefail
+          curl --proto '=https' --tlsv1.2 -fsSL --retry 3 --retry-delay 2 \
+            -o "$RUNNER_TEMP/gitleaks.tar.gz" \
+            "https://github.com/gitleaks/gitleaks/releases/download/${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION#v}_linux_x64.tar.gz"
+          echo "${GITLEAKS_SHA256}  $RUNNER_TEMP/gitleaks.tar.gz" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/gitleaks-bin"
+          tar -xzf "$RUNNER_TEMP/gitleaks.tar.gz" -C "$RUNNER_TEMP/gitleaks-bin" gitleaks
+          echo "$RUNNER_TEMP/gitleaks-bin" >> "$GITHUB_PATH"
+      - name: Exclusion-scope smoke (real gitleaks, fixture repo)
+        run: node scripts/smoke-gitleaks-scratch-exclusion.mjs

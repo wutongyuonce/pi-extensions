@@ -1,82 +1,96 @@
 # Pi Extensions
 
-这是我的个人 [Pi](https://pi.ai) 扩展集合，汇集了自己开发的和社区中优秀的 Pi Agent 扩展插件。
+这是我的个人 [Pi](https://pi.dev/) 扩展仓库，主要收集三类内容：
 
-## 插件列表
+1. 社区优秀 Pi 扩展的源码归档与镜像
+2. 我自己开发或持续维护的 Pi 插件 / 工具项目
+3. 面向源码阅读的解析文档与实验性项目
+
+它不是一个统一构建的 monorepo。大多数子目录都是可以独立安装、独立维护、独立阅读的项目；根目录 `README` 更像一个总导航页。
+
+## 快速导航
+
+| 路径 | 说明 |
+|---|---|
+| [`docs/`](./docs) | 源码解析、阅读索引和专题文档 |
+| [`memory/`](./memory) | 记忆、长期上下文与会话延续相关扩展 |
+| [`@code-yeongyu/`](./@code-yeongyu) | `pi-goal`、`pi-ast-grep` 等项目 |
+| [`@narumiruna/`](./@narumiruna) | `pi-subagents`、`pi-plan-mode`、`pi-lsp`、`pi-firecrawl` 等一组高质量扩展 |
+| [`@nicobailon/`](./@nicobailon) | `pi-mcp-adapter`、`pi-intercom`、`pi-web-access` 等 |
+| [`@rpiv/`](./@rpiv) | `rpiv-web-tools`、`rpiv-btw`、`rpiv-voice` 等工具扩展 |
+| [`@tintinweb/`](./@tintinweb) | `pi-subagents`、`pi-tasks`、`pi-schedule-prompt` |
+| [`@AgwaB/`](./@AgwaB) | `pi-subagent`、`pi-workflow` |
+| [`pi-*`](./) | 独立维护的自研项目、实验项目和增强工具 |
+| [`sandbox/`](./sandbox) | guardrails、sandbox 等安全与隔离相关项目 |
+| [`未命名文件夹/`](./未命名文件夹) | 待整理项目与临时归档 |
+
+## 项目索引
 
 ### 记忆与上下文
 
-| 插件 | 描述 |
-|---|---|
-| **@jayzeng / pi-memory** | Pi 生态中最流行的记忆扩展，通过纯 Markdown 文件（含可选的语义搜索）为 Pi 提供跨会话持久记忆。 |
-| **@elpapi42 / pi-observational-memory** | 在压缩、交接和跨天工作中保持长 agent 会话的连贯性，让 Pi 会话感觉永无止境。 |
+- [`memory/pi-memory`](./memory/pi-memory)：基于 Markdown 的跨会话持久记忆
+- [`memory/pi-observational-memory`](./memory/pi-observational-memory)：在压缩、交接和跨天工作中保持会话连续性
+- [`memory/pi-hermes-memory`](./memory/pi-hermes-memory)：更偏检索和知识召回的记忆方案
 
-### 多 Agent 与子任务
+### 多 Agent、协作与工作流
 
-| 插件 | 描述 |
-|---|---|
-| **@edxeth / pi-subagents** | 高度精心编排的多 agent 框架：命名 agent、交互式面板、后台 worker、异步并行、子父通信、TUI 微件等。 |
-| **@edxeth / edxeth-pi-subagents** | 多 agent 框架早期版，支持命名 agent、交互式面板、后台 worker、异步并行等。 |
-| **@narumitw / pi-subagents** | 用 5 个固定工具将工作委托给专门化的隔离子过程 agent。 |
-| **@tintinweb / pi-subagents** | Claude Code 风格的自主子 agent，支持前台/后台运行、中途引导、恢复已完成的会话等。 |
+- [`pi-subagents`](./pi-subagents)：主仓版本的多 agent / 子任务框架
+- [`@narumiruna/pi-subagents`](./@narumiruna/pi-subagents)：用固定工具把任务委托给隔离子 agent
+- [`@tintinweb/pi-subagents`](./@tintinweb/pi-subagents)：Claude Code 风格的自主子 agent
+- [`@nicobailon/pi-subagents`](./@nicobailon/pi-subagents)：另一种多 agent 实现
+- [`@AgwaB/pi-subagent`](./@AgwaB/pi-subagent)：轻量级子 agent 项目
+- [`@AgwaB/pi-workflow`](./@AgwaB/pi-workflow)：工作流编排与技能支撑
+- [`pi-dynamic-workflows`](./pi-dynamic-workflows)：更动态的工作流实验
+- [`pi-tool-offloading`](./pi-tool-offloading)：工具调用和任务卸载方向的实验项目
+- [`@nicobailon/pi-intercom`](./@nicobailon/pi-intercom)：终端间 / agent 间通信能力
+- [`@narumiruna/pi-chat`](./@narumiruna/pi-chat)：与其他 peer 交互的聊天式扩展
 
-### 目标与计划
+### 目标、计划与任务管理
 
-| 插件 | 描述 |
-|---|---|
-| **@code-yeongyu / pi-goal** | 为 Pi 提供持久化的 `/goal` 支持，含会话作用域目标存储和 Codex 风格 TUI。 |
-| **@code-yeonyu / pi-goal** | 同上（另一个分支/镜像版本）。 |
-| **@narumitw / pi-goal** | 提供会话作用域的 `/goal` 命令、`goal_complete` 和 `goal_blocked` 工具，支持可选的队列模式。 |
-| **@narumitw / pi-plan-mode** | Codex 风格的 `/plan` 协作模式，用于只读探索和生成结构化实施计划。 |
+- [`@code-yeongyu/pi-goal`](./@code-yeongyu/pi-goal)：持久化 `/goal` 支持
+- [`@narumiruna/pi-goal`](./@narumiruna/pi-goal)：目标执行循环与状态持久化
+- [`@narumiruna/pi-plan-mode`](./@narumiruna/pi-plan-mode)：Codex 风格的只读规划模式
+- [`@narumiruna/pi-todo`](./@narumiruna/pi-todo)：多步骤任务可视化
+- [`@rpiv/rpiv-todo`](./@rpiv/rpiv-todo)：另一套 todo 工具实现
+- [`@tintinweb/pi-tasks`](./@tintinweb/pi-tasks)：结构化任务跟踪与协调
+- [`pi-kanban0`](./pi-kanban0)：项目内 Kanban，看板数据用 Markdown 存储
+- [`pi-workspace-history`](./pi-workspace-history)：围绕历史分支切换的工作区状态恢复
 
-### 安全与沙箱
+### 代码、诊断与自动化
 
-| 插件 | 描述 |
-|---|---|
-| **@aliou / pi-guardrails** | 安全检查层，防止 agent 意外读取密钥、写入受保护文件或执行危险命令。 |
-| **@RunMintOn / pi-guard-sandbox** | 高权限 OS 级沙箱，通过真实的边界强制在工作区内给予 agent 完全自由，在工作区外拦截越界行为。 |
+- [`pi-lens`](./pi-lens)：诊断、导航、结构化规则、项目映射和代理护栏
+- [`@narumiruna/pi-lsp`](./@narumiruna/pi-lsp)：通过 LSP 暴露诊断与修复能力
+- [`@code-yeongyu/pi-ast-grep`](./@code-yeongyu/pi-ast-grep)：结构化代码搜索与改写
+- [`@narumiruna/pi-chrome-devtools`](./@narumiruna/pi-chrome-devtools)：通过 CDP 控制 Chrome
+- [`@narumiruna/pi-firecrawl`](./@narumiruna/pi-firecrawl)：抓取、搜索和网页研究工具
+- [`@narumiruna/pi-github-pr`](./@narumiruna/pi-github-pr)：查看当前 PR 状态
+- [`pi-review-loop`](./pi-review-loop)：增量 diff 审查器
+- [`pi-autoresearch`](./pi-autoresearch)：自动实验循环与优化闭环
+- [`pi-transcribe`](./pi-transcribe)：语音 / 转录相关能力
+- [`pi-computer-use`](./pi-computer-use)：桌面自动化与计算机操作
 
-### 代码与开发
+### 工具增强与交互体验
 
-| 插件 | 描述 |
-|---|---|
-| **@injaneity / pi-computer-use** | 让 AI agent 能在 macOS 和 Windows 上操作桌面应用，支持查看窗口、点击、输入、滚动等操作。 |
-| **@narumitw / pi-lsp** | 通过可配置的语言服务器协议路由，暴露诊断和源码修复工具，语言无关。 |
-| **@narumitw / pi-chrome-devtools** | 通过 Chrome DevTools Protocol 提供浏览器标签检查、导航、执行 JS 和截图等自动化能力。 |
-| **@earendil-works / pi-review-loop** | 持久化的增量 diff 审查器，保持原生审查窗口，每次只显示自上次审查以来的变更。 |
-| **pi-repomap** | 代码库感知 CLI，按跨文件重要性排序的符号、项目概览和源/测试对映射。 |
-| **@MattDevy / pi-compass** | 代码库导航工具，生成结构化 codemap 和交互式代码导览。 |
+- [`@rpiv/rpiv-web-tools`](./@rpiv/rpiv-web-tools)：为 Pi 增加 `web_search`、`web_fetch`
+- [`@nicobailon/pi-mcp-adapter`](./@nicobailon/pi-mcp-adapter)：MCP 协议适配器
+- [`pi-tidy-tools`](./pi-tidy-tools)：更紧凑、更易读的工具输出体验
+- [`pi-fff`](./pi-fff)：高性能 `find` / `grep` 替代方案
+- [`pi-compact-thinking`](./pi-compact-thinking)：紧凑型 thinking 渲染
+- [`@nostalfinals pi-compact-thinking`](./@nostalfinals%20pi-compact-thinking)：同类项目的另一份归档
+- [`@narumiruna/pi-statusline`](./@narumiruna/pi-statusline)：Powerline 风格状态栏
+- [`@narumiruna/pi-btw`](./@narumiruna/pi-btw)：不中断主线的侧向提问命令
+- [`@rpiv/rpiv-btw`](./@rpiv/rpiv-btw)：`/btw` 的另一种实现
+- [`@rpiv/rpiv-ask-user-question`](./@rpiv/rpiv-ask-user-question)：结构化向用户追问
+- [`@rpiv/rpiv-voice`](./@rpiv/rpiv-voice)：语音交互相关扩展
+- [`@narumiruna/pi-tool`](./@narumiruna/pi-tool)：浏览 Pi 工具与活动工具状态
+- [`@narumiruna/pi-stamp`](./@narumiruna/pi-stamp)：为会话补充时间戳与耗时信息
+- [`@narumiruna/pi-langfuse`](./@narumiruna/pi-langfuse)：把 Pi 运行链路接入 Langfuse
+- [`pi-web`](./pi-web)：Pi 的 Web 端 / 配套前端探索
+- [`@nicobailon/pi-web-access`](./@nicobailon/pi-web-access)：Web 访问能力扩展
 
-### 工具增强
+### 安全、沙箱与隔离
 
-| 插件 | 描述 |
-|---|---|
-| **@juicesharp / rpiv-web-tools** | 为 Pi 添加 `web_search` 和 `web_fetch` 工具，支持从 10 种后端中选其一。 |
-| **@nicobailon / pi-mcp-adapter** | MCP 协议适配器，惰性加载工具、按需授权，让 Pi 可以使用 MCP 服务器而不会烧掉上下文窗口。 |
-| **@mikeyobrien / pi-tidy-tools** | 通过紧凑的、以推理为先的输出替换原生 tool card，让会话记录更易读。 |
-| **pi-fff** | 使用 Rust 原生 SIMD 加速替换内置的 `find` 和 `grep` 工具，支持模糊匹配、预索引、Git 感知等。 |
-
-### 学习与自动化
-
-| 插件 | 描述 |
-|---|---|
-| **@MattDevy / pi-continuous-learning** | 观察编码会话，从中提炼出可复用的"直觉"——带置信度评分、项目作用域的原子化学习行为。 |
-| **@tintinweb / pi-schedule-prompt** | 心跳式定时调度扩展，让 agent 可自我安排在特定时间或间隔执行的提示。 |
-| **@tintinweb / pi-tasks** | Claude Code 风格的任务跟踪和协调，支持结构化任务、依赖管理和持久化可视化微件。 |
-| **@nostalfinals / pi-compact-thinking** | 将 Pi 内置的思考块渲染器替换为紧凑的、带动画效果的思考过程预览。 |
-
-### UI 与交互
-
-| 插件 | 描述 |
-|---|---|
-| **@narumitw / pi-statusline** | Powerline 样式的底部状态栏，开箱即用且随终端宽度自适应。 |
-| **@narumitw / pi-btw** | `/btw` 侧向提问命令，用于不中断主对话的快速澄清和临时询问。 |
-| **@narumitw / pi-image-drop** | 私有环回页面，用于粘贴、拖放、选择和排序本地图片，按序附加到下一条消息中。 |
-| **@narumitw / pi-firecrawl** | 将 Firecrawl 的抓取、爬取、URL 发现和搜索 API 暴露为 Pi 工具。 |
-| **@narumitw / pi-worktree** | 安全的 Git worktree 管理，支持交互式 worktree 操作和 Pi 工作区切换。 |
-
-### 其他
-
-| 插件 | 描述 |
-|---|---|
-| **ponytail** | 将 Ponytail 的规则注入 AI agent 的会话生命周期中。 |
+- [`sandbox/pi-guardrails`](./sandbox/pi-guardrails)：防止误读密钥、误写敏感路径、误执行危险命令
+- [`sandbox/pi-guard-sandbox`](./sandbox/pi-guard-sandbox)：更强边界的工作区沙箱
+- [`sandbox/pi-sandbox`](./sandbox/pi-sandbox)：沙箱方向的另一套实现 / 实验
+- [`@narumiruna/pi-worktree`](./@narumiruna/pi-worktree)：更安全地管理 Git worktree

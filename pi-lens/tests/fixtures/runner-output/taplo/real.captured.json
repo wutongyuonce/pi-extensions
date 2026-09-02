@@ -1,0 +1,21 @@
+{
+	"provenance": {
+		"runner": "taplo",
+		"tool": "taplo",
+		"version": "0.10.0",
+		"command": "taplo check --colors never bad.toml",
+		"argv": [
+			"check",
+			"--colors",
+			"never",
+			"bad.toml"
+		],
+		"workspace": "tests/fixtures/tool-smoke/toml",
+		"platform": "win32-x64",
+		"capturedAt": "2026-08-21"
+	},
+	"file": "bad.toml",
+	"exitCode": 1,
+	"stdout": "",
+	"stderr": " INFO taplo:lint_files:collect_files: found files total=1 excluded=0 files=[\"__WORKSPACE__/bad.toml\"] cwd=\"__WORKSPACE__\"\nerror: invalid TOML\n  ┌─ __WORKSPACE__/bad.toml:2:9\n  │  \n2 │   [package\n  │ ╭────────^\n3 │ │ name = \"demo\"\n  │ ╰^ expected \"]\"\n\nERROR taplo:lint_files: invalid file error=syntax errors found path=\"__WORKSPACE__/bad.toml\"\n"
+}

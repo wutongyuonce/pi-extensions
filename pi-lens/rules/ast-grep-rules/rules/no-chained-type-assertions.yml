@@ -1,0 +1,66 @@
+id: no-chained-type-assertions
+language: TypeScript
+severity: error
+metadata:
+  category: pi-lens-self-scan
+message: "Chained type assertion (x as A as B) — stacking assertions with no runtime check between them"
+note: |
+  `x as A as B` stacks two assertions with no runtime check between
+  them, so the compiler can't verify either hop. Narrow with a type
+  guard, or assert once to the type you actually need. `as const`
+  chains are allowed — they don't launder the value's type, they just
+  freeze a literal.
+
+  2026-08-19 (refs #1718): promoted `warning` -> `error` and DROPPED the
+  `as unknown as $B` exemption as part of adopting anti-slop's
+  `no-chained-type-assertions` at its upstream strictness for the
+  shipped catalog. anti-slop's own rule (dmmulroy/anti-slop,
+  src/rules/no-chained-type-assertions.ts) treats `as unknown as` as a
+  forbidden chain too — routing a cast through `unknown` still discards
+  the original type's evidence, it just discards it in two hops instead
+  of one. The earlier note here argued `as unknown as` was the
+  TypeScript-endorsed safe-cast idiom (no-as-any.yml's own
+  recommendation) and cited a 22-hit FP scan where every chained-assertion
+  hit in pi-lens's own tree was that form — that FP-load argument is
+  still true, but it is an argument for pi-lens's OWN code, and this
+  catalog ships to other repositories. Users get the stricter upstream
+  form; pi-lens's own ~22 `as unknown as` chains stay non-conforming
+  until #1718 designs a self-scan baseline (or a follow-up narrows this
+  rule back down) — the same trade the audit made for every hint-tier
+  row in this PR: adopt the useful pattern for the product without
+  forcing pi-lens's own history to retroactively conform in the same PR.
+
+  2026-08-20 (review round, refs #1718): `error` severity is semantic-
+  blocking (ast-grep-napi.ts:699) with no independent escape valve — a
+  caller who follows the sibling `require-safety-comment-for-as-unknown-as.yml`
+  hint and adds a `SAFETY:` comment still hit a hard block, because the
+  two rules were wired independently. Fixed by giving THIS rule its own
+  `SAFETY:` exemption for the `as unknown as` arm specifically (the same
+  relational check — `follows`/`inside` a preceding comment matching
+  `SAFETY\s*:` — as the sibling hint rule, so a commented site satisfies
+  both at once). A genuine two-concrete-type chain (`x as A as B`, no
+  `unknown` hop) gets NO escape valve: that shape has no legitimate
+  reading upstream or here, so it stays hard-blocked. The two rules are
+  now a coherent pair: an uncommented `as unknown as` chain is a hard
+  error; a `SAFETY:`-commented one is clean; the hint rule keeps
+  teaching the convention on every OTHER assertion form.
+
+  2026-08-20 (refs #1727, #1777): the `as unknown as` arm is REMOVED from
+  this rule and delegated wholly to
+  `require-safety-comment-for-as-unknown-as.yml`, which was promoted to
+  `error` in the same change. The two rules previously matched the exact
+  same site list — verified identical on four corpora (16/16 pi-lens
+  `clients/`, 182/182 pi core, 194/194 opencode, and 1803 of this rule's
+  1849 oh-my-pi hits) — so every uncommented `x as unknown as T` raised
+  TWO diagnostics for one defect, one of them semantic-blocking. They now
+  partition the space: that rule owns the `unknown` hop and carries the
+  `SAFETY:` escape valve; this rule owns the concrete `x as A as B`
+  chain, which keeps NO escape valve because it has no legitimate
+  reading. Residual census for the concrete arm alone (2026-08-20):
+  pi-lens 0, pi core 0, opencode 0, oh-my-pi 46. Tagged
+  `metadata.category: pi-lens-self-scan` so CI holds pi-lens's own tree
+  at that zero.
+rule:
+  all:
+    - pattern: $X as $A as $B
+    - not: { pattern: $X as unknown as $B }

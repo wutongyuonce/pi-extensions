@@ -1,0 +1,25 @@
+{
+  "type": "object",
+  "required": [
+    "schema",
+    "digest",
+    "implementationMap"
+  ],
+  "properties": {
+    "schema": {
+      "type": "string",
+      "minLength": 1
+    },
+    "digest": {
+      "type": "string",
+      "minLength": 1
+    },
+    "implementationMap": {
+      "type": "array",
+      "items": {
+        "type": "object"
+      },
+      "maxItems": 60
+    }
+  }
+}

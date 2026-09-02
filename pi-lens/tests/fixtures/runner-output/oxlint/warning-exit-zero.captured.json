@@ -1,0 +1,20 @@
+{
+	"provenance": {
+		"runner": "oxlint",
+		"tool": "oxlint",
+		"version": "1.79.0",
+		"command": "oxlint --format json bad.js",
+		"argv": [
+			"--format",
+			"json",
+			"bad.js"
+		],
+		"workspace": "tests/fixtures/tool-smoke/js-oxlint-warning",
+		"platform": "win32-x64",
+		"capturedAt": "2026-08-21"
+	},
+	"file": "bad.js",
+	"exitCode": 0,
+	"stdout": "{ \"diagnostics\": [{\"message\": \"Variable 'unused' is declared but never used. Unused variables should start with a '_'.\",\"code\": \"eslint(no-unused-vars)\",\"severity\": \"warning\",\"url\": \"https://oxc.rs/docs/guide/usage/linter/rules/eslint/no-unused-vars.html\",\"help\": \"Consider removing this declaration.\",\"filename\": \"bad.js\",\"labels\": [{\"label\": \"'unused' is declared here\",\"span\": {\"offset\": 188,\"length\": 6,\"line\": 4,\"column\": 8}}]}],\n              \"number_of_files\": 1,\n              \"number_of_rules\": 96,\n              \"threads_count\": 16,\n              \"start_time\": 0.606185\n            }\n            ",
+	"stderr": ""
+}

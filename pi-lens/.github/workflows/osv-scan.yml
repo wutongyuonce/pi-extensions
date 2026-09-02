@@ -1,0 +1,111 @@
+name: OSV scan
+
+# #1844: advisory dependency-vulnerability sweep. Split out of lint.yml into
+# its own file (rather than a job there) so a problem specific to this one
+# check -- e.g. the third-party reusable workflow it calls -- can't take
+# down the actionlint/PR-title/markdownlint jobs, which are unrelated and
+# have no such external dependency.
+
+on:
+  schedule:
+    # Weekly sweep for advisories against dependencies already in the
+    # lockfile, not just ones a PR happens to touch.
+    - cron: "0 6 * * 1"
+  pull_request:
+    branches: [master]
+  workflow_dispatch: {}
+
+permissions: {}
+
+jobs:
+  # Gates the PR-triggered scan to PRs that actually touch the lockfile.
+  # "changed_files_names" is not a real event-payload field, so this uses
+  # git diff against the PR's base SHA instead. Always runs (no job-level
+  # `if`) so schedule/workflow_dispatch triggers -- which have no PR to
+  # diff -- aren't skipped as an unmet `needs` dependency downstream.
+  detect-lockfile-change:
+    name: Detect lockfile change
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      changed: ${{ steps.diff.outputs.changed }}
+    steps:
+      # Pin to the PR's own head commit, NOT the default checkout ref. For
+      # pull_request events, actions/checkout defaults to GitHub's synthetic
+      # refs/pull/N/merge commit (base branch's CURRENT tip merged with the
+      # PR). Diffing that synthetic HEAD against the PR's recorded (and
+      # potentially stale, once the PR falls BEHIND) base.sha then picks up
+      # every change master accumulated in between as if the PR had made it
+      # -- caught in review verification: this PR doesn't touch
+      # package-lock.json, but the gate still fired because master gained an
+      # unrelated lockfile change after this branch was cut. Pinning `ref`
+      # to head.sha makes HEAD the PR's real, stable branch tip.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        if: github.event_name == 'pull_request'
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+
+      - id: diff
+        run: |
+          set -eu
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            # Non-PR triggers (schedule, workflow_dispatch) always run the
+            # full scan; the gate only applies to PRs.
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git fetch --depth=1 origin "${{ github.event.pull_request.base.sha }}"
+          if git diff --name-only "${{ github.event.pull_request.base.sha }}" HEAD -- package-lock.json | grep -qx package-lock.json; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  osv-scan:
+    name: OSV scan (advisory)
+    needs: [detect-lockfile-change]
+    if: needs.detect-lockfile-change.outputs.changed == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    # Advisory to start (see PR body / #1844): this job is NOT wired into
+    # required-checks branch protection, so it never blocks a merge on its
+    # own. That's exactly why it must NOT use continue-on-error -- a real
+    # finding should show as a red advisory check a reviewer can see and
+    # choose to act on, not a silently-green one (#1917 review F2).
+    steps:
+      # Same head.sha pin as detect-lockfile-change, and for the same
+      # reason: scan the PR's own lockfile, not a merge-drifted one that
+      # would make the result move whenever master changes independently of
+      # this PR. On schedule/workflow_dispatch there's no PR head, so this
+      # falls back to the default (current branch tip).
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || '' }}
+          persist-credentials: false
+
+      # Pinned release + checksum verification, matching the actionlint job
+      # in lint.yml -- no third-party GitHub Action, no unpinned install
+      # script piped to a shell.
+      - name: Download and verify osv-scanner v2.5.1 (linux_amd64)
+        run: |
+          set -eu
+          curl -sLO --proto '=https' --tlsv1.2 https://github.com/google/osv-scanner/releases/download/v2.5.1/osv-scanner_linux_amd64
+          echo "f9f25499a2c8cc367b3af45df2ea7eeca7fbccceab9c35079968f4b3652194be  osv-scanner_linux_amd64" | sha256sum -c -
+          chmod +x osv-scanner_linux_amd64
+
+      # Markdown-format output is written straight to the job summary so a
+      # finding is visible from the PR's checks tab without opening logs
+      # (#1917 review F2). The scan itself still exits non-zero on a real
+      # finding -- captured via $? (not piped, so no PIPESTATUS needed) and
+      # re-raised after the summary write so the job reports red.
+      - name: Scan package-lock.json
+        run: |
+          set +e
+          ./osv-scanner_linux_amd64 --format=markdown --lockfile=./package-lock.json > osv-scan-result.md
+          status=$?
+          set -e
+          cat osv-scan-result.md >> "$GITHUB_STEP_SUMMARY"
+          exit "$status"

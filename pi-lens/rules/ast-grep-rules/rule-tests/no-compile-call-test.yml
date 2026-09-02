@@ -1,0 +1,38 @@
+id: no-compile-call
+valid:
+  - "tree = ast.parse(static_source)"
+  - "import ast; ast.literal_eval(data)"
+  - "code = compile('print(1)', '<static>', 'exec')"
+  - "code = compile(ast.parse(source), '<cell>', 'exec')"
+  - |
+    def f(source):
+        module = ast.parse(source, "<cell>", "exec")
+        return compile(module, "<cell>", "exec")
+  - |
+    def f(source):
+        module = ast.parse(source, "<cell>", "exec")
+        body_module = ast.Module(body=module.body[:-1], type_ignores=[])
+        return compile(body_module, "<cell>", "exec")
+  - |
+    # Known, accepted miss (review round, refs #1806): the trust check
+    # is same-scope/same-name, ANY ORDER — it can't see that `module`
+    # is reassigned to untrusted input AFTER the ast.parse() line.
+    # ast-grep's relational rules can't express statement ordering, only
+    # ancestor/descendant/sibling existence, so this is a documented
+    # false negative rather than a silent one.
+    def f(source):
+        module = ast.parse(source, "<cell>", "exec")
+        module = user_input
+        return compile(module, "<cell>", "exec")
+invalid:
+  - "code = compile(user_input, '<user>', 'exec')"
+  - "obj = compile(request.body, '<user>', 'exec')"
+  - "code = compile(data + suffix, '<user>', 'exec')"
+  - "code = compile(get_source(), '<user>', 'exec')"
+  - "code = compile(user_input)"
+  - |
+    def outer():
+        module = ast.parse(source, "<cell>", "exec")
+        def inner(module):
+            return compile(module, "<cell>", "exec")
+        return inner

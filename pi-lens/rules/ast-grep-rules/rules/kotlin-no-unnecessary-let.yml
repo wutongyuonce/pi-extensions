@@ -1,0 +1,28 @@
+# Kotlin No unnecessary let
+# Detects `.let { }` called on a receiver without a preceding safe-call `?.`.
+# Ported from vinhnx/VTCode rules/kotlin/no-unnecessary-let.yml (#2198, refs #2195).
+id: kotlin-no-unnecessary-let
+language: kotlin
+severity: warning
+message: "let on a non-null-checked receiver adds indirection; use the value directly"
+note: |
+  `.let { }` exists to scope a null-safe transform after `?.`. Calling it on
+  a receiver that is already known non-null (no `?.`) just renames the
+  receiver to `it` inside a lambda, adding a level of nesting with no
+  null-safety benefit.
+  Detection-only: the receiver's own nullability is not tracked here, and
+  `.let` also has legitimate uses for scoping a mutable local or chaining a
+  builder, which this pattern cannot distinguish from the redundant case.
+rule:
+  pattern: $RECEIVER.let { $$$BODY }
+files:
+  - "**/*.kt"
+tags:
+  - kotlin
+  - idiom
+  - readability
+examples:
+  bad: |
+    val length = name.let { it.length }
+  good: |
+    val length = name.length

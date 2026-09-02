@@ -1,0 +1,40 @@
+# yamllint config (dogfood activation, refs #1844). Scopes yamllint to the
+# YAML a human actually maintains here — GitHub Actions workflows and
+# top-level config — and tunes rules so the CURRENT tree passes at error
+# severity. Warnings stay on as advisories (same "downgrade, don't mass-edit
+# source" precedent as .oxlintrc.json and typos.toml in this same PR).
+extends: default
+
+ignore: |
+  node_modules/
+  # Rule-pack YAML is pi-lens's own bespoke DSL (id/severity/pattern
+  # fields), governed by scripts/validate-rule-catalog.mjs and
+  # scripts/audit-astgrep-rule-pairs.mjs, not generic prose-config style —
+  # plus it includes the vendored CodeRabbit pack (AGENTS.md "Rule
+  # catalogs"), which is not ours to reformat.
+  rules/ast-grep-rules/
+  rules/tree-sitter-queries/
+  # Vendored Vale style packages (.vale.ini's own StylesPath), same
+  # not-ours-to-reformat reasoning.
+  .vale/styles/
+  # Runner fixtures intentionally exercise malformed/unusual YAML.
+  tests/fixtures/
+
+rules:
+  line-length:
+    # GitHub Actions `run:`/`if:` lines routinely exceed 80 columns (up to
+    # 253 in this tree's workflows) — a style choice this repo hasn't made,
+    # not a real defect. Same precedent as the oxlint/typos configs in this
+    # PR: downgrade to advisory rather than raise the threshold and lose the
+    # check's ability to flag a genuinely runaway line.
+    level: warning
+  document-start:
+    # Existing workflows and config YAML don't start with `---`; not worth
+    # a mass rewrite to satisfy a style preference this repo hasn't made.
+    present: false
+  truthy:
+    # GitHub Actions' `on:` trigger key is the canonical yamllint false
+    # positive for workflow files (YAML 1.1 treats "on" as boolean).
+    # check-keys: false stops MAP KEYS being truthy-checked while still
+    # catching a genuine bare yes/no/on VALUE elsewhere.
+    check-keys: false
