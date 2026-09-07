@@ -1,0 +1,39 @@
+{
+  "name": "pi-zen-mode",
+  "version": "0.2.4",
+  "description": "Distraction-free focus mode for Pi: hide thinking and tools, words still stream.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/wutongyuonce/pi-zen-mode.git"
+  },
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "focus-mode",
+    "zen",
+    "tui"
+  ],
+  "files": [
+    "zen-mode.ts",
+    "img",
+    "README.md",
+    "README.en.md",
+    "DESIGN.md",
+    "LICENSE"
+  ],
+  "pi": {
+    "extensions": [
+      "./zen-mode.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
