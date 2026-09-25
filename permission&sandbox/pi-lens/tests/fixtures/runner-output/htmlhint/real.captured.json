@@ -1,0 +1,22 @@
+{
+	"provenance": {
+		"runner": "htmlhint",
+		"tool": "htmlhint",
+		"version": "1.9.2",
+		"command": "htmlhint --rules tag-pair,attr-no-duplication,tagname-lowercase,spec-char-escape,id-unique --format unix bad.html",
+		"argv": [
+			"--rules",
+			"tag-pair,attr-no-duplication,tagname-lowercase,spec-char-escape,id-unique",
+			"--format",
+			"unix",
+			"bad.html"
+		],
+		"workspace": "tests/fixtures/tool-smoke/html",
+		"platform": "win32-x64",
+		"capturedAt": "2026-08-22"
+	},
+	"file": "bad.html",
+	"exitCode": 1,
+	"stdout": "__WORKSPACE__\\bad.html:6:5: Tag must be paired, missing: [ </div> ], start tag match failed [ <div> ] on line 6. [error/tag-pair]\n\n\u001b[31m1 problems\u001b[39m\n",
+	"stderr": ""
+}

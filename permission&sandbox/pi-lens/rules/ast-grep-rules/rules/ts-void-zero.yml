@@ -1,0 +1,15 @@
+id: ts-void-zero
+language: typescript
+severity: warning
+message: void 0 for undefined - use undefined directly
+metadata:
+  weight: 2
+  category: slop
+note: |
+  Replacing `void 0` with `undefined` can change behavior when a local binding
+  shadows `undefined`. Shadowing `undefined` is itself a defect, and this fix
+  does not attempt to detect it.
+rule:
+  kind: unary_expression
+  pattern: "void 0"
+fix: undefined

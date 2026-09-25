@@ -1,0 +1,17 @@
+=== context message the agent receives ===
+[pi-lens automated check — not a user request] Address 🔴 blockers before continuing; ℹ️ advisories are informational only.
+
+🔴 STOP — hardcoded secrets detected. Rotate the credentials and remove them from source:
+  src/live.ts:1 — aws-access-token [gitleaks + ast-grep]: AWS key
+  src/dep.ts:1 — aws-secret-access-key [trivy]
+
+
+🔑 ACTION NEEDED — secrets were flagged in files that changed after the scan. [stale — re-run to confirm]
+The cached line numbers are no longer trustworthy, so they are withheld. Re-run a secrets scan to confirm or clear these:
+  src/edited.ts — generic-api-key [gitleaks]
+
+
+ℹ️ Advisory — no action required this turn:
+suppressed by disposition: 1 finding(s) dropped from this turn's gitleaks/govulncheck/trivy sections (gitleaks 1) (marked false-positive or won't-fix).
+
+keep working

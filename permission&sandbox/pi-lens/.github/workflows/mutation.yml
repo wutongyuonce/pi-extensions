@@ -1,0 +1,45 @@
+name: Mutation diff
+
+on:
+  pull_request:
+    branches: [master]
+
+permissions: {}
+
+jobs:
+  mutation:
+    name: mutation (advisory)
+    runs-on: ubuntu-latest
+    # refs #3123: bounds a hang against GitHub's 360-min default. This job runs
+    # on pull_request so --branch master matched no runs; measured max over the
+    # last 8 successful runs regardless of branch: 2184s (36m24s, run 35117203202,
+    # the stryker-diff.mjs step itself); sized at ~2x + margin.
+    timeout-minutes: 90
+    continue-on-error: true
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
+        with:
+          node-version: "22"
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - run: npm run build
+      # The driver mutates only the diff's changed lines and bounds its Stryker
+      # child at MUTATION_BUDGET_MINUTES (60), which must stay strictly below
+      # this job's timeout-minutes (90): run 36098718085 was cancelled by the
+      # runner at the cap, so the driver never regained control and its
+      # "no mutants evaluated" report never printed. The 30-minute margin covers
+      # npm ci, npm run build, Stryker's in-place sandbox restore on SIGTERM, and
+      # the report upload. tests/scripts/stryker-diff.test.ts pins the relation.
+      - run: node scripts/stryker-diff.mjs --base "origin/${{ github.base_ref }}" --max-files 6
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: always()
+        with:
+          name: mutation-report
+          path: reports/mutation/mutation.json
+          if-no-files-found: ignore

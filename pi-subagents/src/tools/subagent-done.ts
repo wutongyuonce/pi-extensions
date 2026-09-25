@@ -6,7 +6,7 @@ import {
 	shouldAutoExitOnAgentEnd,
 	shouldMarkUserTookOver,
 } from "../auto-exit.ts";
-import { PI_SUBAGENT_APPEND_SYSTEM_PROMPT } from "../launch/append-system.ts";
+import { applyChildSystemPromptOverrides } from "./child-system-prompt.ts";
 import { getPublishedRunningSubagentCount } from "../runtime/nested-lifecycle.ts";
 import { installSubagentContextReminders } from "./context-reminders.ts";
 import { createExitSignalWriter } from "./exit-signal.ts";
@@ -15,11 +15,11 @@ import { type FinalContextSnapshot, getFinalContextSnapshot } from "./final-cont
 import { isMissingOptionalDependency, optionalRequire } from "./optional-dependency.ts";
 import { ProviderErrorRecoveryController, resolveProviderRecoveryDelaysMs } from "./provider-error-recovery.ts";
 import { registerSetTabTitleTool, shouldRegisterSetTabTitleTool } from "./set-tab-title.ts";
-import { CALLER_PING_TOOL_NAME, SUBAGENT_DONE_TOOL_NAME, SUBAGENT_LAUNCH_TOOL_NAMES } from "./tool-names.ts";
+import { createCallerPingState, registerCallerPingTool, rearmCallerPingExitAfterReenable, suppressCallerPingExit } from "./caller-ping.ts";
+import { SUBAGENT_DONE_TOOL_NAME, SUBAGENT_LAUNCH_TOOL_NAMES } from "./tool-names.ts";
 
 const TOOL_BOUNDARY_RECOVERY_NUDGE = "continue";
 const MAX_CONSECUTIVE_TOOL_BOUNDARY_ENDS = 3;
-
 export function isMissingOptionalDependencyForTest(error: unknown, id: string): boolean {
 	return isMissingOptionalDependency(error, id);
 }
@@ -101,26 +101,14 @@ export default function (pi: ExtensionAPI) {
 	const doneParams = typebox?.Type?.Object
 		? typebox.Type.Object({})
 		: { type: "object", properties: {}, additionalProperties: false };
-	const callerPingParams = typebox?.Type?.Object
-		? typebox.Type.Object({
-				message: typebox.Type.String({
-					description: "What you need help with",
-				}),
-			})
-		: {
-				type: "object",
-				properties: {
-					message: { type: "string", description: "What you need help with" },
-				},
-				required: ["message"],
-				additionalProperties: false,
-			};
-
 	const autoExit = process.env.PI_SUBAGENT_AUTO_EXIT === "1";
 	const isInteractive = !!process.env.PI_SUBAGENT_SURFACE;
 	const denied: string[] = getDeniedToolNames(autoExit);
 	let outputTokens = 0;
 	let finalContextUsage: FinalContextSnapshot | undefined;
+	// Factory-scoped because the takeover machinery that suppresses it lives
+	// inside the `if (autoExit)` block, while caller_ping registers outside it.
+	const callerPingState = createCallerPingState();
 	const contextReminders = installSubagentContextReminders(pi);
 	installSubagentTimeoutReminders(pi);
 
@@ -268,11 +256,7 @@ export default function (pi: ExtensionAPI) {
 
 	pi.on("before_agent_start", (event) => {
 		enforceDeniedTools();
-		const appendSystemPrompt = process.env[PI_SUBAGENT_APPEND_SYSTEM_PROMPT]?.trim();
-		if (!appendSystemPrompt) return;
-		return {
-			systemPrompt: `${event.systemPrompt}\n\n${appendSystemPrompt}`,
-		};
+		return applyChildSystemPromptOverrides(event);
 	});
 
 	pi.on("message_end", (event, ctx) => {
@@ -350,6 +334,7 @@ export default function (pi: ExtensionAPI) {
 		) => {
 			const alreadyDisabled = autoExitDisabledByOperator;
 			autoExitDisabledByOperator = true;
+			suppressCallerPingExit(callerPingState);
 			if (alreadyDisabled) return;
 			if (!isInteractive) return;
 			ctx.ui.setStatus(AUTO_EXIT_STATUS_KEY, AUTO_EXIT_DISABLED_MSG);
@@ -518,47 +503,18 @@ export default function (pi: ExtensionAPI) {
 				}
 				autoExitDisabledByOperator = false;
 				autoExitReArmed = true;
+				rearmCallerPingExitAfterReenable(callerPingState);
 				ctx.ui.setStatus(AUTO_EXIT_STATUS_KEY, undefined);
 				ctx.ui.notify("Auto-exit re-enabled — will close after next response.", "info");
 			},
 		});
 	}
 
-	// caller_ping is registered for most agents as an escape hatch.
-	// Only interactive agents with autoExit: false don't get it —
-	// the operator is in the pane and can handle things directly.
 	if (!isInteractive || autoExit) {
-		pi.registerTool({
-			name: CALLER_PING_TOOL_NAME,
-			label: "Caller Ping",
-			description:
-				"Ask the launching chat for help, send your message there, then close this helper session. " +
-				"The launching chat can later send follow-up instructions to continue this helper.",
-			parameters: callerPingParams,
-			async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-				const sessionFile = process.env.PI_SUBAGENT_SESSION;
-				if (!sessionFile) {
-					throw new Error(
-						"caller_ping is only available in subagent contexts. " +
-							"PI_SUBAGENT_SESSION environment variable is not set.",
-					);
-				}
-
-				writeExitSignal(
-					{
-						type: "ping",
-						name: process.env.PI_SUBAGENT_NAME ?? "subagent",
-						message: params.message,
-						outputTokens,
-					},
-					{ supersede: true },
-				);
-				requestShutdown(ctx);
-				return {
-					content: [{ type: "text", text: "Ping sent. Parent will be notified." }],
-					details: {},
-				};
-			},
+		registerCallerPingTool(pi, callerPingState, {
+			writeExitSignal,
+			requestShutdown,
+			getOutputTokens: () => outputTokens,
 		});
 	}
 

@@ -1,0 +1,36 @@
+{
+  "name": "pi-guard-sandbox",
+  "version": "0.3.0",
+  "description": "A lightweight OS-level guard for Pi: agents stay useful, sensitive paths stay blocked, and writes stay inside the workspace you allow. No container overhead. No workflow drama.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/RunMintOn/pi-gaurd-sandbox.git"
+  },
+  "homepage": "https://github.com/RunMintOn/pi-gaurd-sandbox#readme",
+  "bugs": {
+    "url": "https://github.com/RunMintOn/pi-gaurd-sandbox/issues"
+  },
+  "keywords": [
+    "pi-package"
+  ],
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "test": "node --test ./test/*.test.mjs",
+    "sync:readme": "node ./scripts/sync-readme.mjs",
+    "prepack": "npm run sync:readme"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ],
+    "image": "https://raw.githubusercontent.com/RunMintOn/pi-gaurd-sandbox/main/1image.png"
+  },
+  "dependencies": {
+    "@pondwader/socks5-server": "^1.0.10",
+    "commander": "^12.1.0",
+    "lodash-es": "^4.17.23",
+    "shell-quote": "^1.8.3",
+    "zod": "^3.24.1"
+  }
+}

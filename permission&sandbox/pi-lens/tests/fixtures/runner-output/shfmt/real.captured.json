@@ -1,0 +1,19 @@
+{
+	"provenance": {
+		"runner": "shfmt",
+		"tool": "shfmt",
+		"version": "3.13.1",
+		"command": "shfmt --diff bad.sh",
+		"argv": [
+			"--diff",
+			"bad.sh"
+		],
+		"workspace": "tests/fixtures/tool-smoke/shell",
+		"platform": "win32-x64",
+		"capturedAt": "2026-08-21"
+	},
+	"file": "bad.sh",
+	"exitCode": 1,
+	"stdout": "diff bad.sh.orig bad.sh\n--- bad.sh.orig\n+++ bad.sh\n@@ -3,5 +3,5 @@\n # info severity, #213); shfmt flags the non-canonical body indentation below.\n files=$(ls)\n for f in $files; do\n-echo $f\n+  echo $f\n done\n",
+	"stderr": ""
+}

@@ -1,0 +1,9 @@
+{
+	"name": "pi-lens-native-ts7-vitest-fixture",
+	"private": true,
+	"type": "module",
+	"devDependencies": {
+		"typescript": "^7.0.2",
+		"vitest": "^4.1.1"
+	}
+}

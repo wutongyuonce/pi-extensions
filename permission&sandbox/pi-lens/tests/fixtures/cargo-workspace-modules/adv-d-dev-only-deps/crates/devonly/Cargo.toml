@@ -1,0 +1,13 @@
+[package]
+name = "adv-d-devonly"
+version = "0.1.0"
+edition = "2021"
+
+[dev-dependencies]
+mockall = "0.11"
+
+[build-dependencies]
+cc = "1.0"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

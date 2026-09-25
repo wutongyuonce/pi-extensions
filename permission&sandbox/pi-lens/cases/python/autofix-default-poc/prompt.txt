@@ -1,0 +1,11 @@
+Turn this into a tiny Python helper-based invoice example.
+
+Requirements:
+1. Keep pyproject.toml as-is.
+2. Work only inside src/.
+3. Create src/helpers.py exporting `format_invoice_label(invoice_id: str) -> str`.
+4. Update src/main.py to use that helper and expose `demo_total` as an int.
+5. Preserve existing imports unless pi-lens/default tooling changes them for you as part of fixing surfaced issues.
+6. Fix any diagnostics pi-lens surfaces while you work.
+7. Do not add dependencies.
+8. End with a short summary of what you changed.

@@ -1,0 +1,15 @@
+id: kotlin-no-nullable-boolean
+valid:
+  - |
+    fun isEligible(): Boolean = false
+  - |
+    class Foo {
+        var count: Int? = null
+    }
+invalid:
+  - |
+    fun isEligible(): Boolean? = null
+  - |
+    class Foo {
+        var flag: Boolean? = null
+    }

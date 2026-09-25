@@ -4,11 +4,39 @@ All notable changes to the `pi-intercom` extension will be documented in this fi
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-09-23
+
+### Highlights
+- Coordinate with other sessions from scripts or over SSH using the new command-line client.
+- Keep messages from interrupting your input with optional human-first delivery.
+- Find sessions more easily with Herdr locations and a shorter session list.
+- Messages arriving during compaction now reach their destination afterward.
+
 ### Added
-- Added `/alias <name>` plus the interactive `/alias` and `/alias menu` forms for naming the current session. The alias is published immediately and reused by existing intercom list, send, reply, overlay, and incoming-message displays. Thanks to [@yceachan](https://github.com/yceachan) for issue #122.
+- Added a command-line client with `list`, `send`, and `ask` commands for scripts and coordination over SSH. Thanks to [@pinion05](https://github.com/pinion05) for #131 and issue #130.
+- Added opt-in `busyDelivery: "human-first"` to hold peer messages while you're typing and deliver them at turn boundaries. The default behavior is unchanged. Thanks to [@SiebertLanhove](https://github.com/SiebertLanhove) for #128.
+- Extensions can use the `intercom:session-identity` event to give a session a fixed ID without changing its readable name. Thanks to [@Q-xuan](https://github.com/Q-xuan) for raising the readable child name problem in nicobailon/pi-subagents#2432.
+- `list` now shows the workspace, tab, and pane for sessions hosted in Herdr. Thanks to [@odfalik](https://github.com/odfalik) for #129.
+
+### Changed
+- `list` and `list-cwd` show a one-line summary in the TUI; expand it to see every session. The model still sees the full list. Thanks to [@SiebertLanhove](https://github.com/SiebertLanhove) for #127.
 
 ### Fixed
-- Write the hidden Windows broker launcher as UTF-16LE with a BOM and explicitly select the VBScript engine so startup works with non-ASCII paths and WSH configurations that cannot infer `.vbs`. Thanks to [@maelo1028](https://github.com/maelo1028) for issue #121 and [@Agustin-Prieto](https://github.com/Agustin-Prieto) for issue #123.
+- Messages held for delivery now report when they're queued or dropped, including after cancellation, supersession, a reply, or session shutdown.
+- Messages arriving during compaction are delivered afterward instead of being lost. Thanks to [@alexjc](https://github.com/alexjc) for #133.
+
+## [0.13.0] - 2026-09-02
+
+### Highlights
+- You can now give the current session a friendly alias from pi-intercom.
+- Aliases show up right away in the session list, messages, replies, overlays, and incoming-message displays.
+- Windows broker startup is more reliable with non-ASCII profile paths and stricter Windows Script Host setups.
+
+### Added
+- Added `/alias <name>` plus the interactive `/alias` and `/alias menu` forms for naming the current session. Thanks to [@yceachan](https://github.com/yceachan) for issue #122.
+
+### Fixed
+- Fixed hidden Windows broker startup when the user profile path contains non-ASCII characters or Windows Script Host cannot infer the VBScript engine. Thanks to [@maelo1028](https://github.com/maelo1028) for issue #121 and [@Agustin-Prieto](https://github.com/Agustin-Prieto) for issue #123.
 
 ## [0.12.1] - 2026-08-29
 

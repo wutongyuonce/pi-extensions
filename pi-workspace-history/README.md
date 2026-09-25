@@ -87,6 +87,8 @@ This plugin is built around the following concrete requirements:
   - Protect manual changes before the next prompt is sent
 
 - Workspace restore through `/tree`
+  - When the current and target snapshots are available, current managed files have no unsnapshotted changes, and both snapshots contain the same managed files, navigation skips the mode choice and keeps files in place while anchoring them to the new branch. A clean workspace alone does not mean an older snapshot has the same files.
+  - Otherwise the choice remains; ordinary interactive tree navigation explains whether target files differ, current files have unsnapshotted changes, or the comparison could not be completed. Branch summaries and pending recovery keep their existing flow.
   - Choose whether to restore the matching workspace state after selecting a history node
   - Applies to `/tree` and Pi's double-Escape tree shortcut
   - Supports moving between historical branches
@@ -106,19 +108,24 @@ This plugin is built around the following concrete requirements:
 
 The plugin stores snapshots in an internal shadow git repository instead of relying on the user's project `.git` history.
 
+The same file-history workflow works in Git repositories, Jujutsu repositories, and colocated Git/Jujutsu repositories. Repository metadata (`.git/` and `.jj/`) is never snapshotted or restored. Consequently, workspace undo restores file contents but does not rewind Git commits, branches, or the index, nor Jujutsu commits, bookmarks, or operations. After an undo, `git status` or `jj status` may show the restored files as working-copy changes; use the VCS's own recovery commands when repository history must also change.
+
+The extension still requires the Git executable for its private shadow repository, including when the workspace itself uses only Jujutsu.
+
 A single undo unit lasts from the original prompt until Pi reports that the agent is settled. Intermediate tool rounds receive their own tree anchors, but queued input never replaces the operation's original prompt or `before` snapshot. One `/undo` therefore removes the complete result of a multi-round operation, and `/redo` restores it as a unit.
 
 For conversation-only navigation without a branch summary, the plugin first resolves any pending recovery from an earlier interrupted restore. If files changed after that interrupted restore, those later edits are kept automatically. The plugin then snapshots the current files before moving the conversation and uses the snapshot as the seed of the continued history branch. Once the conversation continues, its normal visible message nodes restore that kept workspace state through `/tree`. Cancelling the choice leaves both conversation and workspace unchanged. In non-interactive modes, navigation keeps the previous combined conversation-and-workspace behavior.
 
 Default snapshot scope:
 
-- Git tracked files
-- Untracked files that are not ignored
+- Files already managed by the internal shadow repository
+- New files that are not ignored
 - Paths matched by the workspace `.gitignore` are filtered out even if they were previously snapshotted
 
 Default exclusions:
 
 - `.git/`
+- `.jj/`
 - `.pi/workspace-history/`
 - `node_modules/`
 - `dist/`
@@ -136,7 +143,7 @@ During restore, the plugin restores only the managed file set instead of doing a
 
 On Windows, restore operations retry briefly locked managed files. If a lock persists, navigation is cancelled without skipping the file and the notification identifies the Git file operation that failed. Pending recovery survives a session or extension reload; edits made after the failed restore are never overwritten automatically and can be preserved with `/checkpoint`.
 
-The plugin validates each session's shadow repository before using it. If the current session repository or the workspace reusable repository is invalid, it is preserved beside the replacement as `repo.git.invalid-<timestamp>-<uuid>` and a usable repository is rebuilt automatically. Snapshotting then continues normally, but older snapshots stored only in the invalid repository may be unavailable. Invalid repositories belonging to other sessions are skipped without modifying them.
+The plugin validates each session's shadow repository before using it. If a validated repository disappears while the session is still running, the missing repository is detected and rebuilt automatically. If the current session repository or the workspace reusable repository is invalid, it is preserved beside the replacement as `repo.git.invalid-<timestamp>-<uuid>` before rebuilding. Snapshotting then continues normally, but older snapshots stored only in the missing or invalid repository may be unavailable. Invalid repositories belonging to other sessions are skipped without modifying them.
 
 ## Configuration
 
@@ -164,24 +171,30 @@ Settings:
   - Default: `~/.pi/agent/state/workspace-history`
   - Must be outside the workspace. If it is the workspace itself or a descendant, the plugin is disabled even when `enabled` is `true`, and no history directory is created there.
 - `workspaceHistory.maxSessionsPerWorkspace`
-  - Keep only the most recently used sessions per workspace
+  - Target the total number of stored sessions per workspace by removing the least recently used inactive sessions
+  - Active sessions are never removed, so the total may temporarily exceed this limit
   - Default: `3`
 - `workspaceHistory.maxWorkspaces`
-  - Keep only the most recently used workspaces globally
+  - Target the total number of stored workspaces globally by removing the least recently used inactive workspaces
+  - Workspaces containing active sessions are never removed, so the total may temporarily exceed this limit
   - Default: `10`
 - `workspaceHistory.enabled`
   - `auto` (default) enables the plugin when the current directory or an ancestor contains a declared project marker
-  - `true` forces it on
+  - In automatic mode with project markers required, a directory without its own `.git` or `.jj` is skipped when at least two immediate non-hidden child directories are repositories
+  - This multi-repo container check is shallow and bounded; if it cannot finish confidently, workspace history stays enabled
+  - `true` forces it on, including for multi-repo container directories
   - `false` disables it completely
 - `workspaceHistory.allowHomeDirectory`
   - Allow enabling in the user home directory
   - Default: `false`
 - `workspaceHistory.requireProjectMarker`
-  - Require a project marker such as `.git`, `package.json`, `Cargo.toml`, `go.mod`, or `pyproject.toml` in the current directory or an ancestor
+  - Require a project marker such as `.git`, `.jj`, `package.json`, `Cargo.toml`, `go.mod`, or `pyproject.toml` in the current directory or an ancestor
   - Default: `true`
-  - When `false`, automatic mode accepts any directory except a filesystem root or the user home directory (unless `allowHomeDirectory` is also enabled)
-- `workspaceHistory.maxScanFiles` / `workspaceHistory.maxScanDirs` / `workspaceHistory.maxScanMs`
-  - Safety budget for workspace scanning
+  - When `false`, automatic mode accepts any directory except a filesystem root or the user home directory (unless `allowHomeDirectory` is also enabled), and skips multi-repo container detection
+- `workspaceHistory.maxScanFiles`
+- `workspaceHistory.maxScanDirs`
+- `workspaceHistory.maxScanMs`
+  - Safety limits for restore-time workspace scans
 - `workspaceHistory.gitTimeoutMs`
   - Timeout for internal git operations
 
@@ -235,10 +248,12 @@ npm run typecheck
 
 ## Recent Changes
 
+- Git, Jujutsu, and colocated repositories share the same file-history workflow while their VCS metadata remains untouched
 - Complete multi-round agent operations now form one undo/redo unit
 - Hard exclusions remain unmanaged even when `.gitignore` contains negation rules
 - Project markers are detected in ancestor directories for Git, Rust, Go, Python, and other declared project types
 - Invalid shadow repositories are quarantined and rebuilt automatically
+- Concurrent active sessions are protected from retention cleanup
 
 ## Storage Layout
 
@@ -251,6 +266,7 @@ The plugin stores history outside the workspace by default:
       meta.json
       sessions/
         <sessionId>/
+          active-session.json
           repo.git/
           redo.json
           meta.json
@@ -263,6 +279,7 @@ Notes:
 - History is isolated from the user's project `.git` history
 - Invalid shadow repositories are preserved as `repo.git.invalid-<timestamp>-<uuid>` when automatic recovery is needed
 - Old workspace-local `.pi/workspace-history/` state is not migrated automatically
-- Cleanup is LRU-style based on recent use
-- Retention cleanup deletes only non-current entries with valid metadata; entries with damaged metadata are kept for manual recovery
+- Cleanup is LRU-style based on recent use for inactive sessions
+- A process-owned session lease protects active sessions and their workspaces from cleanup. A lease whose process no longer exists is normally treated as inactive; rare PID reuse can conservatively retain old history longer, but cannot make cleanup delete active history
+- Retention cleanup deletes only inactive entries with valid metadata; entries with damaged metadata are kept for manual recovery
 - In `auto` mode, the plugin disables itself in broad directories like the user home folder to avoid expensive scans and startup stalls

@@ -1,0 +1,1185 @@
+{
+  "source": {
+    "pull": 3358,
+    "head": "3e38e36613eea70b7ed7d1191ee67da8a42c818e",
+    "total_count": 162
+  },
+  "pages": [
+    [
+      {
+        "name": "verify",
+        "status": "completed",
+        "conclusion": "success",
+        "started_at": "2026-09-23T22:09:22Z",
+        "id": 107403442699
+      },
+      {
+        "name": "Record post-merge validation",
+        "status": "completed",
+        "conclusion": "skipped",
+        "started_at": "2026-09-23T21:54:49Z",
+        "id": 107398842056
+      },
+      {
+        "name": "Install test (macos-latest)",
+        "status": "completed",
+        "conclusion": "success",
+        "started_at": "2026-09-23T21:51:51Z",
+        "id": 107397855365
+      },
+      {
+        "name": "Install test (windows-latest)",
+        "status": "completed",
+        "conclusion": "success",
+        "started_at": "2026-09-23T21:51:43Z",
+        "id": 107397855320
+      },
+      {
+        "name": "Install test (ubuntu-latest)",
+        "status": "completed",
+        "conclusion": "success",
+        "started_at": "2026-09-23T21:51:43Z",
+        "id": 107397855299
+      },
+      {
+        "name": "Record post-merge validation",
+        "status": "completed",
+        "conclusion": "skipped",
+        "started_at": "2026-09-23T21:46:14Z",
+        "id": 107396086971
+      },
+      {
+        "name": "yamllint (advisory)",
+        "status": "completed",
+        "conclusion": "success",
+        "started_at": "2026-09-23T21:45:48Z",
+        "id": 107395933134
+      },
+      {
+        "name": "taplo (advisory)",
+        "status": "completed",
+        "conclusion": "success",
+        "started_at": "2026-09-23T21:45:47Z",
+        "id": 107395933048
+      },
+      {
+        "name": "jscpd (advisory)",
+        "status": "completed",
+        "conclusion": "success",
+        "started_at": "2026-09-23T21:45:48Z",
+        "id": 107395933044
+      },
+      {
+        "name": "PR title",
+        "status": "completed",
+        "conclusion": "success",
+        "started_at": "2026-09-23T21:45:47Z",
+        "id": 107395933037
+      },
+      {
+        "name": "strictness (advisory)",
+        "status": "completed",
+        "conclusion": "success",
+        "started_at": "2026-09-23T21:45:56Z",
+        "id": 107395933031
+      },
+      {
+        "name": "oxfmt format check",
+        "status": "completed",
+        "conclusion": "success",
+        "started_at": "2026-09-23T21:45:48Z",
+        "id": 107395933026
+      },
+      {
+        "name": "actionlint",
+        "status": "completed",
+        "conclusion": "success",
+        "started_at": "2026-09-23T21:45:48Z",
+        "id": 107395933015
+      },
+      {
+        "name": "Vale prose lint (advisory)",
+        "status": "completed",
+        "conclusion": "success",
+        "started_at": "2026-09-23T21:45:47Z",
+        "id": 107395932983
+      },
+      {
+        "name": "oxlint (advisory)",
+        "status": "completed",
+        "conclusion": "success",
+        "started_at": "2026-09-23T21:45:48Z",
+        "id": 107395932961
+      },
+      {
+        "name": "PR body (advisory)",
+        "status": "completed",
+        "conclusion": "success",
+        "started_at": "2026-09-23T21:45:48Z",
+        "id": 107395932956
+      },
+      {
+        "name": "typos (advisory)",
+        "status": "completed",
+        "conclusion": "success",
+        "started_at": "2026-09-23T21:45:47Z",
+        "id": 107395932935
+      },
+      {
+        "name": "complexity (advisory)",
+        "status": "completed",
+        "conclusion": "success",
+        "started_at": "2026-09-23T21:45:47Z",
+        "id": 107395932932
+      },
+      {
+        "name": "knip (advisory)",
+        "status": "completed",
+        "conclusion": "success",
+        "started_at": "2026-09-23T21:45:48Z",
+        "id": 107395932920
+      },
+      {
+        "name": "markdownlint",
+        "status": "completed",
+        "conclusion": "success",
+        "started_at": "2026-09-23T21:45:48Z",
+        "id": 107395932763
+      },
+      {
+        "name": "Close-keyword syntax",
+        "status": "completed",
+        "conclusion": "success",
+        "started_at": "2026-09-23T21:45:43Z",
+        "id": 107395912411
+      },
+      {
+        "name": "Validate merge-train dispatch",
+        "status": "completed",
+        "conclusion": "success",
+        "started_at": "2026-09-23T21:45:43Z",
+        "id": 107395911886
+      },
+      {
+        "name": "Record post-merge validation",
+        "status": "completed",
+        "conclusion": "skipped",
+        "started_at": "2026-09-23T21:40:50Z",
+        "id": 107394327881
+      },
+      {
+        "name": "jscpd (advisory)",
+        "status": "completed",
+        "conclusion": "success",
+        "started_at": "2026-09-23T21:40:29Z",
+        "id": 107394197526
+      },
+      {
+        "name": "strictness (advisory)",
+        "status": "completed",
+        "conclusion": "success",
+        "started_at": "2026-09-23T21:40:29Z",
+        "id": 107394197524
+      },
+      {
+        "name": "complexity (advisory)",
+        "status": "completed",
+        "conclusion": "success",
+        "started_at": "2026-09-23T21:40:29Z",
+        "id": 107394197502
+      },
+      {
+        "name": "oxlint (advisory)",
+        "status": "completed",
+        "conclusion": "success",
+        "started_at": "2026-09-23T21:40:29Z",
+        "id": 107394197474
+      },
+      {
+        "name": "typos (advisory)",
+        "status": "completed",
+        "conclusion": "success",
+        "started_at": "2026-09-23T21:40:29Z",
+        "id": 107394197453
+      },
+      {
+        "name": "yamllint (advisory)",
+        "status": "completed",
+        "conclusion": "success",
+        "started_at": "2026-09-23T21:40:29Z",
+        "id": 107394197452
+      },
+      {
+        "name": "Vale prose lint (advisory)",
+        "status": "completed",
+        "conclusion": "success",
+        "started_at": "2026-09-23T21:40:29Z",
+        "id": 107394197401
+      },
+      {
+        "name": "PR body (advisory)",
+        "status": "completed",
+        "conclusion": "failure",
+        "started_at": "2026-09-23T21:40:29Z",
+        "id": 107394197273
+      },
+      {
+        "name": "taplo (advisory)",
+        "status": "completed",
+        "conclusion": "success",
+        "started_at": "2026-09-23T21:40:29Z",
+        "id": 107394197254
+      },
+      {
+        "name": "PR title",
+        "status": "completed",
+        "conclusion": "success",
+        "started_at": "2026-09-23T21:40:29Z",
+        "id": 107394197122
+      },
+      {
+        "name": "actionlint",
+        "status": "completed",
+        "conclusion": "success",
+        "started_at": "2026-09-23T21:40:28Z",
+        "id": 107394197116
+      },
+      {
+        "name": "knip (advisory)",
+        "status": "completed",
+        "conclusion": "success",
+        "started_at": "2026-09-23T21:40:28Z",
+        "id": 107394197089
+      },
+      {
+        "name": "oxfmt format check",
+        "status": "completed",
+        "conclusion": "success",
+        "started_at": "2026-09-23T21:40:28Z",
+        "id": 107394197020
+      },
+      {
+        "name": "markdownlint",
+        "status": "completed",
+        "conclusion": "success",
+        "started_at": "2026-09-23T21:40:28Z",
+        "id": 107394197005
+      },
+      {
+        "name": "Validate merge-train dispatch",
+        "status": "completed",
+        "conclusion": "success",
+        "started_at": "2026-09-23T21:40:24Z",
+        "id": 107394172699
+      },
+      {
+        "name": "Record post-merge validation",
+        "status": "completed",
+        "conclusion": "cancelled",
+        "started_at": "2026-09-23T21:40:22Z",
+        "id": 107394170447
+      },
+      {
+        "name": "actionlint",
+        "status": "completed",
+        "conclusion": "cancelled",
+        "started_at": "2026-09-23T21:40:22Z",
+        "id": 107394169584
+      },
+      {
+        "name": "complexity (advisory)",
+        "status": "completed",
+        "conclusion": "cancelled",
+        "started_at": "2026-09-23T21:40:22Z",
+        "id": 107394169574
+      },
+      {
+        "name": "oxlint (advisory)",
+        "status": "completed",
+        "conclusion": "cancelled",
+        "started_at": "2026-09-23T21:40:22Z",
+        "id": 107394169532
+      },
+      {
+        "name": "oxfmt format check",
+        "status": "completed",
+        "conclusion": "cancelled",
+        "started_at": "2026-09-23T21:40:22Z",
+        "id": 107394169530
+      },
+      {
+        "name": "knip (advisory)",
+        "status": "completed",
+        "conclusion": "cancelled",
+        "started_at": "2026-09-23T21:40:22Z",
+        "id": 107394169516
+      },
+      {
+        "name": "jscpd (advisory)",
+        "status": "completed",
+        "conclusion": "cancelled",
+        "started_at": "2026-09-23T21:40:22Z",
+        "id": 107394169503
+      },
+      {
+        "name": "yamllint (advisory)",
+        "status": "completed",
+        "conclusion": "cancelled",
+        "started_at": "2026-09-23T21:40:22Z",
+        "id": 107394169448
+      },
+      {
+        "name": "taplo (advisory)",
+        "status": "completed",
+        "conclusion": "cancelled",
+        "started_at": "2026-09-23T21:40:22Z",
+        "id": 107394169159
+      },
+      {
+        "name": "typos (advisory)",
+        "status": "completed",
+        "conclusion": "cancelled",
+        "started_at": "2026-09-23T21:40:22Z",
+        "id": 107394169135
+      },
+      {
+        "name": "strictness (advisory)",
+        "status": "completed",
+        "conclusion": "cancelled",
+        "started_at": "2026-09-23T21:40:21Z",
+        "id": 107394168955
+      },
+      {
+        "name": "PR title",
+        "status": "completed",
+        "conclusion": "cancelled",
+        "started_at": "2026-09-23T21:40:21Z",
+        "id": 107394168905
+      },
+      {
+        "name": "markdownlint",
+        "status": "completed",
+        "conclusion": "cancelled",
+        "started_at": "2026-09-23T21:40:21Z",
+        "id": 107394168791
+      },
+      {
+        "name": "Vale prose lint (advisory)",
+        "status": "completed",
+        "conclusion": "cancelled",
+        "started_at": "2026-09-23T21:40:21Z",
+        "id": 107394168713
+      },
+      {
+        "name": "PR body (advisory)",
+        "status": "completed",
+        "conclusion": "cancelled",
+        "started_at": "2026-09-23T21:40:21Z",
+        "id": 107394168619
+      },
+      {
+        "name": "Close-keyword syntax",
+        "status": "completed",
+        "conclusion": "success",
+        "started_at": "2026-09-23T21:40:23Z",
+        "id": 107394162288
+      },
+      {
+        "name": "Validate merge-train dispatch",
+        "status": "completed",
+        "conclusion": "cancelled",
+        "started_at": "2026-09-23T21:40:19Z",
+        "id": 107394155906
+      },
+      {
+        "name": "Record post-merge validation",
+        "status": "completed",
+        "conclusion": "cancelled",
+        "started_at": "2026-09-23T21:40:15Z",
+        "id": 107394131651
+      },
+      {
+        "name": "Close-keyword syntax",
+        "status": "completed",
+        "conclusion": "success",
+        "started_at": "2026-09-23T21:40:02Z",
+        "id": 107394044108
+      },
+      {
+        "name": "taplo (advisory)",
+        "status": "completed",
+        "conclusion": "cancelled",
+        "started_at": "2026-09-23T21:39:49Z",
+        "id": 107393988999
+      },
+      {
+        "name": "actionlint",
+        "status": "completed",
+        "conclusion": "cancelled",
+        "started_at": "2026-09-23T21:39:51Z",
+        "id": 107393988873
+      },
+      {
+        "name": "strictness (advisory)",
+        "status": "completed",
+        "conclusion": "cancelled",
+        "started_at": "2026-09-23T21:39:51Z",
+        "id": 107393988858
+      },
+      {
+        "name": "jscpd (advisory)",
+        "status": "completed",
+        "conclusion": "cancelled",
+        "started_at": "2026-09-23T21:39:51Z",
+        "id": 107393988821
+      },
+      {
+        "name": "markdownlint",
+        "status": "completed",
+        "conclusion": "cancelled",
+        "started_at": "2026-09-23T21:39:52Z",
+        "id": 107393988798
+      },
+      {
+        "name": "PR title",
+        "status": "completed",
+        "conclusion": "cancelled",
+        "started_at": "2026-09-23T21:39:51Z",
+        "id": 107393988791
+      },
+      {
+        "name": "yamllint (advisory)",
+        "status": "completed",
+        "conclusion": "cancelled",
+        "started_at": "2026-09-23T21:39:52Z",
+        "id": 107393988778
+      },
+      {
+        "name": "complexity (advisory)",
+        "status": "completed",
+        "conclusion": "cancelled",
+        "started_at": "2026-09-23T21:39:51Z",
+        "id": 107393988764
+      },
+      {
+        "name": "typos (advisory)",
+        "status": "completed",
+        "conclusion": "cancelled",
+        "started_at": "2026-09-23T21:39:53Z",
+        "id": 107393988757
+      },
+      {
+        "name": "oxlint (advisory)",
+        "status": "completed",
+        "conclusion": "cancelled",
+        "started_at": "2026-09-23T21:39:51Z",
+        "id": 107393988746
+      },
+      {
+        "name": "knip (advisory)",
+        "status": "completed",
+        "conclusion": "cancelled",
+        "started_at": "2026-09-23T21:39:51Z",
+        "id": 107393988740
+      },
+      {
+        "name": "Vale prose lint (advisory)",
+        "status": "completed",
+        "conclusion": "cancelled",
+        "started_at": "2026-09-23T21:39:51Z",
+        "id": 107393988730
+      },
+      {
+        "name": "oxfmt format check",
+        "status": "completed",
+        "conclusion": "cancelled",
+        "started_at": "2026-09-23T21:39:51Z",
+        "id": 107393988702
+      },
+      {
+        "name": "PR body (advisory)",
+        "status": "completed",
+        "conclusion": "cancelled",
+        "started_at": "2026-09-23T21:39:51Z",
+        "id": 107393988651
+      },
+      {
+        "name": "Close-keyword syntax",
+        "status": "completed",
+        "conclusion": "cancelled",
+        "started_at": "2026-09-23T21:39:46Z",
+        "id": 107393959524
+      },
+      {
+        "name": "Validate merge-train dispatch",
+        "status": "completed",
+        "conclusion": "success",
+        "started_at": "2026-09-23T21:39:46Z",
+        "id": 107393958648
+      },
+      {
+        "name": "Record post-merge validation",
+        "status": "completed",
+        "conclusion": "skipped",
+        "started_at": "2026-09-23T21:39:34Z",
+        "id": 107393904413
+      },
+      {
+        "name": "oxlint (advisory)",
+        "status": "completed",
+        "conclusion": "success",
+        "started_at": "2026-09-23T21:39:06Z",
+        "id": 107393733952
+      },
+      {
+        "name": "oxfmt format check",
+        "status": "completed",
+        "conclusion": "success",
+        "started_at": "2026-09-23T21:39:14Z",
+        "id": 107393733916
+      },
+      {
+        "name": "actionlint",
+        "status": "completed",
+        "conclusion": "success",
+        "started_at": "2026-09-23T21:39:04Z",
+        "id": 107393733899
+      },
+      {
+        "name": "taplo (advisory)",
+        "status": "completed",
+        "conclusion": "success",
+        "started_at": "2026-09-23T21:39:05Z",
+        "id": 107393733857
+      },
+      {
+        "name": "typos (advisory)",
+        "status": "completed",
+        "conclusion": "success",
+        "started_at": "2026-09-23T21:39:04Z",
+        "id": 107393733830
+      },
+      {
+        "name": "yamllint (advisory)",
+        "status": "completed",
+        "conclusion": "success",
+        "started_at": "2026-09-23T21:39:04Z",
+        "id": 107393733805
+      },
+      {
+        "name": "jscpd (advisory)",
+        "status": "completed",
+        "conclusion": "success",
+        "started_at": "2026-09-23T21:39:04Z",
+        "id": 107393733758
+      },
+      {
+        "name": "complexity (advisory)",
+        "status": "completed",
+        "conclusion": "success",
+        "started_at": "2026-09-23T21:39:04Z",
+        "id": 107393733738
+      },
+      {
+        "name": "Vale prose lint (advisory)",
+        "status": "completed",
+        "conclusion": "success",
+        "started_at": "2026-09-23T21:39:04Z",
+        "id": 107393733709
+      },
+      {
+        "name": "strictness (advisory)",
+        "status": "completed",
+        "conclusion": "success",
+        "started_at": "2026-09-23T21:39:05Z",
+        "id": 107393733683
+      },
+      {
+        "name": "PR title",
+        "status": "completed",
+        "conclusion": "success",
+        "started_at": "2026-09-23T21:39:04Z",
+        "id": 107393733666
+      },
+      {
+        "name": "markdownlint",
+        "status": "completed",
+        "conclusion": "success",
+        "started_at": "2026-09-23T21:39:04Z",
+        "id": 107393733653
+      },
+      {
+        "name": "knip (advisory)",
+        "status": "completed",
+        "conclusion": "success",
+        "started_at": "2026-09-23T21:39:04Z",
+        "id": 107393733638
+      },
+      {
+        "name": "PR body (advisory)",
+        "status": "completed",
+        "conclusion": "failure",
+        "started_at": "2026-09-23T21:39:04Z",
+        "id": 107393733605
+      },
+      {
+        "name": "Validate merge-train dispatch",
+        "status": "completed",
+        "conclusion": "success",
+        "started_at": "2026-09-23T21:38:58Z",
+        "id": 107393697405
+      },
+      {
+        "name": "Record post-merge validation",
+        "status": "completed",
+        "conclusion": "cancelled",
+        "started_at": "2026-09-23T21:38:45Z",
+        "id": 107393636260
+      },
+      {
+        "name": "Close-keyword syntax",
+        "status": "completed",
+        "conclusion": "success",
+        "started_at": "2026-09-23T21:38:43Z",
+        "id": 107393618214
+      },
+      {
+        "name": "typos (advisory)",
+        "status": "completed",
+        "conclusion": "success",
+        "started_at": "2026-09-23T21:38:20Z",
+        "id": 107393490742
+      },
+      {
+        "name": "yamllint (advisory)",
+        "status": "completed",
+        "conclusion": "success",
+        "started_at": "2026-09-23T21:38:21Z",
+        "id": 107393490613
+      },
+      {
+        "name": "Vale prose lint (advisory)",
+        "status": "completed",
+        "conclusion": "success",
+        "started_at": "2026-09-23T21:38:28Z",
+        "id": 107393490611
+      },
+      {
+        "name": "taplo (advisory)",
+        "status": "completed",
+        "conclusion": "cancelled",
+        "started_at": "2026-09-23T21:38:20Z",
+        "id": 107393490584
+      },
+      {
+        "name": "jscpd (advisory)",
+        "status": "completed",
+        "conclusion": "cancelled",
+        "started_at": "2026-09-23T21:38:20Z",
+        "id": 107393490571
+      },
+      {
+        "name": "strictness (advisory)",
+        "status": "completed",
+        "conclusion": "cancelled",
+        "started_at": "2026-09-23T21:38:20Z",
+        "id": 107393490474
+      },
+      {
+        "name": "complexity (advisory)",
+        "status": "completed",
+        "conclusion": "cancelled",
+        "started_at": "2026-09-23T21:38:20Z",
+        "id": 107393490464
+      },
+      {
+        "name": "oxlint (advisory)",
+        "status": "completed",
+        "conclusion": "cancelled",
+        "started_at": "2026-09-23T21:38:20Z",
+        "id": 107393490404
+      },
+      {
+        "name": "PR title",
+        "status": "completed",
+        "conclusion": "cancelled",
+        "started_at": "2026-09-23T21:38:18Z",
+        "id": 107393490256
+      }
+    ],
+    [
+      {
+        "name": "markdownlint",
+        "status": "completed",
+        "conclusion": "cancelled",
+        "started_at": "2026-09-23T21:38:20Z",
+        "id": 107393490253
+      },
+      {
+        "name": "knip (advisory)",
+        "status": "completed",
+        "conclusion": "cancelled",
+        "started_at": "2026-09-23T21:38:19Z",
+        "id": 107393490245
+      },
+      {
+        "name": "oxfmt format check",
+        "status": "completed",
+        "conclusion": "cancelled",
+        "started_at": "2026-09-23T21:38:20Z",
+        "id": 107393490195
+      },
+      {
+        "name": "actionlint",
+        "status": "completed",
+        "conclusion": "success",
+        "started_at": "2026-09-23T21:38:20Z",
+        "id": 107393490180
+      },
+      {
+        "name": "PR body (advisory)",
+        "status": "completed",
+        "conclusion": "cancelled",
+        "started_at": "2026-09-23T21:38:20Z",
+        "id": 107393490157
+      },
+      {
+        "name": "Validate merge-train dispatch",
+        "status": "completed",
+        "conclusion": "success",
+        "started_at": "2026-09-23T21:38:15Z",
+        "id": 107393468174
+      },
+      {
+        "name": "Record post-merge validation",
+        "status": "completed",
+        "conclusion": "cancelled",
+        "started_at": "2026-09-23T21:38:03Z",
+        "id": 107393411686
+      },
+      {
+        "name": "Close-keyword syntax",
+        "status": "completed",
+        "conclusion": "success",
+        "started_at": "2026-09-23T21:37:56Z",
+        "id": 107393365041
+      },
+      {
+        "name": "strictness (advisory)",
+        "status": "completed",
+        "conclusion": "cancelled",
+        "started_at": "2026-09-23T21:37:42Z",
+        "id": 107393159466
+      },
+      {
+        "name": "knip (advisory)",
+        "status": "completed",
+        "conclusion": "cancelled",
+        "started_at": "2026-09-23T21:37:37Z",
+        "id": 107393159367
+      },
+      {
+        "name": "oxfmt format check",
+        "status": "completed",
+        "conclusion": "cancelled",
+        "started_at": "2026-09-23T21:37:41Z",
+        "id": 107393159360
+      },
+      {
+        "name": "complexity (advisory)",
+        "status": "completed",
+        "conclusion": "cancelled",
+        "started_at": "2026-09-23T21:37:32Z",
+        "id": 107393159321
+      },
+      {
+        "name": "oxlint (advisory)",
+        "status": "completed",
+        "conclusion": "cancelled",
+        "started_at": "2026-09-23T21:37:31Z",
+        "id": 107393159304
+      },
+      {
+        "name": "jscpd (advisory)",
+        "status": "completed",
+        "conclusion": "success",
+        "started_at": "2026-09-23T21:37:30Z",
+        "id": 107393159303
+      },
+      {
+        "name": "Vale prose lint (advisory)",
+        "status": "completed",
+        "conclusion": "success",
+        "started_at": "2026-09-23T21:37:30Z",
+        "id": 107393159262
+      },
+      {
+        "name": "PR title",
+        "status": "completed",
+        "conclusion": "success",
+        "started_at": "2026-09-23T21:37:31Z",
+        "id": 107393159213
+      },
+      {
+        "name": "typos (advisory)",
+        "status": "completed",
+        "conclusion": "success",
+        "started_at": "2026-09-23T21:37:25Z",
+        "id": 107393159198
+      },
+      {
+        "name": "yamllint (advisory)",
+        "status": "completed",
+        "conclusion": "success",
+        "started_at": "2026-09-23T21:37:20Z",
+        "id": 107393159184
+      },
+      {
+        "name": "markdownlint",
+        "status": "completed",
+        "conclusion": "cancelled",
+        "started_at": "2026-09-23T21:37:29Z",
+        "id": 107393159161
+      },
+      {
+        "name": "taplo (advisory)",
+        "status": "completed",
+        "conclusion": "success",
+        "started_at": "2026-09-23T21:37:29Z",
+        "id": 107393159152
+      },
+      {
+        "name": "actionlint",
+        "status": "completed",
+        "conclusion": "success",
+        "started_at": "2026-09-23T21:37:20Z",
+        "id": 107393159074
+      },
+      {
+        "name": "PR body (advisory)",
+        "status": "completed",
+        "conclusion": "failure",
+        "started_at": "2026-09-23T21:37:20Z",
+        "id": 107393159035
+      },
+      {
+        "name": "Validate merge-train dispatch",
+        "status": "completed",
+        "conclusion": "success",
+        "started_at": "2026-09-23T21:37:14Z",
+        "id": 107393124995
+      },
+      {
+        "name": "Close-keyword syntax",
+        "status": "completed",
+        "conclusion": "success",
+        "started_at": "2026-09-23T21:37:13Z",
+        "id": 107393123692
+      },
+      {
+        "name": "CodeQL",
+        "status": "completed",
+        "conclusion": "success",
+        "started_at": "2026-09-23T21:37:09Z",
+        "id": 107393112002
+      },
+      {
+        "name": "SonarCloud Code Analysis",
+        "status": "completed",
+        "conclusion": "success",
+        "started_at": "2026-09-23T21:36:45Z",
+        "id": 107393086645
+      },
+      {
+        "name": "Record post-merge validation",
+        "status": "completed",
+        "conclusion": "cancelled",
+        "started_at": "2026-09-23T21:36:56Z",
+        "id": 107393041046
+      },
+      {
+        "name": "Close-keyword syntax",
+        "status": "completed",
+        "conclusion": "cancelled",
+        "started_at": "2026-09-23T21:37:03Z",
+        "id": 107392981897
+      },
+      {
+        "name": "OSV scan (advisory)",
+        "status": "completed",
+        "conclusion": "skipped",
+        "started_at": "2026-09-23T21:36:43Z",
+        "id": 107392970608
+      },
+      {
+        "name": "Lint & type-check",
+        "status": "completed",
+        "conclusion": "success",
+        "started_at": "2026-09-23T21:37:12Z",
+        "id": 107392909660
+      },
+      {
+        "name": "Unit tests",
+        "status": "completed",
+        "conclusion": "success",
+        "started_at": "2026-09-23T21:37:10Z",
+        "id": 107392909586
+      },
+      {
+        "name": "Unit tests Windows (advisory)",
+        "status": "completed",
+        "conclusion": "success",
+        "started_at": "2026-09-23T21:36:53Z",
+        "id": 107392909567
+      },
+      {
+        "name": "Production install build (--omit=dev, from source)",
+        "status": "completed",
+        "conclusion": "success",
+        "started_at": "2026-09-23T21:37:06Z",
+        "id": 107392909554
+      },
+      {
+        "name": "Targeted tests (advisory)",
+        "status": "completed",
+        "conclusion": "success",
+        "started_at": "2026-09-23T21:36:45Z",
+        "id": 107392909552
+      },
+      {
+        "name": "Changelog fragment (fast-fail)",
+        "status": "completed",
+        "conclusion": "success",
+        "started_at": "2026-09-23T21:36:58Z",
+        "id": 107392909472
+      },
+      {
+        "name": "Dependency boundaries",
+        "status": "completed",
+        "conclusion": "success",
+        "started_at": "2026-09-23T21:36:55Z",
+        "id": 107392909445
+      },
+      {
+        "name": "oxlint (advisory)",
+        "status": "completed",
+        "conclusion": "cancelled",
+        "started_at": "2026-09-23T21:36:32Z",
+        "id": 107392908403
+      },
+      {
+        "name": "typos (advisory)",
+        "status": "completed",
+        "conclusion": "cancelled",
+        "started_at": "2026-09-23T21:36:32Z",
+        "id": 107392908368
+      },
+      {
+        "name": "taplo (advisory)",
+        "status": "completed",
+        "conclusion": "cancelled",
+        "started_at": "2026-09-23T21:36:32Z",
+        "id": 107392908296
+      },
+      {
+        "name": "yamllint (advisory)",
+        "status": "completed",
+        "conclusion": "cancelled",
+        "started_at": "2026-09-23T21:36:32Z",
+        "id": 107392908144
+      },
+      {
+        "name": "complexity (advisory)",
+        "status": "completed",
+        "conclusion": "cancelled",
+        "started_at": "2026-09-23T21:36:44Z",
+        "id": 107392908124
+      },
+      {
+        "name": "strictness (advisory)",
+        "status": "completed",
+        "conclusion": "cancelled",
+        "started_at": "2026-09-23T21:36:34Z",
+        "id": 107392908099
+      },
+      {
+        "name": "actionlint",
+        "status": "completed",
+        "conclusion": "cancelled",
+        "started_at": "2026-09-23T21:36:32Z",
+        "id": 107392908089
+      },
+      {
+        "name": "jscpd (advisory)",
+        "status": "completed",
+        "conclusion": "cancelled",
+        "started_at": "2026-09-23T21:36:32Z",
+        "id": 107392908079
+      },
+      {
+        "name": "PR body (advisory)",
+        "status": "completed",
+        "conclusion": "cancelled",
+        "started_at": "2026-09-23T21:36:32Z",
+        "id": 107392908048
+      },
+      {
+        "name": "Vale prose lint (advisory)",
+        "status": "completed",
+        "conclusion": "cancelled",
+        "started_at": "2026-09-23T21:36:32Z",
+        "id": 107392908019
+      },
+      {
+        "name": "PR title",
+        "status": "completed",
+        "conclusion": "cancelled",
+        "started_at": "2026-09-23T21:36:36Z",
+        "id": 107392907958
+      },
+      {
+        "name": "markdownlint",
+        "status": "completed",
+        "conclusion": "cancelled",
+        "started_at": "2026-09-23T21:36:32Z",
+        "id": 107392907946
+      },
+      {
+        "name": "knip (advisory)",
+        "status": "completed",
+        "conclusion": "cancelled",
+        "started_at": "2026-09-23T21:36:35Z",
+        "id": 107392907902
+      },
+      {
+        "name": "oxfmt format check",
+        "status": "completed",
+        "conclusion": "cancelled",
+        "started_at": "2026-09-23T21:36:34Z",
+        "id": 107392907846
+      },
+      {
+        "name": "Analyze (actions)",
+        "status": "completed",
+        "conclusion": "success",
+        "started_at": "2026-09-23T21:36:28Z",
+        "id": 107392873106
+      },
+      {
+        "name": "Validate merge-train dispatch",
+        "status": "completed",
+        "conclusion": "success",
+        "started_at": "2026-09-23T21:36:29Z",
+        "id": 107392872644
+      },
+      {
+        "name": "Analyze (javascript-typescript)",
+        "status": "completed",
+        "conclusion": "success",
+        "started_at": "2026-09-23T21:36:28Z",
+        "id": 107392872496
+      },
+      {
+        "name": "Analyze (ruby)",
+        "status": "completed",
+        "conclusion": "success",
+        "started_at": "2026-09-23T21:36:28Z",
+        "id": 107392872462
+      },
+      {
+        "name": "Analyze (rust)",
+        "status": "completed",
+        "conclusion": "success",
+        "started_at": "2026-09-23T21:36:28Z",
+        "id": 107392872445
+      },
+      {
+        "name": "Analyze (go)",
+        "status": "completed",
+        "conclusion": "success",
+        "started_at": "2026-09-23T21:36:28Z",
+        "id": 107392872434
+      },
+      {
+        "name": "Analyze (python)",
+        "status": "completed",
+        "conclusion": "success",
+        "started_at": "2026-09-23T21:36:28Z",
+        "id": 107392872296
+      },
+      {
+        "name": "greeting",
+        "status": "completed",
+        "conclusion": "success",
+        "started_at": "2026-09-23T21:36:28Z",
+        "id": 107392871999
+      },
+      {
+        "name": "mutation (advisory)",
+        "status": "completed",
+        "conclusion": "success",
+        "started_at": "2026-09-23T21:36:28Z",
+        "id": 107392871903
+      },
+      {
+        "name": "Close-keyword syntax",
+        "status": "completed",
+        "conclusion": "success",
+        "started_at": "2026-09-23T21:36:28Z",
+        "id": 107392871663
+      },
+      {
+        "name": "Detect lockfile change",
+        "status": "completed",
+        "conclusion": "success",
+        "started_at": "2026-09-23T21:36:28Z",
+        "id": 107392871552
+      },
+      {
+        "name": "Validate merge-train dispatch",
+        "status": "completed",
+        "conclusion": "success",
+        "started_at": "2026-09-23T21:36:28Z",
+        "id": 107392871084
+      }
+    ]
+  ],
+  "cancelledReplacement": {
+    "source": {
+      "pull": 3362,
+      "head": "db5a6300573421b663dc999a4f9ba2b5afde4fcb"
+    },
+    "check_runs": [
+      {
+        "name": "Lint & type-check",
+        "status": "completed",
+        "conclusion": "cancelled",
+        "started_at": "2026-09-23T22:17:16Z",
+        "id": 107405814200
+      },
+      {
+        "name": "Lint & type-check",
+        "status": "completed",
+        "conclusion": "success",
+        "started_at": "2026-09-23T22:18:16Z",
+        "id": 107405814201
+      }
+    ]
+  },
+  "cancelledLatest": {
+    "source": {
+      "pull": 3362,
+      "head": "db5a6300573421b663dc999a4f9ba2b5afde4fcb"
+    },
+    "check_runs": [
+      {
+        "name": "Lint & type-check",
+        "status": "completed",
+        "conclusion": "cancelled",
+        "started_at": "2026-09-23T22:58:16Z",
+        "id": 107416999999,
+        "details_url": "https://github.com/apmantza/pi-lens/actions/runs/107416999999/job/107416999999"
+      }
+    ]
+  }
+}

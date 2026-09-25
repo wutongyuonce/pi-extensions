@@ -1,10 +1,14 @@
 import {
 	assert,
 	buildPiPromptArgsForTest,
+	createTestDir,
 	describe,
 	getShellReadyDelayMs,
 	it,
+	join,
+	mkdirSync,
 	subagentsExtension,
+	writeFileSync,
 } from "../support/index.ts";
 
 describe("launch helpers", () => {
@@ -36,33 +40,45 @@ describe("launch helpers", () => {
 	});
 
 	it("registers set_tab_title only when explicitly enabled", () => {
+		const dir = createTestDir();
+		const configDir = join(dir, "agent-root");
+		const agentsDir = join(configDir, "agents");
+		mkdirSync(agentsDir, { recursive: true });
+		writeFileSync(join(agentsDir, "worker.md"), "---\nname: worker\ndescription: Worker\n---\n\nWorker body.");
+		process.env.PI_CODING_AGENT_DIR = configDir;
+		const original = process.env.PI_SUBAGENT_ENABLE_SET_TAB_TITLE;
 		const tools = new Map<string, any>();
 		delete process.env.PI_SUBAGENT_ENABLE_SET_TAB_TITLE;
 
-		subagentsExtension({
-			on() {},
-			registerCommand() {},
-			registerMessageRenderer() {},
-			sendMessage() {},
-			registerTool(definition: any) {
-				tools.set(definition.name, definition);
-				return definition;
-			},
-		} as any);
-		assert.equal(tools.has("set_tab_title"), false);
+		try {
+			subagentsExtension({
+				on() {},
+				registerCommand() {},
+				registerMessageRenderer() {},
+				sendMessage() {},
+				registerTool(definition: any) {
+					tools.set(definition.name, definition);
+					return definition;
+				},
+			} as any);
+			assert.equal(tools.has("set_tab_title"), false);
 
-		process.env.PI_SUBAGENT_ENABLE_SET_TAB_TITLE = "1";
-		tools.clear();
-		subagentsExtension({
-			on() {},
-			registerCommand() {},
-			registerMessageRenderer() {},
-			sendMessage() {},
-			registerTool(definition: any) {
-				tools.set(definition.name, definition);
-				return definition;
-			},
-		} as any);
-		assert.equal(tools.has("set_tab_title"), true);
+			process.env.PI_SUBAGENT_ENABLE_SET_TAB_TITLE = "1";
+			tools.clear();
+			subagentsExtension({
+				on() {},
+				registerCommand() {},
+				registerMessageRenderer() {},
+				sendMessage() {},
+				registerTool(definition: any) {
+					tools.set(definition.name, definition);
+					return definition;
+				},
+			} as any);
+			assert.equal(tools.has("set_tab_title"), true);
+		} finally {
+			if (original == null) delete process.env.PI_SUBAGENT_ENABLE_SET_TAB_TITLE;
+			else process.env.PI_SUBAGENT_ENABLE_SET_TAB_TITLE = original;
+		}
 	});
 });

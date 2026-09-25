@@ -1,4 +1,5 @@
-import { routeSubagentOutcome } from "../../src/runtime/result-router.ts";
+import { deliverCompletedSubagentResult, routeSubagentOutcome } from "../../src/runtime/result-router.ts";
+import { buildCompletedSubagentResult, requestSubagentBatchStop } from "../../src/runtime/state.ts";
 import type { RunningSubagent, SubagentResult } from "../../src/types.ts";
 import {
 	afterEach,
@@ -212,6 +213,7 @@ describe("result router", () => {
 		assert.equal(widgetUpdates, 1);
 		assert.equal(sent.length, 1);
 		assert.equal(sent[0].message.customType, "subagent_result");
+		assert.equal(sent[0].message.display, true, "parent-visible completion messages must be displayed");
 		assert.equal(sent[0].message.details.id, running.id);
 		assert.equal(sent[0].message.details.deliveryState, "detached");
 		assert.equal(sent[0].message.details.status, "completed");
@@ -219,6 +221,81 @@ describe("result router", () => {
 			triggerTurn: true,
 			deliverAs: "steer",
 		});
+	});
+
+	it("does not redeliver an awaited or already delivered completion", () => {
+		const sent: Array<{ message: any; options: any }> = [];
+		const pi = {
+			sendMessage(message: any, options: any) {
+				sent.push({ message, options });
+			},
+		};
+
+		const awaited = buildCompletedSubagentResult(makeRunning({ deliveryState: "awaited" }), makeResult());
+		const deliveredAwaited = deliverCompletedSubagentResult(pi, awaited, (seconds) => `${seconds}s`);
+		assert.equal(deliveredAwaited, awaited);
+		assert.equal(sent.length, 0);
+
+		const alreadyDelivered = buildCompletedSubagentResult(makeRunning(), makeResult());
+		alreadyDelivered.deliveredTo = "steer";
+		const deliveredAgain = deliverCompletedSubagentResult(pi, alreadyDelivered, (seconds) => `${seconds}s`);
+		assert.equal(deliveredAgain, alreadyDelivered);
+		assert.equal(sent.length, 0);
+	});
+
+	it("keeps optional delivery facts in structured completion details", () => {
+		const sent: Array<{ message: any; options: any }> = [];
+		const running = makeRunning();
+		setRunningSubagentForTest(running);
+
+		routeSubagentOutcome({
+			pi: {
+				sendMessage(message: any, options: any) {
+					sent.push({ message, options });
+				},
+			},
+			running,
+			result: makeResult({
+				deliveryId: "run-1-g2",
+				timedOut: "timeout",
+				timedOutAfter: 10,
+				timeoutBlocksResume: true,
+				timeoutWrapUp: { kind: "timeout", seconds: 20, threshold: 80 },
+				errorMessage: "provider unavailable",
+			}),
+			formatElapsed: (seconds) => `${seconds}s`,
+			updateWidget: () => {},
+		});
+
+		assert.equal(sent.length, 1);
+		assert.equal(sent[0].message.details.deliveryId, "run-1-g2");
+		assert.equal(sent[0].message.details.timedOut, "timeout");
+		assert.equal(sent[0].message.details.timedOutAfter, 10);
+		assert.equal(sent[0].message.details.timeoutBlocksResume, true);
+		assert.deepEqual(sent[0].message.details.timeoutWrapUp, { kind: "timeout", seconds: 20, threshold: 80 });
+		assert.equal(sent[0].message.details.errorMessage, "provider unavailable");
+	});
+
+	it("renders an ordinary non-zero exit as a failed child result", () => {
+		const sent: Array<{ message: any; options: any }> = [];
+		const running = makeRunning();
+		setRunningSubagentForTest(running);
+
+		routeSubagentOutcome({
+			pi: {
+				sendMessage(message: any, options: any) {
+					sent.push({ message, options });
+				},
+			},
+			running,
+			result: makeResult({ exitCode: 2, summary: "Child failed" }),
+			formatElapsed: (seconds) => `${seconds}s`,
+			updateWidget: () => {},
+		});
+
+		assert.match(sent[0].message.content, /Sub-agent "Result child" failed \(exit 2\)/);
+		assert.match(sent[0].message.content, /Child failed/);
+		assert.doesNotMatch(sent[0].message.content, /completed \(/);
 	});
 
 	it("appends final child context usage after the session reference", () => {
@@ -297,6 +374,10 @@ describe("result router", () => {
 		});
 
 		assert.match(sent[0].message.content, /Last output before the failure/);
+		assert.match(
+			sent[0].message.content,
+			/Sub-agent "Result child" failed after 3s \(provider\/agent error — auto-retry exhausted\)\./,
+		);
 		assert.match(sent[0].message.content, /Completed the requested implementation\./);
 		assert.doesNotMatch(sent[0].message.content, /did not produce a result/);
 		assert.match(sent[0].message.content, /Sub-agent context: 145K\/200K tokens \(72%\) used at finish\.$/);
@@ -326,6 +407,51 @@ describe("result router", () => {
 		assert.match(sent[0].message.content, /did not produce a result/);
 		assert.doesNotMatch(sent[0].message.content, /Last output before the failure/);
 		assert.doesNotMatch(sent[0].message.content, /provider stack trace/);
+	});
+
+	it("uses next-turn delivery only for a live parent and steers auto-exit parents", () => {
+		const savedAutoExit = process.env.PI_SUBAGENT_AUTO_EXIT;
+		try {
+			delete process.env.PI_SUBAGENT_AUTO_EXIT;
+			const nextTurnSent: Array<{ message: any; options: any }> = [];
+			const nextTurnRunning = makeRunning({ id: "live-parent-child" });
+			setRunningSubagentForTest(nextTurnRunning);
+			requestSubagentBatchStop();
+			routeSubagentOutcome({
+				pi: {
+					sendMessage(message: any, options: any) {
+						nextTurnSent.push({ message, options });
+					},
+				},
+				running: nextTurnRunning,
+				result: makeResult(),
+				formatElapsed: (seconds) => `${seconds}s`,
+				updateWidget: () => {},
+			});
+			assert.equal(nextTurnSent[0]?.options.deliverAs, "nextTurn");
+
+			resetSubagentStateForTest();
+			process.env.PI_SUBAGENT_AUTO_EXIT = "1";
+			const steerSent: Array<{ message: any; options: any }> = [];
+			const autoExitRunning = makeRunning({ id: "auto-exit-parent-child" });
+			setRunningSubagentForTest(autoExitRunning);
+			requestSubagentBatchStop();
+			routeSubagentOutcome({
+				pi: {
+					sendMessage(message: any, options: any) {
+						steerSent.push({ message, options });
+					},
+				},
+				running: autoExitRunning,
+				result: makeResult(),
+				formatElapsed: (seconds) => `${seconds}s`,
+				updateWidget: () => {},
+			});
+			assert.equal(steerSent[0]?.options.deliverAs, "steer");
+		} finally {
+			if (savedAutoExit === undefined) delete process.env.PI_SUBAGENT_AUTO_EXIT;
+			else process.env.PI_SUBAGENT_AUTO_EXIT = savedAutoExit;
+		}
 	});
 
 	it("routes child pings without caching a completed result", () => {

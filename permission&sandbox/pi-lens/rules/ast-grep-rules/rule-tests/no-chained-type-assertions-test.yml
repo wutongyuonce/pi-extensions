@@ -1,0 +1,22 @@
+id: no-chained-type-assertions
+valid:
+  - 'const v = x as A'
+  - 'const w = x as A as const'
+  # 2026-08-20 (#1727/#1777): the `as unknown as` shape is delegated wholly to
+  # require-safety-comment-for-as-unknown-as.yml. This rule owns the concrete
+  # chain only, so BOTH the commented and the uncommented `unknown` forms are
+  # valid here. Deleting the `not: { pattern: $X as unknown as $B }` guard reds
+  # all three.
+  - |
+    // SAFETY: checked above
+    const u = x as unknown as Foo;
+  - 'const u = /* SAFETY: inline */ x as unknown as Foo;'
+  - 'const u = x as unknown as Foo;'
+invalid:
+  - 'const v = x as A as B'
+  - 'const v = foo.bar() as A as B;'
+  # A concrete chain has no escape valve: a SAFETY comment does NOT excuse it.
+  # Re-adding a comment-based exemption to this rule reds this case.
+  - |
+    // SAFETY: I promise
+    const v = x as A as B;

@@ -1,7 +1,10 @@
 import { existsSync, readFileSync } from "node:fs";
 import { activityMonitor } from "./activity.ts";
+import { normalizeDomain } from "./domain-filter-normalization.ts";
 import type { ExtractedContent } from "./extract.ts";
 import type { SearchOptions, SearchResponse } from "./perplexity.ts";
+import { formatSearchResultsAsAnswer } from "./search-answer-formatting.ts";
+import { normalizeSearchResultCount } from "./search-result-count-normalization.ts";
 import { hasCredentialSource, redactCredential, resolveCredential } from "./credential-source.ts";
 import { getWebSearchConfigPath } from "./utils.ts";
 
@@ -67,26 +70,6 @@ async function requireApiKey(signal?: AbortSignal): Promise<string> {
 	return apiKey;
 }
 
-function normalizeCount(value: number | undefined): number {
-	if (typeof value !== "number" || !Number.isFinite(value)) return 5;
-	return Math.max(1, Math.min(Math.floor(value), 20));
-}
-
-function normalizeDomain(value: string): string | null {
-	let input = value.trim().toLowerCase();
-	if (!input) return null;
-	if (input.startsWith("-")) input = input.slice(1).trim();
-	if (!input) return null;
-	try {
-		const parsed = input.includes("://") ? new URL(input) : new URL(`https://${input}`);
-		input = parsed.hostname;
-	} catch {
-		input = input.split("/")[0]?.split(":")[0] ?? "";
-	}
-	input = input.replace(/^\.+|\.+$/g, "");
-	return /^[a-z0-9][a-z0-9.-]*\.[a-z]{2,}$/i.test(input) ? input : null;
-}
-
 function mapDomainFilter(domainFilter: string[] | undefined): { included_sources?: string[]; excluded_sources?: string[] } {
 	if (!domainFilter?.length) return {};
 	const included_sources: string[] = [];
@@ -129,19 +112,13 @@ function parseResponse(value: unknown): ValyuResult[] {
 	return envelope.results as ValyuResult[];
 }
 
-function buildAnswer(results: SearchResponse["results"]): string {
-	return results.map((result) => result.snippet
-		? `${result.snippet}\nSource: ${result.title} (${result.url})`
-		: `Source: ${result.title} (${result.url})`).join("\n\n");
-}
-
 export function isValyuAvailable(): boolean {
 	return hasCredentialSource({ provider: "Valyu", configuredValue: loadConfig().valyuApiKey, environmentValue: process.env.VALYU_API_KEY });
 }
 
 export async function searchWithValyu(query: string, options: SearchOptions & { includeContent?: boolean } = {}): Promise<SearchResponse> {
 	const apiKey = await requireApiKey(options.signal);
-	const numResults = normalizeCount(options.numResults);
+	const numResults = normalizeSearchResultCount(options.numResults);
 	const startDate = recencyToStartDate(options.recencyFilter);
 	const activityId = activityMonitor.logStart({ type: "api", query });
 	let response: Response;
@@ -195,5 +172,5 @@ export async function searchWithValyu(query: string, options: SearchOptions & { 
 		if (options.includeContent && content) inlineContent.push({ url, title, content, error: null });
 		if (results.length >= numResults) break;
 	}
-	return { answer: buildAnswer(results), results, ...(inlineContent.length > 0 ? { inlineContent } : {}) };
+	return { answer: formatSearchResultsAsAnswer(results), results, ...(inlineContent.length > 0 ? { inlineContent } : {}) };
 }

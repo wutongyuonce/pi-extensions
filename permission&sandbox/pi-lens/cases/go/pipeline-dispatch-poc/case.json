@@ -1,0 +1,17 @@
+{
+	"name": "go-pipeline-dispatch-poc",
+	"description": "PoC headless pi case that updates a tiny Go invoice utility project and captures pipeline/dispatch feedback.",
+	"model": "opencode/minimax-m2.5-free",
+	"startupMode": "quick",
+	"allowedTools": ["read", "write", "edit", "bash"],
+	"expectedFiles": ["main.go", "totals.go"],
+	"expectedToolCalls": ["read", "write"],
+	"expectedWorkflow": {
+		"readBeforeFirstMutation": true,
+		"lspUsed": false,
+		"readGuardTriggered": false
+	},
+	"maxFailedToolCalls": 0,
+	"maxToolCallCount": 12,
+	"allowedFailureKinds": []
+}

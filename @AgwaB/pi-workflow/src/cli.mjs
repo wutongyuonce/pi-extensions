@@ -8,6 +8,10 @@ function usage() {
 
 Usage:
   pi-workflow inspect <run-id-or-prefix> [--failures] [--results] [--json]
+  pi-workflow prune [--keep N] [--older-than DAYS] [--yes] [--json]
+  pi-workflow notices list [--json]
+  pi-workflow notices acknowledge <exact-run-id> --state <sha256> --reason <text>
+  pi-workflow notices clear <exact-run-id> [--json]
   pi-workflow supervise <run-id-or-prefix> [--poll-ms N] [--max-runtime-ms N]
   pi-workflow supervise --all [--poll-ms N] [--max-runtime-ms N]
 
@@ -15,6 +19,8 @@ supervise drives workflow scheduling from a standalone process until the
 target run(s) reach a terminal status, so runs keep progressing after the
 Pi session that started them exits. The run lease arbitrates with any
 in-session supervisor. Exit codes: 0 completed, 1 failed/interrupted, 2 blocked.
+For --all, only runs observed running are included; failure takes precedence
+over blocked. Empty batches succeed; historical terminal runs are ignored.
 `;
 }
 
@@ -29,6 +35,14 @@ if (command === "supervise") {
   process.exit(await supervise(args.slice(1)));
 }
 
+if (command === "prune") {
+  process.exit(await prune(args.slice(1)));
+}
+
+if (command === "notices") {
+  process.exit(await notices(args.slice(1)));
+}
+
 if (command !== "inspect") {
   process.stderr.write(`Unknown command "${command}".\n${usage()}`);
   process.exit(1);
@@ -41,6 +55,10 @@ if (!ref) {
 }
 
 const options = new Set(args.slice(2));
+if (ref.startsWith("-") || [...options].some(option => !["--failures", "--results", "--json"].includes(option))) {
+  process.stderr.write(`Unknown inspect argument or option.\n${usage()}`);
+  process.exit(1);
+}
 const cwd = process.cwd();
 const run = await readRun(cwd, ref);
 
@@ -50,9 +68,16 @@ if (options.has("--json")) {
 }
 
 const tasks = Array.isArray(run.tasks) ? run.tasks : [];
-const selected = options.has("--failures")
-  ? tasks.filter((task) => ["failed", "blocked", "interrupted"].includes(task.status))
-  : tasks;
+const failures = tasks.filter((task) =>
+  ["failed", "blocked", "interrupted"].includes(task.status),
+);
+// `--failures` narrows the listing to failure detail. Combined with
+// `--results` on a run that has no failures it would otherwise print nothing
+// useful, so the flags stay additive: fall back to every task's result and
+// say so explicitly.
+const failuresOnly = options.has("--failures");
+const showAllResults = failuresOnly && options.has("--results") && failures.length === 0;
+const selected = failuresOnly && !showAllResults ? failures : tasks;
 const reliability = summarizeReliability(tasks);
 
 const lines = [
@@ -64,6 +89,7 @@ const lines = [
   `completion: ${reliability.health}`,
   `retries: output=${reliability.outputRetries}, launch=${reliability.launchRetries}, resumes=${reliability.resumeEvents}, contextLimitFailures=${reliability.contextLimitFailures}`,
 ];
+if (showAllResults) lines.push("failures: none (showing every task result)");
 
 for (const task of selected) {
   lines.push(`- ${task.taskId}: ${task.status}/${task.statusDetail}${task.lastMessage ? ` — ${task.lastMessage}` : ""}`);
@@ -76,21 +102,75 @@ for (const task of selected) {
 
 process.stdout.write(`${lines.join("\n")}\n`);
 
+async function notices(argv) {
+  try {
+    const packageRoot = dirname(dirname(fileURLToPath(import.meta.url)));
+    const buildDir = await resolveEngineDist(packageRoot);
+    const { executeWorkflowNoticesCommand } = await import(
+      pathToFileURL(join(buildDir, "workflow-notices.js")).href
+    );
+    process.stdout.write(
+      `${await executeWorkflowNoticesCommand(process.cwd(), argv)}\n`,
+    );
+    return 0;
+  } catch (error) {
+    process.stderr.write(`${error.message}\n`);
+    return 1;
+  }
+}
+
+async function prune(argv) {
+  const packageRoot = dirname(dirname(fileURLToPath(import.meta.url)));
+  const buildDir = await resolveEngineDist(packageRoot);
+  // Use the same boundary parser as /workflow prune, before any retention IO.
+  const { parseWorkflowPruneArgs } = await import(pathToFileURL(join(buildDir, "extension.js")).href);
+  let options;
+  try { options = parseWorkflowPruneArgs(argv); }
+  catch (error) {
+    process.stderr.write(`${error.message}\n`);
+    return 1;
+  }
+  const { json, ...retentionOptions } = options;
+  const retention = await import(pathToFileURL(join(buildDir, "run-retention.js")).href);
+  const summary = await retention.pruneWorkflowRuns(process.cwd(), retentionOptions);
+  process.stdout.write(`${json ? JSON.stringify(summary, null, 2) : retention.formatWorkflowPruneSummary(summary)}\n`);
+  return summary.error ? 1 : 0;
+}
+
 async function supervise(argv) {
   let runRef;
   let allMode = false;
   let pollMs = 2_000;
   let maxRuntimeMs = 14_400_000;
+  const seen = new Set();
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
     if (arg === "--all") allMode = true;
-    else if (arg === "--poll-ms") pollMs = Math.max(250, Number(argv[++index]) || pollMs);
-    else if (arg === "--max-runtime-ms") maxRuntimeMs = Math.max(1_000, Number(argv[++index]) || maxRuntimeMs);
+    else if (arg === "--poll-ms" || arg === "--max-runtime-ms") {
+      if (seen.has(arg)) {
+        process.stderr.write(`Duplicate supervise option ${arg}.\n`);
+        return 1;
+      }
+      seen.add(arg);
+      const raw = argv[++index];
+      const value = Number(raw);
+      const minimum = arg === "--poll-ms" ? 250 : 1_000;
+      if (!raw || !/^\d+$/.test(raw) || !Number.isSafeInteger(value) || value < minimum || value > 2_147_483_647) {
+        process.stderr.write(`${arg} requires an integer from ${minimum} to 2147483647.\n`);
+        return 1;
+      }
+      if (arg === "--poll-ms") pollMs = value;
+      else maxRuntimeMs = value;
+    }
     else if (!arg.startsWith("--") && !runRef) runRef = arg;
     else {
       process.stderr.write(`Unknown supervise argument "${arg}".\n${usage()}`);
       return 1;
     }
+  }
+  if (runRef && allMode) {
+    process.stderr.write("Run id and --all are mutually exclusive.\n");
+    return 1;
   }
   if (!runRef && !allMode) {
     process.stderr.write(`Missing run id (or --all).\n${usage()}`);
@@ -107,6 +187,7 @@ async function supervise(argv) {
   const cwd = process.cwd();
   const runId = runRef ? (await store.readRunRecord(cwd, runRef)).runId : undefined;
   const lastPrinted = new Map();
+  const supervised = new Set();
   const deadline = Date.now() + maxRuntimeMs;
   log(`supervising ${runId ?? "all running runs"} in ${cwd} (poll ${pollMs}ms)`);
 
@@ -117,6 +198,7 @@ async function supervise(argv) {
 
     for (const run of runs) {
       if (run.status !== "running") continue;
+      supervised.add(run.runId);
       await engine.scheduleRun(cwd, run.runId).catch((error) => log(`schedule error ${run.runId}: ${error?.message ?? error}`));
     }
 
@@ -138,7 +220,10 @@ async function supervise(argv) {
       }
     } else if (!refreshed.some((run) => run.status === "running")) {
       log("done: no running runs remain");
-      return 0;
+      const outcomes = refreshed.filter(run => supervised.has(run.runId));
+      // Failure/interruption takes precedence over blocked, then completed.
+      if (outcomes.length !== supervised.size || outcomes.some(run => !["completed", "blocked"].includes(run.status))) return 1;
+      return outcomes.some(run => run.status === "blocked") ? 2 : 0;
     }
 
     if (Date.now() >= deadline) {

@@ -6,7 +6,7 @@ import { afterEach, describe, it } from "node:test";
 import { buildWorkflowReceipt, readWorkflowReceipt, resolveWorkflowReceiptResume, workflowReceiptPath, writeWorkflowReceipt } from "../../src/workflows/workflow-receipt.ts";
 import { externalCliReceiptMetadata, resolveExternalCliRunnerStatus } from "../../src/runs/shared/external-cli-contract.ts";
 import type { WorkflowScriptChildResult } from "../../src/workflows/scripted-workflow.ts";
-import type { HostStepNodeV1 } from "../../src/shared/types.ts";
+import type { HostStepNode } from "../../src/shared/types.ts";
 import { parseWorkflowChildSummary, workflowChildSummary } from "../../src/workflows/workflow-child-summary.ts";
 
 const roots: string[] = [];
@@ -39,7 +39,7 @@ function child(key: string, overrides: Partial<WorkflowScriptChildResult> = {}):
 	};
 }
 
-function hostStep(overrides: Partial<HostStepNodeV1> = {}): HostStepNodeV1 {
+function hostStep(overrides: Partial<HostStepNode> = {}): HostStepNode {
 	return {
 		version: 1,
 		kind: "host-step",
@@ -77,6 +77,18 @@ describe("workflow receipts", () => {
 		const receipt = buildWorkflowReceipt({ workflowRunId: "workflow-resource", state: "complete", children: [], resource, createdAt: 10 });
 		writeWorkflowReceipt(asyncDir, receipt);
 		assert.deepEqual(readWorkflowReceipt(asyncRoot, "workflow-resource").resource, resource);
+	});
+
+	it("round-trips the canonical workflow argument digest and rejects malformed digests", () => {
+		const asyncRoot = tempRoot();
+		const asyncDir = path.join(asyncRoot, "workflow-args");
+		fs.mkdirSync(asyncDir, { recursive: true });
+		const argsDigest = "a".repeat(64);
+		writeWorkflowReceipt(asyncDir, buildWorkflowReceipt({ workflowRunId: "workflow-args", state: "complete", children: [], argsDigest }));
+		assert.equal(readWorkflowReceipt(asyncRoot, "workflow-args").argsDigest, argsDigest);
+		assert.throws(() => buildWorkflowReceipt({ workflowRunId: "workflow-args", state: "complete", children: [], argsDigest: "invalid" }), /argsDigest/);
+		fs.writeFileSync(path.join(asyncDir, "workflow-receipt.json"), JSON.stringify({ ...buildWorkflowReceipt({ workflowRunId: "workflow-args", state: "complete", children: [], argsDigest }), argsDigest: "invalid" }));
+		assert.throws(() => readWorkflowReceipt(asyncRoot, "workflow-args"), /argsDigest is invalid/);
 	});
 
 	it("round-trips bounded host CI/gate state in terminal receipts", () => {
@@ -284,7 +296,12 @@ describe("workflow receipts", () => {
 		const runner = resolveExternalCliRunnerStatus({ command: "review-cli" });
 		const externalAdapter = externalCliReceiptMetadata({
 			runner,
-			externalProcess: { startedAt: 1, stdoutPath: "/tmp/stdout.log", stderrPath: "/tmp/stderr.log" },
+			externalProcess: {
+				startedAt: 1,
+				stdoutPath: "/tmp/stdout.log",
+				stderrPath: "/tmp/stderr.log",
+				machine: { provider: "herdr", id: "machine-1", label: "workmac", target: "host.example", cwd: "/srv/repo", remoteGit: { head: "abc123", branch: "main", dirty: true } },
+			},
 			outputReference: "/tmp/final.md",
 		});
 		const receipt = buildWorkflowReceipt({
@@ -298,9 +315,19 @@ describe("workflow receipts", () => {
 		assert.equal(receipt.entries.advisor?.externalAdapter?.capabilities.stop, true);
 		assert.equal(receipt.entries.advisor?.externalAdapter?.capabilities.supervisor, "unsupported");
 		assert.equal(receipt.entries.advisor?.externalAdapter?.handoff.mode, "fresh");
+		assert.deepEqual(receipt.entries.advisor?.externalAdapter?.machine, { provider: "herdr", id: "machine-1", label: "workmac", target: "host.example", cwd: "/srv/repo", remoteGit: { head: "abc123", branch: "main", dirty: true } });
 		assert.match(receipt.entries.advisor?.resumability.state === "not-resumable" ? receipt.entries.advisor.resumability.reason : "", /no durable external session identity/);
 		assert.doesNotMatch(serialized, /artifactPaths|rawOutput|handoffText|contact_supervisor/);
 		assert.ok(Buffer.byteLength(serialized) < 2_000, `external receipt metadata unexpectedly large: ${Buffer.byteLength(serialized)}`);
+		const asyncRoot = tempRoot();
+		const asyncDir = path.join(asyncRoot, "workflow-external");
+		fs.mkdirSync(asyncDir, { recursive: true });
+		writeWorkflowReceipt(asyncDir, receipt);
+		assert.deepEqual(readWorkflowReceipt(asyncRoot, "workflow-external").entries.advisor?.externalAdapter?.machine, externalAdapter.machine);
+		const malformed = JSON.parse(fs.readFileSync(path.join(asyncDir, "workflow-receipt.json"), "utf-8"));
+		malformed.entries.advisor.externalAdapter.machine.remoteGit.dirty = "true";
+		fs.writeFileSync(path.join(asyncDir, "workflow-receipt.json"), JSON.stringify(malformed));
+		assert.throws(() => readWorkflowReceipt(asyncRoot, "workflow-external"), /machine\.remoteGit is invalid/);
 	});
 
 	it("fails closed for malformed external adapter receipt metadata", () => {

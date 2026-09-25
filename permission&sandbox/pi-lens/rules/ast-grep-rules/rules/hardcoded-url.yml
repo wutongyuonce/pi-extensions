@@ -1,0 +1,35 @@
+id: hardcoded-url
+language: TypeScript
+message: "Hardcoded URL — use config or environment variable"
+severity: warning
+note: |
+  URLs should come from configuration, not hardcoded in source.
+  Use environment variables or a config file.
+  The original `$X = $URL` pattern only matched at the lexical-declaration
+  level for some shapes; using a regex on `variable_declarator` (the
+  inner `name = value` node) catches all const/let/var URL assignments
+  regardless of the surrounding keyword.
+  A `SCREAMING_SNAKE_CASE` name is the project-wide convention for a
+  deliberate, named constant (see e.g. `check_secret_pattern` in
+  tree-sitter-client.ts, which trusts the same convention for secrets).
+  Provider/integration endpoint constants (`BASE_URL_CLINE`, `URL_KILO_TOS`,
+  …) are declared this way on purpose — they are configuration, just
+  expressed as a TS constant instead of an env var — so exempting that
+  naming shape removes the low-signal noise while still catching a URL
+  hardcoded under an ordinary lower/camelCase name (#964).
+rule:
+  any:
+    - all:
+        - kind: variable_declarator
+          regex: '"https?://'
+        - not:
+            has:
+              field: name
+              regex: "^[A-Z][A-Z0-9_]*$"
+    - all:
+        - kind: assignment_expression
+          regex: '"https?://'
+        - not:
+            has:
+              field: left
+              regex: "^[A-Z][A-Z0-9_]*$"

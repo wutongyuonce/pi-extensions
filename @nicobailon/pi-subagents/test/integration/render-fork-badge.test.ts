@@ -43,7 +43,7 @@ const theme = {
 	bold: (text: string) => text,
 };
 const expandKey = keyText("app.tools.expand");
-const expandHint = `Press ${expandKey} for full output`;
+const expandHint = expandKey ? `Press ${expandKey} for full output` : "Configure the expand key for full output";
 
 const emptyUsage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, turns: 0 };
 
@@ -171,7 +171,7 @@ describe("renderSubagentResult fork indicator", () => {
 		const lines = widget.render(120).map((line) => line.trimEnd());
 		assert.match(lines[0]!, /^\[fork\] Managed agents:/);
 		assert.match(lines[0]!, /…$/);
-		const hintLineIndex = lines.findIndex((line) => line.includes(expandHint) || (expandKey === "" && line.includes("Press ") && line.includes(" for full output")));
+		const hintLineIndex = lines.findIndex((line) => line.includes(expandHint));
 		assert.ok(hintLineIndex > 0);
 		assert.doesNotMatch(lines[0]!, /reviewer/);
 	});
@@ -213,7 +213,7 @@ describe("renderSubagentResult fork indicator", () => {
 		const text = widget.render(120).join("\n");
 		assert.match(text, /^Run status:/);
 		assert.match(text, /3 lines/);
-		assert.ok(text.includes(expandHint) || (expandKey === "" && text.includes("Press ") && text.includes(" for full output")));
+		assert.ok(text.includes(expandHint));
 		assert.doesNotMatch(text, /State: running/);
 	});
 
@@ -696,6 +696,47 @@ describe("renderSubagentResult fork indicator", () => {
 		assert.match(expanded, /✓ five · completed/);
 	});
 
+	it("keeps mixed workflow host diagnostics visible once while deduplicating child errors", () => {
+		const hostError = "CI command failed: executable not found";
+		const childError = "Child review failed";
+		for (const childFailed of [false, true]) {
+			const result = {
+				content: [{ type: "text" as const, text: "workflow failed" }],
+				isError: true,
+				details: {
+					mode: "workflow" as const,
+					results: [{
+						agent: "reviewer",
+						task: "Review changes",
+						exitCode: childFailed ? 1 : 0,
+						error: childFailed ? childError : undefined,
+						finalOutput: childFailed ? "" : "Review complete",
+						messages: [],
+						usage: emptyUsage,
+					}],
+					workflow: {
+						value: "workflow finished",
+						trace: [],
+						emits: [],
+						console: [],
+						receipt: {
+							hostSteps: [{
+								version: 1, kind: "host-step", monitorKind: "command",
+								id: "ci", label: "CI", state: "error", detail: hostError,
+								exitCode: 127, updatedAt: 1,
+							}],
+						},
+					},
+				},
+			};
+			for (const expanded of childFailed ? [true] : [false, true]) {
+				const text = withTerminalWidth(220, () => renderSubagentResult!(result, { expanded }, theme).render(220).join("\n"));
+				assert.equal(text.split(hostError).length - 1, 1, text);
+				if (expanded) assert.equal(text.split(childError).length - 1, childFailed ? 1 : 0, text);
+			}
+		}
+	});
+
 	it("renders a stale-running interrupted aggregate as paused", () => {
 		const result = {
 			content: [{ type: "text" as const, text: "paused" }],
@@ -804,7 +845,7 @@ describe("renderSubagentResult fork indicator", () => {
 		}, { expanded: false }, theme);
 
 		const text = widget.render(120).join("\n");
-		assert.match(text, /Press configured-expand-key for live detail/);
+		assert.match(text, /Configure the expand key for live detail/);
 		assert.match(text, /active 2s ago/);
 		assert.match(text, /⎿  read: package\.json \| 3\.0s/);
 		assert.match(text, /output: \/tmp\/reviewer_output\.md/);

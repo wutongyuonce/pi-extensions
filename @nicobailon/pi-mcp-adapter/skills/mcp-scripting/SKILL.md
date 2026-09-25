@@ -1,6 +1,7 @@
 ---
 name: mcp-scripting
 description: Write mcpScript JavaScript for discovering, inspecting, and calling MCP tools.
+disable-model-invocation: true
 ---
 
 # MCP scripting
@@ -29,10 +30,20 @@ return result.data;
 2. Inspect the exact returned path with `await tools.describe({ path })`.
 3. Call it with `tools.call(path, args)`.
 
+Descriptors include `inputTypeScript` (a compact parameter shape, or formatted schema fallback). When a compact shape would omit documented fields, `inputGuidance` preserves their descriptions, including formats and units. Undocumented inputs stay compact.
+
+When advertised by the server, `outputSchema` is the original JSON Schema and `outputSchemaTarget` is `"data.structuredContent"`: it describes structured output inside the successful `{ ok: true, data }` call envelope, not the envelope itself. Inspect this schema for result fields and constraints; unsupported constructs remain intact rather than being presented as an approximate TypeScript type. Both output fields are absent when no output schema is advertised. Discovery and cache refresh preserve these optional schemas; old cache entries gain them on the next server metadata refresh. Ordinary search results do not include schemas.
+
 Calls resolve to `{ ok: true, data }` or `{ ok: false, error }`; handle failed calls instead of expecting them to stop the script. `emit(value)` adds user-visible output before the final `return` value. `console` output is captured too.
+
+With `settings.jev.scriptEvaluation` enabled, call `jev.evaluate({ state, questions, sources })`; declare every MCP server represented in state. The host conservatively taints the whole script with every server-attributed call result or error, so every declared or observed source must remain enabled and allowed for later direct evaluations and semantic searches. Semantic search requires `searchMode: "semantic"`. Direct and semantic attempts share count, UTF-8 request-byte, deadline, and provider-reported token budgets. Scores do not bypass `tools.call` approval. Action loops must use fresh observations, positive step/time/evaluation budgets, validated operations and targets, and stop on uncertainty, staleness, no progress, no match, or missing information. Do not retry a possibly side-effectful action.
+
+On success, `data` may still be the raw MCP `CallToolResult` envelope rather than the domain payload. Check `data.structuredContent` for the fields your script expects; if they are absent, inspect text blocks in `data.content` too (some servers emit newline-delimited JSON). If neither shape is understood, return or emit the envelope for inspection instead of coercing it to `[]` or `{}`.
 
 `tools` is a non-enumerable proxy: `Object.keys(tools)` throws. Always use `tools.search` for discovery. When a known flat path is a valid identifier, direct calls such as `tools.github_search_issues(args)` are supported; use bracket syntax for hyphenated names: `tools["server_tool-name"](args)`. `search`, `call`, `describe`, and promise/serialization names (`then`, `catch`, `finally`, `toJSON`, `toString`, `valueOf`) are reserved on the proxy; if a flat path collides with one, call it via `tools.call("exact-path", args)`.
 
-`tools.search` and `tools.describe` are asynchronous and must be awaited. The default script timeout is 30 seconds; the worker is terminated at the deadline, including for infinite loops. Every invocation still uses normal lazy connection, authentication, output guarding, and approval gates. Result details contain a concise `calls` trace with every search, describe, and call operation; each entry includes its query or path, outcome, and duration.
+Successful intermediate data bypasses presentation truncation, summarization, and artifact spill until the script emits, logs, or returns it. A fixed, non-configurable **16 MiB cumulative UTF-8 JSON transfer budget per script** covers sequential and parallel calls. A result exceeding the remaining budget returns `{ ok: false, error: { code: "intermediate_result_too_large", message } }` with a failed call trace; rejected calls do not consume the budget, but upstream side effects may already have happened. Resource calls retain transformed text or `"(empty resource)"`; emitted, logged, or returned output and ordinary MCP calls remain guarded. This is not a memory limit: responses, serialization, copies, concurrency, and script values still allocate memory, and synchronous serialization can delay deadline handling.
+
+`tools.search` and `tools.describe` are asynchronous and must be awaited. The default script timeout is 30 seconds; the worker is terminated at the deadline, including for infinite loops. Every invocation still uses normal lazy connection, authentication, and approval gates. Result details contain a concise `calls` trace with every search, describe, and call operation; each entry includes its query or path, outcome, and duration.
 
 Use plain JavaScript loops and Promise utilities for composition. Fluent helpers such as `tools.find(...).one()`, `tools.parallel(...)`, and `tools.retry(...)` are not provided.

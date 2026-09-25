@@ -5,6 +5,7 @@ const EMPTY_MESSAGES: Record<TabId, string[]> = {
 	running: ["No agents running.", "Launch an agent and it will appear here with live activity."],
 	completed: ["No completed agents yet.", "Finished, cancelled, and failed agents will appear here."],
 	agents: ["No agent definitions found.", "Add .md agent files in .pi/agents or ~/.pi/agent/agents."],
+	orchestrator: ["Orchestrator controls are unavailable.", "Return to the parent session to change orchestration."],
 };
 
 export function renderList(

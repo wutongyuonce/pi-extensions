@@ -1,0 +1,23 @@
+{
+	"extends": "./tsconfig.build.json",
+	"compilerOptions": {
+		"rootDir": ".",
+		"outDir": "./dist",
+		"declaration": false,
+		"sourceMap": false,
+		"types": [],
+		"allowJs": true
+	},
+	"include": [
+		"index.ts",
+		"i18n.ts",
+		"clients/**/*.ts",
+		"commands/**/*.ts",
+		"tools/**/*.ts",
+		"mcp/**/*.ts",
+		"scripts/lib/process-scan.mjs",
+		"scripts/lib/skills-predicate.mjs",
+		"scripts/lib/web-tree-sitter-dir.mjs"
+	],
+	"exclude": ["node_modules", "tests", "**/*.test.ts"]
+}

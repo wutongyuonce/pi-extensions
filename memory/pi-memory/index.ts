@@ -467,7 +467,7 @@ async function generateExitSummary(ctx: ExtensionContext): Promise<ExitSummaryRe
 		const response = await complete(
 			model,
 			{ systemPrompt: EXIT_SUMMARY_SYSTEM_PROMPT, messages: summaryMessages },
-			{ apiKey, reasoningEffort: "low" },
+			{ apiKey, reasoningEffort: getExitSummaryReasoningEffort() },
 		);
 
 		const summaryText = response.content
@@ -535,6 +535,25 @@ const DEFAULT_EXIT_SUMMARY_TIMEOUT_MS = 10_000;
 export function getExitSummaryTimeoutMs(): number {
 	const configured = Number(process.env.PI_MEMORY_EXIT_SUMMARY_TIMEOUT_MS);
 	return Number.isInteger(configured) && configured > 0 ? configured : DEFAULT_EXIT_SUMMARY_TIMEOUT_MS;
+}
+
+const DEFAULT_EXIT_SUMMARY_REASONING_EFFORT = "low";
+
+/**
+ * Reasoning effort passed to the exit-summary LLM call. Defaults to "low".
+ *
+ * Some providers reject certain efforts — e.g. Baseten's GLM-5.2 only accepts
+ * "high"/"max"/"none" and returns HTTP 400 for "low", silently breaking exit
+ * summaries (the error is caught, summary is null, nothing is persisted).
+ * Override with PI_MEMORY_EXIT_SUMMARY_REASONING_EFFORT to a value the
+ * configured PI_MEMORY_EXIT_SUMMARY_MODEL accepts. Set to "off" to omit the
+ * parameter entirely and let the provider apply its own default.
+ */
+export function getExitSummaryReasoningEffort(): string | undefined {
+	const value = (process.env.PI_MEMORY_EXIT_SUMMARY_REASONING_EFFORT ?? "").trim().toLowerCase();
+	if (value === "off") return undefined;
+	if (value === "") return DEFAULT_EXIT_SUMMARY_REASONING_EFFORT;
+	return value;
 }
 
 export function shouldSkipExitSummaryForReason(reason: string | undefined): boolean {
@@ -955,6 +974,7 @@ let qmdAvailabilityCheckedAt = 0;
 const QMD_STATUS_CACHE_TTL_MS = 5 * 60 * 1000;
 const QMD_STATUS_NEGATIVE_CACHE_TTL_MS = 5 * 1000;
 const DEFAULT_QMD_SEARCH_TIMEOUT_MS = 60_000;
+const DEFAULT_EMBED_PROBE_TIMEOUT_MS = 15_000;
 const qmdCollectionStatusCache = new Map<string, { checkedAt: number; exists: boolean }>();
 
 function qmdStatusTtl(positive: boolean): number {
@@ -964,6 +984,11 @@ function qmdStatusTtl(positive: boolean): number {
 export function getQmdSearchTimeoutMs(env: NodeJS.ProcessEnv = process.env): number {
 	const configured = Number(env.PI_MEMORY_QMD_SEARCH_TIMEOUT_MS);
 	return Number.isInteger(configured) && configured > 0 ? configured : DEFAULT_QMD_SEARCH_TIMEOUT_MS;
+}
+
+export function getEmbedProbeTimeoutMs(env: NodeJS.ProcessEnv = process.env): number {
+	const configured = Number(env.PI_MEMORY_EMBED_PROBE_TIMEOUT_MS);
+	return Number.isInteger(configured) && configured > 0 ? configured : DEFAULT_EMBED_PROBE_TIMEOUT_MS;
 }
 let updateTimer: ReturnType<typeof setTimeout> | null = null;
 let exitSummaryReason: ExitSummaryReason | null = null;
@@ -1292,10 +1317,11 @@ export function runQmdSearch(
 	mode: "keyword" | "semantic" | "deep",
 	query: string,
 	limit: number,
+	timeoutOverrideMs?: number,
 ): Promise<{ results: QmdSearchResult[]; stderr: string }> {
 	const subcommand = mode === "keyword" ? "search" : mode === "semantic" ? "vsearch" : "query";
 	const args = [subcommand, "--json", "-c", "pi-memory", "-n", String(limit), query];
-	const timeoutMs = getQmdSearchTimeoutMs();
+	const timeoutMs = timeoutOverrideMs ?? getQmdSearchTimeoutMs();
 
 	return new Promise((resolve, reject) => {
 		execFileFn("qmd", args, { timeout: timeoutMs }, (err, stdout, stderr) => {
@@ -1326,18 +1352,27 @@ export function runQmdSearch(
 
 /**
  * Best-effort check of whether vector embeddings are ready for semantic/deep
- * search. Bounded by a short timeout because the first semantic query can
- * trigger a model download. Returns "unknown" rather than blocking on it.
+ * search. Bounded by a timeout because the first semantic query can trigger a
+ * model download. Returns "unknown" rather than blocking on it.
  * "ready" means a probe query ran without qmd's "need embeddings" warning —
  * it does not prove the index has content.
+ *
+ * The bound must stay well clear of normal `qmd vsearch` latency: the probe
+ * runs an embed + rerank pass (measured ~2.4-3.6s idle, >4s while a background
+ * re-index competes for CPU and the embedding model). A tighter bound made
+ * `memory_status` report "unknown" immediately after a write, which is exactly
+ * when the index is busy. Override with PI_MEMORY_EMBED_PROBE_TIMEOUT_MS.
  */
 export async function probeEmbeddings(): Promise<"ready" | "missing" | "unknown"> {
+	const probeTimeoutMs = getEmbedProbeTimeoutMs();
 	let timer: ReturnType<typeof setTimeout> | undefined;
 	try {
 		const { stderr } = await Promise.race([
-			runQmdSearch("semantic", "memory", 1),
+			// Bound the child by the same budget so a probe we abandon does not
+			// leave a long-running LLM query behind.
+			runQmdSearch("semantic", "memory", 1, probeTimeoutMs),
 			new Promise<never>((_, reject) => {
-				timer = setTimeout(() => reject(new Error("timeout")), 4_000);
+				timer = setTimeout(() => reject(new Error("timeout")), probeTimeoutMs);
 			}),
 		]);
 		return /need embeddings/i.test(stderr ?? "") ? "missing" : "ready";
@@ -1396,7 +1431,6 @@ let snapshotTakenAt: string | null = null;
 let snapshotTakenOnDate: string | null = null;
 let snapshotReason: string | null = null;
 let snapshotDirty = false;
-
 function refreshMemorySnapshot(reason: string) {
 	memorySnapshot = buildMemoryContext("");
 	snapshotTakenAt = nowTimestamp();
@@ -1405,9 +1439,11 @@ function refreshMemorySnapshot(reason: string) {
 	snapshotDirty = false;
 }
 
-function getSnapshotMode(): "stable" | "per-turn" {
+function getSnapshotMode(): "stable" | "refresh" | "per-turn" {
 	const mode = (process.env.PI_MEMORY_SNAPSHOT ?? "stable").toLowerCase();
-	return mode === "per-turn" ? "per-turn" : "stable";
+	if (mode === "per-turn") return "per-turn";
+	if (mode === "refresh") return "refresh";
+	return "stable";
 }
 
 /** Reset snapshot state (for testing). */
@@ -1548,18 +1584,33 @@ export default function (pi: ExtensionAPI) {
 			const searchResults = skipSearch ? "" : await searchRelevantMemories(event.prompt ?? "");
 			memoryContext = buildMemoryContext(searchResults);
 		} else {
+			// "stable" means stable: once taken, the block is emitted byte-for-byte
+			// for the rest of the session. Refreshing on a long-term write or a
+			// midnight rollover rewrites the tail of the system prompt and voids the
+			// whole conversation's prefix cache — the exact cost the snapshot exists
+			// to avoid, paid on the single most common in-session event. The fresh
+			// state is not lost: the write is in tool-call history a few messages
+			// back, deletions are sent as a correction message below, and
+			// memory_read / memory_search reach the files directly. "refresh" restores the old
+			// checkpoint behaviour.
 			const today = todayStr();
-			const needsRefresh = memorySnapshot === null || snapshotDirty || snapshotTakenOnDate !== today;
-			if (needsRefresh) {
+			const stale = mode === "refresh" && (snapshotDirty || snapshotTakenOnDate !== today);
+			if (memorySnapshot === null || stale) {
 				const reason =
 					memorySnapshot === null ? "before_agent_start" : snapshotDirty ? "long_term_write" : "day_rollover";
 				refreshMemorySnapshot(reason);
 			}
 			memoryContext = memorySnapshot ?? "";
+			// Deliberately carries no timestamp and no reason word: both change
+			// between turns without the memory itself changing, which is enough on
+			// its own to invalidate the cache this branch is trying to preserve.
 			snapshotCaveat =
-				`Snapshot ${snapshotReason} at ${snapshotTakenAt}. ` +
-				"Use memory_read / memory_search for the authoritative latest state; " +
-				"recent writes may also be visible in tool-call history.";
+				mode === "refresh"
+					? `Snapshot ${snapshotReason} at ${snapshotTakenAt}. ` +
+						"Use memory_read / memory_search for the authoritative latest state; " +
+						"recent writes may also be visible in tool-call history."
+					: "Loaded once at session start and not re-read since. Use memory_read / memory_search " +
+						"for the authoritative latest state; anything written this session is in tool-call history.";
 		}
 
 		if (!memoryContext) return;
@@ -2114,10 +2165,11 @@ export default function (pi: ExtensionAPI) {
 			// If either write fails, we never report a successful unrecoverable deletion.
 			const recovery = writeRecoveryRecord(target, recoveryDate, result.removed);
 			fs.writeFileSync(filePath, result.content, "utf-8");
-			// Deleted facts must leave the injected snapshot too, whichever file
-			// they lived in — a forgotten-but-still-injected memory defeats the
-			// point of forgetting.
-			snapshotDirty = true;
+			// Forget is a privacy-sensitive mutation. Refresh the snapshot immediately
+			// so deleted content disappears from authoritative context without being
+			// copied into persisted correction messages. This intentionally spends one
+			// cache invalidation on an explicit deletion.
+			refreshMemorySnapshot("memory_forget");
 			await ensureQmdAvailableForUpdate();
 			scheduleQmdUpdate();
 
@@ -2185,7 +2237,9 @@ export default function (pi: ExtensionAPI) {
 			if (missingEntries.length > 0) {
 				const separator = existing.trim() ? "\n\n" : "";
 				fs.writeFileSync(targetPath, `${existing}${separator}${missingEntries.join("\n\n")}\n`, "utf-8");
-				snapshotDirty = true;
+				// Restore changes which durable facts are authoritative, so refresh the
+				// snapshot instead of persisting restored content in a correction message.
+				refreshMemorySnapshot("memory_restore");
 				await ensureQmdAvailableForUpdate();
 				scheduleQmdUpdate();
 			}
@@ -2394,7 +2448,10 @@ export default function (pi: ExtensionAPI) {
 							lines.push("  - Run `qmd embed` once to enable semantic/deep search.");
 						}
 					} else if (embeddings === "unknown") {
-						lines.push("  - Could not verify within the probe timeout; run a semantic search to confirm.");
+						lines.push(
+							`  - Could not verify within the ${getEmbedProbeTimeoutMs() / 1000}s probe timeout; run a semantic search to confirm.`,
+							"  - A background re-index can slow the probe. Raise PI_MEMORY_EMBED_PROBE_TIMEOUT_MS if it persists.",
+						);
 					}
 				} else {
 					lines.push("  - Run a `memory_search` (auto-creates it) or `qmd collection add` manually.");
@@ -2409,9 +2466,11 @@ export default function (pi: ExtensionAPI) {
 				`- PI_MEMORY_SNAPSHOT: ${getSnapshotMode()}`,
 				`- PI_MEMORY_QMD_UPDATE: ${getQmdUpdateMode()}`,
 				`- PI_MEMORY_QMD_SEARCH_TIMEOUT_MS: ${getQmdSearchTimeoutMs()}`,
+				`- PI_MEMORY_EMBED_PROBE_TIMEOUT_MS: ${getEmbedProbeTimeoutMs()}`,
 				`- PI_MEMORY_DIR: ${process.env.PI_MEMORY_DIR ? "set" : "default"}`,
 				`- PI_MEMORY_EXIT_SUMMARY: ${isExitSummaryEnabled() ? "enabled" : "disabled"}`,
 				`- PI_MEMORY_EXIT_SUMMARY_MODEL: ${process.env.PI_MEMORY_EXIT_SUMMARY_MODEL?.trim() || "session model"}`,
+				`- PI_MEMORY_EXIT_SUMMARY_REASONING_EFFORT: ${getExitSummaryReasoningEffort() ?? "off"}`,
 				`- PI_MEMORY_EXIT_SUMMARY_TIMEOUT_MS: ${getExitSummaryTimeoutMs()}`,
 			);
 

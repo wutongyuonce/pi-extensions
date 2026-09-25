@@ -1,0 +1,7 @@
+id: rust-no-chars-enumerate
+valid:
+  - "for (index, character) in text.char_indices() {}"
+  - "for character in text.chars() {}"
+invalid:
+  - "for (index, character) in text.chars().enumerate() {}"
+  - "let positions = value.chars().enumerate();"

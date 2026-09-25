@@ -9,7 +9,6 @@ import { registerAgent } from "../../src/api/agents.ts";
 import { clearRuntimeAgentsForPi } from "../../src/agents/runtime-agent-registry.ts";
 import { scheduledRunStorePath } from "../../src/runs/background/scheduled-runs.ts";
 import { updateActiveRunIndex } from "../../src/runs/background/active-run-index.ts";
-import { SUBAGENT_FANOUT_CHILD_ENV } from "../../src/runs/shared/pi-args.ts";
 import { getArtifactPaths, getArtifactsDir } from "../../src/shared/artifacts.ts";
 import { ASYNC_DIR, DIRS } from "../../src/shared/types.ts";
 import type { WatchdogReviewFunction } from "../../src/watchdog/runtime.ts";
@@ -214,6 +213,7 @@ function createWatchdogHarness(review?: WatchdogReviewFunction) {
 	const commands = new Map<string, RegisteredSlashCommand>();
 	const renderers = new Map<string, (message: { content: string; details?: unknown }, options: { expanded: boolean }, theme: { fg(name: string, value: string): string; bold(value: string): string }) => { render(width: number): string[] } | undefined>();
 	const sent: unknown[] = [];
+	const entries: Array<{ customType: string; data: unknown }> = [];
 	const pi = {
 		events: createEventBus(),
 		on() {},
@@ -222,11 +222,13 @@ function createWatchdogHarness(review?: WatchdogReviewFunction) {
 		registerMessageRenderer(type: string, renderer: (message: { content: string; details?: unknown }, options: { expanded: boolean }, theme: { fg(name: string, value: string): string; bold(value: string): string }) => { render(width: number): string[] } | undefined) {
 			renderers.set(type, renderer);
 		},
+		registerEntryRenderer() {},
+		appendEntry(customType: string, data: unknown) { entries.push({ customType, data }); },
 		getThinkingLevel() { return "medium" as const; },
 		sendMessage(message: unknown) { sent.push(message); },
 	};
 	const runtime = registerMainWatchdog!(pi as never, review ? { review } : undefined);
-	return { commands, renderers, runtime, sent };
+	return { commands, renderers, runtime, sent, entries };
 }
 
 async function captureSlashCommandParams(
@@ -292,6 +294,7 @@ describe("subagents watchdog slash command", { skip: !available ? "watchdog comm
 				assert.match(content, /Subagent watchdog/);
 				assert.match(content, /Main: off \(default off\)/);
 				assert.match(content, /Runtime: idle/);
+				assert.match(content, /Rules: none/);
 				assert.match(content, /Review model call: real model review/);
 				assert.match(content, /Sources:/);
 			});
@@ -323,6 +326,40 @@ describe("subagents watchdog slash command", { skip: !available ? "watchdog comm
 				assert.equal(settings.subagents.watchdog.main.thinking, "high");
 				assert.equal(settings.subagents.watchdog.enabled, undefined);
 				assert.match(String((sent[1] as { content?: unknown }).content ?? ""), /Run \/subagents-watchdog on if the watchdog is still off/);
+			});
+		});
+	});
+
+	it("keeps a configured project watchdog in recommendations and explicit user-scope saves", async () => {
+		await withIsolatedHome(async () => {
+			await withTempProject("pi-watchdog-configured-", async (root) => {
+				const configured = { provider: "github-copilot", id: "gpt-6-astra", reasoning: true };
+				const gpt = { provider: "openai-codex", id: "gpt-5.5", reasoning: true };
+				const models = [configured, gpt];
+				const projectPath = path.join(root, ".pi", "settings.json");
+				fs.mkdirSync(path.dirname(projectPath), { recursive: true });
+				const projectSettings = JSON.stringify({ subagents: { watchdog: { main: { model: "github-copilot/gpt-6-astra", thinking: "high" } } } });
+				fs.writeFileSync(projectPath, projectSettings);
+				const ctx = createCommandContext({ cwd: root, model: configured, modelRegistry: {
+					getAvailable: () => models,
+					find: (provider: string, id: string) => models.find((entry) => entry.provider === provider && entry.id === id),
+					hasConfiguredAuth: () => true,
+				} });
+				const { commands, sent } = createWatchdogHarness();
+				for (const command of ["status", "recommend-model", "check"]) {
+					await commands.get("subagents-watchdog")!.handler(command, ctx);
+					const content = String((sent.at(-1) as { content?: unknown }).content ?? "");
+					assert.match(content, /Keep configured watchdog: github-copilot\/gpt-6-astra:high/);
+					assert.doesNotMatch(content, /Recommended strong watchdog|strong independent watchdog/);
+				}
+				const userPath = path.join(process.env.HOME!, ".pi", "agent", "settings.json");
+				assert.equal(fs.existsSync(userPath), false);
+				await commands.get("subagents-watchdog")!.handler("model recommended", ctx);
+				assert.deepEqual(JSON.parse(fs.readFileSync(userPath, "utf-8")).subagents.watchdog.main, {
+					model: "github-copilot/gpt-6-astra", thinking: "high",
+				});
+				assert.match(String((sent.at(-1) as { content?: unknown }).content), /saved to user settings/);
+				assert.equal(fs.readFileSync(projectPath, "utf-8"), projectSettings);
 			});
 		});
 	});
@@ -430,23 +467,19 @@ describe("subagents watchdog slash command", { skip: !available ? "watchdog comm
 		});
 	});
 
-	it("sends deterministic concern and blocker warning messages through the renderer path", async () => {
+	it("routes explicit low and medium test findings to entries and high findings to messages", async () => {
 		await withIsolatedHome(async () => {
-			const { commands, renderers, sent } = createWatchdogHarness();
-			await commands.get("subagents-watchdog")!.handler("test concern check the concern", createCommandContext());
-			await commands.get("subagents-watchdog")!.handler("test blocker check the blocker", createCommandContext());
+			const { commands, renderers, sent, entries } = createWatchdogHarness();
+			await commands.get("subagents-watchdog")!.handler("test concern low check the concern", createCommandContext());
+			await commands.get("subagents-watchdog")!.handler("test concern medium check the medium concern", createCommandContext());
+			await commands.get("subagents-watchdog")!.handler("test blocker high check the blocker", createCommandContext());
 
-			const concern = sent[0] as { customType?: string; content?: string; display?: boolean; details?: Record<string, unknown> };
-			const blocker = sent[1] as { customType?: string; content?: string; display?: boolean; details?: Record<string, unknown> };
-			assert.equal(concern.customType, "subagent_watchdog_warning");
-			assert.equal(concern.display, true);
-			assert.equal(concern.details?.severity, "concern");
-			assert.equal(concern.details?.source, "main");
-			assert.equal(concern.details?.state, "displayed");
-			assert.match(concern.content ?? "", /source="main"/);
-			assert.match(concern.content ?? "", /<state>displayed<\/state>/);
-			assert.match(concern.content ?? "", /<recommended_action>/);
+			assert.equal(entries.length, 2);
+			assert.deepEqual(entries.map((entry) => (entry.data as any).importance), ["low", "medium"]);
+			assert.equal(sent.length, 1);
+			const blocker = sent[0] as { customType?: string; content?: string; display?: boolean; details?: Record<string, unknown> };
 			assert.equal(blocker.details?.severity, "blocker");
+			assert.equal(blocker.details?.importance, "high");
 			assert.match(blocker.content ?? "", /<blocker_guidance>/);
 
 			const renderer = renderers.get("subagent_watchdog_warning")!;
@@ -463,7 +496,7 @@ describe("subagents watchdog slash command", { skip: !available ? "watchdog comm
 					assert.equal(request.emitWarning({
 						severity: "concern",
 						category: "test-gap",
-						confidence: "high",
+						importance: "high",
 						source: "main",
 						summary: "Focused validation is missing",
 						evidence: "The reviewed turn delta says changes were made but contains no test command.",
@@ -615,15 +648,17 @@ describe("slash command custom message delivery", { skip: !available ? "slash-co
 		assert.match(String((sent[0] as { content?: unknown }).content ?? ""), /Detached foreground run run-123/);
 	});
 
-	it("does not reserve a foreground detach shortcut by default", () => {
+	it("preserves /subagents-fleet without reserving a global shortcut by default", () => {
+		const commands = new Map<string, RegisteredSlashCommand>();
 		const shortcuts = new Map<string, unknown>();
 		registerSlashCommands!({
 			events: createEventBus(),
-			registerCommand() {},
+			registerCommand(name: string, spec: RegisteredSlashCommand) { commands.set(name, spec); },
 			registerShortcut(key: string, spec: unknown) { shortcuts.set(key, spec); },
 			sendMessage() {},
 		}, createState(process.cwd()));
-		assert.equal(shortcuts.has("ctrl+b"), false);
+		assert.ok(commands.has("subagents-fleet"));
+		assert.equal(shortcuts.size, 0);
 	});
 
 	it("/subagents-stop keeps the selector within its allocated width", async () => {

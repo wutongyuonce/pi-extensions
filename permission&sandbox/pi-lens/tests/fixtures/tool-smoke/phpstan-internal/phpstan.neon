@@ -1,0 +1,10 @@
+# Tool-smoke fixture (#1937). `paths` plus reportUnmatchedIgnoredErrors makes
+# phpstan report a finding that is NOT attached to any file, so the capture
+# pins the top-level `errors[]` array the runner used to discard.
+parameters:
+    level: 5
+    paths:
+        - .
+    reportUnmatchedIgnoredErrors: true
+    ignoreErrors:
+        - '#Never emitted by this fixture#'

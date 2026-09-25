@@ -1,12 +1,16 @@
 {
   "name": "pi-web-access",
-  "version": "0.27.0",
-  "description": "Web search, URL fetching, GitHub repo cloning, PDF extraction, YouTube video understanding, and local video analysis for Pi coding agent. Supports OpenAI, Brave, Parallel, TinyFish, Search1API, Searchinfinity, Querit, Tavily, Firecrawl, Jina, SERPdive, Kagi, Ollama, AnySearch, Bright Data SERP, SerpBase, SearXNG, Exa, Perplexity, Gemini, and Kimi.",
+  "version": "0.31.0",
+  "description": "Web search, URL fetching, GitHub repo cloning, PDF extraction, YouTube video understanding, and local video analysis for Pi coding agent. Supports OpenAI, Brave, Parallel, TinyFish, Search1API, Searchinfinity, Querit, Tavily, Firecrawl, Crawl4AI, Jina, SERPdive, Kagi, Ollama, AnySearch, Bright Data SERP, SerpBase, SerpApi, Serply, SearXNG, Exa, Perplexity, Gemini, Kimi, and Mistral.",
   "type": "module",
   "scripts": {
     "test": "node --test",
     "typecheck": "tsc",
-    "audit:runtime": "npm audit --omit=dev --omit=peer"
+    "audit:runtime": "npm audit --omit=dev --omit=peer",
+    "build": "node scripts/build.js",
+    "prepublishOnly": "npm run build && node scripts/pi-extensions-dist.js dist",
+    "postpublish": "node scripts/pi-extensions-dist.js index.ts",
+    "release": "node scripts/publish.js"
   },
   "keywords": [
     "pi-package",
@@ -33,6 +37,7 @@
   },
   "homepage": "https://github.com/nicobailon/pi-web-access#readme",
   "files": [
+    "dist",
     "*.ts",
     "CHANGELOG.md",
     "SECURITY.md",
@@ -40,10 +45,15 @@
     "pi-web-fetch-demo.mp4"
   ],
   "devDependencies": {
+    "@earendil-works/pi-ai": "0.86.1",
+    "@earendil-works/pi-coding-agent": "0.86.1",
+    "@earendil-works/pi-tui": "0.86.1",
     "@types/turndown": "^5.0.6",
+    "esbuild": "^0.28.1",
     "typescript": "^7.0.2"
   },
   "dependencies": {
+    "@modelcontextprotocol/sdk": "1.27.1",
     "@mozilla/readability": "^0.6.0",
     "defuddle": "0.19.3",
     "linkedom": "^0.16.0",

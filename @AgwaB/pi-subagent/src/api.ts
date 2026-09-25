@@ -46,6 +46,14 @@ import {
 } from "./orchestrate/status.ts";
 
 export {
+	formatPruneSubagentRunsSummary,
+	pruneSubagentRuns,
+	type PruneSubagentRunCandidate,
+	type PruneSubagentRunsOptions,
+	type PruneSubagentRunsSummary,
+} from "./orchestrate/prune.ts";
+
+export {
 	assertDurableLaunchBarrierV2ExecutionAuthorized,
 	createDurableLaunchBarrier,
 	createDurableLaunchBarrierV2,
@@ -139,17 +147,17 @@ function hasRunnableSingleInput(input: ResolveInput): boolean {
 function agentRequests(input: ResolveInput): AgentRequest[] {
 	if (input.tasks !== undefined) {
 		return input.tasks
-			.filter(
-				(task): task is typeof task & { agent: string } =>
-					typeof task.agent === "string" && task.agent.length > 0,
-			)
 			.map((task) => ({
-				agent: task.agent,
+				agent: task.agent ?? input.agent,
 				cwd: task.cwd,
 				agentScope: task.agentScope ?? input.agentScope,
 				confirmProjectAgents:
 					task.confirmProjectAgents ?? input.confirmProjectAgents ?? false,
-			}));
+			}))
+			.filter(
+				(request): request is typeof request & { agent: string } =>
+					typeof request.agent === "string" && request.agent.length > 0,
+			);
 	}
 	return typeof input.agent === "string" && input.agent.length > 0
 		? [
@@ -169,10 +177,7 @@ async function assertProjectAgentApproval(
 ): Promise<void> {
 	const projectAgents: AgentDefinition[] = [];
 	for (const request of agentRequests(input)) {
-		if (
-			request.confirmProjectAgents === false ||
-			request.agentScope === "global"
-		)
+		if (request.confirmProjectAgents === false || request.agentScope === "global")
 			continue;
 		const requestCwd = resolve(cwd, request.cwd ?? ".");
 		const agent = await loadAgentByName(
@@ -182,9 +187,7 @@ async function assertProjectAgentApproval(
 		);
 		if (
 			agent?.source === "project" &&
-			!projectAgents.some(
-				(candidate) => candidate.sourcePath === agent.sourcePath,
-			)
+			!projectAgents.some((candidate) => candidate.sourcePath === agent.sourcePath)
 		) {
 			projectAgents.push(agent);
 		}

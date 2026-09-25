@@ -18,7 +18,7 @@ pi install npm:@agwab/pi-subagent
 
 Then reload Pi.
 
-Requires Node.js `>=22.19.0` on macOS or Linux. The package includes a source-auditable universal macOS helper for kernel process birth identity; users do not need a compiler. The published helper is rebuilt from the included C source and executed on both arm64 and Intel macOS runners before npm publish. Native Windows is not supported (POSIX process groups, tmux, and `which`-based Pi discovery); use WSL2.
+Requires Node.js `>=22.19.0` on macOS or Linux and Pi (`@earendil-works/pi-coding-agent`) 0.79 or newer; this release is validated against Pi 0.84.4. The engine imports Pi's SDK from the host process at runtime, so the version you run `pi` with is the version subagents use. The package includes a source-auditable universal macOS helper for kernel process birth identity; users do not need a compiler. The published helper is rebuilt from the included C source and executed on both arm64 and Intel macOS runners before npm publish. Native Windows is not supported (POSIX process groups, tmux, and `which`-based Pi discovery); use WSL2.
 
 For local development, add this package as a Pi extension source and reload Pi.
 
@@ -122,6 +122,8 @@ Existing run:
 
 Recent runs can be addressed by `runId` even when they were launched from another cwd; legacy records still resolve from the explicit or current cwd.
 
+Retention: run artifacts under `.pi/agent/runs/` are kept until you prune them. `{ "action": "prune" }` or `/subagent prune [--yes] [--keep N] [--older-than DAYS]` reports the terminal runs beyond the newest 50 (or older than `olderThanDays`) and deletes them only with `yes`; non-terminal runs are never touched.
+
 ### Panel
 
 Inspect runs, attempts, artifacts, and log tails in a live TUI. The panel defaults to the current Pi session, can switch to current cwd or all indexed runs, and includes status filters plus a scrollable detail pane. It shows active and recent terminal runs by default, with in-panel `m` to show more, and counts stale/malformed run pointers without exposing raw session ids.
@@ -147,4 +149,5 @@ const status = await getSubagentStatus({ runId: run.runId });
 
 ## Detailed docs
 
-- [`docs/usage.md`](./docs/usage.md) — full argument reference, code API, `action` behavior, backend selection, sandbox/worktree behavior, artifacts, and validation notes.
+- [`docs/usage.md`](./docs/usage.md) — full argument reference, code API, `action` behavior, backend selection, sandbox/worktree behavior, artifacts, environment variables, and validation notes.
+- [`docs/api.md`](./docs/api.md) — per-export reference for `@agwab/pi-subagent/api` (runs, prune, durable launch barrier, types).

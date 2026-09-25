@@ -15,7 +15,6 @@ export interface RunningRegistryRuntime {
 	formatElapsed(elapsed: number): string;
 	updateWidget(): void;
 	waitForSubagentResult(params: { id: string }, signal?: AbortSignal): Promise<unknown>;
-	withSubagentBatchStop(result: any): any;
 	asSubagentToolResult(result: unknown): any;
 }
 
@@ -176,7 +175,10 @@ export async function getLaunchedSubagentResult(
 	const parentShouldWait = shouldAwaitSubagentLaunch(running);
 	if (!parentShouldWait) return getStartedSubagentResult(running);
 	const result = await runtime.waitForSubagentResult({ id: running.id }, signal);
-	return runtime.withSubagentBatchStop(runtime.asSubagentToolResult(result));
+	// The parent waited, so the report is already in this tool result. The
+	// coordinator-only turn stop exists for detached launches only; a stop mark
+	// here would end the turn before the model reads the report.
+	return runtime.asSubagentToolResult(result);
 }
 
 /**

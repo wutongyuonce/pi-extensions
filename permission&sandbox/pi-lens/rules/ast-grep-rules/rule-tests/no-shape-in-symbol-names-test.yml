@@ -1,0 +1,13 @@
+id: no-shape-in-symbol-names
+valid:
+  - "const manifest = 1;"
+  - "interface I { name: string; }"
+  - "type Manifest = 1;"
+invalid:
+  - "const shape = 1;"
+  - "const packageJsonShape = 1;"
+  - "class C { shapeField = 1; }"
+  - "class C { #shapeField = 1; }"
+  - "interface I { shapeProp: string; }"
+  - "type PackageJsonShape = 1;"
+  - "function reshape() {}"

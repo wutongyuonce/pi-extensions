@@ -1,6 +1,9 @@
 import { existsSync, readFileSync } from "node:fs";
 import { activityMonitor } from "./activity.ts";
+import { normalizeDomain } from "./domain-filter-normalization.ts";
 import type { SearchOptions, SearchResponse } from "./perplexity.ts";
+import { formatSearchResultsAsAnswer } from "./search-answer-formatting.ts";
+import { normalizeSearchResultCount } from "./search-result-count-normalization.ts";
 import { hasCredentialSource, redactCredential, resolveCredential } from "./credential-source.ts";
 import { getWebSearchConfigPath } from "./utils.ts";
 
@@ -70,11 +73,6 @@ function invalidResponse(message: string): Error {
 	return new Error(`XCrawl API returned invalid response: ${message}`);
 }
 
-function normalizeCount(value: number | undefined): number {
-	if (typeof value !== "number" || !Number.isFinite(value)) return 5;
-	return Math.max(1, Math.min(Math.floor(value), 20));
-}
-
 function hostnameOf(url: string): string {
 	try {
 		return new URL(url).hostname.toLowerCase();
@@ -94,23 +92,6 @@ function absolutizeLink(link: string): string {
 	} catch {
 		return link;
 	}
-}
-
-// Normalize a shared domainFilter entry the same way Valyu does before
-// matching: trim, lowercase, strip URL/paths/ports, validate the shape.
-function normalizeDomain(value: string): string | null {
-	let input = value.trim().toLowerCase();
-	if (!input) return null;
-	if (input.startsWith("-")) input = input.slice(1).trim();
-	if (!input) return null;
-	try {
-		const parsed = input.includes("://") ? new URL(input) : new URL(`https://${input}`);
-		input = parsed.hostname;
-	} catch {
-		input = input.split("/")[0]?.split(":")[0] ?? "";
-	}
-	input = input.replace(/^\.+|\.+$/g, "");
-	return /^[a-z0-9][a-z0-9.-]*\.[a-z]{2,}$/i.test(input) ? input : null;
 }
 
 // XCrawl's SERP API has no server-side domain filter, so apply the shared
@@ -175,17 +156,9 @@ function parseResponse(value: unknown): SearchResponse["results"] {
 	return results;
 }
 
-function buildAnswer(results: SearchResponse["results"]): string {
-	return results
-		.map((result) => result.snippet
-			? `${result.snippet}\nSource: ${result.title} (${result.url})`
-			: `Source: ${result.title} (${result.url})`)
-		.join("\n\n");
-}
-
 export async function searchWithXCrawl(query: string, options: SearchOptions = {}): Promise<SearchResponse> {
 	const apiKey = await getApiKey(options.signal);
-	const numResults = normalizeCount(options.numResults);
+	const numResults = normalizeSearchResultCount(options.numResults);
 	if (!apiKey) {
 		throw new Error(
 			"XCrawl search requires an API key. Set xcrawlApiKey in " + CONFIG_PATH +
@@ -258,7 +231,7 @@ export async function searchWithXCrawl(query: string, options: SearchOptions = {
 	const filtered = (options.domainFilter?.length ? applyDomainFilter(results, options.domainFilter) : results).slice(0, numResults);
 
 	return {
-		answer: buildAnswer(filtered),
+		answer: formatSearchResultsAsAnswer(filtered),
 		results: filtered,
 	};
 }

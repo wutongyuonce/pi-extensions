@@ -341,12 +341,53 @@ describe("project schedule management", () => {
 			{ action: "schedule.create", id: "calendar", every: "day", at: "09:00", timezone: "UTC", workflowScript: "return runs.run('main', { agent: 'worker' })" },
 			{ action: "schedule.create", id: "two-targets", every: "1h", agent: "worker", workflowScript: "return 1" },
 			{ action: "schedule.create", id: "fork", every: "1h", workflowScript: "return runs.run('main', { agent: 'worker' })", context: "fork" },
+			{ action: "schedule.create", id: "invalid-base-ref", every: "1h", workflowScript: "return runs.run('main', { agent: 'worker' })", baseRef: "unsafe..ref" },
+			{ action: "schedule.create", id: "revision-alias-base-ref", every: "1h", workflowScript: "return runs.run('main', { agent: 'worker' })", baseRef: "@" },
+			{ action: "schedule.create", id: "object-id-base-ref", every: "1h", workflowScript: "return runs.run('main', { agent: 'worker' })", baseRef: "a".repeat(40) },
+			{ action: "schedule.create", id: "sha256-object-id-base-ref", every: "1h", workflowScript: "return runs.run('main', { agent: 'worker' })", baseRef: "a".repeat(64) },
+			{ action: "schedule.create", id: "invalid-args", every: "1h", workflowScript: "return 1", args: { task: "" } },
 			{ action: "schedule.create", id: "mission-id", every: "1h", workflowScript: "return runs.run('main', { agent: 'worker' })", missionId: "mission-1" },
 			{ action: "schedule.create", id: "mission-off", every: "1h", workflowScript: "return runs.run('main', { agent: 'worker' })", mission: false },
 		] as const) {
 			const result = await h.manager.handleToolCall(params, h.ctx);
 			assert.equal(result.isError, true, JSON.stringify(params));
 		}
+	});
+
+	it("persists and forwards scheduled workflow arguments and baseRef", async () => {
+		const h = harness();
+		const args = { task: "review", nested: { retries: 2 } };
+		const created = await h.manager.handleToolCall({
+			action: "schedule.create",
+			id: "base-ref",
+			every: "1h",
+			baseRef: "@/foo",
+			args,
+			workflowScript: "return runs.run('main', { agent: 'worker' })",
+		}, h.ctx);
+		assert.equal(created.isError, undefined);
+		assert.doesNotMatch(text(created), /review|retries/);
+		assert.equal(listScheduledRunSummaries(h.ctx.cwd, path.join(h.root, "stores"))[0]?.target.baseRef, "@/foo");
+		assert.deepEqual(listScheduledRunSummaries(h.ctx.cwd, path.join(h.root, "stores"))[0]?.target.args, args);
+		args.nested.retries = 99;
+
+		h.manager.stop();
+		const restoredLaunches: Launch[] = [];
+		const restored = createScheduledRunManager({
+			config: { scheduledRuns: { enabled: true } },
+			storeRoot: path.join(h.root, "stores"),
+			now: () => h.clock.now,
+			timers: new FakeTimers(),
+			launch: (params, launchCtx) => new Promise((resolve) => restoredLaunches.push({ params: params as Record<string, unknown>, ctx: launchCtx, resolve: resolve as Launch["resolve"] })) as never,
+		});
+		restored.bindSession(h.ctx);
+		const running = restored.handleToolCall({ action: "schedule.run", id: "base-ref" }, h.ctx);
+		await flush();
+		assert.equal(restoredLaunches[0]?.params.baseRef, "@/foo");
+		assert.deepEqual(restoredLaunches[0]?.params.args, { task: "review", nested: { retries: 2 } });
+		restoredLaunches[0]!.resolve({ content: [{ type: "text", text: "Async" }], details: { mode: "workflow", results: [], asyncId: "base-ref-async" } });
+		const result = await running;
+		assert.equal(result.isError, undefined);
 	});
 
 	it("pauses, resumes, lists, and deletes an inactive schedule", async () => {
@@ -359,6 +400,41 @@ describe("project schedule management", () => {
 		assert.equal(h.timers.values.size, 1);
 		assert.match(text(await h.manager.handleToolCall({ action: "schedule.delete", id: "maintenance" }, h.ctx)), /Deleted/);
 		assert.match(text(await h.manager.handleToolCall({ action: "schedule.list" }, h.ctx)), /No project schedules/);
+	});
+
+	it("deletes a foreign session-only schedule only after its exact async run is terminal", async () => {
+		const owner = harness({ sessionId: "owner-session" });
+		await owner.manager.handleToolCall({ action: "schedule.create", id: "owner-only", every: "1h", sessionOnly: true, workflowScript: "return runs.run('main', { agent: 'worker' })" }, owner.ctx);
+		const running = owner.manager.handleToolCall({ action: "schedule.run", id: "owner-only" }, owner.ctx);
+		await flush();
+		const asyncDir = path.join(owner.root, "async-owner-only");
+		fs.mkdirSync(asyncDir);
+		owner.launches[0]!.resolve({ content: [{ type: "text", text: "Async" }], details: { mode: "single", results: [], asyncId: "async-owner-only", asyncDir } });
+		await running;
+		owner.manager.stop();
+
+		fs.writeFileSync(path.join(asyncDir, "status.json"), JSON.stringify({ runId: "async-owner-only", mode: "single", state: "running", startedAt: owner.clock.now }), "utf-8");
+		const other = createScheduledRunManager({
+			config: { scheduledRuns: { enabled: true } },
+			storeRoot: path.join(owner.root, "stores"),
+			now: () => owner.clock.now,
+			timers: new FakeTimers(),
+			launch: async () => ({ content: [{ type: "text", text: "unused" }], details: { mode: "management", results: [] } }),
+		});
+		const otherCtx = context(owner.ctx.cwd, "other-session");
+		other.bindSession(otherCtx);
+		const refused = await other.handleToolCall({ action: "schedule.delete", id: "owner-only" }, otherCtx);
+		assert.equal(refused.isError, true);
+		assert.match(text(refused), /has active run/);
+
+		fs.writeFileSync(path.join(asyncDir, "status.json"), JSON.stringify({ runId: "async-owner-only", mode: "single", state: ["failed"], startedAt: owner.clock.now, endedAt: owner.clock.now }), "utf-8");
+		const malformed = await other.handleToolCall({ action: "schedule.delete", id: "owner-only" }, otherCtx);
+		assert.equal(malformed.isError, true);
+		assert.match(text(malformed), /has active run/);
+
+		fs.writeFileSync(path.join(asyncDir, "status.json"), JSON.stringify({ runId: "async-owner-only", mode: "single", state: "failed", startedAt: owner.clock.now, endedAt: owner.clock.now }), "utf-8");
+		assert.match(text(await other.handleToolCall({ action: "schedule.delete", id: "owner-only" }, otherCtx)), /Deleted/);
+		assert.match(text(await other.handleToolCall({ action: "schedule.list" }, otherCtx)), /No project schedules/);
 	});
 
 	it("ignores schedules deleted by another session while a timer is still armed", async () => {
@@ -405,6 +481,23 @@ describe("project schedule management", () => {
 		const result = await h.manager.handleToolCall({ action: "schedule.list" }, h.ctx);
 		assert.equal(result.isError, true);
 		assert.match(text(result), /Failed to read schedule record/);
+	});
+
+	it("fails closed when persisted schedule arguments are invalid", async () => {
+		const h = harness();
+		await h.manager.handleToolCall({ action: "schedule.create", id: "tampered-args", every: "1h", workflowScript: "return 1", args: { task: "valid" } }, h.ctx);
+		h.manager.stop();
+		const schedulePath = path.join(scheduledRunStorePath(h.ctx.cwd, undefined, path.join(h.root, "stores")), "tampered-args", "schedule.json");
+		const record = JSON.parse(fs.readFileSync(schedulePath, "utf-8")) as { target: { args: unknown } };
+		record.target.args = { task: "" };
+		fs.writeFileSync(schedulePath, JSON.stringify(record));
+
+		const restored = createScheduledRunManager({
+			config: { scheduledRuns: { enabled: true } },
+			storeRoot: path.join(h.root, "stores"),
+			launch: async () => ({ content: [{ type: "text", text: "unused" }], details: { mode: "management", results: [] } }),
+		});
+		assert.throws(() => restored.bindSession(h.ctx), /workflow args\.task must not be empty/);
 	});
 
 	it("skips orphan schedule directories during restore and listing", async () => {
@@ -582,6 +675,61 @@ describe("project schedule management", () => {
 	});
 });
 
+describe("quiet schedules", () => {
+	const script = "return runs.run('main', { agent: 'worker', task: 'Maintain backlog' })";
+
+	it("persists quiet only on recurring create and applies it to automatic fires", async () => {
+		const h = harness();
+		const created = await h.manager.handleToolCall({ action: "schedule.create", id: "quiet-hourly", every: "1h", quiet: true, workflowScript: script }, h.ctx);
+		assert.equal(detailRecords(created)[0]?.quiet, true);
+		const onDisk = JSON.parse(fs.readFileSync(path.join(scheduledRunStorePath(h.ctx.cwd, undefined, path.join(h.root, "stores")), "quiet-hourly", "schedule.json"), "utf-8")) as { quiet?: unknown };
+		assert.equal(onDisk.quiet, true);
+
+		h.clock.now += 3_600_000;
+		h.timers.fireAll();
+		assert.deepEqual(h.launches[0]?.params.scheduleOrigin, { id: "quiet-hourly", name: "workflowScript -> agent worker", quiet: true });
+	});
+
+	it("rejects a non-boolean quiet value", async () => {
+		const h = harness();
+		const rejected = await h.manager.handleToolCall({ action: "schedule.create", id: "bad-quiet", every: "1h", quiet: "yes" as unknown as boolean, workflowScript: script }, h.ctx);
+		assert.equal(rejected.isError, true);
+		assert.match(text(rejected), /quiet must be a boolean/);
+	});
+
+	it("keeps one-shot at schedules noisy", async () => {
+		const h = harness();
+		const rejected = await h.manager.handleToolCall({ action: "schedule.create", id: "quiet-once", at: "+10m", quiet: true, workflowScript: script }, h.ctx);
+		assert.equal(rejected.isError, true);
+		assert.match(text(rejected), /quiet is only supported for recurring schedules/);
+
+		const created = await h.manager.handleToolCall({ action: "schedule.create", id: "once", at: "+10m", workflowScript: script }, h.ctx);
+		assert.equal("quiet" in detailRecords(created)[0]!, false);
+		h.clock.now += 10 * 60_000;
+		h.timers.fireAll();
+		await flush();
+		assert.equal("quiet" in (h.launches[0]?.params.scheduleOrigin as Record<string, unknown>), false);
+	});
+
+	it("keeps schedule.run noisy unless that launch asks for quiet", async () => {
+		const h = harness();
+		await h.manager.handleToolCall({ action: "schedule.create", id: "quiet-hourly", every: "1h", quiet: true, workflowScript: script }, h.ctx);
+
+		const manual = h.manager.handleToolCall({ action: "schedule.run", id: "quiet-hourly" }, h.ctx);
+		await flush();
+		assert.equal("quiet" in (h.launches[0]?.params.scheduleOrigin as Record<string, unknown>), false);
+		h.launches[0]!.resolve({ content: [{ type: "text", text: "Async" }], details: { mode: "single", results: [], asyncId: "manual-loud" } });
+		await manual;
+		h.manager.handleAsyncCompletion({ runId: "manual-loud", success: true, summary: "Done" });
+
+		const explicit = h.manager.handleToolCall({ action: "schedule.run", id: "quiet-hourly", quiet: true }, h.ctx);
+		await flush();
+		assert.deepEqual(h.launches[1]?.params.scheduleOrigin, { id: "quiet-hourly", name: "workflowScript -> agent worker", quiet: true });
+		h.launches[1]!.resolve({ content: [{ type: "text", text: "Async" }], details: { mode: "single", results: [], asyncId: "manual-quiet" } });
+		await explicit;
+	});
+});
+
 describe("recurring schedule execution", () => {
 	it("launches a fixed interval from its planned time and records durable history/events", async () => {
 		const h = harness();
@@ -589,7 +737,7 @@ describe("recurring schedule execution", () => {
 		h.clock.now += 3_600_000;
 		h.timers.fireAll();
 		assert.equal(h.launches.length, 1);
-		assert.deepEqual(h.launches[0]?.params, { workflowScript: "return runs.run('main', { agent: 'worker', task: 'Maintain backlog' })", async: true, context: "fresh", cwd: h.ctx.cwd, mission: false, scheduleOrigin: { id: "hourly", name: "workflowScript -> agent worker" } });
+		assert.deepEqual(h.launches[0]?.params, { workflowScript: "return runs.run('main', { agent: 'worker', task: 'Maintain backlog' })", args: {}, async: true, context: "fresh", cwd: h.ctx.cwd, mission: false, scheduleOrigin: { id: "hourly", name: "workflowScript -> agent worker" } });
 		h.launches[0]!.resolve({ content: [{ type: "text", text: "Async worker" }], details: { mode: "single", results: [], asyncId: "async-1", asyncDir: "/tmp/async-1" } });
 		await flush();
 		assert.deepEqual([...h.manager.observedCompletionRunIds()], ["async-1"]);
@@ -881,6 +1029,39 @@ describe("recurring schedule execution", () => {
 		const second = await h.manager.handleToolCall({ action: "schedule.run", id: "manual" }, h.ctx);
 		assert.match(text(second), /skipped/);
 		assert.equal(h.launches.length, 1);
+	});
+
+	it("a successful manual launch satisfies the next natural fire", async () => {
+		const h = harness();
+		await h.manager.handleToolCall({ action: "schedule.create", id: "manual-interval", every: "1h", workflowScript: "return runs.run('main', { agent: 'worker' })" }, h.ctx);
+		h.clock.now += 5 * 60_000;
+		const manual = h.manager.handleToolCall({ action: "schedule.run", id: "manual-interval" }, h.ctx);
+		await flush();
+		h.launches[0]!.resolve({ content: [{ type: "text", text: "Async" }], details: { mode: "single", results: [], asyncId: "manual-async" } });
+		await manual;
+		assert.match(text(await h.manager.handleToolCall({ action: "schedule.show", id: "manual-interval" }, h.ctx)), /Next: 2030-01-01T01:05:00.000Z/);
+		h.manager.handleAsyncCompletion({ runId: "manual-async", success: true });
+		h.clock.now = Date.parse("2030-01-01T01:00:00.000Z");
+		h.timers.fireAll();
+		await flush();
+		assert.equal(h.launches.length, 1);
+	});
+
+	it("a failed manual launch still honors a natural fire that overlapped while attachment was pending", async () => {
+		const h = harness();
+		await h.manager.handleToolCall({ action: "schedule.create", id: "overlap-fail", every: "1h", workflowScript: "return runs.run('main', { agent: 'worker' })" }, h.ctx);
+		const manual = h.manager.handleToolCall({ action: "schedule.run", id: "overlap-fail" }, h.ctx);
+		await flush();
+		h.clock.now += 3_600_000;
+		h.timers.fireAll();
+		await flush();
+		assert.equal(h.launches.length, 1);
+		h.launches[0]!.resolve({ content: [{ type: "text", text: "spawn failed" }], details: { mode: "management", results: [] }, isError: true });
+		assert.match(text(await manual), /failed_launch/);
+		assert.match(text(await h.manager.handleToolCall({ action: "schedule.show", id: "overlap-fail" }, h.ctx)), /Next: 2030-01-01T01:00:00.000Z/);
+		h.timers.fireAll();
+		await flush();
+		assert.equal(h.launches.length, 2);
 	});
 
 	it("distinguishes failed launch from failed async completion", async () => {

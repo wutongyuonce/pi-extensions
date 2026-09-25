@@ -4,11 +4,13 @@ import * as path from "node:path";
 import { afterEach, describe, it } from "node:test";
 import { registerExternalJobProvider } from "../../src/api/external-job-provider.ts";
 import { getArtifactsDir } from "../../src/shared/artifacts.ts";
-import { SUBAGENT_CHILD_STATUS_EVENT } from "../../src/shared/types.ts";
+import { SUBAGENT_CHILD_STATUS_EVENT, SUBAGENT_CONTROL_EVENT, type ControlEvent } from "../../src/shared/types.ts";
 import { ACTIVE_RUN_INDEX_DIR, updateActiveRunIndex } from "../../src/runs/background/active-run-index.ts";
 import { EXTERNAL_JOB_BRIDGE_REQUEST_DIR } from "../../src/runs/shared/external-job-bridge.ts";
+import { createNativeSupervisorChannel, ensureSupervisorChannelDir, resolveSupervisorChannelDir } from "../../src/intercom/native-supervisor-channel.ts";
 import { SubagentFleetComponent } from "../../src/tui/fleet.ts";
-import { createNestedRoute } from "../../src/runs/shared/nested-events.ts";
+import { createNestedRoute, writeNestedEvent } from "../../src/runs/shared/nested-events.ts";
+import { resolveSubagentRunId } from "../../src/runs/background/run-id-resolver.ts";
 import { createTempDir, removeTempDir, tryImport } from "../support/helpers.ts";
 
 interface AsyncJobTrackerModule {
@@ -26,6 +28,7 @@ interface AsyncJobTrackerModule {
 			watch?: typeof fs.watch;
 			kill?: (pid: number, signal?: NodeJS.Signals | 0) => boolean;
 			now?: () => number;
+			supervisorRequestState?: (event: ControlEvent) => "pending" | "resolved" | "unknown";
 		},
 	): {
 		ensurePoller(): void;
@@ -87,6 +90,85 @@ function createEventRecorder() {
 		},
 		events,
 	};
+}
+
+function writeSupervisorRequest(input: { sessionId: string; runId: string; toolCallId: string }): { channelDir: string; requestId: string } {
+	const channelDir = resolveSupervisorChannelDir(input.runId, "worker", 0);
+	ensureSupervisorChannelDir(channelDir);
+	const requestId = `request-${input.toolCallId}`;
+	fs.writeFileSync(path.join(channelDir, "requests", `${requestId}.json`), JSON.stringify({
+		type: "subagent.supervisor.request",
+		id: requestId,
+		createdAt: Date.now(),
+		reason: "need_decision",
+		message: "Need a decision",
+		expectsReply: true,
+		orchestratorSessionId: input.sessionId,
+		runId: input.runId,
+		agent: "worker",
+		childIndex: 0,
+		toolCallId: input.toolCallId,
+	}), "utf-8");
+	return { channelDir, requestId };
+}
+
+function writeControlRecord(runDir: string, event: ControlEvent): void {
+	fs.appendFileSync(path.join(runDir, "events.jsonl"), `${JSON.stringify({ type: "subagent.control", channels: ["event"], event })}\n`, "utf-8");
+}
+
+function supervisorControlEvent(runId: string, toolCallId: string, currentTool = "contact_supervisor"): ControlEvent {
+	return {
+		type: "needs_attention",
+		to: "needs_attention",
+		ts: Date.now(),
+		runId,
+		agent: "worker",
+		index: 0,
+		message: "worker is waiting for a supervisor reply",
+		reason: "supervisor_request",
+		currentTool,
+		toolCallId,
+	};
+}
+
+function writeRunningAsyncStatus(runDir: string, runId: string, sessionId: string): void {
+	fs.mkdirSync(runDir, { recursive: true });
+	fs.writeFileSync(path.join(runDir, "status.json"), JSON.stringify({
+		runId,
+		mode: "single",
+		state: "running",
+		sessionId,
+		startedAt: Date.now(),
+		lastUpdate: Date.now(),
+		steps: [{ agent: "worker", status: "running" }],
+	}), "utf-8");
+}
+
+function createNativeSupervisorHarness(sessionId: string) {
+	const nativeState = createState();
+	(nativeState as { currentSessionId: string; lastUiContext: unknown }).currentSessionId = sessionId;
+	(nativeState as { supervisorOwnerSessionId: string }).supervisorOwnerSessionId = sessionId;
+	(nativeState as { currentSessionId: string; lastUiContext: unknown }).lastUiContext = {
+		hasUI: false,
+		sessionManager: {
+			getSessionId: () => sessionId,
+			getSessionFile: () => null,
+			getEntries: () => [],
+		},
+	};
+	const tools = new Map<string, { execute: (id: string, params: Record<string, unknown>) => Promise<unknown> }>();
+	const sent: Array<{ customType?: string; options?: { triggerTurn?: boolean } }> = [];
+	const pi = {
+		getAllTools: () => [...tools.keys()].map((name) => ({ name })),
+		registerTool: (tool: { name: string; execute: (...args: unknown[]) => Promise<unknown> }) => {
+			tools.set(tool.name, { execute: (id, params) => tool.execute(id, params) });
+		},
+		sendMessage: (message: { customType?: string }, options?: { triggerTurn?: boolean }) => {
+			sent.push({ customType: message.customType, options });
+		},
+	};
+	const channel = createNativeSupervisorChannel(pi as never, nativeState as never, { platform: "win32" });
+	return { channel, tools, sent };
 }
 
 function pidGone(): never {
@@ -210,6 +292,33 @@ describe("async job tracker", { skip: !available ? "pi packages not available" :
 		}
 	});
 
+	it("preserves a workflow job's established session root when attaching its start event", () => {
+		const asyncRoot = createTempDir("pi-async-job-tracker-workflow-session-root-");
+		const sessionRoot = createTempDir("pi-explicit-workflow-sessions-");
+		try {
+			const state = createState();
+			const tracker = createTracker(createEventRecorder().pi, state as never, asyncRoot);
+			const runId = "workflow-established-session-root";
+			const asyncDir = path.join(asyncRoot, runId);
+			state.asyncJobs.set(runId, {
+				asyncId: runId,
+				asyncDir,
+				sessionRoot,
+				status: "running",
+				mode: "workflow",
+				startedAt: 100,
+				updatedAt: 100,
+			});
+
+			tracker.handleStarted({ id: runId, asyncDir, agent: "workflow", mode: "workflow" });
+
+			assert.equal(state.asyncJobs.get(runId)?.sessionRoot, sessionRoot);
+		} finally {
+			removeTempDir(asyncRoot);
+			removeTempDir(sessionRoot);
+		}
+	});
+
 	it("ignores unregistered session roots from async start events", () => {
 		const asyncRoot = createTempDir("pi-async-job-tracker-forged-session-root-");
 		try {
@@ -264,6 +373,28 @@ describe("async job tracker", { skip: !available ? "pi packages not available" :
 			assert.equal(ui.widgets.at(-1), undefined);
 		} finally {
 			removeTempDir(asyncRoot);
+		}
+	});
+
+	it("retains nested lookup authority after async coordinator widget cleanup without crossing sessions", async () => {
+		const asyncRoot = createTempDir("pi-async-retained-lookup-");
+		const route = createNestedRoute("async-coordinator");
+		try {
+			const state = createState();
+			state.currentSessionId = "owner";
+			writeNestedEvent(route, { type: "subagent.nested.completed", ts: 100, parentRunId: route.rootRunId,
+				child: { id: "async-descendant", parentRunId: route.rootRunId, depth: 1, path: [{ runId: route.rootRunId }], state: "complete", agent: "worker" },
+			});
+			const tracker = createTracker(createEventRecorder().pi, state, asyncRoot, { completionRetentionMs: 5 });
+			tracker.handleStarted({ id: route.rootRunId, asyncDir: path.join(asyncRoot, route.rootRunId), agent: "worker", sessionId: "owner", nestedRoute: route });
+			tracker.handleComplete({ id: route.rootRunId, success: true, sessionId: "owner" });
+			await waitForCondition(() => !state.asyncJobs.has(route.rootRunId), "coordinator cleanup", 1000);
+			assert.equal(resolveSubagentRunId("async-descendant", { state })?.kind, "nested");
+			state.currentSessionId = "foreign";
+			assert.equal(resolveSubagentRunId("async-descendant", { state }), undefined);
+		} finally {
+			removeTempDir(asyncRoot);
+			fs.rmSync(path.dirname(route.eventSink), { recursive: true, force: true });
 		}
 	});
 
@@ -343,7 +474,7 @@ describe("async job tracker", { skip: !available ? "pi packages not available" :
 				parallelGroups: [{ start: 1, count: 2, stepIndex: 1 }],
 				steps: [
 					{ agent: "scout", status: "complete" },
-					{ agent: "reviewer", status: "running", currentTool: "read", transcriptPath },
+					{ agent: "reviewer", status: "running", currentTool: "read", transcriptPath, model: "mock/test-model", thinking: "high" },
 					{ agent: "worker", status: "running" },
 					{ agent: "writer", status: "pending" },
 				],
@@ -379,6 +510,7 @@ describe("async job tracker", { skip: !available ? "pi packages not available" :
 			assert.equal(job.cwd, customCwd);
 			assert.deepEqual(job.agents, ["reviewer", "worker"]);
 			assert.deepEqual(job.steps?.map((step: { index?: number }) => step.index), [1, 2]);
+			assert.equal(job.steps?.[0]?.thinking, "high");
 			assert.equal(job.stepsTotal, 2);
 			assert.equal(job.runningSteps, 2);
 			assert.equal(job.completedSteps, 0);
@@ -723,11 +855,16 @@ describe("async job tracker", { skip: !available ? "pi packages not available" :
 			}), "utf-8");
 			const state = createState();
 			const ui = createUiContext();
-			const tracker = createTracker(createEventRecorder().pi, state as never, asyncRoot, { pollIntervalMs: 10 });
+			const tracker = createTracker(createEventRecorder().pi, state as never, asyncRoot, {
+				pollIntervalMs: 10,
+				watch: (() => { throw new Error("native watcher disabled for test"); }) as never,
+			});
 			tracker.resetJobs(ui.ctx as never);
 			tracker.handleStarted({ id: "quiet-run", asyncDir: runDir, agent: "worker" });
 
+			const rendersAfterStart = ui.renderRequests;
 			await waitForCondition(() => state.asyncJobs.get("quiet-run")?.status === "running", "quiet running job refresh");
+			await waitForCondition(() => ui.renderRequests > rendersAfterStart, "quiet running widget redraw");
 			const renderRequests = ui.renderRequests;
 			await new Promise((resolve) => setTimeout(resolve, 120));
 
@@ -1100,8 +1237,10 @@ describe("async job tracker", { skip: !available ? "pi packages not available" :
 			await waitForCondition(() => state.asyncJobs.get("run-unchanged")?.toolCount === 1, "changed status load");
 			await waitForCondition(() => ui.widgets.length > widgetsAfterStatusLoaded, "changed status widget replacement");
 
+			const requestsBeforeTerminal = ui.renderRequests;
 			writeStatus(4000, 1, "complete");
 			await waitForCondition(() => state.asyncJobs.get("run-unchanged")?.status === "complete", "terminal status load");
+			await waitForCondition(() => ui.renderRequests > requestsBeforeTerminal, "terminal status widget redraw");
 			const widgetsAfterTerminal = ui.widgets.length;
 			const requestsAfterTerminal = ui.renderRequests;
 			await new Promise((resolve) => setTimeout(resolve, 35));
@@ -1163,35 +1302,40 @@ describe("async job tracker", { skip: !available ? "pi packages not available" :
 		}
 	});
 
-	it("schedules cleanup when polling observes a completed status without a completion event", async () => {
+	it("schedules cleanup when polling observes terminal statuses without completion events", async () => {
 		const asyncRoot = createTempDir("pi-async-job-tracker-");
 		try {
-			const runDir = path.join(asyncRoot, "run-2");
-			fs.mkdirSync(runDir, { recursive: true });
-			fs.writeFileSync(path.join(runDir, "status.json"), JSON.stringify({
-				runId: "run-2",
-				mode: "single",
-				state: "complete",
-				startedAt: Date.now() - 1000,
-				lastUpdate: Date.now(),
-				steps: [{ agent: "worker", status: "complete" }],
-			}), "utf-8");
-
 			const state = createState();
 			const ui = createUiContext();
-			const recorder = createEventRecorder();
-			const tracker = createTracker(recorder.pi, state as never, asyncRoot, {
+			const tracker = createTracker(createEventRecorder().pi, state as never, asyncRoot, {
 				completionRetentionMs: 5,
 				pollIntervalMs: 10,
 			});
 			tracker.resetJobs(ui.ctx as never);
-			tracker.handleStarted({ id: "run-2", asyncDir: runDir, agent: "worker" });
+			for (const terminalState of ["complete", "partial", "rejected"] as const) {
+				const runId = `run-${terminalState}`;
+				const runDir = path.join(asyncRoot, runId);
+				fs.mkdirSync(runDir, { recursive: true });
+				fs.writeFileSync(path.join(runDir, "status.json"), JSON.stringify({
+					runId,
+					mode: "single",
+					state: terminalState,
+					startedAt: Date.now() - 1000,
+					lastUpdate: Date.now(),
+					steps: [{ agent: "worker", status: terminalState }],
+				}), "utf-8");
+				tracker.handleStarted({ id: runId, asyncDir: runDir, agent: "worker" });
+			}
 
 			await new Promise((resolve) => setTimeout(resolve, 80));
 
 			assert.equal(state.asyncJobs.size, 0);
 			assert.ok(ui.renderRequests > 0, "expected polling cleanup to request a rerender");
 			assert.equal(ui.widgets.at(-1), undefined);
+			assert.equal(state.fleetJobs.get("run-complete")?.status, "complete");
+			assert.equal(state.fleetJobs.get("run-partial")?.status, "partial");
+			assert.equal(state.fleetJobs.get("run-rejected")?.status, "rejected");
+			tracker.resetJobs();
 		} finally {
 			removeTempDir(asyncRoot);
 		}
@@ -1465,6 +1609,135 @@ describe("async job tracker", { skip: !available ? "pi packages not available" :
 			assert.equal(state.asyncJobs.get("run-recovered")?.status, "running");
 		} finally {
 			tracker?.resetJobs();
+			removeTempDir(asyncRoot);
+		}
+	});
+
+	it("suppresses a resolved native supervisor notice before async replay", async () => {
+		const asyncRoot = createTempDir("pi-async-job-supervisor-replay-resolved-");
+		const sessionId = `session-${Date.now()}`;
+		const runId = `run-${Date.now()}`;
+		const toolCallId = `call-${Date.now()}`;
+		const { channel, tools, sent } = createNativeSupervisorHarness(sessionId);
+		const { channelDir, requestId } = writeSupervisorRequest({ sessionId, runId, toolCallId });
+		try {
+			const runDir = path.join(asyncRoot, runId);
+			writeRunningAsyncStatus(runDir, runId, sessionId);
+			const event = supervisorControlEvent(runId, toolCallId);
+			writeControlRecord(runDir, event);
+
+			channel.start();
+			assert.equal(channel.getSupervisorRequestState(event), "pending");
+			const state = createState();
+			const recorder = createEventRecorder();
+			const tracker = createTracker(recorder.pi, state as never, asyncRoot, {
+				pollIntervalMs: 10,
+				supervisorRequestState: channel.getSupervisorRequestState,
+			});
+			tracker.handleStarted({ id: runId, asyncDir: runDir, agent: "worker", sessionId });
+			await tools.get("subagent_supervisor")!.execute("reply", { action: "reply", replyTo: requestId, message: "Approved" });
+			assert.equal(channel.getSupervisorRequestState(event), "resolved");
+			await waitForCondition(() => (state.asyncJobs.get(runId)?.controlEventCursor ?? 0) > 0, "resolved control event cursor");
+
+			assert.equal(recorder.events.some((entry) => entry.channel === SUBAGENT_CONTROL_EVENT), false);
+			assert.deepEqual(sent, [{ customType: "subagent_supervisor_request", options: { triggerTurn: true } }]);
+		} finally {
+			channel.dispose();
+			fs.rmSync(channelDir, { recursive: true, force: true });
+			removeTempDir(asyncRoot);
+		}
+	});
+
+	it("delivers a native supervisor notice while its request is pending through replay", async () => {
+		const asyncRoot = createTempDir("pi-async-job-supervisor-replay-pending-");
+		const sessionId = `session-${Date.now()}`;
+		const runId = `run-${Date.now()}`;
+		const toolCallId = `call-${Date.now()}`;
+		const { channel, sent } = createNativeSupervisorHarness(sessionId);
+		const { channelDir } = writeSupervisorRequest({ sessionId, runId, toolCallId });
+		try {
+			const runDir = path.join(asyncRoot, runId);
+			writeRunningAsyncStatus(runDir, runId, sessionId);
+			const event = supervisorControlEvent(runId, toolCallId);
+			writeControlRecord(runDir, event);
+
+			channel.start();
+			assert.equal(channel.getSupervisorRequestState(event), "pending");
+			const state = createState();
+			const recorder = createEventRecorder();
+			const tracker = createTracker(recorder.pi, state as never, asyncRoot, {
+				pollIntervalMs: 10,
+				supervisorRequestState: channel.getSupervisorRequestState,
+			});
+			tracker.handleStarted({ id: runId, asyncDir: runDir, agent: "worker", sessionId });
+			await waitForCondition(() => recorder.events.some((entry) => entry.channel === SUBAGENT_CONTROL_EVENT), "pending control event replay");
+
+			const payload = recorder.events.find((entry) => entry.channel === SUBAGENT_CONTROL_EVENT)?.data as { event?: ControlEvent } | undefined;
+			assert.equal(payload?.event?.toolCallId, toolCallId);
+			assert.deepEqual(sent.map((entry) => entry.customType), ["subagent_supervisor_request"]);
+		} finally {
+			channel.dispose();
+			fs.rmSync(channelDir, { recursive: true, force: true });
+			removeTempDir(asyncRoot);
+		}
+	});
+
+	it("keeps the first native supervisor notice after resolution and suppresses later replay", async () => {
+		const asyncRoot = createTempDir("pi-async-job-supervisor-replay-late-");
+		const sessionId = `session-${Date.now()}`;
+		const runId = `run-${Date.now()}`;
+		const toolCallId = `call-${Date.now()}`;
+		const { channel, tools } = createNativeSupervisorHarness(sessionId);
+		const { channelDir, requestId } = writeSupervisorRequest({ sessionId, runId, toolCallId });
+		try {
+			const runDir = path.join(asyncRoot, runId);
+			writeRunningAsyncStatus(runDir, runId, sessionId);
+			const event = supervisorControlEvent(runId, toolCallId);
+			writeControlRecord(runDir, event);
+
+			channel.start();
+			const state = createState();
+			const recorder = createEventRecorder();
+			const tracker = createTracker(recorder.pi, state as never, asyncRoot, {
+				pollIntervalMs: 10,
+				supervisorRequestState: channel.getSupervisorRequestState,
+			});
+			tracker.handleStarted({ id: runId, asyncDir: runDir, agent: "worker", sessionId });
+			await waitForCondition(() => recorder.events.filter((entry) => entry.channel === SUBAGENT_CONTROL_EVENT).length === 1, "first control event replay");
+
+			await tools.get("subagent_supervisor")!.execute("reply", { action: "reply", replyTo: requestId, message: "Approved" });
+			writeControlRecord(runDir, event);
+			const eventSize = fs.statSync(path.join(runDir, "events.jsonl")).size;
+			await waitForCondition(() => (state.asyncJobs.get(runId)?.controlEventCursor ?? 0) >= eventSize, "resolved replay cursor");
+			assert.equal(recorder.events.filter((entry) => entry.channel === SUBAGENT_CONTROL_EVENT).length, 1);
+		} finally {
+			channel.dispose();
+			fs.rmSync(channelDir, { recursive: true, force: true });
+			removeTempDir(asyncRoot);
+		}
+	});
+
+	it("delivers an external intercom ask with the native lifecycle lookup enabled", async () => {
+		const asyncRoot = createTempDir("pi-async-job-supervisor-replay-external-");
+		const sessionId = `session-${Date.now()}`;
+		const runId = `run-${Date.now()}`;
+		const { channel } = createNativeSupervisorHarness(sessionId);
+		try {
+			const runDir = path.join(asyncRoot, runId);
+			writeRunningAsyncStatus(runDir, runId, sessionId);
+			const event = supervisorControlEvent(runId, "external-call", "intercom");
+			writeControlRecord(runDir, event);
+			assert.equal(channel.getSupervisorRequestState(event), "unknown");
+			const state = createState();
+			const recorder = createEventRecorder();
+			const tracker = createTracker(recorder.pi, state as never, asyncRoot, {
+				pollIntervalMs: 10,
+				supervisorRequestState: channel.getSupervisorRequestState,
+			});
+			tracker.handleStarted({ id: runId, asyncDir: runDir, agent: "worker", sessionId });
+			await waitForCondition(() => recorder.events.some((entry) => entry.channel === SUBAGENT_CONTROL_EVENT), "external control event replay");
+		} finally {
+			channel.dispose();
 			removeTempDir(asyncRoot);
 		}
 	});
@@ -1937,7 +2210,7 @@ describe("async job tracker", { skip: !available ? "pi packages not available" :
 		}
 	});
 
-	it("bridges async child status events from events.jsonl to the parent event bus", async () => {
+	it("bridges async child started events from events.jsonl to the parent event bus", async () => {
 		const asyncRoot = createTempDir("pi-async-job-tracker-");
 		try {
 			const runDir = path.join(asyncRoot, "run-child-status");
@@ -1955,9 +2228,8 @@ describe("async job tracker", { skip: !available ? "pi packages not available" :
 				version: 1,
 				runId: "run-child-status",
 				childId: "slow",
-				status: "stopped",
+				status: "started",
 				ts: 123,
-				reason: "user",
 				stepIndex: 0,
 				agent: "worker",
 				workflowKey: "slow",
@@ -1981,15 +2253,63 @@ describe("async job tracker", { skip: !available ? "pi packages not available" :
 				version: 1,
 				runId: "run-child-status",
 				childId: "slow",
-				status: "stopped",
+				status: "started",
 				ts: 123,
-				reason: "user",
 				source: "async",
 				asyncDir: runDir,
 				stepIndex: 0,
 				agent: "worker",
 				workflowKey: "slow",
 			});
+		} finally {
+			removeTempDir(asyncRoot);
+		}
+	});
+
+	it("continues replay after a child-status subscriber throws", async (t) => {
+		const asyncRoot = createTempDir("pi-async-job-tracker-");
+		try {
+			const runDir = path.join(asyncRoot, "run-throwing-child-status");
+			fs.mkdirSync(runDir, { recursive: true });
+			fs.writeFileSync(path.join(runDir, "status.json"), JSON.stringify({
+				runId: "run-throwing-child-status",
+				mode: "workflow",
+				state: "running",
+				startedAt: Date.now() - 1000,
+				lastUpdate: Date.now(),
+				steps: [{ agent: "worker", status: "running", workflowKey: "child" }],
+			}), "utf-8");
+			const childEvent = (status: "started" | "stopped", ts: number) => JSON.stringify({
+				type: "subagent.child-status",
+				version: 1,
+				runId: "run-throwing-child-status",
+				childId: "child",
+				status,
+				ts,
+				workflowKey: "child",
+			});
+			fs.writeFileSync(path.join(runDir, "events.jsonl"), `${childEvent("started", 123)}\n${childEvent("stopped", 124)}\n`, "utf-8");
+
+			let emitAttempts = 0;
+			const delivered: unknown[] = [];
+			const pi = { events: { emit(channel: string, data: unknown) {
+				if (channel !== SUBAGENT_CHILD_STATUS_EVENT) return;
+				emitAttempts += 1;
+				if (emitAttempts === 1) throw new Error("simulated replay subscriber failure");
+				delivered.push(data);
+			} } };
+			const diagnostics: unknown[][] = [];
+			const originalError = console.error;
+			console.error = (...args: unknown[]) => { diagnostics.push(args); };
+			t.after(() => { console.error = originalError; });
+			const tracker = createTracker(pi, createState() as never, asyncRoot, { pollIntervalMs: 10 });
+			tracker.handleStarted({ id: "run-throwing-child-status", asyncDir: runDir, agent: "workflow" });
+
+			await waitForCondition(() => delivered.length === 1, "later child status event");
+			await new Promise((resolve) => setTimeout(resolve, 30));
+			assert.equal(emitAttempts, 2);
+			assert.equal((delivered[0] as { status?: string }).status, "stopped");
+			assert.ok(diagnostics.some(([message]) => message === "Failed to emit async child status event:"));
 		} finally {
 			removeTempDir(asyncRoot);
 		}

@@ -9,6 +9,8 @@ import { releaseActiveRunIndex, updateActiveRunIndex } from "../../src/runs/back
 import { resultFilePath, writeAsyncResultFile, writePendingAsyncResultFile } from "../../src/runs/background/result-files.ts";
 import { resolveSubagentRunId } from "../../src/runs/background/run-id-resolver.ts";
 import { createNestedRoute, writeNestedEvent } from "../../src/runs/shared/nested-events.ts";
+import { removeForegroundControlIfIdle } from "../../src/runs/foreground/subagent-executor.ts";
+import { inspectSubagentStatus } from "../../src/runs/background/run-status.ts";
 
 const routeRoots: string[] = [];
 
@@ -65,6 +67,7 @@ describe("subagent run id resolver", () => {
 			const asyncRoot = path.join(root, "runs");
 			const resultsDir = path.join(root, "results");
 			fs.mkdirSync(path.join(asyncRoot, "shared-id"), { recursive: true });
+			fs.writeFileSync(path.join(asyncRoot, "shared-id", "status.json"), "{}");
 			nested("root-shared", "shared-id");
 			nested("root-prefix", "shared-id-child");
 
@@ -79,12 +82,56 @@ describe("subagent run id resolver", () => {
 		}
 	});
 
+	it("does not let a mission-only directory shadow owned nested status by exact id or prefix", () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-run-id-mission-shadow-"));
+		try {
+			const route = nested("mission-root", "mission-child");
+			const state = stateWithNestedRoute(route);
+			const asyncRoot = path.join(root, "runs");
+			fs.mkdirSync(path.join(asyncRoot, "mission-child"), { recursive: true });
+			fs.writeFileSync(path.join(asyncRoot, "mission-child", "mission.json"), "{}");
+			for (const id of ["mission-child", "mission-chi"]) {
+				const deps = { state, asyncDirRoot: asyncRoot, resultsDir: path.join(root, "results") };
+				assert.equal(resolveSubagentRunId(id, deps)?.kind, "nested");
+				assert.notEqual(inspectSubagentStatus({ id }, deps).isError, true);
+			}
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("retains session-owned nested lookup after coordinator removal and descendant completion", () => {
+		const route = nested("retired-root", "finished-coordinator");
+		writeNestedEvent(route, { type: "subagent.nested.started", ts: 110, parentRunId: "finished-coordinator",
+			child: { id: "retired-child", parentRunId: "finished-coordinator", depth: 2, path: [{ runId: route.rootRunId }, { runId: "finished-coordinator" }], state: "running", agent: "worker" },
+		});
+		writeNestedEvent(route, { type: "subagent.nested.completed", ts: 120, parentRunId: route.rootRunId,
+			child: { id: "finished-coordinator", parentRunId: route.rootRunId, depth: 1, path: [{ runId: route.rootRunId }], state: "complete", agent: "coordinator" },
+		});
+		const state = stateWithNestedRoute(route);
+		state.currentSessionId = "owner";
+		state.foregroundControls.get(route.rootRunId)!.sessionId = "owner";
+		assert.equal(resolveSubagentRunId("retired-child", { state })?.kind, "nested");
+		assert.equal(removeForegroundControlIfIdle(state, route.rootRunId), true);
+		assert.equal(resolveSubagentRunId("retired-child", { state })?.kind, "nested");
+		writeNestedEvent(route, { type: "subagent.nested.completed", ts: 200, parentRunId: "finished-coordinator",
+			child: { id: "retired-child", parentRunId: "finished-coordinator", depth: 2, path: [{ runId: route.rootRunId }, { runId: "finished-coordinator" }], state: "complete", agent: "worker" },
+		});
+		const status = inspectSubagentStatus({ id: "retired-child" }, { state });
+		assert.notEqual(status.isError, true);
+		assert.match(status.content[0].text, /State: complete/);
+		assert.equal(resolveSubagentRunId("retired-child", { state, nested: { routes: [] } }), undefined, "child subtree restriction still wins");
+		state.currentSessionId = "foreign";
+		assert.equal(resolveSubagentRunId("retired-child", { state }), undefined);
+	});
+
 	it("reports one combined ambiguity for prefixes across namespaces", () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-run-id-ambiguous-"));
 		try {
 			const asyncRoot = path.join(root, "runs");
 			const resultsDir = path.join(root, "results");
 			fs.mkdirSync(path.join(asyncRoot, "fanout-x-async"), { recursive: true });
+			fs.writeFileSync(path.join(asyncRoot, "fanout-x-async", "status.json"), "{}");
 			nested("root-fanout", "fanout-x-nested");
 			assert.throws(
 				() => resolveSubagentRunId("fanout-x", { asyncDirRoot: asyncRoot, resultsDir }),
@@ -132,6 +179,8 @@ describe("subagent run id resolver", () => {
 			const resultsDir = path.join(root, "results");
 			fs.mkdirSync(path.join(asyncRoot, "dupe-aaa-one"), { recursive: true });
 			fs.mkdirSync(path.join(asyncRoot, "dupe-aaa-two"), { recursive: true });
+			fs.writeFileSync(path.join(asyncRoot, "dupe-aaa-one", "status.json"), "{}");
+			fs.writeFileSync(path.join(asyncRoot, "dupe-aaa-two", "status.json"), "{}");
 
 			assert.throws(
 				() => resolveSubagentRunId("dupe-aaa", { asyncDirRoot: asyncRoot, resultsDir }),

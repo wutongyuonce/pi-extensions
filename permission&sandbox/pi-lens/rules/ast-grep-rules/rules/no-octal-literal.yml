@@ -1,0 +1,14 @@
+id: no-octal-literal
+language: TypeScript
+severity: warning
+message: "Legacy octal literal — a leading-zero number is parsed as octal in sloppy mode and throws in strict mode; use the 0o prefix"
+metadata:
+  category: bug
+note: |
+  A number written with a leading zero (e.g. 0123) is interpreted as octal in
+  non-strict code and is a SyntaxError in strict mode / ES modules. Worse, 08 and
+  09 silently fall back to decimal. Use the explicit 0o prefix for octal (0o123)
+  or drop the leading zero for decimal.
+rule:
+  kind: number
+  regex: '^0[0-9]'

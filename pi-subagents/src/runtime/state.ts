@@ -139,13 +139,6 @@ export function getSubagentBatchStopMetadata(): { terminate?: true } {
 	return stopAfterCurrentSubagentBatch && !currentSubagentBatchHasBlocking ? { terminate: true } : {};
 }
 
-export function withSubagentBatchStop<T extends AgentToolResult<unknown>>(result: T): T & { terminate?: true } {
-	return {
-		...result,
-		...getSubagentBatchStopMetadata(),
-	};
-}
-
 export function getWatcherSignal(_running: RunningSubagent, watcherAbort: AbortController): AbortSignal {
 	return watcherAbort.signal;
 }

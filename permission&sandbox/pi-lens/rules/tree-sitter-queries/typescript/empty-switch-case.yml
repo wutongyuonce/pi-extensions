@@ -1,0 +1,58 @@
+# Empty Switch Case
+# Detects empty switch cases
+id: empty-switch-case
+name: Switch Cases Should Not Be Empty
+severity: error
+category: reliability
+defect_class: correctness
+inline_tier: blocking
+language: typescript
+
+message: "Switch case is empty and shares no body with a following label"
+
+description: |
+  A case with no body and no following label handles nothing — likely
+  incomplete code. Add handling or remove the case.
+
+  Grouped labels are not flagged: in `case 1: case 2: doWork();` the first
+  label deliberately shares the second's body.
+
+  ✅ FIX: Add case body or remove
+
+  ```typescript
+  switch (x) {
+      case 1:
+          handleOne();  // GOOD
+          break;
+  }
+  ```
+
+query: |
+  (switch_statement
+    body: (switch_body
+      (switch_case) @CASE))
+
+metavars:
+  - CASE
+
+post_filter: is_empty_block
+
+tags:
+  - reliability
+  - typescript
+  - bugs
+
+examples:
+  bad: |
+    case 1:
+        doWork();
+        break;
+    case 2:  // BAD - empty, nothing follows it
+
+  good: |
+    case 1:
+    case 2:      // GOOD - grouped labels share the body below
+        doWork();
+        break;
+
+has_fix: false

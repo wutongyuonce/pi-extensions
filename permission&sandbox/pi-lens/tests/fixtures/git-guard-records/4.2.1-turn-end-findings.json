@@ -1,0 +1,13 @@
+{
+	"content": "🔴 STOP — 1 issue(s) must be fixed:\n  L1: alpha is unsafe",
+	"blockerContent": "🔴 STOP — 1 issue(s) must be fixed:\n  L1: alpha is unsafe",
+	"hasBlockers": true,
+	"affectedFiles": [],
+	"blockingFiles": [],
+	"sessionId": "v4-2-1-session",
+	"projectSeqStart": 0,
+	"projectSeqEnd": 1,
+	"fileSeqByPath": {},
+	"fileContentHashes": {},
+	"consumed": false
+}

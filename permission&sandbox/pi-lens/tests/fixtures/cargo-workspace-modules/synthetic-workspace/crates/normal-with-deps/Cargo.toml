@@ -1,0 +1,9 @@
+[package]
+name = "normal-with-deps"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = "1.0"
+tokio = { version = "1", features = ["full"] }
+autofix-smoke = { path = "../autofix-smoke" }

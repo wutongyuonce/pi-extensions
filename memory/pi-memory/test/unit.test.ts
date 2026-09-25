@@ -31,12 +31,15 @@ import {
 	ensureDirs,
 	ensureQmdEmbed,
 	forgetBlocks,
+	getEmbedProbeTimeoutMs,
+	getExitSummaryReasoningEffort,
 	getExitSummaryTimeoutMs,
 	getQmdSearchTimeoutMs,
 	isExitSummaryEmpty,
 	isExitSummaryEnabled,
 	nowTimestamp,
 	parseScratchpad,
+	probeEmbeddings,
 	qmdCollectionInstructions,
 	qmdInstallInstructions,
 	readFileSafe,
@@ -1790,6 +1793,44 @@ describe("lifecycle hooks", () => {
 		});
 	});
 
+	describe("exit summary reasoning effort", () => {
+		let savedEffort: string | undefined;
+		beforeEach(() => {
+			savedEffort = process.env.PI_MEMORY_EXIT_SUMMARY_REASONING_EFFORT;
+		});
+		afterEach(() => {
+			if (savedEffort === undefined) delete process.env.PI_MEMORY_EXIT_SUMMARY_REASONING_EFFORT;
+			else process.env.PI_MEMORY_EXIT_SUMMARY_REASONING_EFFORT = savedEffort;
+		});
+
+		test("getExitSummaryReasoningEffort defaults to low", () => {
+			delete process.env.PI_MEMORY_EXIT_SUMMARY_REASONING_EFFORT;
+			expect(getExitSummaryReasoningEffort()).toBe("low");
+		});
+
+		test("getExitSummaryReasoningEffort passes through configured values", () => {
+			for (const value of ["high", "max", "none", "medium", "minimal", "xhigh"]) {
+				process.env.PI_MEMORY_EXIT_SUMMARY_REASONING_EFFORT = value;
+				expect(getExitSummaryReasoningEffort()).toBe(value);
+			}
+		});
+
+		test("getExitSummaryReasoningEffort is case-insensitive", () => {
+			process.env.PI_MEMORY_EXIT_SUMMARY_REASONING_EFFORT = "HIGH";
+			expect(getExitSummaryReasoningEffort()).toBe("high");
+		});
+
+		test("getExitSummaryReasoningEffort returns undefined for off", () => {
+			process.env.PI_MEMORY_EXIT_SUMMARY_REASONING_EFFORT = "off";
+			expect(getExitSummaryReasoningEffort()).toBeUndefined();
+		});
+
+		test("getExitSummaryReasoningEffort treats empty string as default", () => {
+			process.env.PI_MEMORY_EXIT_SUMMARY_REASONING_EFFORT = "   ";
+			expect(getExitSummaryReasoningEffort()).toBe("low");
+		});
+	});
+
 	// -- session_before_compact --
 
 	test("session_before_compact appends handoff when scratchpad has open items", async () => {
@@ -1912,7 +1953,29 @@ describe("KV cache stability: memory snapshot", () => {
 		expect(result2.systemPrompt).not.toBe(result1.systemPrompt);
 	});
 
-	test("memory_write target=long_term marks snapshot dirty so next turn refreshes", async () => {
+	test("memory_write target=long_term does NOT refresh the snapshot (cache stays warm)", async () => {
+		fs.writeFileSync(path.join(tmpDir, "MEMORY.md"), "OLD_FACT line", "utf-8");
+
+		const result1 = await hooks.before_agent_start({ systemPrompt: "base" }, {});
+		expect(result1.systemPrompt).toContain("OLD_FACT");
+
+		await tools.memory_write.execute(
+			"tc1",
+			{ target: "long_term", content: "NEW_FACT_ABOUT_X", mode: "append" },
+			null,
+			null,
+			createMockCtx(),
+		);
+
+		// The write is already in tool-call history; re-rendering the block would
+		// rewrite the prompt tail and void the whole conversation's prefix cache.
+		const result2 = await hooks.before_agent_start({ systemPrompt: "base" }, {});
+		expect(result2.systemPrompt).toBe(result1.systemPrompt);
+		expect(result2.systemPrompt).not.toContain("NEW_FACT_ABOUT_X");
+	});
+
+	test("PI_MEMORY_SNAPSHOT=refresh restores checkpoint refresh on long_term writes", async () => {
+		process.env.PI_MEMORY_SNAPSHOT = "refresh";
 		fs.writeFileSync(path.join(tmpDir, "MEMORY.md"), "OLD_FACT line", "utf-8");
 
 		const result1 = await hooks.before_agent_start({ systemPrompt: "base" }, {});
@@ -1928,8 +1991,23 @@ describe("KV cache stability: memory snapshot", () => {
 
 		const result2 = await hooks.before_agent_start({ systemPrompt: "base" }, {});
 		expect(result2.systemPrompt).toContain("NEW_FACT_ABOUT_X");
-		// Snapshot did refresh, so previous bytes are no longer identical.
 		expect(result2.systemPrompt).not.toBe(result1.systemPrompt);
+	});
+
+	test("memory_forget refreshes the snapshot without persisting deleted content", async () => {
+		fs.writeFileSync(path.join(tmpDir, "MEMORY.md"), "WRONG_FACT_ABOUT_Z\n\nkeep me\n", "utf-8");
+
+		const result1 = await hooks.before_agent_start({ systemPrompt: "base" }, {});
+		expect(result1.systemPrompt).toContain("WRONG_FACT_ABOUT_Z");
+		expect(result1.message).toBeUndefined();
+
+		await tools.memory_forget.execute("tc1", { match: "WRONG_FACT_ABOUT_Z" }, null, null, {});
+
+		const result2 = await hooks.before_agent_start({ systemPrompt: "base" }, {});
+		expect(result2.systemPrompt).not.toBe(result1.systemPrompt);
+		expect(result2.systemPrompt).not.toContain("WRONG_FACT_ABOUT_Z");
+		expect(result2.systemPrompt).toContain("keep me");
+		expect(result2.message).toBeUndefined();
 	});
 
 	test("memory_write target=daily does NOT mark snapshot dirty (cache stays warm)", async () => {
@@ -1992,11 +2070,15 @@ describe("KV cache stability: memory snapshot", () => {
 		}
 	});
 
-	test("snapshot caveat is included in stable mode header", async () => {
+	test("stable mode header carries a caveat with no volatile timestamp", async () => {
 		fs.writeFileSync(path.join(tmpDir, "MEMORY.md"), "anything", "utf-8");
 		const result = await hooks.before_agent_start({ systemPrompt: "base" }, {});
-		// Reader-facing hint that ambient context may lag behind disk.
-		expect(result.systemPrompt.toLowerCase()).toContain("snapshot");
+		// Reader-facing hint that ambient context may lag behind disk...
+		expect(result.systemPrompt).toContain("not re-read since");
+		expect(result.systemPrompt).toContain("memory_search");
+		// ...but no clock and no reason word: either would change the bytes
+		// between turns without the memory itself changing.
+		expect(result.systemPrompt).not.toMatch(/\d{2}:\d{2}:\d{2}/);
 	});
 });
 
@@ -2397,4 +2479,86 @@ describe("memory_forget tool", () => {
 		);
 		expect(secondRestore.content[0].text).toContain("already restored");
 	});
+});
+
+// ==========================================================================
+// 13. probeEmbeddings timeout behavior
+// ==========================================================================
+
+describe("probeEmbeddings", () => {
+	const ENV_KEY = "PI_MEMORY_EMBED_PROBE_TIMEOUT_MS";
+	let previous: string | undefined;
+
+	beforeEach(() => {
+		previous = process.env[ENV_KEY];
+		delete process.env[ENV_KEY];
+	});
+
+	afterEach(() => {
+		_resetExecFileForTest();
+		if (previous === undefined) delete process.env[ENV_KEY];
+		else process.env[ENV_KEY] = previous;
+	});
+
+	test("defaults to a probe timeout with headroom over a contended qmd call", () => {
+		expect(getEmbedProbeTimeoutMs()).toBeGreaterThanOrEqual(15_000);
+	});
+
+	test("honors PI_MEMORY_EMBED_PROBE_TIMEOUT_MS override", () => {
+		process.env[ENV_KEY] = "9000";
+		expect(getEmbedProbeTimeoutMs()).toBe(9_000);
+	});
+
+	test("ignores invalid PI_MEMORY_EMBED_PROBE_TIMEOUT_MS values", () => {
+		for (const bad of ["0", "-1", "abc", "1.5"]) {
+			process.env[ENV_KEY] = bad;
+			expect(getEmbedProbeTimeoutMs()).toBeGreaterThanOrEqual(15_000);
+		}
+	});
+
+	test("reports ready when qmd answers without an embeddings warning", async () => {
+		_setExecFileForTest(((_file: string, _args: string[], _opts: any, cb: any) => {
+			cb(null, "[]", "");
+		}) as any);
+		expect(await probeEmbeddings()).toBe("ready");
+	});
+
+	test("reports missing when qmd warns that embeddings are needed", async () => {
+		_setExecFileForTest(((_file: string, _args: string[], _opts: any, cb: any) => {
+			cb(null, "[]", "warning: need embeddings for vector search");
+		}) as any);
+		expect(await probeEmbeddings()).toBe("missing");
+	});
+
+	test("survives a slow probe that would trip the old hardcoded 4s race", async () => {
+		process.env[ENV_KEY] = "20000";
+		_setExecFileForTest(((_file: string, _args: string[], _opts: any, cb: any) => {
+			setTimeout(() => cb(null, "[]", ""), 4_200);
+		}) as any);
+		expect(await probeEmbeddings()).toBe("ready");
+	}, 30_000);
+
+	test("bounds the qmd child process by the probe timeout, not the search timeout", async () => {
+		process.env[ENV_KEY] = "15000";
+		process.env.PI_MEMORY_QMD_SEARCH_TIMEOUT_MS = "60000";
+		let observedTimeout: number | undefined;
+		try {
+			_setExecFileForTest(((_file: string, _args: string[], opts: any, cb: any) => {
+				observedTimeout = opts.timeout;
+				cb(null, "[]", "");
+			}) as any);
+			await probeEmbeddings();
+			expect(observedTimeout).toBe(15_000);
+		} finally {
+			delete process.env.PI_MEMORY_QMD_SEARCH_TIMEOUT_MS;
+		}
+	});
+
+	test("still reports unknown when the probe genuinely times out", async () => {
+		process.env[ENV_KEY] = "150";
+		_setExecFileForTest(((_file: string, _args: string[], _opts: any, cb: any) => {
+			setTimeout(() => cb(null, "[]", ""), 2_000);
+		}) as any);
+		expect(await probeEmbeddings()).toBe("unknown");
+	}, 10_000);
 });

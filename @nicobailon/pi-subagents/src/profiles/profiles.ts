@@ -20,7 +20,7 @@ export type RecommendedRoleTier = "cheap" | "medium" | "strong";
 interface ProfileAgentOverride {
 	model?: string;
 	thinking?: string | false;
-	fallbackModels?: string[] | false;
+	machine?: string;
 }
 
 export interface SubagentProfileFile {
@@ -144,10 +144,7 @@ function validateSubagentProfile(filePath: string, parsed: Record<string, unknow
 		if (thinking !== undefined && thinking !== false && typeof thinking !== "string") {
 			throw new Error(`Profile '${filePath}' has invalid thinking for '${name}'; expected a string or false.`);
 		}
-		const fallbackModels = override.fallbackModels;
-		if (fallbackModels !== undefined && fallbackModels !== false && (!Array.isArray(fallbackModels) || fallbackModels.some((item) => typeof item !== "string"))) {
-			throw new Error(`Profile '${filePath}' has invalid fallbackModels for '${name}'; expected an array of strings or false.`);
-		}
+		if ((override as Record<string, unknown>).fallbackModels !== undefined) throw new Error(`Profile '${filePath}' uses removed field fallbackModels for '${name}'; configure one model instead.`);
 	}
 	const disableBuiltins = (subagents as Record<string, unknown>).disableBuiltins;
 	if (disableBuiltins !== undefined && typeof disableBuiltins !== "boolean") {
@@ -489,10 +486,19 @@ export function applySubagentProfile(name: string): { filePath: string; settings
 		: {};
 	// A profile owns the complete agent mapping, but unrelated subagent settings
 	// (notably disableBuiltins, modelScope, watchdog, etc.) survive profile switches.
+	// Machine placement is not a model choice, so an existing pin survives a profile switch too.
+	const agentOverrides: Record<string, ProfileAgentOverride> = { ...profile.subagents.agentOverrides };
+	const existingOverrides = existing.agentOverrides && typeof existing.agentOverrides === "object" && !Array.isArray(existing.agentOverrides)
+		? existing.agentOverrides as Record<string, unknown>
+		: {};
+	for (const [name, value] of Object.entries(existingOverrides)) {
+		const machine = value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>).machine : undefined;
+		if (typeof machine === "string" && agentOverrides[name]?.machine === undefined) agentOverrides[name] = { ...agentOverrides[name], machine };
+	}
 	settings.subagents = {
 		...existing,
 		...profile.subagents,
-		agentOverrides: profile.subagents.agentOverrides,
+		agentOverrides,
 	};
 	writeJsonFile(settingsPath, settings);
 	return { filePath, settingsPath };

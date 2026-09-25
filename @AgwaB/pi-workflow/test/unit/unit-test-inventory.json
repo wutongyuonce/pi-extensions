@@ -1,7 +1,7 @@
 {
 	"schema": "pi-workflow-unit-test-inventory-v1",
 	"source": "unit.test.mjs",
-	"count": 533,
+	"count": 534,
 	"tests": [
 		{
 			"name": "adaptive live workers cap growth at configured live-worker limit",
@@ -84,7 +84,7 @@
 		{
 			"name": "artifact graph output retry falls back to new session after same-session repair fails",
 			"occurrence": 1,
-			"sha256": "4a5a606135a51f82e14a2d1eca0f6d3aa3dc60f11be921e56ba18320c4d91009",
+			"sha256": "02f2ecb6ba7eae7016a99f7e8ce3ce3310f9a0cf1e67aeb53dbc59f58936222c",
 			"domain": "artifact-web"
 		},
 		{
@@ -394,6 +394,12 @@
 			"domain": "dynamic-runtime"
 		},
 		{
+			"name": "artifactGraph mutation-capable agents publish from managed and shared loop worktrees",
+			"occurrence": 1,
+			"sha256": "3d9b585fbecea8993f62958cb40e0076439551f4ecce576cad128b01e6bc9905",
+			"domain": "dynamic-runtime"
+		},
+		{
 			"name": "artifactGraph runtime after dependencies do not inject order-only source context",
 			"occurrence": 1,
 			"sha256": "1617a741682142713b58538537e3f491289eda1ac23e649c91bac62648f7c0e6",
@@ -558,7 +564,7 @@
 		{
 			"name": "bundled deep-research compacts audit packets before executive final",
 			"occurrence": 1,
-			"sha256": "6a3965544a57bb47436d31e8edc1389a4c8fb87ce764b03742595599f516189a",
+			"sha256": "3be9356fe34548b1c611e53a1e18c837a4c783f655125d811a417bc72e1026bb",
 			"domain": "authoring-interface"
 		},
 		{
@@ -576,7 +582,7 @@
 		{
 			"name": "bundled spec-review workflow materializes verifier and partitions verified findings",
 			"occurrence": 1,
-			"sha256": "4171435a6459a49f06d399e9863e6bf5a4a5f8b4e6949ce331a83322a5b5a542",
+			"sha256": "171300031aed64e66afc1e2cd143b4bdce0d4dde0d2c68372d5ab16473f0c7e0",
 			"domain": "authoring-interface"
 		},
 		{
@@ -870,7 +876,7 @@
 		{
 			"name": "deep-research claim-evidence-gate enforces structured evidence, rejoins identity, and partitions statuses",
 			"occurrence": 1,
-			"sha256": "e3c0c5977048fe0b9f1319bd2eb530efbd32bb6fdb8416e1e58017dd403a3932",
+			"sha256": "870aaf5358412d3772f7a5acc13b001ee4248f64681092d68326346899f35096",
 			"domain": "core-runtime"
 		},
 		{
@@ -918,7 +924,7 @@
 		{
 			"name": "deep-research claim-evidence-gate suppresses sourceRef join failures for local evidence",
 			"occurrence": 1,
-			"sha256": "3d1f6c0528c72b089a51341b14cbabe776202a64fce97986210ec3bc88efc82c",
+			"sha256": "b875cf0f33ed3e7930230845b57457bd754bee1cefb79e9e20154bf65cd9dbeb",
 			"domain": "artifact-web"
 		},
 		{
@@ -942,13 +948,13 @@
 		{
 			"name": "deep-research final-audit packet compacts deterministic ledgers",
 			"occurrence": 1,
-			"sha256": "9d665282971e81ebd3355e7e02f5c0a2eb0cdada5e84bb6c846d7ae83b6cec63",
+			"sha256": "f26a19ca70ee9d565a93dc07288abe451051ff4a3691c45dd1c1c1e8c78858e5",
 			"domain": "core-runtime"
 		},
 		{
 			"name": "deep-research final-audit packet does not preserve contradicted fact-slot values as filled",
 			"occurrence": 1,
-			"sha256": "b4e12bf3b4e178f4850f4e95c73acffcf1a8e87af5994f987d714c696485aed7",
+			"sha256": "caa04462b8d5f576f4487276573dfc0df9bfeb9cb04836b2b07db8041df31cd4",
 			"domain": "core-runtime"
 		},
 		{
@@ -978,7 +984,7 @@
 		{
 			"name": "deep-research P3 final-audit replay fixture preserves guardrail floors",
 			"occurrence": 1,
-			"sha256": "268a069065c0ba0a0d4a515432c36159f2ebd1877f79660c9629a4455292edf1",
+			"sha256": "d29055f6d9002c6abd7bd842f935ae943d1ef854a0f2035365d08d77b4591ed0",
 			"domain": "core-runtime"
 		},
 		{
@@ -990,13 +996,13 @@
 		{
 			"name": "deep-research renderer emits evidence-backed report and sidecars",
 			"occurrence": 1,
-			"sha256": "259c645bc812fcc5f55607a9b3a667080274dee9c24c54a2bacd92f0e3de4f8d",
+			"sha256": "0de4734ec055c4175fd5e36830ac2e4a84a90e15158f0e3fb1a97df619aaa3e4",
 			"domain": "core-runtime"
 		},
 		{
 			"name": "deep-research renderer joins synthesis overlay against packet ledgers",
 			"occurrence": 1,
-			"sha256": "1aae296eea4e623fa3b284775b4374258fdcb2a632f71af6ad17edf45255f44a",
+			"sha256": "b7da2ef5dc0e99b743889fa0499b3fed9ddcd9e1e47a108873b580bd4f521b85",
 			"domain": "core-runtime"
 		},
 		{
@@ -1146,7 +1152,7 @@
 		{
 			"name": "deep-review finding-pipeline dedups by file+title-token overlap and partitions verdicts with severity join",
 			"occurrence": 1,
-			"sha256": "8486e75cb64980deadcec0a2632e2016878c334416bdb8959b761268c061b850",
+			"sha256": "b6a0298d7ed6ef5bc97b84a4688453780f953d289fad41c24cd8967940b569c2",
 			"domain": "core-runtime"
 		},
 		{
@@ -1158,19 +1164,19 @@
 		{
 			"name": "deep-review finding-pipeline preserves structured locations through dedup and partition",
 			"occurrence": 1,
-			"sha256": "883ba0ead17cfe056c07236870fe3d2c8e94307f1ee24ea45bd58f852bd793de",
+			"sha256": "0de9b110431084d926ad81cf7379f599320e924ef5a3925abc74531972ff6e24",
 			"domain": "core-runtime"
 		},
 		{
 			"name": "deep-review render-review-report emits finding cards from partition ledger",
 			"occurrence": 1,
-			"sha256": "b9a8b99d1003b157ec9c4aff9bf92ea6c7192597b96cd72f6d67bc2a7844a7cf",
+			"sha256": "f88fff428ccaec4b54faf19e1ec13c2aa0702a37ec7a42ecc6619eda05c5e353",
 			"domain": "core-runtime"
 		},
 		{
 			"name": "deep-review render-review-report surfaces count mismatches and missing partition",
 			"occurrence": 1,
-			"sha256": "ad01f94484240671b5445fa18c0ed4222cf2e128ce43cc8f471ea3fb68b0fcc0",
+			"sha256": "6bd40d77a6b086f99ad2c5440b266fe41dd3edc0afcd404ba31d53e0d8d8975c",
 			"domain": "core-runtime"
 		},
 		{
@@ -1506,7 +1512,7 @@
 		{
 			"name": "fail-fast cleanup releases the global live model worker cap slot for other runs",
 			"occurrence": 1,
-			"sha256": "d477c1129724a5de1a15099aa1bb088133901c3b2c9b89cdae69dbff896919ac",
+			"sha256": "00bcf13dcdc21008a38143b24b6468306467b4e966b31ac194457b59acbe93c8",
 			"domain": "engine-store"
 		},
 		{
@@ -1590,7 +1596,7 @@
 		{
 			"name": "global live model worker cap defers saturated launches without waiting",
 			"occurrence": 1,
-			"sha256": "71f4b697aae3b67b6a3f1fe07ea631917e74e6330ed49862037aba31e4ff6a39",
+			"sha256": "48dc1537fab0efec948b36e6bb36880ebec690d289afc3926de265840b681288",
 			"domain": "engine-store"
 		},
 		{
@@ -1614,7 +1620,7 @@
 		{
 			"name": "launch-bootstrap provenance persists before launch and rejects same-attempt divergence",
 			"occurrence": 1,
-			"sha256": "718058548f947be875a389d05903f27fb19b0319c60d4fe680827b0dd0d75177",
+			"sha256": "f2a8d38544119a050f98c2225a523058ad58527415d49a4cec04befc893e78a1",
 			"domain": "engine-store"
 		},
 		{
@@ -2346,7 +2352,7 @@
 		{
 			"name": "spec-review partition helper joins verifier results and flags missing coverage",
 			"occurrence": 1,
-			"sha256": "40906e890a47e5fd6c89e45b5cc57d7ff7622d9a967487ced8015d1021c57a85",
+			"sha256": "a4cab1b3a4678d10bc1a17f1b2276ca12a351092ddce515d36fe02378c3ce3e1",
 			"domain": "authoring-interface"
 		},
 		{
@@ -2424,7 +2430,7 @@
 		{
 			"name": "structured required read policy enforces projection ledger rows separately from string reads",
 			"occurrence": 1,
-			"sha256": "4bd6b83cbdf4bef64798012d4cf965bb6f72d83e2555f372e88c23dd09d5fd49",
+			"sha256": "7d88ee06b89a264f9de200cb3a994226654695bb93cc97649a473bd4173ab74b",
 			"domain": "artifact-web"
 		},
 		{
@@ -2460,7 +2466,7 @@
 		{
 			"name": "subagent launch gate honors env override and recovers slots after throw",
 			"occurrence": 1,
-			"sha256": "28c1a4df51dbb0fba0e54f9495078a25a8f2bd6da9616aeb3b8792444dfd5008",
+			"sha256": "c693ac3d1052c5d97011575b7c2311b2e5316e6b88202a9f5e050af28c126a3b",
 			"domain": "engine-store"
 		},
 		{
@@ -2508,13 +2514,13 @@
 		{
 			"name": "subagent launch slot abort after acquisition releases slot before action",
 			"occurrence": 1,
-			"sha256": "f0b3e1db3282c32d17c5cc88da79e91869108e52ec94adfd78b0637b9b0cca9d",
+			"sha256": "53086b41923a1c9e81bd6e19114977d128a42739030b1597bddd6e09c587bb6a",
 			"domain": "engine-store"
 		},
 		{
 			"name": "subagent launch slot wait abort removes queued waiter",
 			"occurrence": 1,
-			"sha256": "883dd977409c862f9c7bf65e438b49495144c15e53bba375a3d98b690e6afa4f",
+			"sha256": "7c08c358464d4797a40bb814a080de7471eb184c69c71269a97b3eae003bfe70",
 			"domain": "engine-store"
 		},
 		{
@@ -2694,7 +2700,7 @@
 		{
 			"name": "workflow command completions and run arg parsing preserve task text",
 			"occurrence": 1,
-			"sha256": "325ab8b286915561ce2a4fb89a0760f93e7b73c432caa3be301a2c0310bbddcc",
+			"sha256": "26c279193025e33672725f21cee9c5c0ca1a3e1f34dd385c8dc3e151667f82fd",
 			"domain": "authoring-interface"
 		},
 		{
@@ -2760,7 +2766,7 @@
 		{
 			"name": "workflow index preserves run linkage without embedding task rows",
 			"occurrence": 1,
-			"sha256": "da1baddc5dc2c69c9fb83d84476b3a1fe7b46e5b454df6324b5dd1a7caf2c90e",
+			"sha256": "8f2fb846232abd09cf62a7ec6cd9bc00d68cdbff3b5006fd3b880c5c2a6f80f4",
 			"domain": "engine-store"
 		},
 		{
@@ -2826,7 +2832,7 @@
 		{
 			"name": "workflow output parser repairs known workflow control schema slips before validation",
 			"occurrence": 1,
-			"sha256": "f97bd02449d5f496645c89c9ecc4517de1580191cf5b5d2afc296271ebb387cb",
+			"sha256": "2403a3dd5560272518839e708c6909b347915965a67a009fd1e0589dca5c81c0",
 			"domain": "artifact-web"
 		},
 		{
@@ -2880,7 +2886,7 @@
 		{
 			"name": "workflow output repair wraps bare string object rows only when valid by construction",
 			"occurrence": 1,
-			"sha256": "52679c2e11a0d9aa8a36f7067d1b9bb54c3cec12e7210ad50c9beaae8f7ab14a",
+			"sha256": "f23d4608b56f927d4d18a39f1a0a425807d40a0de80da550937a03cada2ac941",
 			"domain": "artifact-web"
 		},
 		{

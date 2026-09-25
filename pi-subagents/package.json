@@ -1,6 +1,6 @@
 {
 	"name": "pi-subagents",
-	"version": "2.8.0",
+	"version": "2.9.0",
 	"description": "Power-user multi-agent framework for Pi: named agents, interactive sessions via Herdr/cmux/tmux/zellij/WezTerm, background workers, async/sync coordination, fork/resume, child-to-parent messaging, orchestrator mode, and a live TUI",
 	"keywords": [
 		"pi-package"
@@ -19,10 +19,12 @@
 		"test:e2e-live-deny-tools": "node scripts/test-e2e-live-deny-tools.mjs",
 		"test:e2e-live-tools": "node scripts/test-e2e-live-tools.mjs",
 		"test:e2e-live-extensions": "node scripts/test-e2e-live-extensions.mjs",
+		"test:e2e-live-skill-visibility": "node scripts/test-e2e-live-skill-visibility.mjs",
+		"test:e2e-live-skill-visibility-codex": "node scripts/test-e2e-live-skill-visibility-codex.mjs",
 		"test:e2e-live-stop-after-turn": "node scripts/test-e2e-live-stop-after-turn.mjs",
-    "test:e2e-live-mixed-batch": "node scripts/test-e2e-live-mixed-batch.mjs",
-    "test:e2e-live-verified-fanout": "node scripts/test-e2e-live-verified-fanout.mjs",
-    "test:frontmatter-timeout": "node scripts/test-frontmatter-timeout.mjs",
+		"test:e2e-live-mixed-batch": "node scripts/test-e2e-live-mixed-batch.mjs",
+		"test:e2e-live-verified-fanout": "node scripts/test-e2e-live-verified-fanout.mjs",
+		"test:frontmatter-timeout": "node scripts/test-frontmatter-timeout.mjs",
 		"test:frontmatter-idle-timeout": "node scripts/test-frontmatter-idle-timeout.mjs",
 		"test:frontmatter-timeout-warn": "node scripts/test-frontmatter-timeout-warn.mjs",
 		"test:frontmatter-on-timeout": "node scripts/test-frontmatter-on-timeout.mjs",
@@ -32,14 +34,15 @@
 	},
 	"peerDependencies": {
 		"@earendil-works/pi-ai": ">=0.79.0",
-		"@earendil-works/pi-coding-agent": ">=0.79.10",
+		"@earendil-works/pi-coding-agent": ">=0.85.0",
 		"@earendil-works/pi-tui": ">=0.79.0",
 		"typebox": "*"
 	},
 	"devDependencies": {
-		"@earendil-works/pi-ai": "^0.84.0",
-		"@earendil-works/pi-coding-agent": "^0.84.0",
-		"@earendil-works/pi-tui": "^0.84.0",
+		"@earendil-works/pi-ai": "^0.85.0",
+		"@earendil-works/pi-coding-agent": "^0.85.0",
+		"@earendil-works/pi-server": "^0.85.0",
+		"@earendil-works/pi-tui": "^0.85.0",
 		"@types/node": "^25.9.1",
 		"typebox": "^1.1.33",
 		"typescript": "^6.0.3"
@@ -59,9 +62,9 @@
 			"wezterm",
 			"zellij"
 		],
-    "ignoreFiles": [
-      "scripts/live-vf-candidate-router.mjs",
-      "scripts/check-file-sizes.mjs",
+		"ignoreFiles": [
+			"scripts/live-vf-candidate-router.mjs",
+			"scripts/check-file-sizes.mjs",
 			"src/launch/run-child.mjs"
 		]
 	},

@@ -1,0 +1,121 @@
+id: no-runtime-typeof
+language: TypeScript
+severity: hint
+message: "Runtime 'typeof' check — decode/parse the value at its I/O boundary, then branch on the domain value"
+note: |
+  Adapted from dmmulroy/anti-slop's `no-runtime-typeof`
+  (src/rules/no-runtime-typeof.ts, MIT). Upstream's own
+  `allowInTypeGuards` option only exempts a `typeof` sitting inside a
+  function whose return type is a type predicate (`x is T`) — the 2026-
+  08-19 audit found that option alone doesn't rescue the rule for this
+  codebase (73 predicate functions out of 404 client hits), so this
+  port adds two more exemptions, informed by where the audit found the
+  remaining hits actually concentrated: third-party JSON/LSP wire
+  payloads decoded inside functions already named for that job
+  (`trivy-client.ts`, `lsp/client.ts`, `git-guard.ts`).
+
+  Exemptions (all three must miss for a hit to fire):
+  1. `typeof` inside a function whose OWN return type is a type
+     predicate (`x is T`) — upstream's `allowInTypeGuards`.
+  2. `typeof` inside a function/method whose name starts with
+     `parse`, `decode`, `validate`, `is`, or `assert` — these are this
+     codebase's own naming convention for a boundary-parsing or
+     predicate function (`asRecord`, `errorMessage`), even when
+     TypeScript's `is`-predicate return-type syntax isn't used.
+  3. `.d.ts` files — declaration files have no runtime, so a `typeof`
+     there is a type query, not a check (the language keeps these
+     syntactically distinct in tree-sitter, but this glob is cheap
+     insurance).
+
+  These exemptions are structural, not semantic: they check the
+  ENCLOSING function's name/return-type, not what the `typeof` result
+  is actually used for, so a mis-named function (a real boundary
+  parser not named `parse*`, or a `checkFoo` predicate) still fires,
+  and a `parse*`-named function with an unrelated internal `typeof`
+  check is still exempted. `stopBy: end` searches to the nearest
+  enclosing function of that shape at ANY depth, which also exempts a
+  `typeof` inside a nested non-guard closure defined inside a guard —
+  a conservative (under-fires, not over-fires) choice.
+
+  Shipped at `hint`: the 2026-08-19 audit rejected outright adopting
+  this rule against pi-lens's own tree — it has no schema-decoding
+  library, and the concentration of hits is exactly where the rule
+  wants a schema layer (third-party JSON/LSP wire payloads), so
+  self-conformance would be an architecture decision, not a lint fix.
+  That verdict stands for pi-lens's own code; it doesn't mean the
+  pattern has no value for a repository that DOES have a decoder at its
+  boundaries. Self-scan note: do NOT try to make pi-lens's own tree
+  clean against this rule (#1718's baseline problem, likely never, per
+  the architecture-decision finding above); the adopting PR records the
+  2026-08-19 hit count so a rule that fires thousands of times against
+  its own product's source gets its pattern tightened before anyone
+  trusts the count on a real target repo.
+
+  2026-08-20 (refs #1727, #1777): CONSIDERED for promotion to `error`,
+  KEPT at `hint`. Four-corpus census, ast-grep CLI 0.45, with the three
+  exemptions above already applied:
+
+  | corpus | hits |
+  |---|---:|
+  | pi-lens `clients/` | 257 |
+  | pi-lens `tests/` | 232 |
+  | pi core `packages/` | 543 (431 outside test paths) |
+  | opencode `packages/` | 1122 (991) |
+  | oh-my-pi `packages/` | 4114 (3239) |
+
+  Verdict: the highest-volume rule in the whole catalog, and the volume is
+  not noise — it is the finding the note already records, that a codebase
+  without a decoding layer answers this rule with an architecture change.
+  The suppression the maintainer's own framing asks for ("suppress a
+  `typeof` whose checked binding comes from a source typed `unknown`")
+  needs the binding's declared type, which is type information ast-grep
+  does not have; the three exemptions here are the closest structural
+  approximation and they still leave 3,239 hits on one corpus. Promoting
+  at this volume would block agent turns across every one of these trees.
+ignores:
+  - "**/*.d.ts"
+rule:
+  kind: unary_expression
+  pattern: typeof $X
+  not:
+    any:
+      - inside:
+          stopBy: end
+          any:
+            - kind: function_declaration
+            - kind: function_expression
+            - kind: arrow_function
+            - kind: method_definition
+          has:
+            stopBy: neighbor
+            kind: type_annotation
+            has:
+              stopBy: neighbor
+              kind: type_predicate
+      - inside:
+          stopBy: end
+          kind: function_declaration
+          has:
+            stopBy: neighbor
+            kind: identifier
+            regex: '^(parse|decode|validate|is|assert)'
+      - inside:
+          stopBy: end
+          kind: function_expression
+          has:
+            stopBy: neighbor
+            kind: identifier
+            regex: '^(parse|decode|validate|is|assert)'
+      - inside:
+          stopBy: end
+          kind: method_definition
+          has:
+            stopBy: neighbor
+            kind: property_identifier
+            regex: '^(parse|decode|validate|is|assert)'
+      - inside:
+          stopBy: end
+          kind: variable_declarator
+          all:
+            - has: { stopBy: neighbor, kind: identifier, regex: '^(parse|decode|validate|is|assert)' }
+            - has: { stopBy: neighbor, kind: arrow_function }

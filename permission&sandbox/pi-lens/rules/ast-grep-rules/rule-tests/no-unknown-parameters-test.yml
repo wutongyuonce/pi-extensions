@@ -1,0 +1,12 @@
+id: no-unknown-parameters
+valid:
+  - "function f(x: string) {}"
+  - "function f(cause: unknown) {}"
+  - "const g = (cause?: unknown) => {};"
+  - "class C { m(cause: unknown) {} }"
+invalid:
+  - "function f(x: unknown) {}"
+  - "const g = (x: unknown) => {};"
+  - "class C { m(x: unknown) {} }"
+  - "interface I { m(x: unknown): void; }"
+  - "function f(x?: unknown) {}"

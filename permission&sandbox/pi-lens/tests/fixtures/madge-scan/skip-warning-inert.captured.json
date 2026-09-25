@@ -1,0 +1,26 @@
+{
+	"provenance": {
+		"tool": "madge",
+		"version": "8.0.0",
+		"binary": "madge@8.0.0 (the version the managed install ~/.pi-lens/tools/node_modules/madge resolves). The managed tree was absent in the capture environment, so the package was installed into an isolated scratch tree under TMPDIR and driven with the argv the client used BEFORE #3436 (which still passed --warning).",
+		"upstream": "pahen/madge 8.0.0: bin/cli.js:195 (`if (program.warning && !program.json) { output.warnings(res); }`), lib/output.js:118-128 (`module.exports.warnings` prints each skipped file with `console.log`, i.e. STDOUT)",
+		"workspace": "index.ts imports ./missing.js (an unresolvable LOCAL import), real.ts, tsconfig.json",
+		"platform": "linux-x64",
+		"capturedAt": "2026-09-25",
+		"command": "node <madge>/bin/cli.js --circular --extensions ts,tsx,js,jsx,mjs,cjs --ts-config __WORKSPACE__/tsconfig.json --warning --json __WORKSPACE__",
+		"argv": [
+			"--circular",
+			"--extensions",
+			"ts,tsx,js,jsx,mjs,cjs",
+			"--ts-config",
+			"__WORKSPACE__/tsconfig.json",
+			"--warning",
+			"--json",
+			"__WORKSPACE__"
+		],
+		"note": "Measured proof that --warning could not power a skip count under --json (#3436). A workspace with one unresolvable LOCAL import is present, so a usable warning channel would emit it; stderr is EMPTY because bin/cli.js:195 gates --warning on !program.json. The SAME argv WITHOUT --json printed `✖ Skipped 1 file` and `./missing.js` to STDOUT, where --json would have been corrupted — so `parseMadgeSkips(result.stderr)` could only ever return `{ total: 0, local: [] }` and `localSkips` was structurally 0. The client's argv no longer passes --warning."
+	},
+	"exitCode": 0,
+	"stdout": "[]\n",
+	"stderr": ""
+}

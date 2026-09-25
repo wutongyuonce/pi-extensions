@@ -1,0 +1,5 @@
+2026-08-26T00:00:01.0000000Z npm error code ENOTFOUND
+2026-08-26T00:00:01.0000000Z npm error syscall getaddrinfo
+2026-08-26T00:00:01.0000000Z npm error errno -3008
+2026-08-26T00:00:01.0000000Z npm error network request to https://registry.npmjs.org/vitest failed, reason: getaddrinfo ENOTFOUND registry.npmjs.org
+2026-08-26T00:00:01.5000000Z ##[error]Process completed with exit code 1.

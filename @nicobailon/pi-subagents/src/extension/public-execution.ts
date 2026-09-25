@@ -1,3 +1,5 @@
+import { normalizeWorktreeBaseRef } from "../runs/shared/worktree.ts";
+
 export interface PublicSubagentExecutionParams {
 	action?: unknown;
 	capabilities?: unknown;
@@ -28,6 +30,7 @@ export interface PublicSubagentExecutionParams {
 	preflight?: unknown;
 	isolation?: unknown;
 	worktree?: unknown;
+	baseRef?: unknown;
 	lane?: unknown;
 	async?: unknown;
 	output?: unknown;
@@ -69,6 +72,13 @@ export function normalizePublicSubagentExecution<T extends PublicSubagentExecuti
 			return { ok: false, error: "Public execution does not accept workflow resource provenance or permit fields.", mode: params.action === undefined ? "workflow" : "management" };
 		}
 	}
+	if (params.baseRef !== undefined) {
+		try {
+			normalizeWorktreeBaseRef(params.baseRef);
+		} catch (error) {
+			return { ok: false, error: error instanceof Error ? error.message : String(error), mode: params.action === undefined ? "workflow" : "management" };
+		}
+	}
 	if (params.workflowScript !== undefined && params.workflowScriptPath !== undefined) {
 		return { ok: false, error: "workflowScript and workflowScriptPath are mutually exclusive.", mode: "workflow" };
 	}
@@ -79,16 +89,18 @@ export function normalizePublicSubagentExecution<T extends PublicSubagentExecuti
 	if (hasNamedWorkflow && (params.workflowScript !== undefined || params.workflowScriptPath !== undefined)) {
 		return { ok: false, error: "workflow is mutually exclusive with workflowScript and workflowScriptPath.", mode: "workflow" };
 	}
-	if (!hasNamedWorkflow && params.args !== undefined) {
-		return { ok: false, error: "args requires a named workflow resource.", mode: "workflow" };
-	}
 	const hasWorkflowInput = params.workflowScript !== undefined || params.workflowScriptPath !== undefined || hasNamedWorkflow;
+	if (!hasWorkflowInput && params.args !== undefined) {
+		return { ok: false, error: "args requires workflow, workflowScript, or workflowScriptPath.", mode: "workflow" };
+	}
 	const hasCapacityOverride = params.globalConcurrencyLimit !== undefined || params.maxSubagentSpawnsPerRun !== undefined;
 	if (hasCapacityOverride) {
 		const capacityOverrideError = validateWorkflowCapacityOverrides(params);
 		if (capacityOverrideError) return { ok: false, error: capacityOverrideError, mode: params.action === undefined ? "workflow" : "management" };
-		if (params.action !== undefined || hasNamedWorkflow || (params.workflowScript === undefined && params.workflowScriptPath === undefined)) {
-			return { ok: false, error: "Workflow capacity overrides are only supported on top-level workflowScript or workflowScriptPath calls.", mode: params.action === undefined ? "workflow" : "management" };
+		const validatesSpawnBudget = typeof params.action === "string" && params.action.trim() === "validate"
+			&& params.globalConcurrencyLimit === undefined && params.maxSubagentSpawnsPerRun !== undefined;
+		if ((params.action !== undefined && !validatesSpawnBudget) || hasNamedWorkflow || (params.workflowScript === undefined && params.workflowScriptPath === undefined)) {
+			return { ok: false, error: "Workflow capacity overrides are only supported on top-level workflowScript or workflowScriptPath calls; validate accepts maxSubagentSpawnsPerRun for static budget checks.", mode: params.action === undefined ? "workflow" : "management" };
 		}
 	}
 	if (params.preflight !== undefined && !hasWorkflowInput) {
@@ -122,6 +134,9 @@ export function normalizePublicSubagentExecution<T extends PublicSubagentExecuti
 		return { ok: false, error: "action must be a non-empty management/control action, or omit action and use workflowScript.", mode: "management" };
 	}
 	const normalizedAction = typeof action === "string" ? action.trim() : undefined;
+	if (params.baseRef !== undefined && normalizedAction !== undefined && normalizedAction !== "resume" && normalizedAction !== "schedule.create") {
+		return { ok: false, error: "baseRef is only supported for child execution, resume, and schedule.create.", mode: "management" };
+	}
 	if (normalizedAction !== undefined && hasNamedWorkflow) {
 		return { ok: false, error: "Named workflow resource execution must omit action.", mode: "management" };
 	}

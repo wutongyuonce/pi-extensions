@@ -44,7 +44,6 @@ import {
 	resetRuntimeStateForTest,
 	runningSubagents,
 	widgetManager,
-	withSubagentBatchStop,
 } from "./state.ts";
 import { type WaitRuntime, waitForSubagentResult as waitForSubagentResultWithRuntime } from "./wait.ts";
 import { restartSubagentForTimeoutWrapUp } from "./timeout-wrap-up.ts";
@@ -150,7 +149,6 @@ export async function getLaunchedSubagentResult(running: RunningSubagent, signal
 			formatElapsed,
 			updateWidget,
 			waitForSubagentResult,
-			withSubagentBatchStop,
 			asSubagentToolResult,
 		},
 		signal,

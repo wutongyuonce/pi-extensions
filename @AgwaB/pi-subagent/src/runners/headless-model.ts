@@ -31,7 +31,7 @@ import type {
 	ThinkingLevel,
 	ToolResultBudgetInput,
 } from "../core/constants.ts";
-import { sandboxAllowedDomains } from "../core/constants.ts";
+import { abortFailureKind, sandboxAllowedDomains } from "../core/constants.ts";
 import { SandboxUnavailableError, withSandboxedArgv } from "../sandbox/srt.ts";
 import {
 	flushToolCallTelemetry,
@@ -149,8 +149,7 @@ export function resolveContextLengthState(
 		rawContextLengthExceeded && finalAssistantSucceeded(parsed);
 	return {
 		rawContextLengthExceeded,
-		contextLengthExceeded:
-			rawContextLengthExceeded && !contextOverflowRecovered,
+		contextLengthExceeded: rawContextLengthExceeded && !contextOverflowRecovered,
 		contextOverflowRecovered,
 		recoveredStreamErrors: contextOverflowRecovered
 			? parsed.errors.filter((error) =>
@@ -162,17 +161,14 @@ export function resolveContextLengthState(
 
 function finalAssistantSucceeded(parsed: PiJsonParseResult): boolean {
 	return (
-		parsed.finalAssistantText.length > 0 &&
-		parsed.metadata.stopReason !== "error"
+		parsed.finalAssistantText.length > 0 && parsed.metadata.stopReason !== "error"
 	);
 }
 
 function normalizeTimeoutMs(timeoutMs: number | undefined): number | undefined {
 	if (timeoutMs === undefined) return undefined;
 	if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
-		throw new Error(
-			"timeoutMs must be a positive finite number when provided.",
-		);
+		throw new Error("timeoutMs must be a positive finite number when provided.");
 	}
 	return timeoutMs;
 }
@@ -271,7 +267,7 @@ function errorText(value: unknown): string | undefined {
  * Pi reports per-request usage on each assistant message; keeping only the
  * last one drops every earlier turn's tokens and cost.
  */
-function sumUsageValues(total: unknown, next: unknown): unknown {
+export function sumUsageValues(total: unknown, next: unknown): unknown {
 	if (typeof next === "number") {
 		if (!Number.isFinite(next)) return total;
 		return typeof total === "number" ? total + next : next;
@@ -300,9 +296,7 @@ function accumulateAssistantUsage(
 		turnEnd: { count: 0, total: undefined },
 	});
 	const slot =
-		eventType === "message_end"
-			? accumulation.messageEnd
-			: accumulation.turnEnd;
+		eventType === "message_end" ? accumulation.messageEnd : accumulation.turnEnd;
 	slot.count += 1;
 	slot.total = sumUsageValues(slot.total, usage);
 	// Pi emits both message_end and turn_end for the same assistant message, so
@@ -408,9 +402,7 @@ function parsePiJsonLine(
 					message !== null &&
 					(message as Record<string, unknown>).role === "assistant"
 				) {
-					const text = textFromContent(
-						(message as Record<string, unknown>).content,
-					);
+					const text = textFromContent((message as Record<string, unknown>).content);
 					if (text.length > 0) parsed.finalAssistantText = text;
 				}
 			}
@@ -716,10 +708,7 @@ async function runProcess(
 		return {
 			outcome,
 			stderrRef: store.refFor("stderr", await fileBytes(stderrPath)),
-			toolCallArtifactRefs: await flushToolCallTelemetry(
-				toolCallTelemetry,
-				store,
-			),
+			toolCallArtifactRefs: await flushToolCallTelemetry(toolCallTelemetry, store),
 			parsed,
 			stderrText,
 			stderrContextLengthExceeded,
@@ -729,7 +718,7 @@ async function runProcess(
 	if (abortSignal?.aborted) {
 		return await finishWith({
 			status: "cancelled",
-			failureKind: "abort",
+			failureKind: abortFailureKind(abortSignal),
 			exitCode: null,
 			signal: null,
 		});
@@ -739,17 +728,13 @@ async function runProcess(
 		const gatePath = fileURLToPath(
 			new URL("../workers/process-gate.mjs", import.meta.url),
 		);
-		const child = spawn(
-			process.execPath,
-			[gatePath],
-			{
+		const child = spawn(process.execPath, [gatePath], {
 			cwd,
 			shell: false,
 			detached: process.platform !== "win32",
 			stdio: ["pipe", "pipe", "pipe"],
 			env: processGateEnvironment(process.env),
-			},
-		);
+		});
 
 		let settled = false;
 		let gateReleased = false;
@@ -778,17 +763,48 @@ async function runProcess(
 			abortSignal?.removeEventListener("abort", onAbort);
 		}
 
+		function noteRunnerDiagnostic(line: string): void {
+			const text = `${line}\n`;
+			stderrText = appendLimited(stderrText, text, STDERR_TEXT_LIMIT);
+			if (!stderrStream.writableEnded) stderrStream.write(text);
+		}
+
+		// Signalling must never throw: it runs from abort listeners and timers,
+		// and an escaped error there kills the worker before it can record a
+		// terminal result, leaving the run "running" forever. macOS answers a
+		// process-group kill with EPERM when the group holds only an unreaped
+		// zombie (the child died from the operator's direct signal microseconds
+		// earlier and libuv has not collected it yet); fall back to signalling
+		// the child directly and record what happened as evidence.
 		function signalChild(signal: NodeJS.Signals): void {
-			try {
-				if (
-					authorizedProcessGroupId !== undefined &&
-					process.platform !== "win32"
-				)
-					process.kill(-authorizedProcessGroupId, signal);
-				else child.kill(signal);
-			} catch (error) {
-				if ((error as NodeJS.ErrnoException)?.code !== "ESRCH") throw error;
+			const attempts: Array<() => void> = [];
+			if (authorizedProcessGroupId !== undefined && process.platform !== "win32") {
+				const processGroupId = authorizedProcessGroupId;
+				attempts.push(() => process.kill(-processGroupId, signal));
 			}
+			attempts.push(() => {
+				child.kill(signal);
+			});
+			const failures: string[] = [];
+			for (const attempt of attempts) {
+				try {
+					attempt();
+					if (failures.length > 0)
+						noteRunnerDiagnostic(
+							`headless signal ${signal} delivered to the child directly after the process-group kill failed: ${failures.join(", ")}`,
+						);
+					return;
+				} catch (error) {
+					const code = (error as NodeJS.ErrnoException)?.code;
+					if (code === "ESRCH") return;
+					failures.push(
+						code ?? (error instanceof Error ? error.message : String(error)),
+					);
+				}
+			}
+			noteRunnerDiagnostic(
+				`headless signal ${signal} could not be delivered: ${failures.join(", ")}`,
+			);
 		}
 
 		function requestStop(kind: "timeout" | "abort"): void {
@@ -843,11 +859,22 @@ async function runProcess(
 				throw new ProcessOwnershipError(
 					"headless process group drain could not be verified",
 				);
-			try {
-				process.kill(-processGroupId, "SIGTERM");
-			} catch (error) {
-				if ((error as NodeJS.ErrnoException)?.code !== "ESRCH") throw error;
-			}
+			// A group kill fails with EPERM on macOS when the group holds only an
+			// unreaped zombie. That is not proof the group survived: keep
+			// verifying liveness and let the final "remained populated" check
+			// decide once the zombie is reaped.
+			const signalGroup = (signal: NodeJS.Signals): void => {
+				try {
+					process.kill(-processGroupId, signal);
+				} catch (error) {
+					const code = (error as NodeJS.ErrnoException)?.code;
+					if (code === "ESRCH") return;
+					noteRunnerDiagnostic(
+						`headless process group ${signal} could not be delivered: ${code ?? String(error)}`,
+					);
+				}
+			};
+			signalGroup("SIGTERM");
 			for (let index = 0; index < 10; index += 1) {
 				status = inspectProcessGroup(processGroupId);
 				if (status === "dead") return;
@@ -857,11 +884,7 @@ async function runProcess(
 					);
 				await new Promise((resolveSleep) => setTimeout(resolveSleep, 50));
 			}
-			try {
-				process.kill(-processGroupId, "SIGKILL");
-			} catch (error) {
-				if ((error as NodeJS.ErrnoException)?.code !== "ESRCH") throw error;
-			}
+			signalGroup("SIGKILL");
 			for (let index = 0; index < 10; index += 1) {
 				status = inspectProcessGroup(processGroupId);
 				if (status === "dead") return;
@@ -876,11 +899,12 @@ async function runProcess(
 			);
 		}
 
-		function startGroupDrain(): Promise<ProcessOwnershipError | Error | undefined> {
+		function startGroupDrain(): Promise<
+			ProcessOwnershipError | Error | undefined
+		> {
 			groupDrainResult ??= drainAuthorizedProcessGroup().then(
 				() => undefined,
-				(error) =>
-					error instanceof Error ? error : new Error(String(error)),
+				(error) => (error instanceof Error ? error : new Error(String(error))),
 			);
 			return groupDrainResult;
 		}
@@ -959,12 +983,15 @@ async function runProcess(
 					});
 					return;
 				}
-				const failureKind = stopKind ?? (exitCode === 0 ? null : "model");
+				const failureKind =
+					stopKind === "abort"
+						? abortFailureKind(abortSignal)
+						: (stopKind ?? (exitCode === 0 ? null : "model"));
 				settle({
 					status:
 						failureKind === null
 							? "completed"
-							: failureKind === "abort"
+							: stopKind === "abort"
 								? "cancelled"
 								: "failed",
 					failureKind,
@@ -986,16 +1013,12 @@ async function runProcess(
 		child.once("spawn", () => {
 			const pid = child.pid;
 			if (pid === undefined) {
-				rejectOwnership(
-					new Error("headless gated launcher did not expose a pid"),
-				);
+				rejectOwnership(new Error("headless gated launcher did not expose a pid"));
 				return;
 			}
 			ownershipTimer = setTimeout(() => {
 				rejectOwnership(
-					new Error(
-						"headless gated launch timed out before ownership was recorded",
-					),
+					new Error("headless gated launch timed out before ownership was recorded"),
 				);
 			}, PROCESS_OWNERSHIP_TIMEOUT_MS);
 			void captureProcessIdentity(pid)
@@ -1011,7 +1034,9 @@ async function runProcess(
 						processBirthIdentity: identity.birthIdentity,
 						command: argv[0],
 					});
-					if (settled || ownershipError !== undefined) return;
+					// Cancellation can kill the gate while ownership persistence is
+					// pending. Do not write a launch payload to that closed stdin.
+					if (settled || ownershipError !== undefined || stopKind !== null) return;
 					if (ownershipTimer) clearTimeout(ownershipTimer);
 					ownershipTimer = null;
 					gateReleased = true;
@@ -1119,8 +1144,7 @@ export async function runHeadlessModel(
 									};
 									delete env.PI_SUBAGENT_DURABLE_WORKER_BINDING_JSON;
 									if (explicitBinding !== undefined)
-										env.PI_SUBAGENT_DURABLE_WORKER_BINDING_JSON =
-											explicitBinding;
+										env.PI_SUBAGENT_DURABLE_WORKER_BINDING_JSON = explicitBinding;
 									return env;
 								})(),
 								options.onProcessStart,

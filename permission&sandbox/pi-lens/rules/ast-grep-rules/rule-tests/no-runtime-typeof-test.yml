@@ -1,0 +1,33 @@
+id: no-runtime-typeof
+valid:
+  - |
+    function isFoo(x: unknown): x is Foo {
+      return typeof x === "object";
+    }
+  - |
+    const isBar = (x: unknown): x is Bar => typeof x === "object";
+  - |
+    function parseThing(x: unknown) {
+      return typeof x === "string";
+    }
+  - |
+    const validateThing = (x: unknown) => typeof x === "string";
+  - |
+    class C {
+      isFoo(x: unknown): x is Foo {
+        return typeof x === "object";
+      }
+    }
+invalid:
+  - |
+    function plain(x: unknown) {
+      return typeof x === "string";
+    }
+  - |
+    const check = (x: unknown) => typeof x === "string";
+  - |
+    class C {
+      plain(x: unknown) {
+        return typeof x === "string";
+      }
+    }

@@ -1,8 +1,11 @@
 import { existsSync, readFileSync } from "node:fs";
 import { activityMonitor } from "./activity.ts";
+import { normalizeDomain } from "./domain-filter-normalization.ts";
 import { hasCredentialSource, redactCredential, resolveCredential } from "./credential-source.ts";
 import type { ExtractedContent, ExtractOptions } from "./extract.ts";
 import type { SearchOptions, SearchResponse } from "./perplexity.ts";
+import { formatSearchResultsAsAnswer } from "./search-answer-formatting.ts";
+import { normalizeSearchResultCount } from "./search-result-count-normalization.ts";
 import { getWebSearchConfigPath } from "./utils.ts";
 
 const SEARCH1API_SEARCH_URL = "https://api.search1api.com/search";
@@ -102,26 +105,6 @@ function requestSignal(signal: AbortSignal | undefined, timeoutMs: number): Abor
 	return signal ? AbortSignal.any([signal, timeout]) : timeout;
 }
 
-function normalizeNumResults(value: number | undefined): number {
-	if (typeof value !== "number" || !Number.isFinite(value)) return 5;
-	return Math.max(1, Math.min(Math.floor(value), 20));
-}
-
-function normalizeDomain(value: string): string | null {
-	let input = value.trim().toLowerCase();
-	if (!input) return null;
-	if (input.startsWith("-")) input = input.slice(1).trim();
-	if (!input) return null;
-	try {
-		const parsed = input.includes("://") ? new URL(input) : new URL(`https://${input}`);
-		input = parsed.hostname;
-	} catch {
-		input = input.split("/")[0]?.split(":")[0] ?? "";
-	}
-	input = input.replace(/^\.+|\.+$/g, "");
-	return /^[a-z0-9][a-z0-9.-]*\.[a-z]{2,}$/i.test(input) ? input : null;
-}
-
 function mapDomainFilter(domainFilter: string[] | undefined): { includeSites: string[]; excludeSites: string[] } {
 	const includeSites: string[] = [];
 	const excludeSites: string[] = [];
@@ -135,7 +118,7 @@ function mapDomainFilter(domainFilter: string[] | undefined): { includeSites: st
 }
 
 function buildSearchBody(query: string, options: Search1APISearchOptions): Record<string, unknown> {
-	const numResults = normalizeNumResults(options.numResults);
+	const numResults = normalizeSearchResultCount(options.numResults);
 	const { includeSites, excludeSites } = mapDomainFilter(options.domainFilter);
 	return {
 		query,
@@ -215,13 +198,6 @@ function mapInlineContent(results: Search1APISearchResult[] | undefined): Extrac
 	});
 }
 
-function buildAnswer(results: SearchResponse["results"]): string {
-	return results.map((result) => {
-		if (result.snippet) return `${result.snippet}\nSource: ${result.title} (${result.url})`;
-		return `Source: ${result.title} (${result.url})`;
-	}).join("\n\n");
-}
-
 export async function searchWithSearch1API(
 	query: string,
 	options: Search1APISearchOptions = {},
@@ -238,7 +214,7 @@ export async function searchWithSearch1API(
 			options.signal,
 		);
 		const results = mapSearchResults(data.results);
-		const response: SearchResponse = { answer: buildAnswer(results), results };
+		const response: SearchResponse = { answer: formatSearchResultsAsAnswer(results), results };
 		if (options.includeContent) {
 			const inlineContent = mapInlineContent(data.results);
 			if (inlineContent.length > 0) response.inlineContent = inlineContent;

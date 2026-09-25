@@ -4,7 +4,6 @@ import { buildHostHtmlTemplate, type HostHtmlTemplateInput } from "../host-html-
 function createMinimalInput(overrides: Partial<HostHtmlTemplateInput> = {}): HostHtmlTemplateInput {
   return {
     sessionToken: "test-token-123",
-    uiResourceToken: "resource-token-456",
     serverName: "test-server",
     toolName: "test-tool",
     toolArgs: { arg1: "value1" },
@@ -17,6 +16,7 @@ function createMinimalInput(overrides: Partial<HostHtmlTemplateInput> = {}): Hos
     allowAttribute: "",
     requireToolConsent: false,
     cacheToolConsent: true,
+    sandboxProxyUrl: "http://localhost:9876/sandbox",
     ...overrides,
   };
 }
@@ -53,9 +53,8 @@ describe("buildHostHtmlTemplate", () => {
       const html = buildHostHtmlTemplate(createMinimalInput());
 
       expect(html).toContain('<iframe id="mcp-app"');
-      expect(html).toContain('sandbox="allow-scripts allow-forms allow-modals allow-popups allow-downloads"');
+      expect(html).toContain('sandbox="allow-scripts allow-forms allow-modals allow-popups allow-downloads allow-same-origin"');
       expect(html).not.toContain("allow-popups-to-escape-sandbox");
-      expect(html).not.toContain("allow-same-origin");
       expect(html).toContain('referrerpolicy="no-referrer"');
     });
 
@@ -63,8 +62,31 @@ describe("buildHostHtmlTemplate", () => {
       const html = buildHostHtmlTemplate(createMinimalInput());
 
       expect(html).toContain("new PostMessageTransport(iframe.contentWindow, iframe.contentWindow)");
-      expect(html).toContain("if (event.source !== iframe.contentWindow) return;");
+      expect(html).toContain("if (event.source !== iframe.contentWindow || event.origin !== sandboxProxyOrigin) return;");
+      expect(html).toContain("event.source === iframe.contentWindow && event.origin !== sandboxProxyOrigin");
       expect(html).not.toContain("new PostMessageTransport(iframe.contentWindow, null)");
+    });
+
+    it("tells the proxy to navigate only after its ready handshake", () => {
+      const html = buildHostHtmlTemplate(createMinimalInput({
+        resource: {
+          uri: "ui://test/widget",
+          html: "<p>provider</p>",
+          meta: {
+            csp: { resourceDomains: ["https://cdn.example.com"] },
+            permissions: { clipboardWrite: {} },
+          },
+        },
+      }));
+
+      expect(html).toContain("bridge.onsandboxready = () => {");
+      expect(html).toContain("bridge.sendSandboxResourceReady({");
+      expect(html).toContain('html: ""');
+      expect(html).toContain("sandbox: INNER_SANDBOX");
+      expect(html).toContain('"https://cdn.example.com"');
+      expect(html).toContain('"clipboardWrite"');
+      expect(html).not.toContain("<p>provider</p>");
+      expect(html).not.toContain("/ui-app");
     });
 
     it("includes control buttons", () => {
@@ -99,14 +121,14 @@ describe("buildHostHtmlTemplate", () => {
       const html = buildHostHtmlTemplate(
         createMinimalInput({
           sessionToken: "secret-session-token",
-          uiResourceToken: "app-resource-token",
         })
       );
 
       expect(html).toContain('const SESSION_TOKEN = "secret-session-token"');
-      expect(html).toContain('const UI_RESOURCE_TOKEN = "app-resource-token"');
-      expect(html).toContain('iframe.src = "/ui-app?resource=" + encodeURIComponent(UI_RESOURCE_TOKEN)');
-      expect(html).not.toContain('iframe.src = "/ui-app?session="');
+      expect(html).toContain('const SANDBOX_PROXY_URL = "http://localhost:9876/sandbox"');
+      expect(html).toContain('iframe.src = SANDBOX_PROXY_URL');
+      expect(html).not.toContain('iframe.src = "/ui-app?resource="');
+      expect(html).not.toContain("http://localhost:9876/sandbox?session=");
     });
 
     it("injects tool arguments", () => {

@@ -13,6 +13,10 @@ export function createMockPi(): MockPi {
 	return _createMockPi();
 }
 
+export function resolveMockPiCallArgs(call: { args?: readonly string[]; effectiveArgs?: readonly string[] }): string[] {
+	return [...(call.effectiveArgs ?? call.args ?? [])];
+}
+
 export function createTempDir(prefix = "pi-subagent-test-"): string {
 	return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
 }
@@ -48,7 +52,6 @@ interface AgentConfig {
 	defaultContext?: "fresh" | "fork";
 	systemPrompt?: string;
 	model?: string;
-	fallbackModels?: string[];
 	tools?: string[];
 	extensions?: string[];
 	subagentOnlyExtensions?: string[];
@@ -66,7 +69,6 @@ interface AgentConfig {
 	toolBudget?: { soft?: number; hard: number; block?: string[] | "*" };
 	mcpDirectTools?: string[];
 	maxSubagentDepth?: number;
-	completionGuard?: boolean;
 }
 
 export function makeAgentConfigs(names: string[]): AgentConfig[] {
@@ -173,6 +175,26 @@ export const events = {
 				stopReason: "stop",
 				usage: { input: 100, output: 50, cacheRead: 0, cacheWrite: 0, cost: { total: 0.001 } },
 			},
+		};
+	},
+
+	/** Final assistant turn carrying a satisfied acceptance report. */
+	acceptanceReport(): object {
+		const report = { criteriaSatisfied: [{ id: "criterion-1", status: "satisfied", evidence: "implemented" }], changedFiles: ["src/file.ts"], testsAddedOrUpdated: ["test/file.test.ts"], commandsRun: [{ command: "npm test", result: "passed", summary: "passed" }], validationOutput: ["tests passed"], residualRisks: [], noStagedFiles: true };
+		return events.assistantMessage(["done", "```acceptance-report", JSON.stringify(report), "```"].join("\n"));
+	},
+
+	watchdogStatusWarning(severity: "concern" | "blocker", summary: string, overrides: Record<string, unknown> = {}): object {
+		const { seq = 1, runId, agent, childIndex, ...warning } = overrides;
+		return {
+			type: "subagent.watchdog.status",
+			seq,
+			phase: "idle",
+			ts: Date.now(),
+			...(runId ? { runId } : {}),
+			...(agent ? { agent } : {}),
+			...(childIndex !== undefined ? { childIndex, stepIndex: childIndex } : {}),
+			warning: { severity, importance: "high", category: "test-gap", summary, evidence: "The transcript claims tests passed but no test command ran.", recommendedAction: "Run the focused test before finishing.", addressed: false, stalemate: false, ...warning },
 		};
 	},
 

@@ -1,0 +1,35 @@
+# Kotlin Prefer isEmpty
+# Detects `.size == 0` / `.length == 0`, which usually reads better as
+# `.isEmpty()`.
+# Ported from vinhnx/VTCode rules/kotlin/prefer-is-empty.yml (#2198, refs #2195).
+id: kotlin-prefer-is-empty
+language: kotlin
+severity: warning
+message: "Use isEmpty() instead of comparing size/length to zero"
+note: |
+  `.isEmpty()` states intent directly. It is exactly equivalent to a
+  zero-size/zero-length comparison for every Kotlin collection, Array, and
+  String, but this rule cannot see the receiver's actual type — a class with
+  its own unrelated `size`/`length` property (e.g. `class Segment(val
+  length: Int)`) has no `isEmpty()` member at all, so a blind rewrite would
+  emit code that doesn't compile.
+  Detection-only for that reason, matching the Java sibling
+  `prefer-string-is-empty.yml`: the receiver's type is not checked here
+  either. Only the exact `== 0` comparison is flagged; `> 0`, `!= 0`, and
+  other comparisons are left alone because their natural rewrite
+  (isNotEmpty, or none) differs per shape.
+rule:
+  any:
+    - pattern: $RECEIVER.size == 0
+    - pattern: $RECEIVER.length == 0
+files:
+  - "**/*.kt"
+tags:
+  - kotlin
+  - idiom
+  - readability
+examples:
+  bad: |
+    if (items.size == 0) return
+  good: |
+    if (items.isEmpty()) return

@@ -1,0 +1,77 @@
+id: no-bare-except
+valid:
+  - |
+    try:
+        doThing()
+    except ValueError:
+        handle()
+  - |
+    try:
+        doThing()
+    except (ValueError, KeyError):
+        handle()
+  - |
+    try:
+        doThing()
+    except Exception as e:
+        handle(e)
+  - |
+    # dotted/qualified name (#1031)
+    try:
+        doThing()
+    except asyncio.TimeoutError:
+        handle()
+  - |
+    # parenthesized single name (mirrors #1026's tree-sitter spec set)
+    try:
+        doThing()
+    except (ValueError):
+        handle()
+  - |
+    # subscripted generic (#1244)
+    try:
+        doThing()
+    except dict[str, int]:
+        handle()
+  - |
+    # subscripted PEP 654 exception group (#1244)
+    try:
+        doThing()
+    except BaseExceptionGroup[TypeError, ValueError]:
+        handle()
+  - |
+    try:
+        doThing()
+    except ValueError | TypeError:
+        handle()
+  - |
+    try:
+        doThing()
+    except cache[key]:
+        handle()
+  - |
+    try:
+        doThing()
+    except (ValueError,):
+        handle()
+  - |
+    try:
+        doThing()
+    except (mod.E1, E2) as error:
+        handle(error)
+  - |
+    try:
+        doThing()
+    except* ValueError:
+        handle()
+invalid:
+  - |
+    try:
+        doThing()
+    except:
+        handle()
+  - |
+    try:
+        doThing()
+    except:
+        pass

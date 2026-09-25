@@ -1,0 +1,24 @@
+id: no-javascript-url-js
+valid:
+  - 'a.href = "https://x"'
+  - 'a.href = "https://example.com"'
+  - 'a.href = "/"'
+  - 'expect(openBrowser("javascript:alert(1)")).toBe(false)'
+  - |
+    it("rejects javascript: urls", () => {
+      expect(openBrowser("javascript:alert(1)")).toBe(false);
+    });
+  - 'const links = arr.filter((l) => !l.startsWith("javascript:"))'
+  - 'if (url.includes("javascript:")) return null;'
+  - 'const isBlocked = url === "javascript:alert(1)"'
+  - 'const safe = url !== "javascript:alert(1)"'
+  - 'url?.startsWith("javascript:")'
+invalid:
+  - 'a.href = "javascript:alert(1)"'
+  - 'a.href = "javascript:void(0)"'
+  - 'const u = "javascript:alert(1)"'
+  - 'a.href = str.replace("http:", "javascript:alert(1)")'
+  - 'if (candidates.includes(link.href = "javascript:alert(1)")) { doThing(); }'
+  - 'someArray.includes((a.href = "javascript:alert(1)", true));'
+  - 'if ((a.href = "javascript:alert(1)") === expected) { doThing(); }'
+  - 'const ok = (typeof (a.href = "javascript:alert(1)")) === "string";'

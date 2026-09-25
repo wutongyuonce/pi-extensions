@@ -1,0 +1,60 @@
+id: redundant-unsafe-function
+valid:
+  - |
+    unsafe fn f() -> *const i32 {
+        unsafe {
+            let ptr = 0x1234 as *const i32;
+            ptr
+        }
+    }
+  - |
+    fn f() -> i32 { 42 }
+  - |
+    /// Dereferences a raw pointer.
+    ///
+    /// # Safety
+    ///
+    /// Caller must ensure the pointer is valid and aligned.
+    unsafe fn ptr_deref(p: *const i32) -> i32 {
+        let x = 1;
+        x
+    }
+invalid:
+  - |
+    unsafe fn f() {
+        let x = 1;
+    }
+  - |
+    unsafe fn redundant_unsafe() {
+        println!("no unsafe block");
+    }
+  - |
+    unsafe fn proper_unsafe() -> *const i32 {
+        let ptr = 0x1234 as *const i32;
+        ptr
+    }
+  - |
+    /// Does something.
+    unsafe fn no_real_safety_doc() {
+        println!("nope");
+    }
+  - |
+    // # Safety
+    // This is a stray file-top comment, not attached to any function.
+
+    fn helper() {}
+
+    unsafe fn no_doc_at_all() {
+        println!("bad 1");
+    }
+  - |
+    /// # Safety
+    /// Caller must ensure the pointer is valid.
+    unsafe fn documented_fn(p: *const i32) -> i32 {
+        let x = 1;
+        x
+    }
+
+    unsafe fn undocumented_fn_b() {
+        println!("no doc for me");
+    }

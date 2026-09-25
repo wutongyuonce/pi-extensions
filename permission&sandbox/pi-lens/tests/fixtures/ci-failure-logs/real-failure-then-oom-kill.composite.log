@@ -1,0 +1,13 @@
+2026-08-26T00:05:51.8562109Z  [32m✓[39m [30m[42m default [49m[39m tests/clients/trivy-client.test.ts [2m([22m[2m21 tests[22m[2m)[22m[32m 26[2mms[22m[39m
+2026-08-26T00:05:52.6816577Z  [32m✓[39m [30m[42m default [49m[39m tests/clients/turn-scenarios.test.ts [2m([22m[2m6 tests[22m[2m | [22m[33m3 skipped[39m[2m)[22m[32m 26[2mms[22m[39m
+2026-08-26T00:05:53.7306942Z  [31m❯[39m [30m[42m default [49m[39m tests/clients/word-index-lifecycle.test.ts [2m([22m[2m5 tests[22m[2m | [22m[31m1 failed[39m[2m)[22m[33m 460[2mms[22m[39m
+2026-08-26T00:05:53.7349245Z      [32m✓[39m builds and persists when no snapshot exists yet (absent)[32m 92[2mms[22m[39m
+2026-08-26T00:05:53.7350582Z      [32m✓[39m rebuilds when the persisted snapshot's seq is stale[32m 70[2mms[22m[39m
+2026-08-26T00:05:53.7352043Z [31m     [31m×[31m reuses a fresh persisted snapshot without rebuilding[39m[32m 127[2mms[22m[39m
+2026-08-25T22:59:51.4770635Z  [32m✓[39m [30m[42m default [49m[39m tests/clients/tool-render.test.ts [2m([22m[2m14 tests[22m[2m)[22m[32m 34[2mms[22m[39m
+2026-08-25T22:59:51.5151275Z  [32m✓[39m [30m[42m default [49m[39m tests/clients/lsp/launch.test.ts [2m([22m[2m12 tests[22m[2m | [22m[33m5 skipped[39m[2m)[22m[32m 221[2mms[22m[39m
+2026-08-25T22:59:51.5236809Z /home/runner/work/_temp/5a3fd468-5615-4f9a-a18c-73fa6da90221.sh: line 1:  2464 Killed                  node scripts/with-memory-watch.mjs -- npm test
+2026-08-25T22:59:51.6765201Z  [32m✓[39m [30m[42m default [49m[39m tests/clients/bounded-telemetry.test.ts [2m([22m[2m16 tests[22m[2m)[22m[32m 10[2mms[22m[39m
+2026-08-25T22:59:56.0924437Z  [32m✓[39m [30m[42m default [49m[39m tests/clients/write-autofix-attachment-message.test.ts [2m([22m[2m4 tests[22m[2m)[22m[32m 52[2mms[22m[39m
+2026-08-25T22:59:56.2562525Z  [32m✓[39m [30m[42m default [49m[39m tests/clients/codebase-model.test.ts [2m([22m[2m19 tests[22m[2m)[22m[32m 32[2mms[22m[39m
+2026-08-25T22:59:56.5323567Z ##[error]Process completed with exit code 137.

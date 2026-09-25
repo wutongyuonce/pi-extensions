@@ -1,0 +1,7 @@
+[package.metadata.docs.rs]
+name = "wrong-metadata-name"
+
+[package]
+name = "metadata-before-package"
+version = "0.1.0"
+edition = "2021"

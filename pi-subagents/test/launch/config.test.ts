@@ -41,6 +41,7 @@ import {
 	writeSubagentLaunchMetadataEntryForTest,
 	writeSubagentModelStateEntriesForTest,
 } from "../support/index.ts";
+import { isHeadlessLaunchSession } from "../../src/tools/subagent-tools.ts";
 
 describe("agent launch configuration", () => {
 	afterEach(() => {
@@ -204,6 +205,9 @@ describe("agent launch configuration", () => {
 		assert.equal(isOneShotPromptInvocationForTest(startupPromptArgv), false);
 		assert.equal(isInitialPromptInvocationForTest(startupPromptArgv), true);
 		assert.equal(isInitialPromptInvocationForTest(["node", "pi"]), false);
+		assert.equal(isHeadlessLaunchSession(true, printArgv), true);
+		assert.equal(isHeadlessLaunchSession(true, startupPromptArgv), false);
+		assert.equal(isHeadlessLaunchSession(false, startupPromptArgv), true);
 		assert.equal(shouldForceSynchronousLaunchForTest(true, printArgv), true);
 		assert.equal(shouldForceSynchronousLaunchForTest(true, startupPromptArgv), true);
 		assert.equal(shouldForceSynchronousLaunchForTest(false, ["node", "pi", "task"]), true);

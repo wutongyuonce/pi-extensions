@@ -37,6 +37,8 @@ describe("completion replay", () => {
 		try {
 			const now = Date.now();
 			recordWaitCompletion(makeState(), "run-a", {
+				runId: "run-a",
+				sessionId: "session-a",
 				agent: "worker",
 				mode: "single",
 				state: "complete",

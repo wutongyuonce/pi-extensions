@@ -1,0 +1,20 @@
+{
+	"provenance": {
+		"runner": "yamllint",
+		"tool": "yamllint",
+		"version": "1.38.0",
+		"command": "yamllint -f parsable bad.yaml",
+		"argv": [
+			"-f",
+			"parsable",
+			"bad.yaml"
+		],
+		"workspace": "tests/fixtures/tool-smoke/yaml",
+		"platform": "win32-x64",
+		"capturedAt": "2026-08-21"
+	},
+	"file": "bad.yaml",
+	"exitCode": 1,
+	"stdout": "bad.yaml:5:3: [error] duplication of key \"name\" in mapping (key-duplicates)\r\n",
+	"stderr": ""
+}

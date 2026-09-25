@@ -1,0 +1,60 @@
+export interface MemorySample {
+	totalMb: number;
+	availableMb: number;
+	source: "meminfo" | "os";
+}
+
+export declare function readMemory(meminfoPath?: string): MemorySample;
+
+export declare function parseMeminfo(text: string): {
+	totalMb: number;
+	availableMb: number;
+	source: "meminfo";
+};
+
+export declare function shouldPrint(
+	sample: { availableMb: number },
+	state: {
+		lastPrintedMb: number | null;
+		thresholdMb: number;
+		stepMb: number;
+	},
+): boolean;
+
+export interface MemoryWatchState {
+	totalMb: number;
+	lowWaterMb: number;
+	lowWaterAt: string | null;
+	/** The pid the wrapper was watching, to match against the kernel's victim. */
+	childPid?: number | null;
+	/** Sampling period, so the verdict can state what its cadence cannot see. */
+	intervalMs?: number | null;
+}
+
+export declare function formatVerdict(
+	exit: { code: number | null; signal: string | null },
+	watch: MemoryWatchState,
+): string;
+
+export declare function resolveCgroupDir(
+	cgroupRoot?: string,
+	procCgroupPath?: string,
+): string | null;
+
+export interface CgroupSample {
+	memCurrentMb: number | null;
+	memPeakMb: number | null;
+	pidsCurrent: number | null;
+	memPressureSomeTotal: number | null;
+	cpuPressureSomeTotal: number | null;
+}
+
+export declare function readCgroupSample(
+	cgroupDir: string | null,
+): CgroupSample;
+
+export declare function formatSampleLine(
+	atMs: string,
+	hostSample: { availableMb: number; totalMb: number },
+	cgroupSample: CgroupSample,
+): string;

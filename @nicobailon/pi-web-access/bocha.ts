@@ -1,5 +1,7 @@
 import { existsSync, readFileSync } from "node:fs";
 import { activityMonitor } from "./activity.ts";
+import { normalizeDomain } from "./domain-filter-normalization.ts";
+import { formatSearchResultsAsAnswer } from "./search-answer-formatting.ts";
 import type { SearchOptions, SearchResponse } from "./perplexity.ts";
 import { hasCredentialSource, redactCredential, resolveCredential } from "./credential-source.ts";
 import { getWebSearchConfigPath } from "./utils.ts";
@@ -77,21 +79,6 @@ interface DomainFilters {
 	exclude: string[];
 }
 
-function normalizeDomain(value: string): string | null {
-	let input = value.trim().toLowerCase();
-	if (!input) return null;
-	if (input.startsWith("-")) input = input.slice(1).trim();
-	if (!input) return null;
-	try {
-		const parsed = input.includes("://") ? new URL(input) : new URL(`https://${input}`);
-		input = parsed.hostname;
-	} catch {
-		input = input.split("/")[0]?.split(":")[0] ?? "";
-	}
-	input = input.replace(/^\.+|\.+$/g, "");
-	return /^[a-z0-9][a-z0-9.-]*\.[a-z]{2,}$/i.test(input) ? input : null;
-}
-
 function parseDomainFilter(domainFilter: string[] | undefined): DomainFilters {
 	const filters: DomainFilters = { include: [], exclude: [] };
 	for (const raw of domainFilter ?? []) {
@@ -158,12 +145,6 @@ function parseSearchResponse(value: unknown): { results: SearchResponse["results
 	return { results };
 }
 
-function buildAnswer(results: SearchResponse["results"]): string {
-	return results.map((result) => result.snippet
-		? `${result.snippet}\nSource: ${result.title} (${result.url})`
-		: `Source: ${result.title} (${result.url})`).join("\n\n");
-}
-
 export function isBochaAvailable(): boolean {
 	return hasCredentialSource({ provider: "Bocha", configuredValue: loadConfig().bochaApiKey, environmentValue: process.env.BOCHA_API_KEY });
 }
@@ -217,5 +198,5 @@ export async function searchWithBocha(query: string, options: SearchOptions = {}
 	}
 	activityMonitor.logComplete(activityId, response.status);
 	const results = parsed.results.filter((result) => passesDomainFilters(result.url, filters)).slice(0, numResults);
-	return { answer: buildAnswer(results), results };
+	return { answer: formatSearchResultsAsAnswer(results), results };
 }

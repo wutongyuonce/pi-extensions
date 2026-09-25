@@ -1,0 +1,12 @@
+id: ts-string-split-index
+language: typescript
+severity: warning
+message: "split(sep)[n] with a magic index - use destructuring or named variables"
+metadata:
+  weight: 3
+  category: slop
+rule:
+  any:
+  - pattern: "$S.split($SEP)[1]"
+  - pattern: "$S.split($SEP)[2]"
+  - pattern: "$S.split($SEP)[3]"

@@ -1,9 +1,38 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { prepareWorkflowLaunchParams, promptAuditRedoParams, sanitizeRunPathSegment } from "../../src/runs/foreground/subagent-executor.ts";
+import type { AgentConfig } from "../../src/agents/agents.ts";
+import { prepareWorkflowLaunchParams, promptAuditRedoParams, resolveRevivalControlConfig, resolveWorkflowChildLocalCwd, sanitizeRunPathSegment } from "../../src/runs/foreground/subagent-executor.ts";
+import { resolveControlConfig } from "../../src/runs/shared/subagent-control.ts";
 
 describe("workflow launch params", () => {
-	it("keeps omitted workflow child async foreground", () => {
+	it("keeps remote workflow cwd out of local discovery for explicit and agent-pinned machines", () => {
+		const workflowCwd = "/local/workflow";
+		const discoverCalls: string[] = [];
+		const pinned: AgentConfig = {
+			name: "pinned",
+			description: "Pinned agent",
+			systemPrompt: "Run remotely.",
+			systemPromptMode: "replace",
+			inheritProjectContext: false,
+			inheritGlobalContext: false,
+			inheritSkills: false,
+			source: "project",
+			filePath: "/local/workflow/.pi/agents/pinned.md",
+			machine: "workmac",
+		};
+		const discoverAgents = (cwd: string) => {
+			discoverCalls.push(cwd);
+			return { agents: [pinned] };
+		};
+		const shared = { workflowCwd, discoverAgents, agents: [] as AgentConfig[] };
+
+		assert.equal(resolveWorkflowChildLocalCwd({ ...shared, params: { agent: "worker", machine: "workmac", cwd: "/remote/repo" } }), workflowCwd);
+		assert.deepEqual(discoverCalls, []);
+		assert.equal(resolveWorkflowChildLocalCwd({ ...shared, params: { agent: "pinned", cwd: "/remote/repo" } }), workflowCwd);
+		assert.deepEqual(discoverCalls, [workflowCwd]);
+	});
+
+	it("preserves omitted workflow child async defaults and awaits background resolution", () => {
 		assert.deepEqual(
 			prepareWorkflowLaunchParams(
 				{},
@@ -14,10 +43,49 @@ describe("workflow launch params", () => {
 			{
 				agent: "worker",
 				task: "Run",
-				async: false,
+				workflowAwaitAsync: true,
 				workflowParentRunId: "workflow-run",
 				workflowKey: "run",
 			},
+		);
+	});
+
+	it("forwards workflow baseRef only to launches where it can affect allocation", () => {
+		assert.equal(
+			prepareWorkflowLaunchParams(
+				{ baseRef: "refs/heads/release" },
+				{ agent: "worker", task: "Run" },
+				"workflow-run",
+				"run",
+			).baseRef,
+			"refs/heads/release",
+		);
+		assert.equal(
+			prepareWorkflowLaunchParams(
+				{ baseRef: "refs/heads/release" },
+				{ resume: "retained-run", task: "Continue" },
+				"workflow-run",
+				"resume",
+			).baseRef,
+			undefined,
+		);
+		assert.equal(
+			prepareWorkflowLaunchParams(
+				{ baseRef: "refs/heads/release" },
+				{ resume: "retained-run", task: "Continue", baseRef: "refs/heads/topic" },
+				"workflow-run",
+				"resume-explicit",
+			).baseRef,
+			"refs/heads/topic",
+		);
+		assert.equal(
+			prepareWorkflowLaunchParams(
+				{ baseRef: "refs/heads/release" },
+				{ agent: "worker", task: "Run", baseRef: "refs/heads/topic" },
+				"workflow-run",
+				"override",
+			).baseRef,
+			"refs/heads/topic",
 		);
 	});
 
@@ -30,6 +98,20 @@ describe("workflow launch params", () => {
 		);
 		assert.equal(params.globalConcurrencyLimit, undefined);
 		assert.equal(params.maxSubagentSpawnsPerRun, undefined);
+	});
+
+	it("merges partial control overrides into workflow child defaults", () => {
+		const params = prepareWorkflowLaunchParams(
+			{ control: { needsAttentionAfterMs: 111, activeNoticeAfterMs: 222 } },
+			{ agent: "worker", task: "Run", control: { activeNoticeAfterMs: 333 } },
+			"workflow-run",
+			"run",
+		);
+
+		assert.deepEqual(params.control, {
+			needsAttentionAfterMs: 111,
+			activeNoticeAfterMs: 333,
+		});
 	});
 
 	it("marks only new async workflow children to preserve live supervisor-detach awaits", () => {
@@ -77,7 +159,8 @@ describe("workflow launch params", () => {
 			"run",
 			{ parentDeadlineAt },
 		);
-		assert.equal(params.async, false);
+		assert.equal(params.async, undefined);
+		assert.equal(params.workflowAwaitAsync, true);
 		assert.equal(params.timeoutMs, undefined);
 		assert.equal(params.workflowParentDeadlineAt, parentDeadlineAt);
 	});
@@ -184,7 +267,7 @@ describe("workflow launch params", () => {
 				agent: "worker",
 				task: "Run",
 				intercomBridge: { mode: "off" },
-				async: false,
+				workflowAwaitAsync: true,
 				workflowParentRunId: "workflow-run",
 				workflowKey: "isolated",
 			},
@@ -211,10 +294,25 @@ describe("workflow launch params", () => {
 				agent: "worker",
 				task: "Implement",
 				worktree: true,
-				async: false,
+				workflowAwaitAsync: true,
 				workflowParentRunId: "workflow-run",
 				workflowKey: "gated",
 				acceptance: { level: "verified", verify: [{ id: "gate", command: "npm test" }] },
+			},
+		);
+	});
+
+	it("projects an object gate into a typed verify command", () => {
+		const gate = { command: "classify.sh --report r.md", output: "json", schema: { type: "object" }, timeoutMs: 5000 };
+		assert.deepEqual(
+			prepareWorkflowLaunchParams({}, { agent: "reviewer", task: "Review", gate }, "workflow-run", "typed"),
+			{
+				agent: "reviewer",
+				task: "Review",
+				workflowAwaitAsync: true,
+				workflowParentRunId: "workflow-run",
+				workflowKey: "typed",
+				acceptance: { level: "verified", verify: [{ id: "gate", command: "classify.sh --report r.md", output: "json", schema: { type: "object" }, timeoutMs: 5000 }] },
 			},
 		);
 	});
@@ -236,6 +334,40 @@ describe("workflow launch params", () => {
 				intercomBridge: { mode: "off" },
 			},
 		);
+	});
+
+	it("forwards control defaults and overrides to retained workflow children", () => {
+		assert.deepEqual(
+			prepareWorkflowLaunchParams(
+				{ control: { needsAttentionAfterMs: 111, activeNoticeAfterMs: 222 } },
+				{ resume: "retained-run", task: "Continue", control: { activeNoticeAfterMs: 333 } },
+				"workflow-run",
+				"continue",
+			),
+			{
+				action: "resume",
+				id: "retained-run",
+				message: "Continue",
+				workflowParentRunId: "workflow-run",
+				workflowKey: "continue",
+				control: {
+					needsAttentionAfterMs: 111,
+					activeNoticeAfterMs: 333,
+				},
+			},
+		);
+	});
+
+	it("lets retained workflow child control overrides amend recovered control configs", () => {
+		const recovered = resolveControlConfig(undefined, { needsAttentionAfterMs: 111, activeNoticeAfterMs: 222 });
+		const control = resolveRevivalControlConfig({
+			recoveryControlConfig: recovered,
+			requestedControl: { activeNoticeAfterMs: 333, notifyChannels: [] },
+		});
+
+		assert.equal(control.needsAttentionAfterMs, 111);
+		assert.equal(control.activeNoticeAfterMs, 333);
+		assert.deepEqual(control.notifyChannels, []);
 	});
 
 	it("does not inherit parent deadlines for retained workflow children", () => {

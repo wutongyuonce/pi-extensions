@@ -1,7 +1,7 @@
 import * as path from "node:path";
 import type { AgentConfig } from "../../agents/agents.ts";
 import { resolveChildCwd } from "../../shared/utils.ts";
-import type { OutputMode } from "../../shared/types.ts";
+import type { JsonSchemaObject, OutputMode } from "../../shared/types.ts";
 import { resolveSingleOutputPath } from "./single-output.ts";
 
 export interface ResolvedStepBehavior {
@@ -12,6 +12,7 @@ export interface ResolvedStepBehavior {
 	skills: string[] | false;
 	model?: string;
 	fast?: boolean;
+	outputSchema?: JsonSchemaObject;
 }
 
 export type OutputOverrideInput = string | boolean;
@@ -24,6 +25,7 @@ export interface StepOverrides {
 	skills?: string[] | false;
 	model?: string;
 	fast?: boolean;
+	outputSchema?: JsonSchemaObject | false;
 }
 
 export interface ChildLaunchPlanInput {
@@ -35,6 +37,7 @@ export interface ChildLaunchPlanInput {
 	runtimeCwd: string;
 	stepCwdInput?: string;
 	behaviorCwd?: string;
+	machineCwd?: string;
 	chainSkills?: string[];
 	outputBaseDir?: string;
 	parallelOutputNamespace?: { stepIndex: number; taskIndex?: number };
@@ -56,6 +59,14 @@ export function normalizeOutputOverride(output: unknown): string | false | undef
 	if (output === false || output === "false") return false;
 	if (output === true || output === "true") return undefined;
 	return typeof output === "string" && output.length > 0 ? output : undefined;
+}
+
+export const resolveEffectiveOutputSchema = (agentConfig: AgentConfig, override?: JsonSchemaObject | false): JsonSchemaObject | undefined => override === false ? undefined : override !== undefined ? override : agentConfig.outputSchema;
+
+type OutputSchemaStep = { agent: string; outputSchema?: JsonSchemaObject | false };
+export function projectChainOutputSchemas<S extends OutputSchemaStep, R = S, G = { parallel: R[] | R }>(chain: readonly (S | { parallel: S[] | S })[], agents: AgentConfig[], projectStep?: (step: S, outputSchema: JsonSchemaObject | undefined) => R, projectGroup?: (step: { parallel: S[] | S }, parallel: R[] | R) => G): Array<R | G> {
+	const project = (step: S): R => { const agent = agents.find((candidate) => candidate.name === step.agent); if (!agent && !projectStep) return step as unknown as R; const outputSchema = agent && resolveEffectiveOutputSchema(agent, step.outputSchema); return projectStep ? projectStep(step, outputSchema) : { ...step, outputSchema } as unknown as R; };
+	return chain.map((step) => { if (!("parallel" in step)) return project(step as S); const parallel = Array.isArray(step.parallel) ? step.parallel.map(project) : project(step.parallel as S); return projectGroup ? projectGroup(step, parallel) : { ...step, parallel } as unknown as G; });
 }
 
 export function resolveStepBehavior(
@@ -94,7 +105,8 @@ export function resolveStepBehavior(
 	const outputMode = stepOverrides.outputMode ?? agentConfig.outputMode ?? "inline";
 	const model = stepOverrides.model ?? agentConfig.model;
 	const fast = stepOverrides.fast ?? agentConfig.fast;
-	return { output, outputMode, reads, progress, skills, model, fast };
+	const outputSchema = resolveEffectiveOutputSchema(agentConfig, stepOverrides.outputSchema);
+	return { output, outputMode, reads, progress, skills, model, fast, ...(outputSchema !== undefined ? { outputSchema } : {}) };
 }
 
 export function resolveTaskTextForFileUpdatePolicy(task: string | undefined, originalTask?: string): string | undefined {
@@ -117,7 +129,7 @@ export function suppressProgressForReadOnlyTask(behavior: ResolvedStepBehavior, 
 }
 
 export function planChildLaunch(input: ChildLaunchPlanInput): ChildLaunchPlan {
-	const stepCwd = resolveChildCwd(input.runnerCwd, input.stepCwdInput);
+	const stepCwd = input.machineCwd ?? resolveChildCwd(input.runnerCwd, input.stepCwdInput);
 	const instructionCwd = input.behaviorCwd ?? stepCwd;
 	const readExistenceCwd = input.behaviorCwd ? stepCwd : instructionCwd;
 	let behavior = suppressProgressForReadOnlyTask(

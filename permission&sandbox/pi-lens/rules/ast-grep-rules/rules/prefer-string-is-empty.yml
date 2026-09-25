@@ -1,0 +1,11 @@
+id: prefer-string-is-empty
+language: java
+severity: warning
+message: Use .isEmpty() instead of .length() == 0 or .equals("").
+note: Ported from VTCode (https://github.com/vinhnx/VTCode), refs #2195. The receiver's type is not checked, so this rule is detection-only. Detection is limited to the exact empty-string and zero-length forms.
+rule:
+  any:
+    - pattern: $S.length() == 0
+    - pattern: $S.equals("")
+files:
+  - "**/*.java"

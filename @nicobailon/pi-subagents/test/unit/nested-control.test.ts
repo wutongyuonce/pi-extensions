@@ -1,36 +1,26 @@
 import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { afterEach, describe, it } from "node:test";
+import { afterEach, beforeEach, describe, it } from "node:test";
 import registerFanoutChildSubagentExtension from "../../src/extension/fanout-child.ts";
 import { createSubagentExecutor, readNestedRecoveryDescriptor } from "../../src/runs/foreground/subagent-executor.ts";
-import { createNestedRoute, findNestedControlResult, projectNestedEvents, readNestedControlRequests, readNestedControlResults, snapshotNestedEventFiles, writeNestedControlRequest, writeNestedControlResult, writeNestedEvent } from "../../src/runs/shared/nested-events.ts";
-import {
-	SUBAGENT_CHILD_ENV,
-	SUBAGENT_FANOUT_CHILD_ENV,
-	SUBAGENT_PARENT_CAPABILITY_TOKEN_ENV,
-	SUBAGENT_PARENT_CHILD_INDEX_ENV,
-	SUBAGENT_PARENT_CONTROL_INBOX_ENV,
-	SUBAGENT_PARENT_EVENT_SINK_ENV,
-	SUBAGENT_PARENT_ROOT_RUN_ID_ENV,
-	SUBAGENT_PARENT_RUN_ID_ENV,
-} from "../../src/runs/shared/pi-args.ts";
-import { ASYNC_DIR, type SubagentState } from "../../src/shared/types.ts";
+import { createNestedRoute, findNestedControlResult, nestedResultsPath, projectNestedEvents, readNestedControlRequests, readNestedControlResults, snapshotNestedEventFiles, writeNestedControlRequest, writeNestedControlResult, writeNestedEvent } from "../../src/runs/shared/nested-events.ts";
+import type { ChildRuntimeConfig } from "../../src/runs/shared/child-runtime-config.ts";
+import { ASYNC_DIR, RESULTS_DIR, TEMP_ROOT_DIR, type SubagentState } from "../../src/shared/types.ts";
 import { createRunFanoutBudget } from "../../src/runs/shared/run-fanout-budget.ts";
+import { getArtifactPaths, getArtifactsDir } from "../../src/shared/artifacts.ts";
+import { EXTERNAL_JOB_PROVIDER_REGISTRY_KEY, ExternalJobProviderError, registerExternalJobProvider } from "../../src/api/external-job-provider.ts";
+import { makeAgent } from "../support/helpers.ts";
+import { externalJobPromptDigest, runExternalJob } from "../../src/runs/shared/external-job-runner.ts";
+import { requestExternalJobOperation, serviceExternalJobBridgeRequests } from "../../src/runs/shared/external-job-bridge.ts";
+import { isActiveAsyncState } from "../../src/runs/background/active-run-index.ts";
+import { readProcessTerminal } from "../../src/runs/background/process-terminal.ts";
+import { readStatus } from "../../src/shared/utils.ts";
 
 const routeRoots: string[] = [];
 const fanoutListenerCleanupKey = "__piSubagentFanoutChildNestedControlInboxCleanups";
-const savedEnv = {
-	[SUBAGENT_CHILD_ENV]: process.env[SUBAGENT_CHILD_ENV],
-	[SUBAGENT_FANOUT_CHILD_ENV]: process.env[SUBAGENT_FANOUT_CHILD_ENV],
-	[SUBAGENT_PARENT_EVENT_SINK_ENV]: process.env[SUBAGENT_PARENT_EVENT_SINK_ENV],
-	[SUBAGENT_PARENT_CONTROL_INBOX_ENV]: process.env[SUBAGENT_PARENT_CONTROL_INBOX_ENV],
-	[SUBAGENT_PARENT_ROOT_RUN_ID_ENV]: process.env[SUBAGENT_PARENT_ROOT_RUN_ID_ENV],
-	[SUBAGENT_PARENT_CAPABILITY_TOKEN_ENV]: process.env[SUBAGENT_PARENT_CAPABILITY_TOKEN_ENV],
-	[SUBAGENT_PARENT_RUN_ID_ENV]: process.env[SUBAGENT_PARENT_RUN_ID_ENV],
-	[SUBAGENT_PARENT_CHILD_INDEX_ENV]: process.env[SUBAGENT_PARENT_CHILD_INDEX_ENV],
-};
 
 afterEach(() => {
 	const globalStore = globalThis as Record<string, unknown>;
@@ -43,10 +33,6 @@ afterEach(() => {
 	}
 	delete globalStore[fanoutListenerCleanupKey];
 	for (const root of routeRoots.splice(0)) fs.rmSync(root, { recursive: true, force: true });
-	for (const [key, value] of Object.entries(savedEnv)) {
-		if (value === undefined) delete process.env[key];
-		else process.env[key] = value;
-	}
 });
 
 function createState(): SubagentState {
@@ -68,7 +54,7 @@ function createState(): SubagentState {
 	};
 }
 
-function createExecutor(state = createState(), agents: Array<Record<string, unknown>> = [], allowMutatingManagementActions = true, events: any = { emit() {}, on() { return () => {}; } }) {
+function createExecutor(state = createState(), agents: Array<Record<string, unknown>> = [], allowMutatingManagementActions = true, events: any = { emit() {}, on() { return () => {}; } }, childRuntime?: ChildRuntimeConfig) {
 	return createSubagentExecutor({
 		pi: { events, getSessionName() { return "parent"; } } as any,
 		state,
@@ -79,6 +65,7 @@ function createExecutor(state = createState(), agents: Array<Record<string, unkn
 		expandTilde: (value) => value,
 		discoverAgents: () => ({ agents: agents as any }),
 		allowMutatingManagementActions,
+		...(childRuntime ? { childRuntime } : {}),
 	});
 }
 
@@ -117,13 +104,16 @@ function stateWithNestedRoute(route: ReturnType<typeof createNestedRoute>): Suba
 	return state;
 }
 
-function setNestedRouteEnv(route: ReturnType<typeof createNestedRoute>, parentRunId = route.rootRunId) {
-	process.env[SUBAGENT_PARENT_EVENT_SINK_ENV] = route.eventSink;
-	process.env[SUBAGENT_PARENT_CONTROL_INBOX_ENV] = route.controlInbox;
-	process.env[SUBAGENT_PARENT_ROOT_RUN_ID_ENV] = route.rootRunId;
-	process.env[SUBAGENT_PARENT_CAPABILITY_TOKEN_ENV] = route.capabilityToken;
-	process.env[SUBAGENT_PARENT_RUN_ID_ENV] = parentRunId;
-	process.env[SUBAGENT_PARENT_CHILD_INDEX_ENV] = "0";
+/** The child runtime config of a fanout child launched under `route` by `parentRunId`. */
+function fanoutChildRuntime(route: ReturnType<typeof createNestedRoute>, parentRunId = route.rootRunId): ChildRuntimeConfig {
+	return {
+		fanoutChild: true,
+		depth: 1,
+		waitTool: { enabled: true },
+		fast: false,
+		nestedRoute: route,
+		nestedParent: { parentRunId, parentChildIndex: 0, depth: 1, path: [{ runId: parentRunId, stepIndex: 0 }] },
+	};
 }
 
 function text(result: Awaited<ReturnType<ReturnType<typeof createExecutor>["execute"]>>): string {
@@ -183,8 +173,15 @@ describe("nested control routing", () => {
 		try {
 			const route = createNestedRun("nested-foreground");
 			const state = createState();
+			state.artifactDirPreference = "project";
+			const artifactRoot = getArtifactsDir(null, root, "project");
+			fs.mkdirSync(artifactRoot, { recursive: true });
+			fs.writeFileSync(getArtifactPaths(artifactRoot, "root-control", "orchestrator", 0).transcriptPath,
+				`${JSON.stringify({ recordType: "message", role: "assistant", text: "LIVE_FOREGROUND_ACTIVITY" })}\n`);
 			state.foregroundControls.set("root-control", {
 				runId: "root-control",
+				sessionId: "session",
+				cwd: root,
 				mode: "single",
 				startedAt: 1,
 				updatedAt: 1,
@@ -205,6 +202,12 @@ describe("nested control routing", () => {
 			const transcript = await createExecutor(state).execute("transcript", { action: "status", id: "root-control", index: 0, view: "transcript" }, new AbortController().signal, undefined, ctx(root));
 			assert.equal(transcript.isError, undefined);
 			assert.match(text(transcript), /^Transcript target: run root-control · child 0\nSpawn budget:/);
+			assert.match(text(transcript), /LIVE_FOREGROUND_ACTIVITY/);
+			for (const hasUI of [false, true]) {
+				const implicit = await createExecutor(state).execute("implicit-transcript", { action: "status", view: "transcript" }, new AbortController().signal, undefined, { ...ctx(root), hasUI });
+				assert.equal(implicit.isError, undefined);
+				assert.match(text(implicit), /LIVE_FOREGROUND_ACTIVITY/);
+			}
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
 		}
@@ -250,7 +253,6 @@ describe("nested control routing", () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-nested-child-scope-"));
 		try {
 			const allowedRoute = createNestedRun("shared-nested");
-			setNestedRouteEnv(allowedRoute, "root-control");
 			const outsideRoute = createNestedRoute("root-outside");
 			routeRoots.push(path.dirname(outsideRoute.eventSink));
 			writeNestedEvent(outsideRoute, {
@@ -261,7 +263,7 @@ describe("nested control routing", () => {
 				child: { id: "shared-nested", parentRunId: "root-outside", parentStepIndex: 0, depth: 1, path: [{ runId: "root-outside", stepIndex: 0 }], state: "running", agent: "outside" },
 			});
 
-			const result = await createExecutor(createState(), [], false).execute("status", { action: "status", id: "shared-nested" }, new AbortController().signal, undefined, ctx(root));
+			const result = await createExecutor(createState(), [], false, undefined, fanoutChildRuntime(allowedRoute, "root-control")).execute("status", { action: "status", id: "shared-nested" }, new AbortController().signal, undefined, ctx(root));
 
 			assert.equal(result.isError, undefined);
 			assert.match(text(result), /Nested run: shared-nested/);
@@ -337,22 +339,33 @@ describe("nested control routing", () => {
 		}
 	});
 
-	it("routes resume for live nested runs through the control inbox", async () => {
+	for (const workflow of [false, true]) it(`routes ${workflow ? "workflow string" : "action"} resume for live nested runs through the control inbox`, async () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-nested-live-resume-"));
 		try {
 			const emitted: Array<{ name: string; payload: unknown }> = [];
 			const events = { emit(name: string, payload: unknown) { emitted.push({ name, payload }); }, on() { return () => {}; } };
 			const route = createNestedRun("nested-live-resume", "running", { intercomTarget: "attacker-target", leafIntercomTarget: "attacker-leaf" });
 			const executor = createExecutor(stateWithNestedRoute(route), [], true, events);
-			setTimeout(() => {
-				const request = readNestedControlRequests(route)[0];
+			const responder = (async () => {
+				const deadline = Date.now() + 2_000;
+				let request = readNestedControlRequests(route)[0];
+				while (!request && Date.now() < deadline) {
+					await new Promise((resolve) => setTimeout(resolve, 10));
+					request = readNestedControlRequests(route)[0];
+				}
 				assert.ok(request, "expected a nested resume request");
 				assert.equal(request.action, "resume");
 				assert.equal(request.message, "continue please");
 				writeNestedControlResult(route, { ts: Date.now(), requestId: request.requestId, targetRunId: request.targetRunId, ok: true, message: "nested resume accepted" });
-			}, 50);
+			})();
 
-			const result = await executor.execute("resume", { action: "resume", id: "nested-live-resume", message: "continue please" }, new AbortController().signal, undefined, ctx(root));
+			const execution = Promise.resolve().then(() => executor.execute("resume", workflow
+				? { async: false, workflowScript: `return runs.run("live", { resume: "nested-live-resume", task: "continue please", output: false });` }
+				: { action: "resume", id: "nested-live-resume", message: "continue please" }, new AbortController().signal, undefined, ctx(root)));
+			const [response, executed] = await Promise.allSettled([responder, execution]);
+			if (response.status === "rejected") throw response.reason;
+			if (executed.status === "rejected") throw executed.reason;
+			const result = executed.value;
 
 			assert.equal(result.isError, undefined);
 			assert.match(text(result), /nested resume accepted/);
@@ -375,6 +388,27 @@ describe("nested control routing", () => {
 
 			assert.equal(result.isError, true);
 			assert.match(text(result), /session file does not exist/);
+		} finally {
+			fs.rmSync(root, { recursive: true, force: true });
+		}
+	});
+
+	it("fails closed for terminal nested revival without original-authority metadata", async () => {
+		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-nested-terminal-no-recovery-"));
+		try {
+			const runId = "nested-no-recovery";
+			const parentSessionFile = path.join(root, "parent.jsonl");
+			const sessionFile = path.join(root, "parent", runId, "run-0", "session.jsonl");
+			fs.mkdirSync(path.dirname(sessionFile), { recursive: true });
+			fs.writeFileSync(parentSessionFile, "");
+			fs.writeFileSync(sessionFile, "");
+			const route = createNestedRun(runId, "complete", { sessionFile });
+
+			const result = await createExecutor(stateWithNestedRoute(route), [{ name: "worker", description: "Worker", prompt: "Do work" }])
+				.execute("resume", { action: "resume", id: runId, message: "continue" }, new AbortController().signal, undefined, ctx(root, parentSessionFile));
+
+			assert.equal(result.isError, true);
+			assert.match(text(result), /missing its required recovery identity/);
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
 		}
@@ -407,13 +441,15 @@ describe("nested control routing", () => {
 		}
 	});
 
-	it("rejects stopped nested runs before attempting revival", async () => {
+	for (const workflow of [false, true]) it(`rejects stopped nested runs before ${workflow ? "workflow string resume" : "action revival"}`, async () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-nested-stopped-resume-"));
 		try {
 			const route = createNestedRun("nested-stopped-resume", "stopped", { sessionFile: path.join(root, "missing-session.jsonl") });
 
 			const result = await createExecutor(stateWithNestedRoute(route), [{ name: "worker", description: "Worker", prompt: "Do work" }])
-				.execute("resume", { action: "resume", id: "nested-stopped-resume", message: "continue" }, new AbortController().signal, undefined, ctx(root));
+				.execute("resume", workflow
+					? { async: false, workflowScript: `return runs.run("stopped", { resume: "nested-stopped-resume", task: "continue", output: false });` }
+					: { action: "resume", id: "nested-stopped-resume", message: "continue" }, new AbortController().signal, undefined, ctx(root));
 
 			assert.equal(result.isError, true);
 			assert.match(text(result), /was stopped and cannot be resumed/);
@@ -468,13 +504,12 @@ describe("nested control routing", () => {
 		try {
 			const route = createNestedRoute("root-parent");
 			routeRoots.push(path.dirname(route.eventSink));
-			setNestedRouteEnv(route, "root-parent");
 			const throwingCtx = {
 				...ctx(root),
 				modelRegistry: { getAvailable() { throw new Error("model registry exploded"); } },
 			};
 
-			const result = await createExecutor(createState(), [{ name: "worker", description: "Worker", prompt: "Do work" }])
+			const result = await createExecutor(createState(), [{ name: "worker", description: "Worker", prompt: "Do work" }], true, undefined, fanoutChildRuntime(route, "root-parent"))
 				.execute("run", { agent: "worker", task: "go" }, new AbortController().signal, undefined, throwingCtx);
 
 			assert.equal(result.isError, true);
@@ -488,13 +523,71 @@ describe("nested control routing", () => {
 		}
 	});
 
+	it("services only the current session's external-job bridge in a fanout child", async () => {
+		const route = createNestedRoute("root-external-job");
+		routeRoots.push(path.dirname(route.eventSink));
+		const asyncDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-nested-external-job-"));
+		routeRoots.push(asyncDir);
+		const foreignDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-nested-foreign-job-"));
+		routeRoots.push(foreignDir);
+		const writeStatus = (dir: string, state: string) => fs.writeFileSync(path.join(dir, "status.json"), JSON.stringify({ state, steps: [{ runner: { type: "external-job" } }] }));
+		writeStatus(asyncDir, "running");
+		writeStatus(foreignDir, "running");
+		const statusCalls: string[] = [];
+		registerExternalJobProvider({
+			name: "surf-oracle",
+			start: () => ({ providerJobId: "job-1", state: "completed" }),
+			status: (providerJobId) => { statusCalls.push(providerJobId); return { providerJobId, state: "completed" }; },
+			reattach: () => ({ providerJobId: "job-1", state: "completed" }),
+			result: () => ({ providerJobId: "job-1", state: "completed", output: "advisor result" }),
+		});
+		const listeners = new Map<string, (payload: unknown) => void>();
+		const lifecycle = new Map<string, () => void>();
+		const pi = {
+			on(event: string, handler: () => void) { lifecycle.set(event, handler); },
+			events: { emit() {}, on(event: string, handler: (payload: unknown) => void) { listeners.set(event, handler); return () => listeners.delete(event); } },
+			registerTool() {},
+			getSessionName() { return "child"; },
+		} as any;
+		let stop: (() => void) | undefined;
+		let cancelForeign = false;
+		let foreignRequest: ReturnType<typeof requestExternalJobOperation> | undefined;
+		try {
+			const runtime = fanoutChildRuntime(route, "root-external-job");
+			runtime.runtimeState = createState();
+			runtime.runtimeState.currentSessionId = "session";
+			registerFanoutChildSubagentExtension(pi, runtime);
+			foreignRequest = requestExternalJobOperation(foreignDir, { operation: "status", provider: "surf-oracle", providerJobId: "foreign-job" }, 30_000,
+				() => cancelForeign ? new ExternalJobProviderError("Foreign request canceled", { code: "canceled" }) : undefined);
+			void foreignRequest.catch(() => {});
+			listeners.get("subagent:async-started")?.({ id: "foreign-run", asyncDir: foreignDir, sessionId: "other-session" });
+			const pending = requestExternalJobOperation(asyncDir, { operation: "status", provider: "surf-oracle", providerJobId: "owner-job" }, 30_000);
+			listeners.get("subagent:async-started")?.({ id: "run-1", asyncDir, sessionId: "session" });
+			assert.deepEqual(await pending, { providerJobId: "owner-job", state: "completed" });
+			assert.deepEqual(statusCalls, ["owner-job"], "foreign session must not service provider requests");
+			cancelForeign = true;
+			await assert.rejects(foreignRequest, { code: "canceled" });
+			let output: string | undefined;
+			void runExternalJob({ provider: "surf-oracle", options: {}, cwd: asyncDir, prompt: "prompt text", asyncDir, stepIndex: 0, runId: "run-1", agent: "gpt-pro", registerStop: (handler) => { stop = handler; } })
+				.then((result) => { output = result.output; });
+			await waitFor(() => output !== undefined, 5_000);
+			assert.equal(output, "advisor result");
+		} finally {
+			cancelForeign = true;
+			await foreignRequest?.catch(() => {});
+			stop?.();
+			writeStatus(asyncDir, "complete");
+			lifecycle.get("session_shutdown")?.();
+			delete (globalThis as Record<PropertyKey, unknown>)[Symbol.for(EXTERNAL_JOB_PROVIDER_REGISTRY_KEY)];
+		}
+	});
+
 	it("keeps the fanout child control listener alive after control inbox polling errors", async () => {
 		const route = createNestedRoute("root-poll-error");
 		routeRoots.push(path.dirname(route.eventSink));
-		setNestedRouteEnv(route, "root-poll-error");
-		process.env[SUBAGENT_CHILD_ENV] = "1";
-		process.env[SUBAGENT_FANOUT_CHILD_ENV] = "1";
+		const childRuntime = fanoutChildRuntime(route, "root-poll-error");
 		const pi = {
+			on() {},
 			events: { emit() {}, on() { return () => {}; } },
 			registerTool() {},
 			getSessionName() { return "child"; },
@@ -507,7 +600,7 @@ describe("nested control routing", () => {
 			logged.push(args);
 		};
 		try {
-			registerFanoutChildSubagentExtension(pi);
+			registerFanoutChildSubagentExtension(pi, childRuntime);
 			await waitFor(() => logged.some((entry) => String(entry[0] ?? "").includes(route.controlInbox) && String(entry[0] ?? "").includes("root-poll-error")));
 
 			fs.rmSync(route.controlInbox, { force: true });
@@ -529,10 +622,9 @@ describe("nested control routing", () => {
 	it("keeps fanout child control requests when result writing fails and retries after recovery", async () => {
 		const route = createNestedRoute("root-result-write-fails");
 		routeRoots.push(path.dirname(route.eventSink));
-		setNestedRouteEnv(route, "root-result-write-fails");
-		process.env[SUBAGENT_CHILD_ENV] = "1";
-		process.env[SUBAGENT_FANOUT_CHILD_ENV] = "1";
+		const childRuntime = fanoutChildRuntime(route, "root-result-write-fails");
 		const pi = {
+			on() {},
 			events: { emit() {}, on() { return () => {}; } },
 			registerTool() {},
 			getSessionName() { return "child"; },
@@ -551,7 +643,7 @@ describe("nested control routing", () => {
 			logged.push(args);
 		};
 		try {
-			registerFanoutChildSubagentExtension(pi);
+			registerFanoutChildSubagentExtension(pi, childRuntime);
 			await waitFor(() => logged.some((entry) => String(entry[0] ?? "").includes("result-write-fails") && /keeping request for retry/.test(String(entry[0] ?? ""))));
 			assert.equal(fs.existsSync(requestPath), true);
 
@@ -567,9 +659,7 @@ describe("nested control routing", () => {
 	it("cleans the prior listener on reload and processes a resume request once", async () => {
 		const route = createNestedRoute("root-reload-listener");
 		routeRoots.push(path.dirname(route.eventSink));
-		setNestedRouteEnv(route, "root-reload-listener");
-		process.env[SUBAGENT_CHILD_ENV] = "1";
-		process.env[SUBAGENT_FANOUT_CHILD_ENV] = "1";
+		const childRuntime = fanoutChildRuntime(route, "root-reload-listener");
 		const registrations: string[] = [];
 		const activeIntervals = new Set<ReturnType<typeof setInterval>>();
 		const originalSetInterval = globalThis.setInterval;
@@ -585,31 +675,26 @@ describe("nested control routing", () => {
 		}) as typeof clearInterval;
 		try {
 			const makePi = () => ({
+				on() {},
 				events: { emit() {}, on() { return () => {}; } },
 				registerTool() { registrations.push("subagent"); },
 				getSessionName() { return "child"; },
 			}) as any;
 			const firstPi = makePi();
 
-			registerFanoutChildSubagentExtension(firstPi);
-			registerFanoutChildSubagentExtension(firstPi);
-			registerFanoutChildSubagentExtension(makePi());
+			registerFanoutChildSubagentExtension(firstPi, childRuntime);
+			registerFanoutChildSubagentExtension(firstPi, childRuntime);
+			registerFanoutChildSubagentExtension(makePi(), childRuntime);
 			assert.equal(activeIntervals.size, 1);
 
 			const unrelatedRoute = createNestedRoute("root-unrelated-listener");
 			routeRoots.push(path.dirname(unrelatedRoute.eventSink));
-			setNestedRouteEnv(unrelatedRoute, "root-unrelated-listener");
-			registerFanoutChildSubagentExtension(makePi());
+			registerFanoutChildSubagentExtension(makePi(), fanoutChildRuntime(unrelatedRoute, "root-unrelated-listener"));
 			assert.equal(activeIntervals.size, 2);
 
-			delete process.env[SUBAGENT_PARENT_EVENT_SINK_ENV];
-			delete process.env[SUBAGENT_PARENT_CONTROL_INBOX_ENV];
-			delete process.env[SUBAGENT_PARENT_ROOT_RUN_ID_ENV];
-			delete process.env[SUBAGENT_PARENT_CAPABILITY_TOKEN_ENV];
-			registerFanoutChildSubagentExtension(makePi());
+			registerFanoutChildSubagentExtension(makePi(), { ...childRuntime, nestedRoute: undefined });
 			assert.equal(activeIntervals.size, 2);
 
-			setNestedRouteEnv(route, "root-reload-listener");
 			writeNestedControlRequest(route, {
 				ts: Date.now(),
 				requestId: "reload-resume-once",
@@ -630,10 +715,9 @@ describe("nested control routing", () => {
 	it("negatively acknowledges ownerless fanout child control requests and removes them", async () => {
 		const route = createNestedRoute("root-ownerless");
 		routeRoots.push(path.dirname(route.eventSink));
-		setNestedRouteEnv(route, "root-ownerless");
-		process.env[SUBAGENT_CHILD_ENV] = "1";
-		process.env[SUBAGENT_FANOUT_CHILD_ENV] = "1";
+		const childRuntime = fanoutChildRuntime(route, "root-ownerless");
 		const pi = {
+			on() {},
 			events: { emit() {}, on() { return () => {}; } },
 			registerTool() {},
 			getSessionName() { return "child"; },
@@ -645,11 +729,215 @@ describe("nested control routing", () => {
 			action: "interrupt",
 		});
 
-		registerFanoutChildSubagentExtension(pi);
+		registerFanoutChildSubagentExtension(pi, childRuntime);
 		await waitFor(() => readNestedControlResults(route).some((result) => result.requestId === "ownerless-request" && result.ok === false));
 
 		assert.equal(fs.existsSync(requestPath), false);
 		const result = readNestedControlResults(route).find((item) => item.requestId === "ownerless-request");
 		assert.match(result?.message ?? "", /not active/);
+	});
+});
+
+const NESTED_ADVISOR = "nested-advisor";
+const EXTERNAL_JOB_RUNNER = { type: "external-job", provider: NESTED_ADVISOR, options: {}, capabilities: { stop: false, steer: false, resume: false, structuredOutput: false, toolEvents: false } };
+const AGENTS = [makeAgent("advisor", { runner: { type: "external-job", provider: NESTED_ADVISOR, options: {} } }), makeAgent("worker")];
+
+function externalJobStep(overrides: { providerJobId?: string; state?: string; externalJob?: false } = {}) {
+	return {
+		agent: "advisor",
+		status: "complete",
+		runner: EXTERNAL_JOB_RUNNER,
+		...(overrides.externalJob === false ? {} : {
+			externalJob: { provider: NESTED_ADVISOR, providerJobId: overrides.providerJobId ?? "job-parent", promptDigest: externalJobPromptDigest("original prompt"), options: {}, state: overrides.state ?? "completed" },
+		}),
+	};
+}
+
+interface NestedRunOptions {
+	steps?: unknown[];
+	/** Status file content verbatim; `null` writes no status file. */
+	statusText?: string | null;
+	status?: Record<string, unknown>;
+	summary?: Record<string, unknown>;
+}
+
+/** Writes a terminal nested run of the fanout child under `route`, with its own run directory. */
+function writeNestedRun(route: ReturnType<typeof createNestedRoute>, runId: string, options: NestedRunOptions = {}): string {
+	// A follow-up runner starts in the source run's cwd, so record one that per-test teardown never removes.
+	const cwd = os.tmpdir();
+	const asyncDir = path.join(TEMP_ROOT_DIR, "nested-subagent-runs", route.rootRunId, runId);
+	fs.mkdirSync(asyncDir, { recursive: true });
+	if (options.statusText !== null) {
+		const steps = options.steps ?? [externalJobStep()];
+		const status = { runId, mode: steps.length > 1 ? "parallel" : "single", state: "complete", startedAt: 100, lastUpdate: 200, cwd, steps, ...options.status };
+		fs.writeFileSync(path.join(asyncDir, "status.json"), options.statusText ?? JSON.stringify(status), "utf-8");
+	}
+	writeNestedEvent(route, {
+		type: "subagent.nested.completed",
+		ts: 100,
+		parentRunId: route.rootRunId,
+		parentStepIndex: 0,
+		child: { id: runId, parentRunId: route.rootRunId, parentStepIndex: 0, depth: 1, path: [{ runId: route.rootRunId, stepIndex: 0 }], state: "complete", agent: "advisor", ownerState: "gone", asyncDir, ...options.summary },
+	});
+	return asyncDir;
+}
+
+describe("nested external-job follow-up", () => {
+	let root: string;
+	let route: ReturnType<typeof createNestedRoute>;
+	let runId: string;
+	const cleanup: string[] = [];
+	const followUps: Array<{ parentProviderJobId: string; sourceStepIndex: number }> = [];
+	let disposeProvider: () => void = () => {};
+
+	function registerAdvisor(options: { followUp?: boolean } = {}): void {
+		disposeProvider = registerExternalJobProvider({
+			name: NESTED_ADVISOR,
+			start: () => { throw new Error("start must not be called"); },
+			...(options.followUp === false ? {} : {
+				followUp: (input: { parentProviderJobId: string; sourceStepIndex: number }) => {
+					followUps.push({ parentProviderJobId: input.parentProviderJobId, sourceStepIndex: input.sourceStepIndex });
+					return { providerJobId: "job-child", state: "completed" as const };
+				},
+			}),
+			status: (providerJobId) => ({ providerJobId, state: "completed" }),
+			reattach: (providerJobId) => ({ providerJobId, state: "completed" }),
+			result: (providerJobId) => ({ providerJobId, state: "completed", output: "follow-up answer" }),
+		});
+	}
+
+	/** Resumes `runId` from the fanout child that launched it, or from the root session with `from: "root"`. */
+	function resume(params: Record<string, unknown> = {}, from: "child" | "root" = "child") {
+		const executor = from === "child"
+			? createExecutor(createState(), AGENTS, false, undefined, fanoutChildRuntime(route))
+			: createExecutor(stateWithNestedRoute(route), AGENTS);
+		return executor.execute("resume", { action: "resume", id: runId, message: "The QA failure was a missing test.", ...params }, new AbortController().signal, undefined, ctx(root));
+	}
+
+	/** Services the follow-up run's bridge until its runner has finished and exited, so teardown never races its writes. */
+	async function runFollowUp(followUpDir: string): Promise<void> {
+		const followUpId = path.basename(followUpDir);
+		cleanup.push(followUpDir, path.join(RESULTS_DIR, `${followUpId}.json`), nestedResultsPath(route.rootRunId, followUpId));
+		const deadline = Date.now() + 10_000;
+		for (;;) {
+			serviceExternalJobBridgeRequests(followUpDir);
+			const status = readStatus(followUpDir);
+			const runnerId = status?.processTerminal?.runnerProcessInstanceId;
+			const terminal = runnerId ? readProcessTerminal(followUpDir, { runId: followUpId, runnerProcessInstanceId: runnerId }) : undefined;
+			if (followUps.length > 0 && status && !isActiveAsyncState(status.state) && terminal?.state === "observed"
+				&& terminal.instances?.some((instance) => instance.kind === "runner" && instance.processInstanceId === runnerId && instance.exitCode === 0)) return;
+			if (Date.now() >= deadline) {
+				const stderrPath = path.join(followUpDir, "runner.stderr.log");
+				assert.fail(`Timed out waiting for the external-job follow-up to finish; status=${JSON.stringify(status)}; terminal=${JSON.stringify(terminal)}; stderr=${fs.existsSync(stderrPath) ? fs.readFileSync(stderrPath, "utf-8") : "missing"}`);
+			}
+			await new Promise((resolve) => setTimeout(resolve, 25));
+		}
+	}
+
+	beforeEach(() => {
+		root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-nested-external-job-follow-up-"));
+		route = createNestedRoute("root-control");
+		routeRoots.push(path.dirname(route.eventSink));
+		runId = `nested-external-job-${randomUUID()}`;
+		followUps.length = 0;
+		cleanup.push(root, path.join(TEMP_ROOT_DIR, "nested-subagent-runs", route.rootRunId, runId));
+	});
+
+	afterEach(() => {
+		disposeProvider();
+		disposeProvider = () => {};
+		for (const target of cleanup.splice(0)) fs.rmSync(target, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
+	});
+
+	it("follows up a completed external-job run that the child launched", async () => {
+		registerAdvisor();
+		writeNestedRun(route, runId);
+
+		const result = await resume();
+
+		assert.equal(result.isError, undefined, text(result));
+		assert.match(text(result), new RegExp(`Started external-job follow-up for ${runId}`));
+		const followUpDir = String(result.details?.asyncDir);
+		assert.ok(followUpDir.startsWith(path.join(TEMP_ROOT_DIR, "nested-subagent-runs", route.rootRunId)), followUpDir);
+		await runFollowUp(followUpDir);
+		assert.deepEqual(followUps, [{ parentProviderJobId: "job-parent", sourceStepIndex: 0 }]);
+	});
+
+	it("reports a repeated child follow-up as existing instead of calling the provider again", async () => {
+		registerAdvisor();
+		writeNestedRun(route, runId);
+		const first = await resume();
+		await runFollowUp(String(first.details?.asyncDir));
+
+		const repeated = await resume();
+
+		assert.equal(repeated.isError, undefined, text(repeated));
+		assert.match(text(repeated), /already exists/);
+		assert.equal(repeated.details?.asyncId, first.details?.asyncId);
+		assert.equal(followUps.length, 1);
+	});
+
+	it("follows up the indexed external-job step of a multi-step nested run", async () => {
+		registerAdvisor();
+		writeNestedRun(route, runId, { steps: [{ agent: "worker", status: "complete" }, externalJobStep({ providerJobId: "job-second" })] });
+
+		const result = await resume({ index: 1 });
+
+		assert.equal(result.isError, undefined, text(result));
+		await runFollowUp(String(result.details?.asyncDir));
+		assert.deepEqual(followUps, [{ parentProviderJobId: "job-second", sourceStepIndex: 1 }]);
+	});
+
+	it("lets the root session follow up an external-job run that its child launched", async () => {
+		registerAdvisor();
+		writeNestedRun(route, runId);
+
+		const result = await resume({}, "root");
+
+		assert.equal(result.isError, undefined, text(result));
+		await runFollowUp(String(result.details?.asyncDir));
+		assert.deepEqual(followUps, [{ parentProviderJobId: "job-parent", sourceStepIndex: 0 }]);
+	});
+
+	const refusals: Array<{ name: string; run?: NestedRunOptions; params?: Record<string, unknown>; provider?: { followUp?: boolean }; expected: RegExp; absent?: RegExp }> = [
+		{ name: "a nested Pi run keeps needing its session file", run: { steps: [{ agent: "worker", status: "complete" }], summary: { agent: "worker" } }, expected: /does not have a persisted session file to resume from/ },
+		{ name: "a provider state that is not completed", run: { steps: [externalJobStep({ state: "failed" })] }, expected: /provider state is failed/ },
+		{ name: "a stopped run", run: { summary: { state: "stopped" } }, expected: /was stopped and cannot be resumed/ },
+		{ name: "a provider without followUp", provider: { followUp: false }, expected: /does not support follow-up/ },
+		{ name: "an external-job step without provider metadata", run: { steps: [externalJobStep({ externalJob: false })] }, expected: /has no persisted provider metadata/ },
+		{ name: "a launch status that has no runner yet", run: { steps: [{ agent: "advisor", status: "failed" }], status: { state: "failed" } }, expected: /has no persisted provider metadata/, absent: /session file/ },
+		{ name: "an index out of range", params: { index: 5 }, expected: /out of range/ },
+		{ name: "a missing status file", run: { statusText: null }, expected: /does not have a persisted session file to resume from/ },
+		{ name: "a malformed status file without a Pi session", run: { statusText: "{not json" }, expected: /Failed to parse async status file/ },
+		{ name: "a malformed status file of a Pi run with a session file", run: { statusText: "{not json", summary: { agent: "worker", sessionFile: "/missing/session.jsonl" } }, expected: /session file/, absent: /Failed to parse/ },
+		{ name: "a live status file", run: { steps: [{ ...externalJobStep(), status: "running" }], status: { state: "running", pid: process.pid, lastUpdate: Date.now() } }, expected: /is still running\. Wait for completion/, absent: /steer/ },
+	];
+	for (const refusal of refusals) {
+		it(`fails closed without a follow-up for ${refusal.name}`, async () => {
+			registerAdvisor(refusal.provider);
+			writeNestedRun(route, runId, refusal.run);
+
+			const result = await resume(refusal.params);
+
+			assert.equal(result.isError, true);
+			assert.match(text(result), refusal.expected);
+			if (refusal.absent) assert.doesNotMatch(text(result), refusal.absent);
+			assert.deepEqual(followUps, []);
+		});
+	}
+
+	it("never follows up a run directory outside the nested run's own directory", async () => {
+		registerAdvisor();
+		const outside = path.join(ASYNC_DIR, `outside-${randomUUID()}`);
+		cleanup.push(outside);
+		fs.mkdirSync(outside, { recursive: true });
+		fs.writeFileSync(path.join(outside, "status.json"), JSON.stringify({ runId, mode: "single", state: "complete", startedAt: 100, lastUpdate: 200, cwd: root, steps: [externalJobStep({ providerJobId: "job-foreign" })] }), "utf-8");
+		writeNestedRun(route, runId, { statusText: null, summary: { asyncDir: outside } });
+
+		const result = await resume();
+
+		assert.equal(result.isError, true);
+		assert.match(text(result), /does not have a persisted session file to resume from/);
+		assert.deepEqual(followUps, []);
 	});
 });

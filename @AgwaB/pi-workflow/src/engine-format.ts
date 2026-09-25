@@ -1,4 +1,5 @@
-import { readFile } from "node:fs/promises";
+import { lstat } from "node:fs/promises";
+import { readFileLinesBounded } from "./workflow-preview.js";
 
 import { formatDynamicAuditSummary } from "./dynamic-audit.js";
 import { buildDynamicToolResultBudgetMetrics } from "./dynamic-tool-result-budget-metrics.js";
@@ -9,7 +10,6 @@ import {
 	refreshRun,
 } from "./engine-wait.js";
 import {
-	fromProjectPath,
 	isMockRunProvenance,
 	LEASE_STALE_MS,
 	listRunRecords,
@@ -20,6 +20,7 @@ import {
 	summarizeTaskFailureClasses,
 	supervisorPath,
 	updateIndex,
+	workflowsRoot,
 } from "./store.js";
 import { summarizeWorkflowTelemetry } from "./workflow-artifacts.js";
 import { buildWorkflowRunMetrics } from "./workflow-metrics.js";
@@ -119,10 +120,23 @@ export async function formatStatus(cwd: string): Promise<string> {
 		return formatHumanRunList(cwd, refreshed);
 	}
 
-	await reconcileActiveRuns(cwd);
+	const runs = await reconcileActiveRuns(cwd);
+	if (runs.length === 0 && !(await hasWorkflowState(cwd)))
+		return "No workflow runs found.";
 	const rebuilt = await updateIndex(cwd).catch(() => readIndex(cwd));
 	if (!rebuilt || rebuilt.runs.length === 0) return "No workflow runs found.";
 	return formatHumanRunList(cwd, rebuilt);
+}
+
+async function hasWorkflowState(cwd: string): Promise<boolean> {
+	try {
+		await lstat(workflowsRoot(cwd));
+		return true;
+	} catch (error) {
+		if (error instanceof Error && "code" in error && error.code === "ENOENT")
+			return false;
+		throw error;
+	}
 }
 
 interface FormatRefreshResult {
@@ -196,20 +210,11 @@ export async function formatLogs(
 	);
 	if (!task) throw new Error(`Task not found in ${run.runId}: ${taskId}`);
 
-	const outputFile = fromProjectPath(cwd, task.files.output);
 	const count = Math.max(
 		1,
 		Math.min(LOG_LINES_MAX, Math.floor(lineCount || LOG_LINES_DEFAULT)),
 	);
-	let text: string;
-	try {
-		text = await readFile(outputFile, "utf8");
-	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code === "ENOENT") text = "";
-		else throw error;
-	}
-
-	const tail = text.split(/\r?\n/).slice(-count).join("\n").trim();
+	const tail = (await readFileLinesBounded(cwd, task.files.output, count)).join("\n").trim();
 	return prependRefreshWarning(
 		[
 			`Logs: ${task.displayName || task.specId}`,
@@ -303,6 +308,30 @@ export function formatHumanRunLaunch(
 	].join("\n");
 }
 
+/**
+ * One line per loop stage so status/show expose round count and the loop
+ * outcome, which otherwise only appear in run.json `loopStates` or per-round
+ * task ids such as `<loop>.r02.<child>`.
+ */
+export function formatLoopSummaryLines(run: WorkflowRunRecord): string[] {
+	const states = run.loopStates ?? [];
+	if (states.length === 0) return [];
+	return states.map((state) => {
+		const rounds = `${state.round} round${state.round === 1 ? "" : "s"}`;
+		const outcome =
+			state.status === "completed"
+				? "stopped: until condition met"
+				: state.status === "exhausted"
+					? "exhausted: maxRounds reached before the until condition was met"
+					: state.status === "stopped_no_progress"
+						? "stopped: no progress between rounds"
+						: state.awaitingOnExhausted
+							? "awaiting onExhausted stage"
+							: "in progress";
+		return `Loop ${state.loopId}: ${rounds} · ${outcome}`;
+	});
+}
+
 function formatHumanRunCard(
 	run: WorkflowRunRecord,
 	options: {
@@ -323,6 +352,7 @@ function formatHumanRunCard(
 		lines.push(`Updated: ${friendlyTimestamp(run.updatedAt)}`);
 	}
 	lines.push("", `Progress: ${formatHumanProgress(run)}`);
+	lines.push(...formatLoopSummaryLines(run));
 	const usage = options.includeUsage ? formatHumanUsageLine(run) : undefined;
 	if (usage) lines.push(usage);
 	lines.push(...formatWarnings(run, options));
@@ -785,12 +815,15 @@ function formatRunUsageLine(run: WorkflowRunRecord): string | undefined {
 	return `usage=${parts.join(", ")}`;
 }
 
-async function reconcileActiveRuns(cwd: string): Promise<void> {
+async function reconcileActiveRuns(
+	cwd: string,
+): Promise<WorkflowRunRecord[]> {
 	const runs = await listRunRecords(cwd);
 	for (const run of runs) {
 		if (hasActiveSchedulerWork(run))
 			await refreshRunRecordingSupervisorError(cwd, run.runId);
 	}
+	return runs;
 }
 
 async function reconcileIndexedActiveRuns(

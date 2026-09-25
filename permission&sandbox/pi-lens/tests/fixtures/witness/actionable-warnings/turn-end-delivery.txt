@@ -1,0 +1,43 @@
+=== marked 1-of-3: rendered 2 + suppression note ===
+[pi-lens automated check — not a user request] Address 🔴 blockers before continuing; ℹ️ advisories are informational only.
+
+🔴 STOP — hardcoded secrets detected. Rotate the credentials and remove them from source:
+  src/secret.ts:1 — aws-access-token [gitleaks]: AWS key
+
+
+ℹ️ Advisory — no action required this turn:
+🟡 Fixable warnings introduced this turn: 2.
+suppressed by disposition: 1 finding(s).
+Use lens_diagnostics with mode=delta to inspect these warnings.
+Files:
+  src/partial.ts: 2
+If continuing in these files, resolve warnings that are safe and relevant. Do not apply broad refactors unless requested.
+Raw report (only if you need the JSON): <ACTIONABLE_REPORT>
+
+keep working
+
+=== delivered location: secret row suppressed ===
+[pi-lens automated check — not a user request] Address 🔴 blockers before continuing; ℹ️ advisories are informational only.
+
+🔴 STOP — hardcoded secrets detected. Rotate the credentials and remove them from source:
+  src/secret.ts:1 — aws-access-token [gitleaks + ast-grep]: AWS key
+
+
+ℹ️ Advisory — no action required this turn:
+🟡 Fixable warnings introduced this turn: 1.
+Use lens_diagnostics with mode=delta to inspect these warnings.
+Files:
+  src/secret.ts: 1
+If continuing in these files, resolve warnings that are safe and relevant. Do not apply broad refactors unless requested.
+Raw report (only if you need the JSON): <ACTIONABLE_REPORT>
+
+keep working
+
+=== empty survivors: no actionable-warnings section ===
+[pi-lens automated check — not a user request] Address 🔴 blockers before continuing; ℹ️ advisories are informational only.
+
+🔴 STOP — hardcoded secrets detected. Rotate the credentials and remove them from source:
+  src/secret.ts:1 — aws-access-token [gitleaks]: AWS key
+
+
+keep working

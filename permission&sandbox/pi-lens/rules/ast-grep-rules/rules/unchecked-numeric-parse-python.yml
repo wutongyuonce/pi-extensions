@@ -1,0 +1,44 @@
+id: unchecked-numeric-parse-python
+language: Python
+severity: warning
+message: "int()/float() without try/except — raises ValueError on non-numeric input"
+note: |
+  Split out of `unchecked-throwing-call-python` (#3211): `int()`/`float()`
+  raise `ValueError` on non-numeric strings, but whether a given call CAN
+  raise depends on the argument's runtime type — often undecidable from
+  syntax alone — so this ships at `warning`, separate from the
+  syntactically-certain `error`-level calls (open/json/os/shutil).
+
+  Excluded as already-safe by construction: a numeric literal argument
+  (`int(3.7)`), and an argument that is itself a call to `int()`/
+  `float()`/`Decimal()` (already-converted, or a `Decimal` — which raises
+  `decimal.InvalidOperation`, not `ValueError`, and is out of scope here).
+
+  Residual, undecidable false positive: a call whose argument is a typed
+  parameter already known to be numeric, e.g.
+
+    def f(valor: Decimal):
+        return float(valor)  # valor is a Decimal, not a raw string
+
+  The rule cannot see the parameter's declared type from the call site.
+  Suppress that shape explicitly:
+
+    return float(valor)  # pi-lens-ignore: unchecked-numeric-parse-python
+rule:
+  any:
+    - pattern: int($EXPR)
+    - pattern: float($EXPR)
+  not:
+    any:
+      - inside:
+          stopBy: end
+          kind: try_statement
+      - has:
+          field: arguments
+          has:
+            any:
+              - kind: integer
+              - kind: float
+              - pattern: Decimal($$$)
+              - pattern: int($$$)
+              - pattern: float($$$)

@@ -207,6 +207,60 @@ function getLaunchError(
 	return null;
 }
 
+async function launchSubagentByMode(
+	params: SubagentParamsInput,
+	launchCtx: SubagentLaunchContext,
+	runtime: SubagentToolRuntime,
+	ctx: ExtensionContext,
+	isBackground: boolean,
+): Promise<RunningSubagent> {
+	const usesBackgroundLaunch = isBackground || !ctx.hasUI || !isMuxAvailable();
+	const running = usesBackgroundLaunch
+		? await runtime.launchBackgroundSubagent(params, launchCtx)
+		: await runtime.launchSubagent(params, launchCtx);
+	claimSpawnWidthSlot(running);
+	const watcherAbort = new AbortController();
+	running.abortController = watcherAbort;
+	const watch = usesBackgroundLaunch ? runtime.watchBackgroundSubagent : runtime.watchSubagent;
+	running.completionPromise = releaseSpawnWidthSlotOnCompletion(
+		running,
+		watch(running, runtime.getWatcherSignal(running, watcherAbort)),
+	);
+	return running;
+}
+
+function applySynchronousLaunchPolicy(
+	params: SubagentParamsInput,
+	agentDefs: AgentDefaults | null,
+	hasUI: boolean,
+): true | undefined {
+	const forceSynchronousLaunch = shouldForceSynchronousLaunch(hasUI);
+	if (forceSynchronousLaunch) {
+		params.async = false;
+		params.blocking = true;
+		markSubagentBatchBlocking();
+	}
+	return forceSynchronousLaunch && agentDefs?.autoExit !== true ? true : undefined;
+}
+
+function buildSubagentLaunchContext(
+	toolCallId: string,
+	ctx: ExtensionContext,
+	pi: ExtensionAPI,
+	autoExit: true | undefined,
+): SubagentLaunchContext {
+	const parentModelRef = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
+	return {
+		sessionManager: ctx.sessionManager,
+		cwd: ctx.cwd,
+		launchToolCallId: toolCallId,
+		autoExit,
+		modelRegistry: ctx.modelRegistry,
+		parentModelRef,
+		parentThinking: pi.getThinkingLevel() as string,
+	};
+}
+
 async function launchOneSubagent(
 	toolCallId: string,
 	params: SubagentParamsInput,
@@ -215,30 +269,15 @@ async function launchOneSubagent(
 	runtime: SubagentToolRuntime,
 	pi: ExtensionAPI,
 ): Promise<RunningSubagent> {
-	const forceSynchronousLaunch = shouldForceSynchronousLaunch(ctx.hasUI);
-	const headlessAutoExit = forceSynchronousLaunch && agentDefs?.autoExit !== true ? true : undefined;
 	const effectiveParams = enforceAgentFrontmatter(params, agentDefs);
 	// In print/prompt-style runs there is no durable parent turn for async steer
-	// delivery. Force blocking so the child completes before the parent exits.
-	if (forceSynchronousLaunch) {
-		effectiveParams.async = false;
-		effectiveParams.blocking = true;
-	}
+	// delivery. Force blocking and record the batch as blocking too, so a stop
+	// requested from frontmatter cannot attach `terminate` to the completed
+	// result before the model reads the report it just waited for.
+	const headlessAutoExit = applySynchronousLaunchPolicy(effectiveParams, agentDefs, ctx.hasUI);
 	const isBackground = effectiveParams.background ?? agentDefs?.mode === "background";
 
-	const parentModelRef = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
-	const parentThinking = pi.getThinkingLevel() as string;
-
-	const launchCtx: SubagentLaunchContext = {
-		sessionManager: ctx.sessionManager,
-		cwd: ctx.cwd,
-
-		launchToolCallId: toolCallId,
-		autoExit: headlessAutoExit,
-		modelRegistry: ctx.modelRegistry,
-		parentModelRef,
-		parentThinking,
-	};
+	const launchCtx = buildSubagentLaunchContext(toolCallId, ctx, pi, headlessAutoExit);
 	if (agentDefs?.llmAsVerifier === true) {
 		// One logical child fronts the whole fan-out: N candidates are planned
 		// here and owned by a detached supervisor; no per-candidate routes are
@@ -248,36 +287,7 @@ async function launchOneSubagent(
 		});
 		return running;
 	}
-	let running: RunningSubagent;
-	if (isBackground) {
-		running = await runtime.launchBackgroundSubagent(effectiveParams, launchCtx);
-		claimSpawnWidthSlot(running);
-		const watcherAbort = new AbortController();
-		running.abortController = watcherAbort;
-		running.completionPromise = releaseSpawnWidthSlotOnCompletion(
-			running,
-			runtime.watchBackgroundSubagent(running, runtime.getWatcherSignal(running, watcherAbort)),
-		);
-	} else if (ctx.hasUI && isMuxAvailable()) {
-		running = await runtime.launchSubagent(effectiveParams, launchCtx);
-		claimSpawnWidthSlot(running);
-		const watcherAbort = new AbortController();
-		running.abortController = watcherAbort;
-		running.completionPromise = releaseSpawnWidthSlotOnCompletion(
-			running,
-		runtime.watchSubagent(running, runtime.getWatcherSignal(running, watcherAbort)),
-		);
-	} else {
-		running = await runtime.launchBackgroundSubagent(effectiveParams, launchCtx);
-		claimSpawnWidthSlot(running);
-		const watcherAbort = new AbortController();
-		running.abortController = watcherAbort;
-		running.completionPromise = releaseSpawnWidthSlotOnCompletion(
-			running,
-		runtime.watchBackgroundSubagent(running, runtime.getWatcherSignal(running, watcherAbort)),
-		);
-	}
-	return running;
+	return launchSubagentByMode(effectiveParams, launchCtx, runtime, ctx, isBackground);
 }
 
 export function isOneShotPromptInvocation(argv = process.argv): boolean {
@@ -342,9 +352,40 @@ export function markInitialPromptLaunchComplete(): void {
 	initialPromptLaunchActive = false;
 }
 
+/**
+ * A session with no durable turn for later steer delivery: no UI, or a
+ * one-shot `pi -p` / `--mode json|rpc` run. Every launch in it is awaited, so
+ * no helper ever reports later.
+ */
+export function isHeadlessLaunchSession(hasUI: boolean, argv = process.argv): boolean {
+	return !hasUI || isOneShotPromptInvocation(argv);
+}
+
 export function shouldForceSynchronousLaunch(hasUI: boolean, argv = process.argv): boolean {
 	const startupPromptActive = argv === process.argv ? initialPromptLaunchActive : isInitialPromptInvocation(argv);
-	return !hasUI || isOneShotPromptInvocation(argv) || startupPromptActive;
+	return isHeadlessLaunchSession(hasUI, argv) || startupPromptActive;
+}
+
+function getAfterLaunchPrompt(): string {
+	// The tool is registered before any extension context exists, so only the
+	// argv-based one-shot check is available here. Background children are
+	// `pi -p` processes, which is the case that matters.
+	if (isOneShotPromptInvocation()) {
+		return (
+			"After launch:\n" +
+			"- In this session every launch waits for the helper and returns its report as the tool result. Read the report and continue; do not redo delegated work.\n" +
+			"- Ask the user only when there is a plausible next step but ownership is ambiguous.\n"
+		);
+	}
+	return (
+		"After launch:\n" +
+		"- If a helper returns later, continue only with clearly independent work. Do not redo delegated work and do not claim the helper's findings before its later message appears.\n" +
+		"- If no safe independent work is clear, stop your response and wait for the later helper message.\n" +
+		"- Ask the user only when there is a plausible next step but ownership is ambiguous.\n" +
+		"Results arrive automatically as a steer message that starts a new turn. " +
+		"Do not poll, sleep-read, or check session files — the harness handles delivery.\n" +
+		getCoordinatorOnlyTurnPrompt()
+	);
 }
 
 function getToolWaitSignal(running: RunningSubagent, signal: AbortSignal | undefined): AbortSignal | undefined {
@@ -385,13 +426,7 @@ export function registerSubagentCoreTools(
 				"- For non-trivial work, write readable Markdown with objective, scope, relevant files/facts, constraints, and requested output.\n" +
 				"- For parallel helpers, make each task non-overlapping.\n" +
 				"\n" +
-				"After launch:\n" +
-				"- If a helper returns later, continue only with clearly independent work. Do not redo delegated work and do not claim the helper's findings before its later message appears.\n" +
-				"- If no safe independent work is clear, stop your response and wait for the later helper message.\n" +
-				"- Ask the user only when there is a plausible next step but ownership is ambiguous.\n" +
-				"Results arrive automatically as a steer message that starts a new turn. " +
-				"Do not poll, sleep-read, or check session files — the harness handles delivery.\n" +
-				getCoordinatorOnlyTurnPrompt(),
+				getAfterLaunchPrompt(),
 			parameters: SubagentParams,
 			execute: async (toolCallId, params, signal, _onUpdate, ctx) => {
 				const children = getRequestedChildren(params as SubagentToolParams);

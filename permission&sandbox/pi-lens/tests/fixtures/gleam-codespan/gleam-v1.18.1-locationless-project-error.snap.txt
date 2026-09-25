@@ -1,0 +1,7 @@
+---
+source: compiler-core/src/diagnostic.rs
+expression: project diagnostic
+---
+----- ERROR
+error: Could not find a package required by this project
+

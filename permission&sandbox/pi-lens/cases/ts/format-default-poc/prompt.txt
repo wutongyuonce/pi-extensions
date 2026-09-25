@@ -1,0 +1,10 @@
+Update src/main.ts to add a third sample invoice with totalCents 700 and export `demoCount`, the number of invoices.
+
+Requirements:
+1. Keep package.json and tsconfig.json as-is.
+2. Work only inside src/.
+3. Preserve the existing behavior of demoTotal.
+4. Do not manually reformat unrelated code just to make it pretty; make the requested semantic change and let pi-lens/default tooling do any formatting it wants.
+5. Fix any diagnostics pi-lens surfaces while you work.
+6. Do not add dependencies.
+7. End with a short summary of what you changed.

@@ -1,0 +1,25 @@
+id: kotlin-prefer-data-class
+valid:
+  - |
+    data class Point(val x: Int, val y: Int)
+  - |
+    open class Base(val x: Int)
+  - |
+    class Mixed(val x: Int, y: Int)
+  - |
+    class WithBehavior(val x: Int) {
+        fun scale(factor: Int): Int = x * factor
+    }
+  - |
+    class WithInit(val x: Int) {
+        init { println(x) }
+    }
+  - |
+    class WithComputed(val x: Int) {
+        val doubled: Int get() = x * 2
+    }
+invalid:
+  - |
+    class Point(val x: Int, val y: Int)
+  - |
+    class Ok(val v: String) : Result()

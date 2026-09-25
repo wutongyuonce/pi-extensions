@@ -1,0 +1,2 @@
+🔴 STOP — 1 issue(s) must be fixed:
+  L2: govet: bad Go

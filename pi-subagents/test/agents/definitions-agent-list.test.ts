@@ -563,4 +563,32 @@ describe("agent definitions and catalog", () => {
 		assert.match(tool.promptSnippet, /Do not redo delegated work/);
 		assert.doesNotMatch(tool.promptSnippet, /For helpers with tool_return=later_message, the runtime may stop/);
 	});
+
+	it("tells a one-shot pi -p parent that every launch waits and returns the report inline", () => {
+		const originalArgv = process.argv;
+		process.argv = ["node", "pi", "-p", "@task.md"];
+		const tools = new Map<string, any>();
+		try {
+			subagentsExtension({
+				on() {},
+				registerCommand() {},
+				registerMessageRenderer() {},
+				sendMessage() {},
+				registerTool(definition: any) {
+					tools.set(definition.name, definition);
+					return definition;
+				},
+			} as any);
+		} finally {
+			process.argv = originalArgv;
+		}
+
+		const tool = tools.get("subagent");
+		assert.ok(tool);
+		assert.match(
+			tool.promptSnippet,
+			/every launch waits for the helper and returns its report as the tool result\. Read the report and continue; do not redo delegated work/,
+		);
+		assert.doesNotMatch(tool.promptSnippet, /later_message|later report|steer message/);
+	});
 });

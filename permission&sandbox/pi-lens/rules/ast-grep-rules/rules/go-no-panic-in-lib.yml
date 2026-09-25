@@ -1,0 +1,41 @@
+# Go No panic() in Library Code
+# Detects panic() calls outside tests and cmd/ entry points; library code
+# should return error values instead.
+# Ported from vinhnx/VTCode rules/go/no-panic-in-lib.yml (#2200, refs #2195).
+id: go-no-panic-in-lib
+language: go
+severity: warning
+message: "Avoid panic() in library code; return errors instead"
+note: |
+  panic() unwinds the entire goroutine stack and is not recoverable by
+  callers unless they use defer/recover. Library code should return error
+  values so callers can handle failures gracefully. Scoped to non-test,
+  non-cmd Go files, since main packages under cmd/ legitimately panic on
+  unrecoverable startup failures.
+  Detection-only: converting a panic to an error return changes the
+  function's signature and every caller, which this rule cannot verify is
+  safe.
+rule:
+  pattern: panic($MSG)
+ignores:
+  - "**/*_test.go"
+  - "**/cmd/**"
+tags:
+  - go
+  - idiom
+  - error-handling
+examples:
+  bad: |
+    func mustDivide(a, b int) int {
+        if b == 0 {
+            panic("division by zero")
+        }
+        return a / b
+    }
+  good: |
+    func divide(a, b int) (int, error) {
+        if b == 0 {
+            return 0, errors.New("division by zero")
+        }
+        return a / b, nil
+    }

@@ -1,0 +1,24 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["executable", "home_dir", "profile_dir", "environment_keys"],
+  "properties": {
+    "executable": { "type": "string", "pattern": "^/" },
+    "home_dir": {
+      "type": "string",
+      "pattern": "^/",
+      "description": "Unix HOME for the Codex child. Not the native thread store."
+    },
+    "profile_dir": {
+      "type": "string",
+      "pattern": "^/",
+      "description": "Isolated CODEX_HOME. initialize.codexHome and thread store. Distinct from home_dir."
+    },
+    "environment_keys": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": { "type": "string", "pattern": "^[A-Z][A-Z0-9_]*$" }
+    }
+  }
+}

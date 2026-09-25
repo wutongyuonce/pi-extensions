@@ -1,0 +1,10 @@
+id: ts-while-index-length
+language: typescript
+severity: warning
+message: while loop with index < length - consider for-of or array methods
+metadata:
+  weight: 3
+  category: slop
+rule:
+  kind: while_statement
+  pattern: "while ($I < $ARR.length) { $$$ }"

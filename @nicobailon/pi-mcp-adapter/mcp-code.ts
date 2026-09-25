@@ -1,17 +1,22 @@
 import type { ToolInfo } from "@earendil-works/pi-coding-agent";
 import { formatWithOptions } from "node:util";
 import { Worker } from "node:worker_threads";
+import { throwIfAborted } from "./abort.ts";
 import { guardMcpOutput, guardedMcpDetails, resolveMcpOutputGuardOptions } from "./mcp-output-guard.ts";
+import { evaluateJev, validateJevSettings } from "./jev-client.ts";
+import type { JevErrorCode, JevEvaluateInput, JevEvaluationEnvelope } from "./jev-contracts.ts";
 import { executeCall } from "./proxy-modes.ts";
 import { combineAbortSignals } from "./runtime-owner.ts";
 import { paginate, rankSuggestions, rankToolMatches } from "./search-ranking.ts";
+import { semanticSearch, type SemanticSearchEvaluator } from "./semantic-search.ts";
 import { isServerInActiveFailureBackoff } from "./failure-backoff.ts";
 import type { McpExtensionState } from "./state.ts";
-import { findToolByName, formatSchema } from "./tool-metadata.ts";
+import { findToolByName, formatSchema, hasSchemaDescriptions } from "./tool-metadata.ts";
 import { renderTsShape } from "./ts-shape.ts";
 import type { ContentBlock } from "./types.ts";
 
 export const DEFAULT_MCP_SCRIPT_TIMEOUT_MS = 30_000;
+const MCP_SCRIPT_INTERMEDIATE_MAX_BYTES = 16 * 1024 * 1024;
 
 class McpScriptTimeoutError extends Error {
   constructor(timeoutMs: number) {
@@ -20,17 +25,19 @@ class McpScriptTimeoutError extends Error {
   }
 }
 
-type SearchInput = { query?: unknown; server?: unknown; limit?: unknown; offset?: unknown };
+type SearchInput = { query?: unknown; server?: unknown; limit?: unknown; offset?: unknown; searchMode?: unknown; regex?: unknown };
 type DescribeInput = { path?: unknown };
 type WorkerMessage =
   | { type: "emit"; block: unknown }
   | { type: "call"; id: number; path: string; args?: unknown }
+  | { type: "evaluate"; id: number; input: unknown }
   | { type: "search"; id: number; input?: unknown }
   | { type: "describe"; id: number; input?: unknown }
   | { type: "done"; returnBlock?: unknown }
   | { type: "error"; message: string };
 
-type WorkerResultMessage = { type: "result"; id: number; envelope: unknown };
+type WorkerResultPayload = { envelope: unknown } | { dataJson: string };
+type WorkerResultMessage = { type: "result"; id: number } & WorkerResultPayload;
 
 function needsInspectableFormatting(value: unknown, stack = new WeakSet<object>()): boolean {
   if (value === undefined || typeof value === "bigint" || typeof value === "function" || typeof value === "symbol") return true;
@@ -91,6 +98,9 @@ function parseWorkerMessage(value: unknown): WorkerMessage | null {
       ? { type: "call", id: message.id, path: message.path, args: message.args }
       : { type: "call", id: message.id, path: message.path };
   }
+  if (message.type === "evaluate" && typeof message.id === "number" && "input" in message) {
+    return { type: "evaluate", id: message.id, input: message.input };
+  }
   if ((message.type === "search" || message.type === "describe") && typeof message.id === "number") {
     return "input" in message
       ? { type: message.type, id: message.id, input: message.input }
@@ -105,12 +115,20 @@ function parseWorkerMessage(value: unknown): WorkerMessage | null {
   return null;
 }
 
+export type McpScriptJevEvaluator = (
+  state: McpExtensionState,
+  input: JevEvaluateInput,
+  options: { purpose: "script"; signal?: AbortSignal; observedSources?: readonly string[] },
+) => Promise<JevEvaluationEnvelope>;
+
 export async function runMcpScript(
   state: McpExtensionState,
   code: string,
   timeoutMs = DEFAULT_MCP_SCRIPT_TIMEOUT_MS,
   getPiTools?: () => ToolInfo[],
   signal?: AbortSignal,
+  jevEvaluator: McpScriptJevEvaluator = evaluateJev,
+  semanticEvaluator?: SemanticSearchEvaluator,
 ) {
   const resolvedTimeoutMs = Number.isFinite(timeoutMs) && timeoutMs > 0
     ? Math.floor(timeoutMs)
@@ -119,6 +137,7 @@ export async function runMcpScript(
   const externalSignal = combineAbortSignals(state.owner?.signal, signal);
   const timeoutController = new AbortController();
   const callSignal = combineAbortSignals(externalSignal, timeoutController.signal);
+  const observedSources = new Set<string>();
 
   type ScriptOperation =
     | { operation: "call"; path: string; ok: true; durationMs: number }
@@ -126,7 +145,9 @@ export async function runMcpScript(
     | { operation: "search"; query: string; ok: true; durationMs: number }
     | { operation: "search"; query: string; ok: false; error: string; durationMs: number }
     | { operation: "describe"; path: string; ok: true; durationMs: number }
-    | { operation: "describe"; path: string; ok: false; error: string; durationMs: number };
+    | { operation: "describe"; path: string; ok: false; error: string; durationMs: number }
+    | { operation: "evaluate"; ok: true; model: string; inputTokens: number; outputTokens: number; durationMs: number }
+    | { operation: "evaluate"; ok: false; error: JevErrorCode | "incomplete"; durationMs: number };
   type TrackedScriptOperation = ScriptOperation & { startedAt: number };
   const calls: TrackedScriptOperation[] = [];
   const snapshotCalls = (): ScriptOperation[] => calls.map(({ startedAt, ...operation }) => ({
@@ -136,12 +157,26 @@ export async function runMcpScript(
       : operation.durationMs,
   }));
   let callsSnapshot: ScriptOperation[] | undefined;
-  const callTool = async (path: string, args?: Record<string, unknown>) => {
+  let intermediateBytes = 0;
+  const reserveIntermediateBytes = (dataJson: string): boolean => {
+    const bytes = Buffer.byteLength(dataJson, "utf8");
+    if (bytes > MCP_SCRIPT_INTERMEDIATE_MAX_BYTES - intermediateBytes) return false;
+    intermediateBytes += bytes;
+    return true;
+  };
+  const callTool = async (path: string, args?: Record<string, unknown>): Promise<WorkerResultPayload> => {
     // Record before dispatch so calls still in flight at timeout/abort appear in the trace.
     const startedAt = Date.now();
     const index = calls.push({ operation: "call", path, ok: false, error: "incomplete", durationMs: 0, startedAt }) - 1;
-    const result = await executeCall(state, path, args, undefined, getPiTools, callSignal, "script");
+    let dataJson: string | undefined;
+    const result = await executeCall(state, path, args, undefined, getPiTools, callSignal, "script", {
+      onSuccess(data) {
+        // Serialize once for both byte accounting and worker transfer, never for display.
+        dataJson = JSON.stringify(data);
+      },
+    });
     const details = result.details;
+    if (typeof details.server === "string") observedSources.add(details.server);
     if (details.error !== undefined) {
       const errorCode = String(details.error);
       const suggestions = Array.isArray(details.suggestions)
@@ -154,29 +189,120 @@ export async function runMcpScript(
           : textFromContent(result.content);
       calls[index] = { operation: "call", path, ok: false, error: errorCode, durationMs: Date.now() - startedAt, startedAt };
       return {
-        ok: false as const,
-        error: { code: errorCode, message },
+        envelope: { ok: false, error: { code: errorCode, message } },
       };
     }
+    throwIfAborted(callSignal);
+    if (dataJson === undefined) throw new Error("MCP intermediate result was not JSON serializable");
+    if (!reserveIntermediateBytes(dataJson)) {
+      const code = "intermediate_result_too_large";
+      calls[index] = { operation: "call", path, ok: false, error: code, durationMs: Date.now() - startedAt, startedAt };
+      return {
+        envelope: {
+          ok: false,
+          error: { code, message: "MCP result exceeds the remaining mcpScript intermediate transfer budget (16 MiB per script). Request less data or use a new script." },
+        },
+      };
+    }
+    // Rejected responses do not consume budget. This bounds transfer, not upstream allocation.
     calls[index] = { operation: "call", path, ok: true, durationMs: Date.now() - startedAt, startedAt };
-    return {
-      ok: true as const,
-      data: details.mcpResult !== undefined ? details.mcpResult : textFromContent(result.content),
-    };
+    return { dataJson };
   };
 
-  const searchTools = (input?: SearchInput) => {
+  const jevSettings = validateJevSettings(state.config.settings?.jev);
+  let evaluationAttempts = 0;
+  let evaluationBytes = 0;
+  let evaluationTokensRemaining = jevSettings.maxEvaluationTokensPerScript;
+  const tokenBudgetExhausted = (): JevEvaluationEnvelope => ({ ok: false, error: { code: "budget_exhausted", message: "Jev evaluation token budget exhausted." } });
+  const chargeEvaluationTokens = (envelope: JevEvaluationEnvelope): JevEvaluationEnvelope => {
+    if (!envelope.ok) return envelope;
+    const used = envelope.data.usage.inputTokens + envelope.data.usage.outputTokens;
+    if (!Number.isSafeInteger(used) || used < 0 || used > evaluationTokensRemaining) {
+      evaluationTokensRemaining = 0;
+      return tokenBudgetExhausted();
+    }
+    evaluationTokensRemaining -= used;
+    return envelope;
+  };
+  const admitEvaluation = (input: unknown): JevEvaluationEnvelope | undefined => {
+    if (++evaluationAttempts > jevSettings.maxEvaluationsPerScript) {
+      return { ok: false, error: { code: "budget_exhausted", message: "Jev evaluation count budget exhausted." } };
+    }
+    if (evaluationTokensRemaining === 0) return tokenBudgetExhausted();
+    let serialized: string | undefined;
+    try { serialized = JSON.stringify(input); }
+    catch { return { ok: false, error: { code: "invalid_request", message: "Invalid Jev evaluation request." } }; }
+    if (serialized === undefined) return { ok: false, error: { code: "invalid_request", message: "Invalid Jev evaluation request." } };
+    const bytes = Buffer.byteLength(serialized, "utf8");
+    if (bytes > jevSettings.maxEvaluationBytesPerScript - evaluationBytes) {
+      return { ok: false, error: { code: "budget_exhausted", message: "Jev evaluation byte budget exhausted." } };
+    }
+    evaluationBytes += bytes;
+    return undefined;
+  };
+  const evaluate = async (input: unknown): Promise<WorkerResultPayload> => {
+    const startedAt = Date.now();
+    const index = calls.push({ operation: "evaluate", ok: false, error: "incomplete", durationMs: 0, startedAt }) - 1;
+    let envelope: JevEvaluationEnvelope;
+    const rejected = admitEvaluation(input);
+    if (rejected) {
+      envelope = rejected;
+    } else {
+      envelope = await jevEvaluator(state, input as JevEvaluateInput, {
+        purpose: "script",
+        ...(callSignal ? { signal: callSignal } : {}),
+        ...(observedSources.size > 0 ? { observedSources: [...observedSources] } : {}),
+      });
+    }
+    envelope = chargeEvaluationTokens(envelope);
+    throwIfAborted(callSignal);
+    if (!reserveIntermediateBytes(JSON.stringify(envelope))) {
+      envelope = { ok: false, error: { code: "budget_exhausted", message: "Jev evaluation exceeds the remaining mcpScript intermediate transfer budget (16 MiB per script)." } };
+    }
+    calls[index] = envelope.ok
+      ? {
+          operation: "evaluate", ok: true, model: envelope.data.model,
+          inputTokens: envelope.data.usage.inputTokens, outputTokens: envelope.data.usage.outputTokens,
+          durationMs: Date.now() - startedAt, startedAt,
+        }
+      : { operation: "evaluate", ok: false, error: envelope.error.code, durationMs: Date.now() - startedAt, startedAt };
+    return { envelope };
+  };
+
+  const searchTools = async (input?: SearchInput) => {
     const startedAt = Date.now();
     const query = typeof input?.query === "string" ? input.query : "";
+    const index = calls.push({ operation: "search", query, ok: false, error: "incomplete", durationMs: 0, startedAt }) - 1;
     let error: unknown;
     try {
-      if (query.trim() === "") {
+      if (input?.searchMode !== undefined && input.searchMode !== "lexical" && input.searchMode !== "semantic") {
+        error = "invalid_search_mode";
+        return { items: [], total: 0, hasMore: false, nextOffset: null, error: { code: "invalid_search_mode", message: "Search mode must be lexical or semantic." } };
+      }
+      if (query.trim() === "" && input?.searchMode !== "semantic") {
         return { items: [], total: 0, hasMore: false, nextOffset: null };
       }
       const server = typeof input?.server === "string" ? input.server : undefined;
       const limit = typeof input?.limit === "number" ? input.limit : 12;
       const offset = typeof input?.offset === "number" ? input.offset : 0;
-      const page = paginate(rankToolMatches(state, query, server), offset, limit);
+      const searchMode = input?.searchMode === "semantic" ? "semantic" : "lexical";
+      if (searchMode === "semantic" && input?.regex === true) {
+        error = "invalid_search_mode";
+        return { items: [], total: 0, hasMore: false, nextOffset: null, error: { code: "invalid_search_mode", message: "Semantic search cannot be combined with regex search." } };
+      }
+      const semantic = searchMode === "semantic"
+        ? await semanticSearch(state, query, server, callSignal, async (semanticState, semanticInput, options) => {
+            const rejected = admitEvaluation(semanticInput);
+            if (rejected) return rejected;
+            const envelope = await (semanticEvaluator ?? evaluateJev)(semanticState, semanticInput, options);
+            return chargeEvaluationTokens(envelope);
+          }, [...observedSources])
+        : undefined;
+      if (semantic && !semantic.ok) {
+        error = semantic.error.code;
+        return { items: [], total: 0, hasMore: false, nextOffset: null, error: semantic.error };
+      }
+      const page = paginate(semantic?.matches ?? rankToolMatches(state, query, server), offset, limit);
       return {
         ...page,
         items: page.items.map(({ server: matchServer, tool, score }) => ({
@@ -186,14 +312,15 @@ export async function runMcpScript(
           ...(tool.description ? { description: tool.description } : {}),
           score,
         })),
+        ...(semantic ? { backend: semantic.backend } : {}),
       };
     } catch (caught) {
       error = caught;
       throw caught;
     } finally {
-      calls.push(error === undefined
+      calls[index] = error === undefined
         ? { operation: "search", query, ok: true, durationMs: Date.now() - startedAt, startedAt }
-        : { operation: "search", query, ok: false, error: error instanceof Error ? error.message : String(error), durationMs: Date.now() - startedAt, startedAt });
+        : { operation: "search", query, ok: false, error: error instanceof Error ? error.message : String(error), durationMs: Date.now() - startedAt, startedAt };
     }
   };
 
@@ -206,15 +333,20 @@ export async function runMcpScript(
         if (isServerInActiveFailureBackoff(state, server)) continue;
         const tool = findToolByName(metadata, path);
         if (!tool) continue;
-        const inputTypeScript = tool.inputSchema
-          ? renderTsShape(tool.inputSchema) ?? formatSchema(tool.inputSchema)
-          : null;
+        const inputShape = tool.inputSchema ? renderTsShape(tool.inputSchema) : null;
+        const inputTypeScript = inputShape ?? (tool.inputSchema ? formatSchema(tool.inputSchema) : null);
         return {
           path: tool.name,
           name: tool.originalName,
           server,
           ...(tool.description ? { description: tool.description } : {}),
           ...(inputTypeScript ? { inputTypeScript } : {}),
+          ...(inputShape && hasSchemaDescriptions(tool.inputSchema)
+            ? { inputGuidance: formatSchema(tool.inputSchema) } : {}),
+          ...(tool.outputSchema !== undefined ? {
+            outputSchemaTarget: "data.structuredContent",
+            outputSchema: tool.outputSchema,
+          } : {}),
         };
       }
       const suggestions = path ? rankSuggestions(state, path, 5) : [];
@@ -279,15 +411,18 @@ export async function runMcpScript(
         }
 
         void (async () => {
-          let envelope: unknown;
+          let payload: WorkerResultPayload;
           if (message.type === "call") {
-            envelope = await callTool(message.path, message.args as Record<string, unknown> | undefined);
+            payload = await callTool(message.path, message.args as Record<string, unknown> | undefined);
+          } else if (message.type === "evaluate") {
+            payload = await evaluate(message.input);
           } else if (message.type === "search") {
-            envelope = searchTools(message.input as SearchInput | undefined);
+            payload = { envelope: await searchTools(message.input as SearchInput | undefined) };
           } else {
-            envelope = describeTool(message.input as DescribeInput | undefined);
+            payload = { envelope: describeTool(message.input as DescribeInput | undefined) };
           }
-          const response: WorkerResultMessage = { type: "result", id: message.id, envelope };
+          if (completed || callSignal?.aborted) return;
+          const response: WorkerResultMessage = { type: "result", id: message.id, ...payload };
           activeWorker.postMessage(response);
         })().catch(reject);
       });

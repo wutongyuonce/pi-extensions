@@ -1,0 +1,120 @@
+id: no-dupe-class-members
+message: Duplicate class member '$NAME'.
+severity: error
+language: TypeScript
+rule:
+  any:
+    - all:
+        - matches: accessor-name
+        - inside:
+            field: name
+            matches: is-class-members
+            any:
+              # 2026-08-20 (review round, refs #1806): staticness must be
+              # compared BETWEEN the pair, not blanket-exempted. A static
+              # member and a same-named instance member live in separate
+              # namespaces (`ClassName.foo` vs `instance.foo`) — no
+              # overwrite, correctly exempt. Two static members (or two
+              # instance members) with the same name DO collide — the
+              # original review-round fix over-corrected by excluding
+              # ANY static-enclosed accessor from pairing at all, which
+              # silently dropped the rule's core case
+              # (`static foo(){} static foo(){}`, the exact silent
+              # overwrite this rule exists to catch). These two arms
+              # require the anchor and its paired duplicate to agree on
+              # staticness: a static anchor only pairs with a later
+              # static member, a non-static anchor only pairs with a
+              # later non-static member.
+              - all:
+                  - matches: is-static-member
+                  - precedes:
+                      stopBy: end
+                      all:
+                        - matches: is-static-member
+                        - has:
+                            matches: accessor-name
+              - all:
+                  - not:
+                      matches: is-static-member
+                  - precedes:
+                      stopBy: end
+                      all:
+                        - not:
+                            matches: is-static-member
+                        - has:
+                            matches: accessor-name
+    - matches: member-name
+      all:
+        - not:
+            follows:
+              pattern: $$ACCESS
+        - inside:
+            field: name
+            matches: is-class-members
+            any:
+              - follows:
+                  stopBy: end
+                  matches: duplicate-field
+              - precedes:
+                  stopBy: end
+                  matches: duplicate-field
+utils:
+  duplicate-field:
+    matches: is-class-members
+    not:
+      # Anchored on the member's own text (which starts at its first
+      # modifier keyword), not on the single nearest-preceding-sibling
+      # token. `follows: pattern: $$ACCESS` only ever binds the LAST
+      # modifier before the name — for `static async foo() {}` that is
+      # "async", so a `not: regex: static` check nested under that
+      # follows clause never sees "static" and the escape valve never
+      # fires (#1806 audit: 3 FP hits, static factory + same-named
+      # instance method both flagged as duplicates).
+      regex: '^static\b'
+    has:
+      matches: member-name
+      any:
+        - follows:
+            pattern: $$ACCESS
+          not:
+            regex: constructor
+        - not:
+            follows:
+              pattern: $$ACCESS
+
+
+  accessor-name:
+    matches: member-name
+    follows:
+      pattern: $$ACCESS
+  is-static-member:
+    # Anchored on the member's own text (which starts at its first
+    # modifier keyword), not on the single nearest-preceding-sibling
+    # token — see the `duplicate-field` comment below for why
+    # `follows: pattern: $$ACCESS` can't be trusted to see "static"
+    # once another modifier (e.g. "async") sits closer to the name.
+    matches: is-class-members
+    regex: '^static\b'
+  is-class-members:
+    any:
+      - kind: method_definition
+      - kind: public_field_definition
+  member-name:
+    any:
+      - kind: property_identifier
+        pattern: $NAME
+      - kind: string
+        has:
+          pattern: $NAME
+          kind: string_fragment
+      - kind: number
+        pattern: $NAME
+      - kind: string
+        has:
+          pattern: $NAME
+          kind: string_fragment
+      - kind: computed_property_name
+        has:
+          matches: member-name
+note: |
+  If there are declarations of the same name in class members, the last declaration overwrites other declarations silently. It can cause unexpected behaviors.

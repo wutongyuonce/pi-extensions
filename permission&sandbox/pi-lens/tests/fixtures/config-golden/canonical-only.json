@@ -1,0 +1,77 @@
+{
+	"global": null,
+	"lsp": {
+		"ignore": [
+			"dist/**"
+		],
+		"lsp": {
+			"disabledServers": [
+				"typos"
+			],
+			"servers": {
+				"custom": {
+					"args": [
+						"--stdio"
+					],
+					"command": "custom-lsp",
+					"extensions": [
+						".custom"
+					],
+					"name": "Custom",
+					"rootMarkers": [
+						"package.json"
+					]
+				}
+			}
+		},
+		"maxProjectFiles": 4000,
+		"rules": {
+			"high-complexity": {
+				"threshold": 25
+			}
+		}
+	},
+	"project": {
+		"configPath": "<HOME>/proj/.pi-lens.json",
+		"ignore": [
+			"dist/**"
+		],
+		"maxProjectFiles": 4000,
+		"raw": {
+			"ignore": [
+				"dist/**"
+			],
+			"lsp": {
+				"disabledServers": [
+					"typos"
+				],
+				"servers": {
+					"custom": {
+						"args": [
+							"--stdio"
+						],
+						"command": "custom-lsp",
+						"extensions": [
+							".custom"
+						],
+						"name": "Custom",
+						"rootMarkers": [
+							"package.json"
+						]
+					}
+				}
+			},
+			"maxProjectFiles": 4000,
+			"rules": {
+				"high-complexity": {
+					"threshold": 25
+				}
+			}
+		},
+		"rules": {
+			"high-complexity": {
+				"threshold": 25
+			}
+		}
+	}
+}

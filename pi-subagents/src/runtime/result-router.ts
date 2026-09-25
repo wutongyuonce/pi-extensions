@@ -72,42 +72,65 @@ export function deliverCompletedSubagentResult(
 		return completed;
 	}
 
-	const deliverAs = stopAfterCurrentSubagentBatch ? "nextTurn" : "steer";
+	const deliverAs = getCompletedResultDeliveryMode();
 	completed.deliveredTo = "steer";
 	const sessionRef = formatSessionRef(completed);
-	const contextRef =
-		completed.reportContextUsage === false ? formatContextExitNotice(completed) : formatFinalContextUsage(completed);
+	const contextRef = getCompletedContextReference(completed);
 	pi.sendMessage(
 		{
 			customType: "subagent_result",
 			content: getCompletedSubagentContent(completed, formatElapsed, `${sessionRef}${contextRef}`),
 			display: true,
-			details: {
-				id: completed.id,
-				name: completed.name,
-				task: completed.task,
-				agent: completed.agent,
-				mode: completed.mode,
-				status: completed.status,
-				deliveryState: completed.deliveryState,
-				parentClosePolicy: completed.parentClosePolicy,
-				blocking: completed.blocking,
-				async: completed.async,
-				exitCode: completed.exitCode,
-				elapsed: completed.elapsed,
-				outputTokens: completed.outputTokens,
-				contextTokens: completed.contextTokens,
-				contextWindow: completed.contextWindow,
-				sessionFile: completed.sessionFile,
-				...(completed.deliveryId ? { deliveryId: completed.deliveryId } : {}),
-				...getTimeoutResultDetails(completed),
-				...(completed.timeoutWrapUp ? { timeoutWrapUp: completed.timeoutWrapUp } : {}),
-				...(completed.errorMessage ? { errorMessage: completed.errorMessage } : {}),
-			},
+			details: getCompletedResultDetails(completed),
 		},
 		{ triggerTurn: true, deliverAs },
 	);
 	return completed;
+}
+
+function getCompletedResultDeliveryMode(): "nextTurn" | "steer" {
+	// A result that lands while the parent is still unwinding its async-launch
+	// batch waits for the next human prompt, so the chat does not stay in the
+	// Working state and swallow the operator's next input as a steer. An
+	// auto-exit session never gets that prompt: the loop ends, the running
+	// count is already zero, and a `nextTurn` message is not pending, so the
+	// session would close with the report unread. Pi still drains queued steers
+	// after a terminating batch, so steer is the delivery that guarantees the
+	// model reads it there.
+	return stopAfterCurrentSubagentBatch && !isAutoExitSession() ? "nextTurn" : "steer";
+}
+
+function isAutoExitSession(): boolean {
+	return process.env.PI_SUBAGENT_AUTO_EXIT === "1";
+}
+
+function getCompletedContextReference(completed: CompletedSubagentResult): string {
+	return completed.reportContextUsage === false ? formatContextExitNotice(completed) : formatFinalContextUsage(completed);
+}
+
+function getCompletedResultDetails(completed: CompletedSubagentResult): Record<string, unknown> {
+	return {
+		id: completed.id,
+		name: completed.name,
+		task: completed.task,
+		agent: completed.agent,
+		mode: completed.mode,
+		status: completed.status,
+		deliveryState: completed.deliveryState,
+		parentClosePolicy: completed.parentClosePolicy,
+		blocking: completed.blocking,
+		async: completed.async,
+		exitCode: completed.exitCode,
+		elapsed: completed.elapsed,
+		outputTokens: completed.outputTokens,
+		contextTokens: completed.contextTokens,
+		contextWindow: completed.contextWindow,
+		sessionFile: completed.sessionFile,
+		...(completed.deliveryId ? { deliveryId: completed.deliveryId } : {}),
+		...getTimeoutResultDetails(completed),
+		...(completed.timeoutWrapUp ? { timeoutWrapUp: completed.timeoutWrapUp } : {}),
+		...(completed.errorMessage ? { errorMessage: completed.errorMessage } : {}),
+	};
 }
 
 function deliverSubagentPing(
@@ -159,21 +182,10 @@ function getCompletedSubagentContent(
 			{ ...completed, timedOut: completed.timedOut },
 			hasRealSubagentOutput(completed),
 			formatElapsed,
-		)}${sessionRef}`;
+			)}${sessionRef}`;
 	}
 	if (completed.errorMessage) {
-		const resultBody = hasRealSubagentOutput(completed)
-			? `Last output before the failure (may be incomplete — verify before trusting):\n\n${completed.summary}`
-			: completed.contextExhausted
-				? `The subagent did not produce a result, and its context window is spent. ` +
-					`A fresh subagent is usually better than resuming this session.`
-				: `The subagent did not produce a result. You can retry by spawning a new ` +
-					`subagent or resume the session with subagent_resume.`;
-		return (
-			`Sub-agent "${completed.name}" failed after ${formatElapsed(completed.elapsed)} ` +
-			`(provider/agent error — auto-retry exhausted).\n\n` +
-			`Error: ${completed.errorMessage}\n\n${resultBody}${sessionRef}`
-		);
+		return getProviderErrorContent(completed, formatElapsed, sessionRef);
 	}
 	if (completed.exitCode === 0 && completed.timeoutWrapUp) {
 		return `${formatTimeoutWrapUpOutcome(
@@ -181,7 +193,35 @@ function getCompletedSubagentContent(
 			formatElapsed,
 		)}${sessionRef}`;
 	}
-	return completed.exitCode !== 0
-		? `Sub-agent "${completed.name}" failed (exit ${completed.exitCode}).\n\n${completed.summary}${sessionRef}`
-		: `Sub-agent "${completed.name}" completed (${formatElapsed(completed.elapsed)}).\n\n${completed.summary}${sessionRef}`;
+	return getNormalCompletionContent(completed, formatElapsed, sessionRef);
+}
+
+function getProviderErrorContent(
+	completed: CompletedSubagentResult,
+	formatElapsed: (elapsed: number) => string,
+	sessionRef: string,
+): string {
+	const resultBody = hasRealSubagentOutput(completed)
+		? `Last output before the failure (may be incomplete — verify before trusting):\n\n${completed.summary}`
+		: completed.contextExhausted
+			? `The subagent did not produce a result, and its context window is spent. ` +
+				`A fresh subagent is usually better than resuming this session.`
+			: `The subagent did not produce a result. You can retry by spawning a new ` +
+				`subagent or resume the session with subagent_resume.`;
+	return (
+		`Sub-agent "${completed.name}" failed after ${formatElapsed(completed.elapsed)} ` +
+		`(provider/agent error — auto-retry exhausted).\n\n` +
+		`Error: ${completed.errorMessage}\n\n${resultBody}${sessionRef}`
+	);
+}
+
+function getNormalCompletionContent(
+	completed: CompletedSubagentResult,
+	formatElapsed: (elapsed: number) => string,
+	sessionRef: string,
+): string {
+	if (completed.exitCode !== 0) {
+		return `Sub-agent "${completed.name}" failed (exit ${completed.exitCode}).\n\n${completed.summary}${sessionRef}`;
+	}
+	return `Sub-agent "${completed.name}" completed (${formatElapsed(completed.elapsed)}).\n\n${completed.summary}${sessionRef}`;
 }

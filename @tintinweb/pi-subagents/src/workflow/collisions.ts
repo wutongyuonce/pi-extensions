@@ -46,11 +46,14 @@ import { SUBAGENT_TOOL_NAMES } from "../agent-runner.js";
  *
  * Our own name, because pi resolves a duplicate registration silently, and
  * Claude Code's bare `Workflow`, because a port of that tool is what a second
- * workflow extension most likely calls itself.
+ * workflow extension most likely calls itself. Lowercase `workflow` is the same
+ * tool by pi convention: it is what `@quintinshaw/pi-dynamic-workflows`
+ * registers, and the match here is exact, so the case has to be listed by hand.
  */
 export const FOREIGN_WORKFLOW_TOOL_NAMES: ReadonlySet<string> = new Set([
   SUBAGENT_TOOL_NAMES.WORKFLOW,
   "Workflow",
+  "workflow",
 ]);
 
 /** The fields of a registered tool this decision reads. */

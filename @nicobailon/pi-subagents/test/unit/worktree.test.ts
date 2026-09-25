@@ -1,9 +1,12 @@
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import { execFile, spawnSync } from "node:child_process";
 import * as fs from "node:fs";
+import { createRequire, syncBuiltinESMExports } from "node:module";
 import * as os from "node:os";
 import * as path from "node:path";
 import { describe, it } from "node:test";
+import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
 import {
 	cleanupWorktrees,
 	createWorktrees,
@@ -11,13 +14,18 @@ import {
 	findWorktreeTaskCwdConflict,
 	formatWorktreeDiffSummary,
 	buildWorktreeNaming,
+	normalizeWorktreeBaseRef,
 	normalizeWorktreeBranchPrefix,
 	resolveExpectedWorktreeAgentCwd,
 	resolveWorktreeProvider,
 	sanitizeWorktreePathComponent,
 	shouldDeferWorktreeCwd,
+	WorktreeSetupError,
 	type WorktreeSetup,
 } from "../../src/runs/shared/worktree.ts";
+
+const require = createRequire(import.meta.url);
+const fsCjs = require("node:fs") as typeof fs;
 
 function git(cwd: string, args: string[]): string {
 	const result = spawnSync("git", ["-C", cwd, ...args], { encoding: "utf-8" });
@@ -37,11 +45,19 @@ function createRepo(prefix: string): string {
 	fs.writeFileSync(path.join(repoDir, "tracked.txt"), "initial\n", "utf-8");
 	git(repoDir, ["add", "-A"]);
 	git(repoDir, ["commit", "-m", "initial commit"]);
-	return repoDir;
+	// Match Git's canonical top-level path for macOS symlinked temp roots.
+	return fs.realpathSync(repoDir);
 }
 
-function cleanupRepo(repoDir: string): void {
+function cleanupRepo(repoDir: string, baseDir?: string): void {
+	cleanupProjectWorktrees(repoDir, baseDir);
 	try { fs.rmSync(repoDir, { recursive: true, force: true }); } catch {}
+}
+
+/** Removes only this repo's nested project folder; never the shared dedicated root. */
+function cleanupProjectWorktrees(repoDir: string, baseDir?: string): void {
+	const dedicatedRoot = baseDir ?? path.join(path.dirname(repoDir), "worktrees");
+	try { fs.rmSync(path.join(dedicatedRoot, path.basename(repoDir)), { recursive: true, force: true }); } catch {}
 }
 
 function createHookScript(_repoDir: string, fileName: string, source: string): string {
@@ -55,16 +71,41 @@ function createHookScript(_repoDir: string, fileName: string, source: string): s
 const hookScriptSkip = process.platform === "win32"
 	? "Hook script execution differs on Windows CI environments."
 	: undefined;
-const worktrunkShimSkip = process.platform === "win32"
-	? "Windows Terminal installs a wt.exe app alias that can outrank test command shims."
-	: undefined;
+// Unknown settlement intentionally poisons the process. Re-run only that case in
+// an awaited real child so subsequent tests retain normal mutation admission.
+async function runPoisonCaseInChild(name: string): Promise<boolean> {
+	if (process.env.PI_WORKTREE_POISON_CASE === name) return false;
+	await promisify(execFile)(process.execPath, [
+		"--experimental-strip-types", "--import", "./test/support/register-loader.mjs",
+		"--test", `--test-name-pattern=${name}`, fileURLToPath(import.meta.url),
+	], { env: { ...process.env, NODE_TEST_CONTEXT: undefined, PI_WORKTREE_POISON_CASE: name } });
+	return true;
+}
+
+function assertRetainedHookFailure(error: unknown, message: RegExp): true {
+	assert.ok(error instanceof WorktreeSetupError);
+	assert.match(error.message, message);
+	assert.match(error.message, /manual reconciliation required/i);
+	assert.ok(error.snapshot.unknown);
+	assert.equal(error.snapshot.cleanup?.state, "partial");
+	assert.equal(error.snapshot.cleanup?.pruned, false);
+	const worktree = error.snapshot.setup.worktrees[0]!;
+	assert.ok(worktree);
+	assert.equal(error.snapshot.attempts[0]?.validated, true);
+	assert.equal(fs.existsSync(worktree.path), true);
+	assert.equal(git(worktree.path, ["branch", "--show-current"]), worktree.branch);
+	assert.equal(fs.readFileSync(path.join(worktree.path, "tracked.txt"), "utf-8"), "initial\n");
+	assert.throws(() => cleanupWorktrees(error.snapshot.setup, { kind: "setup-rollback" }), /Worktree mutation blocked/i);
+	assert.equal(fs.existsSync(worktree.path), true);
+	return true;
+}
 
 describe("worktree", () => {
-	it("createWorktrees returns expected structure", () => {
+	it("createWorktrees returns expected structure", async () => {
 		const repoDir = createRepo("pi-worktree-structure-");
 		let setup: WorktreeSetup | undefined;
 		try {
-			setup = createWorktrees(repoDir, "structure", 2, { provider: "native" });
+			setup = await createWorktrees(repoDir, "structure", 2, { provider: "native" });
 			assert.equal(setup.worktrees.length, 2);
 			assert.equal(setup.cwd, git(repoDir, ["rev-parse", "--show-toplevel"]));
 			for (let i = 0; i < setup.worktrees.length; i++) {
@@ -82,21 +123,32 @@ describe("worktree", () => {
 		}
 	});
 
-	it("invokes beforeCreate with deterministic ownership metadata before creating worktrees", () => {
+	it("reports attempted ownership before spawn and only validated worktrees after allocation", async () => {
 		const repoDir = createRepo("pi-worktree-before-create-");
 		let setup: WorktreeSetup | undefined;
-		let planned: WorktreeSetup | undefined;
+		let attemptedPath: string | undefined;
+		let validated: WorktreeSetup | undefined;
 		try {
-			setup = createWorktrees(repoDir, "before-create", 1, {
+			setup = await createWorktrees(repoDir, "before-create", 1, {
 				provider: "native",
-				beforeCreate: (candidate) => {
-					planned = candidate;
-					assert.equal(fs.existsSync(candidate.worktrees[0]!.path), false);
-					assert.equal(candidate.worktrees[0]!.branch, "pi-subagents/task-before-creat-s0-t0");
+				onProgress: (snapshot) => {
+					const attempt = snapshot.attempts[0];
+					if (attempt && !attempt.command?.pid && !attempt.validated) {
+						attemptedPath = attempt.path;
+						assert.ok(attemptedPath);
+						assert.equal(fs.existsSync(attemptedPath), false);
+						assert.equal(attempt.branch, "pi-subagents/task-before-creat-s0-t0");
+						assert.deepEqual(snapshot.setup.worktrees, []);
+					}
+					if (snapshot.setup.worktrees.length) {
+						assert.equal(attempt?.validated, true);
+						validated = snapshot.setup;
+					}
 				},
 			});
-			assert.equal(planned?.baseCommit, setup.baseCommit);
-			assert.equal(planned?.worktrees[0]?.path, setup.worktrees[0]?.path);
+			assert.equal(attemptedPath, setup.worktrees[0]?.path);
+			assert.equal(validated?.baseCommit, setup.baseCommit);
+			assert.equal(validated?.worktrees[0]?.path, setup.worktrees[0]?.path);
 			assert.equal(fs.existsSync(setup.worktrees[0]!.path), true);
 		} finally {
 			if (setup) cleanupWorktrees(setup);
@@ -104,12 +156,44 @@ describe("worktree", () => {
 		}
 	});
 
-	it("records Worktrunk ownership and uses its returned path", () => {
+	it("compensates a rejected ready publication without retaining command output in snapshots", async () => {
+		const repoDir = createRepo("pi-worktree-ready-rejected-");
+		try {
+			await assert.rejects(() => createWorktrees(repoDir, "ready-rejected", 1, {
+				provider: "native",
+				onProgress: (snapshot) => {
+					const commands = [snapshot.command, ...snapshot.attempts.flatMap((attempt) => [attempt.command, attempt.hookCommand])];
+					for (const command of commands) {
+						if (!command?.result) continue;
+						assert.equal("stdout" in command.result, false);
+						assert.equal("stdoutBuffer" in command.result, false);
+						assert.equal("stderr" in command.result, false);
+						assert.equal(Object.values(command.result).some(Buffer.isBuffer), false);
+						assert.equal(JSON.stringify(command.result).includes('"data"'), false);
+					}
+					if (snapshot.phase === "ready") throw new Error("ready publication rejected");
+				},
+			}), (error: unknown) => {
+				assert.ok(error instanceof WorktreeSetupError);
+				assert.match(error.message, /ready publication rejected/);
+				assert.equal(error.snapshot.cleanup?.state, "complete");
+				assert.equal(error.snapshot.cleanup.tasks.length, 1);
+				const task = error.snapshot.cleanup.tasks[0]!;
+				assert.equal(task.worktreeRemoved, true);
+				assert.equal(task.branchRemoved, true);
+				assert.equal(fs.existsSync(task.path), false);
+				assert.equal(git(repoDir, ["branch", "--list", task.branch]), "");
+				return true;
+			});
+		} finally { cleanupRepo(repoDir); }
+	});
+
+	it("records Worktrunk ownership and uses its returned path", async () => {
 		try { resolveWorktreeProvider("worktrunk"); } catch { return; }
 		const repoDir = createRepo("pi-worktree-worktrunk-");
 		let setup: WorktreeSetup | undefined;
 		try {
-			setup = createWorktrees(repoDir, "worktrunk-s0", 1, {
+			setup = await createWorktrees(repoDir, "worktrunk-s0", 1, {
 				provider: "worktrunk",
 				agents: ["worker"],
 				labels: ["Review API"],
@@ -128,10 +212,12 @@ describe("worktree", () => {
 		}
 	});
 
-	it("rejects Worktrunk responses that point at the source checkout", { skip: worktrunkShimSkip }, () => {
+	it("rejects Worktrunk responses that point at the source checkout", async () => {
+		if (await runPoisonCaseInChild("rejects Worktrunk responses that point at the source checkout")) return;
 		const fakeBin = fs.mkdtempSync(path.join(os.tmpdir(), "pi-worktree-fake-source-wt-"));
 		const fakeScript = path.join(fakeBin, "wt.cjs");
-		const fakeWt = path.join(fakeBin, process.platform === "win32" ? "wt.cmd" : "wt");
+		// Git for Windows dispatches extensionless git-* test commands through its bundled shell.
+		const fakeWt = path.join(fakeBin, process.platform === "win32" ? "git-wt" : "wt");
 		fs.writeFileSync(fakeScript, `const { spawnSync } = require("node:child_process");
 const args = process.argv.slice(2);
 if (args[0] === "--version") { console.log("wt v0.75.0"); process.exit(0); }
@@ -143,26 +229,38 @@ const result = spawnSync("git", ["-C", repo, "checkout", "-b", branch], { encodi
 if (result.status !== 0) { process.stderr.write(result.stderr || result.stdout); process.exit(result.status || 1); }
 console.log(JSON.stringify({ action: "created", branch, path: repo, created_branch: true, base_branch: base }));
 `, "utf-8");
-		if (process.platform === "win32") fs.writeFileSync(fakeWt, `@echo off\r\n"${process.execPath}" "%~dp0wt.cjs" %*\r\n`, "utf-8");
-		else {
-			fs.writeFileSync(fakeWt, `#!/bin/sh\nexec "${process.execPath}" "${fakeScript}" "$@"\n`, "utf-8");
-			fs.chmodSync(fakeWt, 0o755);
-		}
+		fs.writeFileSync(fakeWt, `#!/bin/sh\nexec "${process.execPath.replaceAll("\\", "/")}" "${fakeScript.replaceAll("\\", "/")}" "$@"\n`, "utf-8");
+		fs.chmodSync(fakeWt, 0o755);
 		const previousPath = process.env.PATH;
 		const previousWindowsPath = process.env.Path;
 		const previousPathExt = process.env.PATHEXT;
 		const repoDir = createRepo("pi-worktree-source-wt-");
 		try {
-			const originalBranch = git(repoDir, ["branch", "--show-current"]);
+			const originalHead = git(repoDir, ["rev-parse", "HEAD"]);
 			process.env.PATH = `${fakeBin}${path.delimiter}${previousPath ?? ""}`;
 			process.env.Path = `${fakeBin}${path.delimiter}${previousWindowsPath ?? previousPath ?? ""}`;
 			process.env.PATHEXT = [".CMD", ".EXE", ".BAT", previousPathExt ?? ""].filter(Boolean).join(path.delimiter);
-			assert.throws(
+			assert.equal(resolveWorktreeProvider("worktrunk"), "worktrunk");
+			await assert.rejects(
 				() => createWorktrees(repoDir, "source-path", 1, { provider: "worktrunk" }),
-				/source checkout path/i,
+				(error: unknown) => {
+					assert.ok(error instanceof WorktreeSetupError);
+					assert.match(error.message, /source checkout path/i);
+					assert.match(error.message, /manual reconciliation required/i);
+					assert.ok(error.snapshot.unknown);
+					assert.deepEqual(error.snapshot.setup.worktrees, []);
+					assert.equal(error.snapshot.attempts[0]?.validated, false);
+					assert.equal(error.snapshot.attempts[0]?.branch, "pi-subagents/task-source-path-s0-t0");
+					assert.equal(error.snapshot.cleanup?.pruned, false);
+					return true;
+				},
 			);
-			assert.equal(git(repoDir, ["branch", "--show-current"]), originalBranch);
-			assert.equal(git(repoDir, ["branch", "--list", "pi-subagents/task-source-path-s0-t0"]), "");
+			// Invalid output grants no authority to restore or delete source state.
+			assert.equal(git(repoDir, ["branch", "--show-current"]), "pi-subagents/task-source-path-s0-t0");
+			assert.equal(git(repoDir, ["rev-parse", "HEAD"]), originalHead);
+			assert.equal(fs.readFileSync(path.join(repoDir, "tracked.txt"), "utf-8"), "initial\n");
+			await assert.rejects(() => createWorktrees(repoDir, "after-unknown", 1, { provider: "native" }), /unknown|manual reconciliation/i);
+			assert.equal(git(repoDir, ["branch", "--list", "pi-subagents/task-after-unknow-s0-t0"]), "");
 		} finally {
 			if (previousPath === undefined) delete process.env.PATH;
 			else process.env.PATH = previousPath;
@@ -175,11 +273,11 @@ console.log(JSON.stringify({ action: "created", branch, path: repo, created_bran
 		}
 	});
 
-	it("falls back to native only when Worktrunk capability probing fails", () => {
+	it("falls back to native only when Worktrunk capability probing fails", async () => {
 		const fakeBin = fs.mkdtempSync(path.join(os.tmpdir(), "pi-worktree-fake-wt-"));
-		const fakeWt = path.join(fakeBin, process.platform === "win32" ? "wt.cmd" : "wt");
-		fs.writeFileSync(fakeWt, process.platform === "win32" ? "@echo not-worktrunk\r\n" : "#!/bin/sh\nprintf 'not-worktrunk\\n'\n", "utf-8");
-		if (process.platform !== "win32") fs.chmodSync(fakeWt, 0o755);
+		const fakeWt = path.join(fakeBin, process.platform === "win32" ? "git-wt" : "wt");
+		fs.writeFileSync(fakeWt, "#!/bin/sh\nprintf 'not-worktrunk\\n'\n", "utf-8");
+		fs.chmodSync(fakeWt, 0o755);
 		const previousPath = process.env.PATH;
 		const previousWindowsPath = process.env.Path;
 		const previousPathExt = process.env.PATHEXT;
@@ -193,8 +291,8 @@ console.log(JSON.stringify({ action: "created", branch, path: repo, created_bran
 			assert.equal(shouldDeferWorktreeCwd(undefined), true);
 			assert.equal(resolveWorktreeProvider(undefined, " "), "native");
 			assert.equal(shouldDeferWorktreeCwd(undefined, " "), false);
-			assert.throws(() => createWorktrees(repoDir, "provider-fallback", 1, { baseDir: " " }), /cannot be empty/i);
-			setup = createWorktrees(repoDir, "provider-fallback", 1);
+			await assert.rejects(() => createWorktrees(repoDir, "provider-fallback", 1, { baseDir: " " }), /cannot be empty/i);
+			setup = await createWorktrees(repoDir, "provider-fallback", 1);
 			assert.equal(setup.worktrees[0]?.provider, "native");
 			assert.throws(() => resolveWorktreeProvider("worktrunk"), /Worktrunk provider is unavailable/i);
 		} finally {
@@ -227,7 +325,17 @@ console.log(JSON.stringify({ action: "created", branch, path: repo, created_bran
 		assert.throws(() => normalizeWorktreeBranchPrefix("../unsafe"), /invalid/i);
 	});
 
-	it("createWorktrees maps subdirectory cwd to each agentCwd", () => {
+	it("keeps naming labels within the 256-byte cap when truncation splits a multi-byte character", () => {
+		for (let pad = 0; pad < 8; pad++) {
+			const task = `${"x".repeat(pad)}${"审".repeat(120)} tail`;
+			const naming = buildWorktreeNaming({ runId: "run", index: 0, agent: "worker", task });
+			const labelBytes = Buffer.byteLength(naming.label, "utf-8");
+			assert.ok(labelBytes <= 256, `label must fit the 256-byte cap, got ${labelBytes} (pad=${pad})`);
+			assert.ok(!naming.label.endsWith("\uFFFD"), `label must not end with U+FFFD (pad=${pad})`);
+		}
+	});
+
+	it("createWorktrees maps subdirectory cwd to each agentCwd", async () => {
 		const repoDir = createRepo("pi-worktree-subdir-");
 		const nestedDir = path.join(repoDir, "packages", "app");
 		fs.mkdirSync(nestedDir, { recursive: true });
@@ -237,7 +345,7 @@ console.log(JSON.stringify({ action: "created", branch, path: repo, created_bran
 
 		let setup: WorktreeSetup | undefined;
 		try {
-			setup = createWorktrees(nestedDir, "subdir", 1);
+			setup = await createWorktrees(nestedDir, "subdir", 1);
 			assert.equal(setup.worktrees[0]!.agentCwd, path.join(setup.worktrees[0]!.path, "packages", "app"));
 		} finally {
 			if (setup) cleanupWorktrees(setup);
@@ -254,31 +362,41 @@ console.log(JSON.stringify({ action: "created", branch, path: repo, created_bran
 		git(repoDir, ["commit", "-m", "add nested dir"]);
 
 		try {
+			const repoRoot = git(nestedDir, ["rev-parse", "--show-toplevel"]);
 			assert.equal(
 				resolveExpectedWorktreeAgentCwd(nestedDir, "preview", 2),
-				path.join(os.tmpdir(), "pi-worktree-preview-2", "packages", "app"),
+				path.join(
+					path.dirname(repoRoot),
+					"worktrees",
+					path.basename(repoRoot),
+					"pi-worktree-preview-2",
+					"packages",
+					"app",
+				),
 			);
 		} finally {
 			cleanupRepo(repoDir);
 		}
 	});
 
-	it("creates worktrees under a configured base directory", () => {
+	it("creates worktrees under a configured base directory", async () => {
 		const repoDir = createRepo("pi-worktree-base-dir-");
 		const baseDir = path.join(os.tmpdir(), `pi-worktree-base-${Date.now().toString(36)}`, "nested");
 		let setup: WorktreeSetup | undefined;
 		try {
-			setup = createWorktrees(repoDir, "base-dir", 1, { baseDir });
-			assert.equal(setup.worktrees[0]!.path, path.join(baseDir, "pi-worktree-base-dir-0"));
+			setup = await createWorktrees(repoDir, "base-dir", 1, { baseDir });
+			assert.equal(
+				setup.worktrees[0]!.path,
+				path.join(baseDir, path.basename(repoDir), "pi-worktree-base-dir-0"),
+			);
 			assert.ok(fs.existsSync(baseDir), "configured base directory should be created");
 		} finally {
 			if (setup) cleanupWorktrees(setup);
-			cleanupRepo(repoDir);
-			fs.rmSync(path.dirname(baseDir), { recursive: true, force: true });
+			cleanupRepo(repoDir, baseDir);
 		}
 	});
 
-	it("rejects worktree base directories inside Pi extensions", () => {
+	it("rejects worktree base directories inside Pi extensions", async () => {
 		const repoDir = createRepo("pi-worktree-extension-dir-");
 		const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "pi-worktree-home-"));
 		const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
@@ -289,11 +407,11 @@ console.log(JSON.stringify({ action: "created", branch, path: repo, created_bran
 			process.env.HOME = tempHome;
 			process.env.USERPROFILE = tempHome;
 			delete process.env.PI_CODING_AGENT_DIR;
-			assert.throws(
+			await assert.rejects(
 				() => createWorktrees(repoDir, "extension-dir", 1, { baseDir: extensionsDir }),
 				/worktree base directory cannot be inside Pi extensions directory/i,
 			);
-			assert.throws(
+			await assert.rejects(
 				() => createWorktrees(repoDir, "extension-subdir", 1, { baseDir: path.join(extensionsDir, "checkout") }),
 				/worktree base directory cannot be inside Pi extensions directory/i,
 			);
@@ -309,7 +427,7 @@ console.log(JSON.stringify({ action: "created", branch, path: repo, created_bran
 		}
 	});
 
-	it("rejects symlinked worktree base directories inside Pi extensions", () => {
+	it("rejects symlinked worktree base directories inside Pi extensions", async () => {
 		const repoDir = createRepo("pi-worktree-extension-symlink-");
 		const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "pi-worktree-home-"));
 		const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
@@ -323,7 +441,7 @@ console.log(JSON.stringify({ action: "created", branch, path: repo, created_bran
 			delete process.env.PI_CODING_AGENT_DIR;
 			fs.mkdirSync(extensionsDir, { recursive: true });
 			fs.symlinkSync(extensionsDir, aliasDir, process.platform === "win32" ? "junction" : "dir");
-			assert.throws(
+			await assert.rejects(
 				() => createWorktrees(repoDir, "extension-symlink", 1, { baseDir: path.join(aliasDir, "checkout") }),
 				/worktree base directory cannot be inside Pi extensions directory/i,
 			);
@@ -339,15 +457,164 @@ console.log(JSON.stringify({ action: "created", branch, path: repo, created_bran
 		}
 	});
 
-	it("uses PI_SUBAGENTS_WORKTREE_DIR when no base directory is configured", () => {
+	it("keeps auto-managed extension repository worktrees outside extension discovery", async () => {
+		const sourceRepo = createRepo("pi-worktree-extension-source-");
+		const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "pi-worktree-home-"));
+		const agentDir = path.join(tempHome, ".pi", "agent");
+		const repoDir = path.join(agentDir, "extensions", "powerline-footer");
+		const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+		const previousHome = process.env.HOME;
+		const previousUserProfile = process.env.USERPROFILE;
+		let setup: WorktreeSetup | undefined;
+		try {
+			fs.mkdirSync(path.dirname(repoDir), { recursive: true });
+			fs.renameSync(sourceRepo, repoDir);
+			process.env.PI_CODING_AGENT_DIR = agentDir;
+			process.env.HOME = tempHome;
+			process.env.USERPROFILE = tempHome;
+
+			setup = await createWorktrees(repoDir, "extension-auto", 1);
+
+			assert.equal(setup.worktrees[0]?.provider, "native");
+			assert.equal(setup.worktrees[0]?.path, path.join(agentDir, "worktrees", "powerline-footer", "pi-worktree-extension-auto-0"));
+			assert.equal(resolveExpectedWorktreeAgentCwd(repoDir, "extension-auto", 0), setup.worktrees[0]?.path);
+		} finally {
+			if (setup) cleanupWorktrees(setup, { kind: "setup-rollback" });
+			if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+			else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+			if (previousHome === undefined) delete process.env.HOME;
+			else process.env.HOME = previousHome;
+			if (previousUserProfile === undefined) delete process.env.USERPROFILE;
+			else process.env.USERPROFILE = previousUserProfile;
+			cleanupRepo(repoDir);
+			cleanupRepo(sourceRepo);
+			fs.rmSync(tempHome, { recursive: true, force: true });
+		}
+	});
+
+	it("does not relocate explicitly native extension repository worktrees", async () => {
+		const sourceRepo = createRepo("pi-worktree-extension-native-source-");
+		const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "pi-worktree-home-"));
+		const agentDir = path.join(tempHome, ".pi", "agent");
+		const repoDir = path.join(agentDir, "extensions", "powerline-footer");
+		const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+		const previousHome = process.env.HOME;
+		const previousUserProfile = process.env.USERPROFILE;
+		try {
+			fs.mkdirSync(path.dirname(repoDir), { recursive: true });
+			fs.renameSync(sourceRepo, repoDir);
+			process.env.PI_CODING_AGENT_DIR = agentDir;
+			process.env.HOME = tempHome;
+			process.env.USERPROFILE = tempHome;
+
+			await assert.rejects(
+				() => createWorktrees(repoDir, "extension-native", 1, { provider: "native" }),
+				/worktree base directory cannot be inside Pi extensions directory/i,
+			);
+			assert.equal(fs.existsSync(path.join(agentDir, "worktrees")), false);
+		} finally {
+			if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+			else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+			if (previousHome === undefined) delete process.env.HOME;
+			else process.env.HOME = previousHome;
+			if (previousUserProfile === undefined) delete process.env.USERPROFILE;
+			else process.env.USERPROFILE = previousUserProfile;
+			cleanupRepo(repoDir);
+			cleanupRepo(sourceRepo);
+			fs.rmSync(tempHome, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects a final project directory inside Pi extensions", async () => {
+		const sourceRepo = createRepo("pi-worktree-extension-project-");
+		const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "pi-worktree-home-"));
+		const repoDir = path.join(tempHome, "extensions");
+		const agentDir = path.join(tempHome, ".pi", "agent");
+		const extensionsDir = path.join(agentDir, "extensions");
+		const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+		const previousHome = process.env.HOME;
+		const previousUserProfile = process.env.USERPROFILE;
+		try {
+			fs.renameSync(sourceRepo, repoDir);
+			fs.mkdirSync(extensionsDir, { recursive: true });
+			process.env.PI_CODING_AGENT_DIR = agentDir;
+			process.env.HOME = tempHome;
+			process.env.USERPROFILE = tempHome;
+
+			await assert.rejects(
+				() => createWorktrees(repoDir, "extension-project", 1, { provider: "native", baseDir: agentDir }),
+				/worktree path cannot be inside Pi extensions directory/i,
+			);
+			assert.throws(
+				() => resolveExpectedWorktreeAgentCwd(repoDir, "extension-project", 0, agentDir),
+				/worktree path cannot be inside Pi extensions directory/i,
+			);
+			assert.deepEqual(git(repoDir, ["worktree", "list", "--porcelain"]).split("\n").filter((line) => line.startsWith("worktree ")), [`worktree ${git(repoDir, ["rev-parse", "--show-toplevel"])}`]);
+			assert.deepEqual(fs.readdirSync(extensionsDir), []);
+		} finally {
+			if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+			else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+			if (previousHome === undefined) delete process.env.HOME;
+			else process.env.HOME = previousHome;
+			if (previousUserProfile === undefined) delete process.env.USERPROFILE;
+			else process.env.USERPROFILE = previousUserProfile;
+			cleanupRepo(repoDir);
+			cleanupRepo(sourceRepo);
+			fs.rmSync(tempHome, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects a project directory symlink into Pi extensions", async () => {
+		const repoDir = createRepo("pi-worktree-extension-project-symlink-");
+		const tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "pi-worktree-home-"));
+		const agentDir = path.join(tempHome, ".pi", "agent");
+		const extensionsDir = path.join(agentDir, "extensions");
+		const baseDir = path.join(tempHome, "worktree-root");
+		const previousAgentDir = process.env.PI_CODING_AGENT_DIR;
+		const previousHome = process.env.HOME;
+		const previousUserProfile = process.env.USERPROFILE;
+		try {
+			fs.mkdirSync(extensionsDir, { recursive: true });
+			fs.mkdirSync(baseDir, { recursive: true });
+			fs.symlinkSync(extensionsDir, path.join(baseDir, path.basename(repoDir)), process.platform === "win32" ? "junction" : "dir");
+			process.env.PI_CODING_AGENT_DIR = agentDir;
+			process.env.HOME = tempHome;
+			process.env.USERPROFILE = tempHome;
+
+			await assert.rejects(
+				() => createWorktrees(repoDir, "extension-project-symlink", 1, { provider: "native", baseDir }),
+				/worktree path cannot be inside Pi extensions directory/i,
+			);
+			assert.throws(
+				() => resolveExpectedWorktreeAgentCwd(repoDir, "extension-project-symlink", 0, baseDir),
+				/worktree path cannot be inside Pi extensions directory/i,
+			);
+			assert.deepEqual(git(repoDir, ["worktree", "list", "--porcelain"]).split("\n").filter((line) => line.startsWith("worktree ")), [`worktree ${git(repoDir, ["rev-parse", "--show-toplevel"])}`]);
+			assert.deepEqual(fs.readdirSync(extensionsDir), []);
+		} finally {
+			if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
+			else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
+			if (previousHome === undefined) delete process.env.HOME;
+			else process.env.HOME = previousHome;
+			if (previousUserProfile === undefined) delete process.env.USERPROFILE;
+			else process.env.USERPROFILE = previousUserProfile;
+			cleanupRepo(repoDir, baseDir);
+			fs.rmSync(tempHome, { recursive: true, force: true });
+		}
+	});
+
+	it("uses PI_SUBAGENTS_WORKTREE_DIR when no base directory is configured", async () => {
 		const repoDir = createRepo("pi-worktree-env-base-dir-");
 		const previous = process.env.PI_SUBAGENTS_WORKTREE_DIR;
 		const baseDir = path.join(os.tmpdir(), `pi-worktree-env-base-${Date.now().toString(36)}`);
 		let setup: WorktreeSetup | undefined;
 		try {
 			process.env.PI_SUBAGENTS_WORKTREE_DIR = baseDir;
-			setup = createWorktrees(repoDir, "env-base-dir", 1);
-			assert.equal(setup.worktrees[0]!.path, path.join(baseDir, "pi-worktree-env-base-dir-0"));
+			setup = await createWorktrees(repoDir, "env-base-dir", 1);
+			assert.equal(
+				setup.worktrees[0]!.path,
+				path.join(baseDir, path.basename(repoDir), "pi-worktree-env-base-dir-0"),
+			);
 		} finally {
 			if (setup) cleanupWorktrees(setup);
 			if (previous === undefined) {
@@ -355,17 +622,104 @@ console.log(JSON.stringify({ action: "created", branch, path: repo, created_bran
 			} else {
 				process.env.PI_SUBAGENTS_WORKTREE_DIR = previous;
 			}
-			cleanupRepo(repoDir);
-			fs.rmSync(baseDir, { recursive: true, force: true });
+			cleanupRepo(repoDir, baseDir);
 		}
 	});
 
-	it("createWorktrees rejects dirty repositories", () => {
+	it("rejects empty worktree base directory", async () => {
+		const repoDir = createRepo("pi-worktree-empty-base-");
+		try {
+			await assert.rejects(
+				() => createWorktrees(repoDir, "empty-base", 1, { baseDir: "   " }),
+				/worktree base directory cannot be empty/,
+			);
+		} finally {
+			cleanupRepo(repoDir);
+		}
+	});
+
+	it("rejects worktree paths that would land inside the repository checkout", async () => {
+		const repoDir = createRepo("pi-worktree-inside-");
+		const repoParent = path.dirname(repoDir);
+		const leakedLeaf = "pi-worktree-inside-0";
+		try {
+			await assert.rejects(
+				() => createWorktrees(repoDir, "inside", 1, { baseDir: repoParent }),
+				/inside the repository/i,
+			);
+			assert.throws(
+				() => resolveExpectedWorktreeAgentCwd(repoDir, "inside", 0, repoParent),
+				/inside the repository/i,
+			);
+
+			const porcelain = git(repoDir, ["worktree", "list", "--porcelain"]);
+			const worktreeLines = porcelain.split("\n").filter((line) => line.startsWith("worktree "));
+			assert.deepEqual(worktreeLines, [`worktree ${git(repoDir, ["rev-parse", "--show-toplevel"])}`]);
+			assert.equal(fs.existsSync(path.join(repoDir, leakedLeaf)), false);
+			assert.equal(fs.existsSync(path.join(repoParent, leakedLeaf)), false);
+		} finally {
+			cleanupRepo(repoDir);
+		}
+	});
+
+	it("rejects worktree paths that are direct children of the repository parent", async () => {
+		const repoDir = createRepo("pi-worktree-parent-child-");
+		const repoParent = path.dirname(repoDir);
+		const dedicatedRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pi-worktree-parent-child-root-"));
+		const projectDir = path.join(dedicatedRoot, path.basename(repoDir));
+		const leakedLeaf = path.join(repoParent, "pi-worktree-parent-child-0");
+		try {
+			fs.symlinkSync(repoParent, projectDir, process.platform === "win32" ? "junction" : "dir");
+			await assert.rejects(
+				() => createWorktrees(repoDir, "parent-child", 1, { baseDir: dedicatedRoot }),
+				/direct child of the repository parent/i,
+			);
+			assert.throws(
+				() => resolveExpectedWorktreeAgentCwd(repoDir, "parent-child", 0, dedicatedRoot),
+				/direct child of the repository parent/i,
+			);
+
+			const porcelain = git(repoDir, ["worktree", "list", "--porcelain"]);
+			const worktreeLines = porcelain.split("\n").filter((line) => line.startsWith("worktree "));
+			assert.deepEqual(worktreeLines, [`worktree ${git(repoDir, ["rev-parse", "--show-toplevel"])}`]);
+			assert.equal(fs.existsSync(leakedLeaf), false);
+		} finally {
+			try { fs.rmSync(leakedLeaf, { recursive: true, force: true }); } catch {}
+			fs.rmSync(dedicatedRoot, { recursive: true, force: true });
+			cleanupRepo(repoDir);
+		}
+	});
+
+	it("does not mkdir inside the checkout when rejecting unsafe locations", async () => {
+		const repoDir = createRepo("pi-worktree-no-mkdir-inside-");
+		try {
+			await assert.rejects(
+				() => createWorktrees(repoDir, "inside-self", 1, { baseDir: repoDir }),
+				/inside the repository/i,
+			);
+			assert.throws(
+				() => resolveExpectedWorktreeAgentCwd(repoDir, "inside-self", 0, repoDir),
+				/inside the repository/i,
+			);
+			assert.equal(fs.existsSync(path.join(repoDir, path.basename(repoDir))), false);
+
+			await assert.rejects(
+				() => createWorktrees(repoDir, "rel-worktrees", 1, { baseDir: "worktrees" }),
+				/inside the repository/i,
+			);
+			assert.equal(fs.existsSync(path.join(repoDir, "worktrees")), false);
+			assert.equal(fs.existsSync(path.join(repoDir, "worktrees", path.basename(repoDir))), false);
+		} finally {
+			cleanupRepo(repoDir);
+		}
+	});
+
+	it("createWorktrees rejects dirty repositories before resolving the requested base ref", async () => {
 		const repoDir = createRepo("pi-worktree-dirty-");
 		try {
 			fs.writeFileSync(path.join(repoDir, "tracked.txt"), "dirty\n", "utf-8");
-			assert.throws(
-				() => createWorktrees(repoDir, "dirty", 1),
+			await assert.rejects(
+				() => createWorktrees(repoDir, "dirty", 1, { baseRef: "unsafe..ref" }),
 				/worktree isolation requires a clean git working tree/i,
 			);
 		} finally {
@@ -373,13 +727,64 @@ console.log(JSON.stringify({ action: "created", branch, path: repo, created_bran
 		}
 	});
 
-	it("createWorktrees ignores pi-subagents runtime artifacts in the source checkout", () => {
+	it("allocates from baseRef while preserving source HEAD and propagating baseCommit to hooks and diffs", { skip: hookScriptSkip }, async () => {
+		const repoDir = createRepo("pi-worktree-base-ref-");
+		const firstCommit = git(repoDir, ["rev-parse", "HEAD"]);
+		git(repoDir, ["branch", "release"]);
+		fs.writeFileSync(path.join(repoDir, "tracked.txt"), "second\n", "utf-8");
+		git(repoDir, ["add", "tracked.txt"]);
+		git(repoDir, ["commit", "-m", "second commit"]);
+		const sourceHead = git(repoDir, ["rev-parse", "HEAD"]);
+		const hookPath = createHookScript(repoDir, "base-ref-hook.mjs", `
+import * as fs from "node:fs";
+const payload = JSON.parse(fs.readFileSync(0, "utf-8"));
+fs.writeFileSync(payload.worktreePath + "/.base-commit", payload.baseCommit + "\\n", "utf-8");
+process.stdout.write(JSON.stringify({ syntheticPaths: [".base-commit"] }));
+`);
+	let setup: WorktreeSetup | undefined;
+	try {
+		setup = await createWorktrees(repoDir, "base-ref", 1, {
+			provider: "native",
+			baseRef: "release",
+			setupHook: { hookPath: path.relative(repoDir, hookPath) },
+		});
+		const worktree = setup.worktrees[0]!;
+		assert.equal(setup.baseCommit, firstCommit);
+		assert.equal(git(worktree.path, ["rev-parse", "HEAD"]), firstCommit);
+		assert.equal(git(repoDir, ["rev-parse", "HEAD"]), sourceHead);
+		assert.equal(fs.readFileSync(path.join(worktree.path, ".base-commit"), "utf-8").trim(), firstCommit);
+		fs.writeFileSync(path.join(worktree.path, "tracked.txt"), "agent change\n", "utf-8");
+		const diffs = diffWorktrees(setup, ["worker"], path.join(repoDir, "artifacts", "base-ref"));
+		assert.equal(diffs[0]?.error, undefined);
+		assert.match(fs.readFileSync(diffs[0]!.patchPath, "utf-8"), /tracked\.txt/);
+	} finally {
+		if (setup) cleanupWorktrees(setup, { kind: "setup-rollback" });
+		cleanupRepo(repoDir);
+	}
+	});
+
+	it("rejects unsafe and unresolved base refs before allocation", async () => {
+		const repoDir = createRepo("pi-worktree-invalid-base-ref-");
+		try {
+			for (const baseRef of ["unsafe..ref", "branch name", "HEAD^{tree}", "@", "a".repeat(40), "a".repeat(64)] as const) {
+				await assert.rejects(() => createWorktrees(repoDir, `invalid-${baseRef.length}`, 1, { provider: "native", baseRef }), /baseRef.*HEAD.*named ref.*40\/64-character commit IDs.*revision expressions.*unsupported/);
+			}
+			git(repoDir, ["tag", "tree-object", "HEAD^{tree}"]);
+			await assert.rejects(() => createWorktrees(repoDir, "invalid-tree", 1, { provider: "native", baseRef: "tree-object" }), /could not be resolved to a commit/i);
+			await assert.rejects(() => createWorktrees(repoDir, "invalid-missing", 1, { provider: "native", baseRef: "refs/heads/missing" }), /could not be resolved to a commit/i);
+			assert.equal(git(repoDir, ["worktree", "list", "--porcelain"]).split("\n").filter((line) => line.startsWith("worktree ")).length, 1);
+		} finally {
+			cleanupRepo(repoDir);
+		}
+	});
+
+	it("createWorktrees ignores pi-subagents runtime artifacts in the source checkout", async () => {
 		const repoDir = createRepo("pi-worktree-runtime-artifacts-");
 		let setup: WorktreeSetup | undefined;
 		try {
 			fs.mkdirSync(path.join(repoDir, ".pi/subagents", "missions"), { recursive: true });
 			fs.writeFileSync(path.join(repoDir, ".pi/subagents", "missions", "mission.json"), "{}\n", "utf-8");
-			setup = createWorktrees(repoDir, "runtime-artifacts", 1);
+			setup = await createWorktrees(repoDir, "runtime-artifacts", 1);
 			assert.equal(setup.worktrees.length, 1);
 		} finally {
 			if (setup) cleanupWorktrees(setup);
@@ -428,7 +833,7 @@ console.log(JSON.stringify({ action: "created", branch, path: repo, created_bran
 		});
 	});
 
-	it("diffWorktrees captures committed, modified, and new files without staging the node_modules symlink", () => {
+	it("diffWorktrees captures committed, modified, and new files without staging the node_modules symlink", async () => {
 		const repoDir = createRepo("pi-worktree-diff-");
 		const nodeModulesDir = path.join(repoDir, "node_modules");
 		fs.mkdirSync(nodeModulesDir, { recursive: true });
@@ -436,7 +841,7 @@ console.log(JSON.stringify({ action: "created", branch, path: repo, created_bran
 
 		let setup: WorktreeSetup | undefined;
 		try {
-			setup = createWorktrees(repoDir, `diff-${process.pid}`, 1);
+			setup = await createWorktrees(repoDir, `diff-${process.pid}`, 1);
 			const worktree = setup.worktrees[0]!;
 			fs.writeFileSync(path.join(worktree.path, "committed.ts"), "export const committed = true;\n", "utf-8");
 			git(worktree.path, ["add", "committed.ts"]);
@@ -467,11 +872,58 @@ console.log(JSON.stringify({ action: "created", branch, path: repo, created_bran
 		}
 	});
 
-	it("cleanupWorktrees removes worktrees and branches", () => {
+	it("captures applyable patches despite external diffs and display configuration", { skip: hookScriptSkip }, async () => {
+		const repoDir = createRepo("pi-worktree-diff-external-");
+		const externalDiffPath = createHookScript(repoDir, "external-diff.mjs", `
+process.stdout.write("corrupt external diff output\\n");
+`);
+		let setup: WorktreeSetup | undefined;
+		try {
+			git(repoDir, ["config", "diff.external", externalDiffPath]);
+			git(repoDir, ["config", "color.ui", "always"]);
+			git(repoDir, ["config", "diff.noprefix", "true"]);
+			git(repoDir, ["config", "diff.linePrefix", "corrupt display prefix "]);
+			git(repoDir, ["config", "diff.relative", "true"]);
+			setup = await createWorktrees(repoDir, "diff-external", 1);
+			const worktree = setup.worktrees[0]!;
+			fs.writeFileSync(path.join(worktree.path, "tracked.txt"), "external-safe\n", "utf-8");
+
+			const diffs = diffWorktrees(setup, ["worker"], path.join(repoDir, "artifacts", "external"));
+			assert.equal(diffs[0]?.error, undefined);
+			const patch = fs.readFileSync(diffs[0]!.patchPath, "utf-8");
+			assert.match(patch, /^diff --git a\/tracked\.txt b\/tracked\.txt/m);
+			assert.doesNotMatch(patch, /corrupt external diff output|corrupt display prefix|\u001b/);
+			assert.equal(git(worktree.path, ["apply", "--check", "--cached", "--reverse", diffs[0]!.patchPath]), "");
+		} finally {
+			if (setup) cleanupWorktrees(setup, { kind: "setup-rollback" });
+			cleanupRepo(repoDir);
+		}
+	});
+
+	it("includes binary data in captured patches", async () => {
+		const repoDir = createRepo("pi-worktree-diff-binary-");
+		let setup: WorktreeSetup | undefined;
+		try {
+			setup = await createWorktrees(repoDir, "diff-binary", 1);
+			const worktree = setup.worktrees[0]!;
+			fs.writeFileSync(path.join(worktree.path, "binary.dat"), Buffer.from([0, 1, 2, 255, 0, 3]));
+
+			const diffs = diffWorktrees(setup, ["worker"], path.join(repoDir, "artifacts", "binary"));
+			assert.equal(diffs[0]?.error, undefined);
+			const patch = fs.readFileSync(diffs[0]!.patchPath, "utf-8");
+			assert.match(patch, /GIT binary patch/);
+			assert.equal(git(worktree.path, ["apply", "--check", "--cached", "--reverse", diffs[0]!.patchPath]), "");
+		} finally {
+			if (setup) cleanupWorktrees(setup, { kind: "setup-rollback" });
+			cleanupRepo(repoDir);
+		}
+	});
+
+	it("cleanupWorktrees removes worktrees and branches", async () => {
 		const repoDir = createRepo("pi-worktree-cleanup-");
 		let setup: WorktreeSetup | undefined;
 		try {
-			setup = createWorktrees(repoDir, "cleanup", 2);
+			setup = await createWorktrees(repoDir, "cleanup", 2);
 			const worktreePaths = setup.worktrees.map((worktree) => worktree.path);
 			const branches = setup.worktrees.map((worktree) => worktree.branch);
 			const cleanup = cleanupWorktrees(setup);
@@ -494,11 +946,11 @@ console.log(JSON.stringify({ action: "created", branch, path: repo, created_bran
 		}
 	});
 
-	it("preserves dirty worktrees when no patch was captured", () => {
+	it("preserves dirty worktrees when no patch was captured", async () => {
 		const repoDir = createRepo("pi-worktree-uncaptured-");
 		let setup: WorktreeSetup | undefined;
 		try {
-			setup = createWorktrees(repoDir, "uncaptured", 1);
+			setup = await createWorktrees(repoDir, "uncaptured", 1);
 			const worktree = setup.worktrees[0]!;
 			fs.writeFileSync(path.join(worktree.path, "tracked.txt"), "uncaptured\n", "utf-8");
 
@@ -521,11 +973,11 @@ console.log(JSON.stringify({ action: "created", branch, path: repo, created_bran
 		}
 	});
 
-	it("preserves committed branch work when no patch was captured", () => {
+	it("preserves committed branch work when no patch was captured", async () => {
 		const repoDir = createRepo("pi-worktree-committed-uncaptured-");
 		let setup: WorktreeSetup | undefined;
 		try {
-			setup = createWorktrees(repoDir, "committed-uncaptured", 1);
+			setup = await createWorktrees(repoDir, "committed-uncaptured", 1);
 			const worktree = setup.worktrees[0]!;
 			fs.writeFileSync(path.join(worktree.path, "committed.txt"), "unlanded commit\n", "utf-8");
 			git(worktree.path, ["add", "committed.txt"]);
@@ -545,11 +997,36 @@ console.log(JSON.stringify({ action: "created", branch, path: repo, created_bran
 		}
 	});
 
-	it("removes dirty worktrees only after their captured patch is recorded in the handoff manifest", () => {
+	it("does not let trusted external diff hide uncaptured committed work during cleanup", { skip: hookScriptSkip }, async () => {
+		const repoDir = createRepo("pi-worktree-cleanup-external-diff-");
+		const externalDiffPath = createHookScript(repoDir, "external-diff-clean.mjs", "process.exit(0);");
+		let setup: WorktreeSetup | undefined;
+		try {
+			git(repoDir, ["config", "diff.external", externalDiffPath]);
+			git(repoDir, ["config", "diff.trustExitCode", "true"]);
+			setup = await createWorktrees(repoDir, "cleanup-external-diff", 1);
+			const worktree = setup.worktrees[0]!;
+			fs.writeFileSync(path.join(worktree.path, "committed.txt"), "unlanded work\n", "utf-8");
+			git(worktree.path, ["add", "committed.txt"]);
+			git(worktree.path, ["commit", "-m", "unlanded work"]);
+
+			const cleanup = cleanupWorktrees(setup);
+			assert.equal(cleanup.state, "partial");
+			assert.equal(cleanup.tasks[0]?.preserved, true);
+			assert.match(cleanup.tasks[0]?.reason ?? "", /not represented by a captured handoff patch/);
+			assert.equal(fs.existsSync(worktree.path), true);
+			assert.notEqual(git(repoDir, ["branch", "--list", worktree.branch]), "");
+		} finally {
+			if (setup) cleanupWorktrees(setup, { kind: "setup-rollback" });
+			cleanupRepo(repoDir);
+		}
+	});
+
+	it("removes dirty worktrees only after their captured patch is recorded in the handoff manifest", async () => {
 		const repoDir = createRepo("pi-worktree-captured-");
 		let setup: WorktreeSetup | undefined;
 		try {
-			setup = createWorktrees(repoDir, "captured", 1);
+			setup = await createWorktrees(repoDir, "captured", 1);
 			const worktreePath = setup.worktrees[0]!.path;
 			fs.writeFileSync(path.join(worktreePath, "tracked.txt"), "captured\n", "utf-8");
 			const diffs = diffWorktrees(setup, ["worker"], path.join(repoDir, "artifacts", "captured"));
@@ -565,7 +1042,21 @@ console.log(JSON.stringify({ action: "created", branch, path: repo, created_bran
 				version: 1,
 				groups: [{ children: [{ patch: { path: diffs[0]!.patchPath } }] }],
 			}), "utf-8");
-			const cleanup = cleanupWorktrees(setup, { kind: "preserve", capturedDiffs: diffs, handoffManifestPath });
+			fs.writeFileSync(diffs[0]!.patchPath, "corrupt patch\n", "utf-8");
+			const invalidPatch = cleanupWorktrees(setup, { kind: "preserve", capturedDiffs: diffs, handoffManifestPath });
+			assert.equal(invalidPatch.state, "partial");
+			assert.match(invalidPatch.tasks[0]?.reason ?? "", /failed validation/);
+			assert.equal(fs.existsSync(worktreePath), true);
+
+			const validatedDiffs = diffWorktrees(setup, ["worker"], path.join(repoDir, "artifacts", "captured"));
+			fs.writeFileSync(path.join(worktreePath, "late.txt"), "late\n", "utf-8");
+			const stalePatch = cleanupWorktrees(setup, { kind: "preserve", capturedDiffs: validatedDiffs, handoffManifestPath });
+			assert.equal(stalePatch.state, "partial");
+			assert.match(stalePatch.tasks[0]?.reason ?? "", /does not match current worktree changes/);
+			assert.equal(fs.existsSync(worktreePath), true);
+
+			const currentDiffs = diffWorktrees(setup, ["worker"], path.join(repoDir, "artifacts", "captured"));
+			const cleanup = cleanupWorktrees(setup, { kind: "preserve", capturedDiffs: currentDiffs, handoffManifestPath });
 			assert.equal(cleanup.state, "complete");
 			assert.equal(fs.existsSync(worktreePath), false);
 			setup = undefined;
@@ -575,9 +1066,7 @@ console.log(JSON.stringify({ action: "created", branch, path: repo, created_bran
 		}
 	});
 
-	it("createWorktrees creates node_modules symlink when node_modules exists", {
-		skip: process.platform === "win32" ? "Symlink behavior differs on Windows CI environments." : undefined,
-	}, () => {
+	it("createWorktrees creates node_modules link when node_modules exists", async () => {
 		const repoDir = createRepo("pi-worktree-node-modules-");
 		const nodeModulesDir = path.join(repoDir, "node_modules");
 		fs.mkdirSync(nodeModulesDir, { recursive: true });
@@ -585,22 +1074,172 @@ console.log(JSON.stringify({ action: "created", branch, path: repo, created_bran
 
 		let setup: WorktreeSetup | undefined;
 		try {
-			setup = createWorktrees(repoDir, "node-modules", 1);
+			setup = await createWorktrees(repoDir, "node-modules", 1);
 			const symlinkPath = path.join(setup.worktrees[0]!.path, "node_modules");
 			assert.equal(setup.worktrees[0]!.nodeModulesLinked, true);
 			assert.deepEqual(setup.worktrees[0]!.syntheticPaths, ["node_modules"]);
-			assert.ok(fs.existsSync(symlinkPath), "node_modules link should exist");
 			assert.equal(fs.lstatSync(symlinkPath).isSymbolicLink(), true, "node_modules should be a symlink");
-			assert.equal(fs.realpathSync(symlinkPath), fs.realpathSync(nodeModulesDir));
+			assert.equal(fs.realpathSync.native(symlinkPath), fs.realpathSync.native(nodeModulesDir));
 		} finally {
 			if (setup) cleanupWorktrees(setup);
 			cleanupRepo(repoDir);
 		}
 	});
 
+	it("preserves a dangling node_modules destination", {
+		skip: process.platform === "win32" ? "Git symlink behavior differs on Windows CI environments." : undefined,
+	}, async () => {
+		const repoDir = createRepo("pi-worktree-dangling-node-modules-");
+		const sourceModulesName = ".source-dependencies";
+		fs.mkdirSync(path.join(repoDir, sourceModulesName));
+		fs.appendFileSync(path.join(repoDir, ".git", "info", "exclude"), `${sourceModulesName}/\n`);
+		fs.symlinkSync(sourceModulesName, path.join(repoDir, "node_modules"));
+		git(repoDir, ["add", "node_modules", "-f"]);
+		git(repoDir, ["commit", "-m", "track environment-relative node_modules symlink"]);
+
+		let setup: WorktreeSetup | undefined;
+		try {
+			setup = await createWorktrees(repoDir, `dangling-node-modules-${process.pid}`, 1);
+			const destination = path.join(setup.worktrees[0]!.path, "node_modules");
+			assert.equal(fs.lstatSync(destination).isSymbolicLink(), true);
+			assert.equal(fs.existsSync(destination), false, "tracked destination should be dangling in the managed worktree");
+			assert.equal(fs.readlinkSync(destination), sourceModulesName);
+			assert.equal(setup.worktrees[0]!.nodeModulesLinked, false);
+			assert.deepEqual(setup.worktrees[0]!.syntheticPaths, []);
+		} finally {
+			if (setup) cleanupWorktrees(setup, { kind: "setup-rollback" });
+			cleanupRepo(repoDir);
+		}
+	});
+
+	it("preserves a tracked node_modules destination before validating the source", async () => {
+		const repoDir = createRepo("pi-worktree-tracked-node-modules-file-");
+		fs.writeFileSync(path.join(repoDir, "node_modules"), "tracked destination\n", "utf-8");
+		git(repoDir, ["add", "node_modules"]);
+		git(repoDir, ["commit", "-m", "track node_modules file"]);
+
+		let setup: WorktreeSetup | undefined;
+		try {
+			setup = await createWorktrees(repoDir, "tracked-node-modules-file", 1);
+			const destination = path.join(setup.worktrees[0]!.path, "node_modules");
+			assert.equal(fs.readFileSync(destination, "utf-8").trim(), "tracked destination");
+			assert.equal(setup.worktrees[0]!.nodeModulesLinked, false);
+			assert.deepEqual(setup.worktrees[0]!.syntheticPaths, []);
+		} finally {
+			if (setup) cleanupWorktrees(setup, { kind: "setup-rollback" });
+			cleanupRepo(repoDir);
+		}
+	});
+
+	it("treats a dangling source node_modules as absent", {
+		skip: process.platform === "win32" ? "Creating a dangling directory symlink requires elevated privileges on Windows." : undefined,
+	}, async () => {
+		const repoDir = createRepo("pi-worktree-dangling-source-node-modules-");
+		fs.appendFileSync(path.join(repoDir, ".git", "info", "exclude"), "/node_modules\n");
+		fs.symlinkSync("missing-source-dependencies", path.join(repoDir, "node_modules"));
+
+		let setup: WorktreeSetup | undefined;
+		try {
+			setup = await createWorktrees(repoDir, `dangling-source-node-modules-${process.pid}`, 1);
+			const destination = path.join(setup.worktrees[0]!.path, "node_modules");
+			assert.equal(fs.lstatSync(path.join(repoDir, "node_modules")).isSymbolicLink(), true);
+			assert.equal(fs.existsSync(destination), false);
+			assert.equal(setup.worktrees[0]!.nodeModulesLinked, false);
+			assert.deepEqual(setup.worktrees[0]!.syntheticPaths, []);
+		} finally {
+			if (setup) cleanupWorktrees(setup, { kind: "setup-rollback" });
+			cleanupRepo(repoDir);
+		}
+	});
+
+	it("adds dependency paths and cause when source inspection fails", async () => {
+		const repoDir = createRepo("pi-worktree-node-modules-probe-failure-");
+		const nodeModulesDir = path.join(repoDir, "node_modules");
+		fs.mkdirSync(nodeModulesDir);
+		const originalStatSync = fsCjs.statSync;
+		let attemptedSource: string | undefined;
+		try {
+			fsCjs.statSync = ((candidate, ...args) => {
+				if (path.basename(String(candidate)) === "node_modules") {
+					attemptedSource = String(candidate);
+					const error = new Error("permission denied during source inspection") as NodeJS.ErrnoException;
+					error.code = "EACCES";
+					throw error;
+				}
+				return originalStatSync(candidate, ...args);
+			}) as typeof fsCjs.statSync;
+			syncBuiltinESMExports();
+
+			await assert.rejects(() => createWorktrees(repoDir, "node-modules-probe-failure", 1), (error: unknown) => {
+				assert.ok(error instanceof WorktreeSetupError);
+				assert.match(error.message, /failed to link node_modules/);
+				assert.match(error.message, /EACCES/);
+				assert.ok(attemptedSource);
+				assert.ok(error.message.includes(attemptedSource));
+				const task = error.snapshot.cleanup?.tasks[0];
+				assert.ok(task);
+				assert.ok(error.message.includes(path.join(task.path, "node_modules")));
+				assert.ok(error.cause instanceof Error && error.cause.cause instanceof Error);
+				assert.equal((error.cause.cause as NodeJS.ErrnoException).code, "EACCES");
+				assert.equal(error.snapshot.cleanup?.state, "complete");
+				assert.equal(task.worktreeRemoved, true);
+				assert.equal(task.branchRemoved, true);
+				assert.equal(fs.existsSync(task.path), false);
+				assert.equal(git(repoDir, ["branch", "--list", task.branch]), "");
+				return true;
+			});
+		} finally {
+			fsCjs.statSync = originalStatSync;
+			syncBuiltinESMExports();
+			cleanupRepo(repoDir);
+		}
+	});
+
+	it("rejects and compensates when node_modules link creation fails", async () => {
+		const repoDir = createRepo("pi-worktree-node-modules-failure-");
+		const nodeModulesDir = path.join(repoDir, "node_modules");
+		fs.mkdirSync(nodeModulesDir);
+		const originalSymlinkSync = fsCjs.symlinkSync;
+		let attemptedSource: string | undefined;
+		let attemptedDestination: string | undefined;
+		try {
+			fsCjs.symlinkSync = ((target, destination) => {
+				attemptedSource = String(target);
+				attemptedDestination = String(destination);
+				const error = new Error("operation not permitted") as NodeJS.ErrnoException;
+				error.code = "EPERM";
+				throw error;
+			}) as typeof fsCjs.symlinkSync;
+			syncBuiltinESMExports();
+
+			await assert.rejects(() => createWorktrees(repoDir, "node-modules-failure", 1), (error: unknown) => {
+				assert.ok(error instanceof WorktreeSetupError);
+				assert.match(error.message, /failed to link node_modules/);
+				assert.match(error.message, /EPERM/);
+				assert.ok(attemptedSource);
+				assert.ok(error.message.includes(attemptedSource));
+				assert.ok(attemptedDestination);
+				assert.ok(error.message.includes(attemptedDestination));
+				assert.ok(error.cause instanceof Error && error.cause.cause instanceof Error);
+				assert.equal((error.cause.cause as NodeJS.ErrnoException).code, "EPERM");
+				assert.equal(error.snapshot.cleanup?.state, "complete");
+				const task = error.snapshot.cleanup?.tasks[0];
+				assert.equal(task?.worktreeRemoved, true);
+				assert.equal(task?.branchRemoved, true);
+				assert.equal(fs.existsSync(task!.path), false);
+				assert.equal(git(repoDir, ["branch", "--list", task!.branch]), "");
+				return true;
+			});
+		} finally {
+			fsCjs.symlinkSync = originalSymlinkSync;
+			syncBuiltinESMExports();
+			cleanupRepo(repoDir);
+		}
+	});
+
 	it("diffWorktrees preserves a tracked node_modules symlink", {
 		skip: process.platform === "win32" ? "Symlink behavior differs on Windows CI environments." : undefined,
-	}, () => {
+	}, async () => {
 		const repoDir = createRepo("pi-worktree-tracked-node-modules-");
 		const vendorDir = path.join(repoDir, "vendor-modules");
 		fs.mkdirSync(vendorDir, { recursive: true });
@@ -611,7 +1250,7 @@ console.log(JSON.stringify({ action: "created", branch, path: repo, created_bran
 
 		let setup: WorktreeSetup | undefined;
 		try {
-			setup = createWorktrees(repoDir, `tracked-node-modules-${process.pid}`, 1);
+			setup = await createWorktrees(repoDir, `tracked-node-modules-${process.pid}`, 1);
 			assert.equal(setup.worktrees[0]!.nodeModulesLinked, false);
 			assert.deepEqual(setup.worktrees[0]!.syntheticPaths, []);
 			fs.writeFileSync(path.join(setup.worktrees[0]!.path, "tracked.txt"), "modified\n", "utf-8");
@@ -627,7 +1266,7 @@ console.log(JSON.stringify({ action: "created", branch, path: repo, created_bran
 		}
 	});
 
-	it("runs a repo-relative worktree setup hook and records synthetic paths", { skip: hookScriptSkip }, () => {
+	it("runs a repo-relative worktree setup hook and records synthetic paths", { skip: hookScriptSkip }, async () => {
 		const repoDir = createRepo("pi-worktree-hook-relative-");
 		const hookPath = createHookScript(repoDir, "setup-hook.mjs", `
 import * as fs from "node:fs";
@@ -640,7 +1279,7 @@ process.stdout.write(JSON.stringify({ syntheticPaths: [".venv"] }));
 
 		let setup: WorktreeSetup | undefined;
 		try {
-			setup = createWorktrees(repoDir, "hook-relative", 1, {
+			setup = await createWorktrees(repoDir, "hook-relative", 1, {
 				setupHook: { hookPath: path.relative(repoDir, hookPath) },
 			});
 			assert.ok(setup.worktrees[0]!.syntheticPaths.includes(".venv"));
@@ -650,7 +1289,7 @@ process.stdout.write(JSON.stringify({ syntheticPaths: [".venv"] }));
 		}
 	});
 
-	it("runs an absolute worktree setup hook path", { skip: hookScriptSkip }, () => {
+	it("runs an absolute worktree setup hook path", { skip: hookScriptSkip }, async () => {
 		const repoDir = createRepo("pi-worktree-hook-absolute-");
 		const hookPath = createHookScript(repoDir, "setup-hook.mjs", `
 import * as fs from "node:fs";
@@ -660,7 +1299,7 @@ process.stdout.write(JSON.stringify({ syntheticPaths: [] }));
 
 		let setup: WorktreeSetup | undefined;
 		try {
-			setup = createWorktrees(repoDir, "hook-absolute", 1, {
+			setup = await createWorktrees(repoDir, "hook-absolute", 1, {
 				setupHook: { hookPath },
 			});
 			assert.equal(setup.worktrees.length, 1);
@@ -670,10 +1309,10 @@ process.stdout.write(JSON.stringify({ syntheticPaths: [] }));
 		}
 	});
 
-	it("rejects bare command names for worktree setup hooks", () => {
+	it("rejects bare command names for worktree setup hooks", async () => {
 		const repoDir = createRepo("pi-worktree-hook-bare-");
 		try {
-			assert.throws(
+			await assert.rejects(
 				() => createWorktrees(repoDir, "hook-bare", 1, { setupHook: { hookPath: "node" } }),
 				/worktree setup hook must be an absolute path or a repo-relative path/i,
 			);
@@ -682,7 +1321,8 @@ process.stdout.write(JSON.stringify({ syntheticPaths: [] }));
 		}
 	});
 
-	it("rejects tracked synthetic paths from hook output", { skip: hookScriptSkip }, () => {
+	it("rejects tracked synthetic paths from hook output", { skip: hookScriptSkip }, async () => {
+		if (await runPoisonCaseInChild("rejects tracked synthetic paths from hook output")) return;
 		const repoDir = createRepo("pi-worktree-hook-tracked-");
 		const hookPath = createHookScript(repoDir, "tracked-hook.mjs", `
 import * as fs from "node:fs";
@@ -690,17 +1330,24 @@ JSON.parse(fs.readFileSync(0, "utf-8"));
 process.stdout.write(JSON.stringify({ syntheticPaths: ["tracked.txt"] }));
 `);
 		const runId = `hook-tracked-${Date.now().toString(36)}`;
+		let retained: WorktreeSetup | undefined;
 		try {
-			assert.throws(
+			await assert.rejects(
 				() => createWorktrees(repoDir, runId, 1, { setupHook: { hookPath: path.relative(repoDir, hookPath) } }),
-				/cannot mark tracked paths as synthetic/i,
+				(error: unknown) => {
+					assert.ok(error instanceof WorktreeSetupError);
+					retained = error.snapshot.setup;
+					return assertRetainedHookFailure(error, /cannot mark tracked paths as synthetic/i);
+				},
 			);
 		} finally {
+			for (const worktree of retained?.worktrees ?? []) fs.rmSync(worktree.path, { recursive: true, force: true });
 			cleanupRepo(repoDir);
 		}
 	});
 
-	it("rejects absolute synthetic paths from hook output", { skip: hookScriptSkip }, () => {
+	it("rejects absolute synthetic paths from hook output", { skip: hookScriptSkip }, async () => {
+		if (await runPoisonCaseInChild("rejects absolute synthetic paths from hook output")) return;
 		const repoDir = createRepo("pi-worktree-hook-absolute-synthetic-");
 		const hookPath = createHookScript(repoDir, "absolute-path-hook.mjs", `
 import * as fs from "node:fs";
@@ -708,17 +1355,23 @@ const payload = JSON.parse(fs.readFileSync(0, "utf-8"));
 process.stdout.write(JSON.stringify({ syntheticPaths: [payload.worktreePath + "/.venv"] }));
 `);
 		const runId = `hook-absolute-synthetic-${Date.now().toString(36)}`;
+		let retained: WorktreeSetup | undefined;
 		try {
-			assert.throws(
+			await assert.rejects(
 				() => createWorktrees(repoDir, runId, 1, { setupHook: { hookPath: path.relative(repoDir, hookPath) } }),
-				/synthetic path must be relative/i,
+				(error: unknown) => {
+					assert.ok(error instanceof WorktreeSetupError);
+					retained = error.snapshot.setup;
+					return assertRetainedHookFailure(error, /synthetic path must be relative/i);
+				},
 			);
 		} finally {
+			for (const worktree of retained?.worktrees ?? []) fs.rmSync(worktree.path, { recursive: true, force: true });
 			cleanupRepo(repoDir);
 		}
 	});
 
-	it("excludes hook-created synthetic files from captured patch output", { skip: hookScriptSkip }, () => {
+	it("excludes hook-created synthetic files from captured patch output", { skip: hookScriptSkip }, async () => {
 		const repoDir = createRepo("pi-worktree-hook-diff-");
 		const hookPath = createHookScript(repoDir, "setup-copy-hook.mjs", `
 import * as fs from "node:fs";
@@ -730,7 +1383,7 @@ process.stdout.write(JSON.stringify({ syntheticPaths: [".env.local"] }));
 
 		let setup: WorktreeSetup | undefined;
 		try {
-			setup = createWorktrees(repoDir, `hook-diff-${process.pid}`, 1, {
+			setup = await createWorktrees(repoDir, `hook-diff-${process.pid}`, 1, {
 				setupHook: { hookPath: path.relative(repoDir, hookPath) },
 			});
 			fs.writeFileSync(path.join(setup.worktrees[0]!.path, "tracked.txt"), "modified-by-agent\n", "utf-8");
@@ -744,9 +1397,11 @@ process.stdout.write(JSON.stringify({ syntheticPaths: [".env.local"] }));
 		}
 	});
 
-	it("cleans up created worktrees when a later hook setup fails", { skip: hookScriptSkip }, () => {
+	it("retains created worktrees when a later hook failure has unknown settlement", { skip: hookScriptSkip }, async () => {
+		if (await runPoisonCaseInChild("retains created worktrees when a later hook failure has unknown settlement")) return;
 		const repoDir = createRepo("pi-worktree-hook-cleanup-");
 		const runId = `hook-cleanup-${Date.now().toString(36)}`;
+		let retained: WorktreeSetup | undefined;
 		const hookPath = createHookScript(repoDir, "flaky-hook.mjs", `
 import * as fs from "node:fs";
 const payload = JSON.parse(fs.readFileSync(0, "utf-8"));
@@ -757,18 +1412,29 @@ if (payload.index === 1) {
 process.stdout.write(JSON.stringify({ syntheticPaths: [] }));
 `);
 		try {
-			assert.throws(
+			await assert.rejects(
 				() => createWorktrees(repoDir, runId, 2, { setupHook: { hookPath: path.relative(repoDir, hookPath) } }),
-				/worktree setup hook failed with exit code 1/i,
+				(error: unknown) => {
+					assert.ok(error instanceof WorktreeSetupError);
+					retained = error.snapshot.setup;
+					assertRetainedHookFailure(error, /worktree setup hook failed/i);
+					assert.equal(error.snapshot.attempts[1]?.hookCommand?.result?.status, 1);
+					assert.equal(error.snapshot.setup.worktrees.length, 2);
+					for (const worktree of error.snapshot.setup.worktrees) {
+						assert.equal(fs.existsSync(worktree.path), true);
+						assert.equal(git(worktree.path, ["branch", "--show-current"]), worktree.branch);
+					}
+					return true;
+				},
 			);
-			const branchList = git(repoDir, ["branch", "--list", "pi-subagents/task-hook-cleanup-s0-t*"]);
-			assert.equal(branchList.trim(), "", "temporary branches should be cleaned up after setup failure");
+			await assert.rejects(() => createWorktrees(repoDir, "after-hook-failure", 1, { provider: "native" }), /Worktree mutation blocked/i);
 		} finally {
+			for (const worktree of retained?.worktrees ?? []) fs.rmSync(worktree.path, { recursive: true, force: true });
 			cleanupRepo(repoDir);
 		}
 	});
 
-	it("fails when the hook exceeds the configured timeout", { skip: hookScriptSkip }, () => {
+	it("fails when the hook exceeds the configured timeout", { skip: hookScriptSkip }, async () => {
 		const repoDir = createRepo("pi-worktree-hook-timeout-");
 		const hookPath = createHookScript(repoDir, "slow-hook.mjs", `
 import * as fs from "node:fs";
@@ -779,11 +1445,16 @@ setTimeout(() => {
 `);
 		const runId = `hook-timeout-${Date.now().toString(36)}`;
 		try {
-			assert.throws(
+			await assert.rejects(
 				() => createWorktrees(repoDir, runId, 1, {
 					setupHook: { hookPath: path.relative(repoDir, hookPath), timeoutMs: 50 },
 				}),
-				/timed out/i,
+				(error: unknown) => {
+					assert.ok(error instanceof WorktreeSetupError);
+					assert.ok(error.cause instanceof Error && error.cause.cause instanceof Error);
+					assert.match(error.cause.cause.message, /timed out/i);
+					return true;
+				},
 			);
 		} finally {
 			cleanupRepo(repoDir);

@@ -1,0 +1,10 @@
+Turn this into a tiny Go invoice utility project.
+
+Requirements:
+1. Keep go.mod as-is.
+2. Work only in the workspace root.
+3. Create totals.go exporting `sumInvoiceTotals(invoices []Invoice) int`.
+4. Update main.go to use that helper and expose a `demoTotal` variable computed from two sample invoices.
+5. Fix any diagnostics pi-lens surfaces while you work.
+6. Do not add dependencies.
+7. End with a short summary of what you changed.

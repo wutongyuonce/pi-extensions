@@ -1,0 +1,26 @@
+{
+  "success": true,
+  "scannedAt": "2026-08-18T07:00:00.000Z",
+  "analyzed": true,
+  "summary": "1 vulnerability",
+  "findings": [
+    {
+      "osv": "GO-2026-1234",
+      "module": "example.com/vulnerable",
+      "packageName": "example.com/vulnerable/pkg",
+      "fixedVersion": "v1.2.3",
+      "severity": "HIGH",
+      "summary": "Denial of service in example.com/vulnerable",
+      "url": "https://pkg.go.dev/vuln/GO-2026-1234",
+      "trace": [
+        {
+          "module": "example.com/app",
+          "packageName": "main",
+          "functionName": "main",
+          "filename": "__PROJECT_ROOT__/cmd/main.go",
+          "line": 88
+        }
+      ]
+    }
+  ]
+}

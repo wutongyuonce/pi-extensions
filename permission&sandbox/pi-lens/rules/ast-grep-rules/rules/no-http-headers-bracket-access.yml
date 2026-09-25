@@ -1,0 +1,27 @@
+id: no-http-headers-bracket-access
+language: Python
+message: "HTTP headers should be accessed via .get() to avoid KeyError"
+severity: warning
+note: |
+  Port of SonarCloud python:S8371.
+
+  `request.headers["X-Foo"]` raises KeyError if the header is
+  missing. Use `request.headers.get("X-Foo")` (returns None) or
+  `request.headers["X-Foo"]` after a guard check.
+
+  Matches bracket-style subscript READS on a `headers` attribute
+  (`$REQ.headers[$KEY]` already subsumes the `request.`/`response.`-
+  named forms). A write through the same bracket syntax —
+  `resp.headers["X"] = v`, `resp.headers["X"] += v`, or
+  `del resp.headers["X"]` — sets or removes the header and can never
+  raise KeyError, so those are excluded.
+metadata:
+  sonar: S8371
+rule:
+  all:
+    - pattern: "$REQ.headers[$KEY]"
+    - not:
+        any:
+          - inside: { kind: assignment, field: left }
+          - inside: { kind: augmented_assignment, field: left }
+          - inside: { kind: delete_statement }

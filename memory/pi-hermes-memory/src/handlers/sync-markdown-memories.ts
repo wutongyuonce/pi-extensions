@@ -32,6 +32,10 @@ export interface MigrationSyncOptions extends ExtensionRootMigrationOptions {
   onMigrationSucceeded?: () => void;
 }
 
+export interface SyncMarkdownOptions {
+  force?: boolean;
+}
+
 function readEntries(filePath: string): string[] {
   if (!fs.existsSync(filePath)) return [];
   const raw = fs.readFileSync(filePath, 'utf-8').trim();
@@ -135,6 +139,7 @@ export async function syncMarkdownMemoriesToSqlite(
   globalDir: string,
   projectsMemoryDir?: string,
   agentRoot = AGENT_ROOT,
+  options?: SyncMarkdownOptions,
 ): Promise<BackfillCounters & { projectCount: number }> {
   const counters: BackfillCounters = {
     filesScanned: 0,
@@ -160,11 +165,16 @@ export async function syncMarkdownMemoriesToSqlite(
       counters.entriesScanned += entries.length;
       try {
         const result = target === 'failure'
-          ? reconcileMarkdownFailureScopes(dbManager, entries)
-          : reconcileMarkdownMemoryScope(dbManager, entries, target, project);
+          ? reconcileMarkdownFailureScopes(dbManager, entries, options)
+          : reconcileMarkdownMemoryScope(dbManager, entries, target, project, options);
         counters.imported += result.inserted;
         counters.skipped += result.existing;
         counters.removed += result.removed;
+        if (result.degraded) {
+          counters.warnings.push(
+            `${path.basename(project ?? 'global')}/${target}: FTS5 search index error (${result.degradedReason}); run /memory-sync-markdown to rebuild`,
+          );
+        }
       } catch (err) {
         counters.warnings.push(
           `${path.basename(project ?? 'global')}/${target}: ${err instanceof Error ? err.message : String(err)}`,
@@ -232,7 +242,7 @@ export function registerSyncMarkdownMemoriesCommand(
       ctx.ui.notify('🔄 Reconciling the SQLite search mirror with Markdown memories...', 'info');
 
       try {
-        const counters = await syncMarkdownMemoriesToSqlite(dbManager, globalDir, projectsMemoryDir, agentRoot);
+        const counters = await syncMarkdownMemoriesToSqlite(dbManager, globalDir, projectsMemoryDir, agentRoot, { force: true });
 
         let output = `\n✅ Markdown → SQLite sync complete!\n\n`;
         output += `📊 Results:\n`;

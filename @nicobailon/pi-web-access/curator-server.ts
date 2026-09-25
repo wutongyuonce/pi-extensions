@@ -17,6 +17,8 @@ type CuratorStoredEvent =
 
 export interface CuratorServerOptions {
 	queries: string[];
+	/** First index available to searches added while initial results are still streaming. */
+	initialResultIndexCapacity?: number;
 	sessionToken: string;
 	timeout: number;
 	availableProviders: ProviderAvailability;
@@ -39,7 +41,7 @@ export interface IndexedCuratorSearchEntry extends CuratorSearchEntry {
 }
 
 export interface CuratorServerCallbacks {
-	onSubmit: (payload: { selectedQueryIndices: number[]; summary?: string; summaryMeta?: SummaryMeta; rawResults?: boolean }) => void;
+	onSubmit: (payload: { selectedQueryIndices: number[]; summary?: string; summaryMeta?: SummaryMeta; rawResults?: boolean; autoApproveRemainingSearches?: boolean }) => void;
 	onCancel: (reason: "user" | "timeout" | "stale") => void;
 	onProviderChange: (provider: string) => void;
 	onAddSearch: (query: string, provider?: string) => Promise<CuratorSearchEntry[]>;
@@ -194,6 +196,7 @@ export function startCuratorServer(
 ): Promise<CuratorServerHandle> {
 	const {
 		queries,
+		initialResultIndexCapacity,
 		sessionToken,
 		timeout,
 		availableProviders,
@@ -213,7 +216,7 @@ export function startCuratorServer(
 	let sseResponse: ServerResponse | null = null;
 	const streamedEventsByResultIndex = new Map<number, CuratorStoredEvent>();
 	let searchStreamDone = queries.length === 0;
-	let nextQueryIndex = queries.length;
+	let nextQueryIndex = Math.max(queries.length, initialResultIndexCapacity ?? queries.length);
 	let summarizeAbortController: AbortController | null = null;
 	let summarizeRequestSeq = 0;
 
@@ -297,9 +300,12 @@ export function startCuratorServer(
 		if (provider === "anysearch") return availableProviders.anysearch;
 		if (provider === "xcrawl") return availableProviders.xcrawl;
 		if (provider === "xai") return availableProviders.xai;
+		if (provider === "mistral") return availableProviders.mistral;
 		if (provider === "brightdata") return availableProviders.brightdata;
 		if (provider === "serpbase") return availableProviders.serpbase;
 		if (provider === "serper") return availableProviders.serper;
+		if (provider === "serply") return availableProviders.serply;
+		if (provider === "baizhi") return availableProviders.baizhi;
 		if (provider === "valyu") return availableProviders.valyu;
 		return false;
 	}
@@ -638,12 +644,14 @@ export function startCuratorServer(
 					return;
 				}
 				const rawResults = (body as { rawResults?: unknown }).rawResults === true;
+				const autoApproveRemainingSearches = (body as { autoApproveRemainingSearches?: unknown }).autoApproveRemainingSearches === true;
 				sendJson(res, 200, { ok: true });
 				setImmediate(() => callbacks.onSubmit({
 					selectedQueryIndices: parsed.indices,
 					...(summary !== undefined ? { summary } : {}),
 					...(summaryMeta !== undefined ? { summaryMeta } : {}),
 					rawResults,
+					...(autoApproveRemainingSearches ? { autoApproveRemainingSearches: true } : {}),
 				}));
 				return;
 			}

@@ -183,9 +183,63 @@ test("get_search_content normalizes bridge defaults for search matches", async (
 	});
 
 	assert.equal(result.details.findMode, "case-insensitive");
-	assert.equal(result.details.matchCount, 3);
+	assert.equal(result.details.matchCount, 4);
 	assert.match(result.content[0].text, /ScriptManager\.swift/);
 	assert.match(result.content[0].text, /ScriptMenu/);
+});
+
+test("get_search_content pages complete search data and validates search ranges", async () => {
+	const tool = getContentTool();
+	const lateSnippet = `LATE_SNIPPET_${"S".repeat(116_000)}`;
+	const source = {
+		query: "oversized stored search",
+		answer: `answer ${"A".repeat(40_000)} OMITTED_ANSWER`,
+		results: [
+			{ title: "First", url: "https://example.com/first", snippet: "first snippet" },
+			{ title: "Late", url: "https://example.com/late", snippet: lateSnippet },
+		],
+		error: null,
+		provider: "fixture-provider",
+	};
+	storeResult("oversized-search", { id: "oversized-search", type: "search", timestamp: Date.now(), queries: [source] });
+
+	const first = await tool.execute("call", { responseId: "oversized-search", queryIndex: 0, limit: 30_000 });
+	assert.ok(first.details.returnedChars < 30_000);
+	assert.equal(first.details.nextOffset, first.details.returnedChars);
+	assert.equal(first.details.truncated, true);
+	assert.ok(first.content[0].text.length <= 30_000);
+	assert.ok(first.details.contentLength > 156_000);
+	assert.match(first.content[0].text, /Provider:\*\* fixture-provider/);
+	assert.doesNotMatch(first.content[0].text, /LATE_SNIPPET/);
+
+	const late = await tool.execute("call", {
+		responseId: "oversized-search",
+		queryIndex: 0,
+		findText: ["OMITTED_ANSWER", "LATE_SNIPPET"],
+		findMode: "exact",
+	});
+	assert.equal(late.details.matchCount, 2);
+	assert.match(late.content[0].text, /OMITTED_ANSWER/);
+	assert.match(late.content[0].text, /LATE_SNIPPET/);
+
+	const one = await tool.execute("call", { responseId: "oversized-search", queryIndex: 0, limit: 1 });
+	assert.equal(one.details.returnedChars, 1);
+	assert.equal(one.details.nextOffset, 1);
+	assert.ok(one.content[0].text.length <= 30_000);
+	assert.match(one.content[0].text, /offset: 1, limit: 1/);
+
+	const eof = await tool.execute("call", { responseId: "oversized-search", queryIndex: 0, offset: first.details.contentLength, limit: 1 });
+	assert.equal(eof.content[0].text, "");
+	assert.equal(eof.details.returnedChars, 0);
+	assert.equal(eof.details.nextOffset, null);
+	assert.equal(eof.details.truncated, false);
+
+	const invalidLimit = await tool.execute("call", { responseId: "oversized-search", queryIndex: 0, limit: 30_001 });
+	assert.equal(invalidLimit.details.error, "Invalid limit");
+	const invalidOffset = await tool.execute("call", { responseId: "oversized-search", queryIndex: 0, offset: -1 });
+	assert.equal(invalidOffset.details.error, "Invalid offset");
+	const outOfRange = await tool.execute("call", { responseId: "oversized-search", queryIndex: 0, offset: first.details.contentLength + 1 });
+	assert.equal(outOfRange.details.error, "Offset out of range");
 });
 
 test("get_search_content returns small fetched content without continuation noise", async () => {
@@ -220,4 +274,44 @@ test("get_search_content finds bounded passages in stored fetched content", asyn
 	assert.equal(result.details.findMode, "case-insensitive");
 	assert.match(result.content[0].text, /Installation requires Node 22/);
 	assert.ok(result.content[0].text.length < 1_000);
+});
+
+test("get_search_content represents every matching maximum-length query under overflow", async () => {
+	const tool = getContentTool();
+	const sequence = "a".repeat(499) + "0123456789";
+	const queries = Array.from({ length: 10 }, (_, index) => sequence.slice(index, index + 500));
+	const gap = "Z".repeat(1_000);
+	const occurrence = query => `${"x".repeat(500)}${query}${"x".repeat(500)}`;
+	const content = [
+		...queries.slice(0, 9).map(occurrence),
+		sequence,
+		occurrence(queries[0]),
+		occurrence(queries[1]),
+		occurrence(queries[9]),
+	].join(gap);
+	storeFetchedContent(content);
+
+	assert.equal(new Set(queries).size, 10);
+	assert.ok(queries.every(query => query.length === 500));
+	assert.equal(Value.Check(tool.parameters.properties.findText, queries), true);
+	const result = await tool.execute("call", {
+		responseId: "large-fetch",
+		urlIndex: 0,
+		findText: queries,
+		findMode: "exact",
+	});
+	const excerpts = result.content[0].text.split("\n\n").slice(1).join("\n\n");
+
+	assert.equal(result.details.matchCount, 22);
+	assert.ok(result.details.returnedMatches <= result.details.matchCount);
+	const snippets = excerpts.split("\n\n").filter(section => /^\d+\. /.test(section))
+		.map(section => section.split("\n").slice(1).join("\n")).join("");
+	for (const [index, query] of queries.entries()) {
+		assert.ok(excerpts.includes(`Q${index + 1} = "${query}"`), "missing legend entry");
+		assert.ok(snippets.includes(query), "missing representative occurrence");
+	}
+	if (result.details.returnedMatches < result.details.matchCount) {
+		assert.match(excerpts, /Showing \d+ of 22 matches\./);
+	}
+	assert.ok(excerpts.length <= 20_000);
 });

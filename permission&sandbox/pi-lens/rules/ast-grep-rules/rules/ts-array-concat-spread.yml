@@ -1,0 +1,10 @@
+id: ts-array-concat-spread
+language: typescript
+severity: warning
+message: arr.concat([...items]) - use arr.push(...items) or [...arr, ...items]
+metadata:
+  weight: 2
+  category: slop
+rule:
+  kind: call_expression
+  pattern: "$ARR.concat([...$ITEMS])"

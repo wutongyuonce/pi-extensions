@@ -1,0 +1,18 @@
+{
+	"provenance": {
+		"runner": "markdownlint",
+		"tool": "markdownlint",
+		"version": "0.23.0",
+		"command": "markdownlint bad.md",
+		"argv": [
+			"bad.md"
+		],
+		"workspace": "tests/fixtures/tool-smoke/markdown",
+		"platform": "win32-x64",
+		"capturedAt": "2026-08-21"
+	},
+	"file": "bad.md",
+	"exitCode": 1,
+	"stdout": "markdownlint-cli2 v0.23.0 (markdownlint v0.41.0)\nFinding: bad.md\nLinting: 1 file(s)\nSummary: 1 error(s)\n",
+	"stderr": "bad.md:3 error MD025/single-title/single-h1 Multiple top-level headings in the same document [Context: \"Second Top-Level Heading\"]\n"
+}

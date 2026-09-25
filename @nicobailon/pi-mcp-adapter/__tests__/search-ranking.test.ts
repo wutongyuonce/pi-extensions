@@ -21,6 +21,24 @@ describe("search ranking", () => {
     expect(scoreToolMatch(tool("search_records", "Find records"), "demo", "search missing")).toBeNull();
   });
 
+  it("keeps single-character Unicode query terms", () => {
+    expect(scoreToolMatch(tool("weather", "天气和雨"), "demo", "雨")).not.toBeNull();
+    expect(scoreToolMatch(tool("calendar", "Calendar events"), "demo", "calendar历")).toBeNull();
+  });
+
+  it("does not match only the retained prefix of a long Unicode query", () => {
+    const query = Array.from({ length: 80 }, (_, index) => String.fromCodePoint(0x4e00 + index)).join("");
+
+    expect(scoreToolMatch(tool("prefix", query.slice(0, 79)), "demo", query)).toBeNull();
+    expect(scoreToolMatch(tool("complete", query), "demo", query)).not.toBeNull();
+  });
+
+  it("does not apply ASCII stemming to astral Unicode tokens", () => {
+    const query = Array.from({ length: 80 }, (_, index) => String.fromCodePoint(0x20000 + index)).join("");
+
+    expect(scoreToolMatch(tool("prefix", [...query].slice(0, 2).join("")), "demo", query)).toBeNull();
+  });
+
   it("ignores single-letter possessive tokens instead of stem-matching them", () => {
     // "project's" tokenizes to ["project", "s"]; a bare "s" must not match "simulator".
     expect(scoreToolMatch(tool("sync_icon", "Add an icon to your project's icons file."), "better-icons", "simulator")).toBeNull();

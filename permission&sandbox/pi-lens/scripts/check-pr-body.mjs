@@ -1,0 +1,1485 @@
+import { readdirSync, readFileSync, statSync } from "node:fs";
+import { dirname, isAbsolute, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
+import { gitExecFileSync } from "./lib/git-fixture-env.mjs";
+
+const TEMPLATE_PATH = ".github/PULL_REQUEST_TEMPLATE.md";
+const TEMPLATE_FILE = resolve(
+	dirname(fileURLToPath(import.meta.url)),
+	"..",
+	TEMPLATE_PATH,
+);
+const REQUIRED_SECTIONS = [
+	"Why",
+	"Notes for the reviewer",
+	"Change outline",
+	"Tests",
+	"Blast radius",
+	"Class sweep",
+	"Observability",
+];
+const HEADING = /^#{2,4}\s+(.+?)\s*$/;
+const FLATTENED_BODY_MAX_NEWLINES = 2;
+const REPAIR_HEADINGS = [
+	"Why",
+	"Notes for the reviewer",
+	"Change outline",
+	"Summary",
+	"Tests",
+	"Test assessment",
+	"Blast radius",
+	"Class sweep",
+	"Observability",
+	"Fix round \\d+",
+	"Review round \\d+",
+];
+const REPAIR_HEADING_PATTERN = REPAIR_HEADINGS.join("|");
+const CORRUPTED_HEADING_TAILS = [
+	"hy",
+	"otes for the reviewer",
+	"hange outline",
+	"ummary",
+	"ests",
+	"est assessment",
+	"last radius",
+	"lass sweep",
+	"bservability",
+	"ix round \\d+",
+	"eview round \\d+",
+];
+const CORRUPTED_IDENTIFIER_TAILS = ["etchOpenPullRequests", "px"];
+
+// Fleet census from the review of 11 bodies: ## OBSERVABILITY x5,
+// ## what changed x6, ## verification x7, and ## Summary x1. “What changed”
+// (with or without “and why”) satisfies Summary; “Verification” satisfies
+// Tests. Heading matching is deliberately case-insensitive.
+const SECTION_SYNONYMS = new Map([
+	["why", "why"],
+	["notes for the reviewer", "notes for the reviewer"],
+	["change outline", "change outline"],
+	["summary", "summary"],
+	["problem", "summary"],
+	["what changed", "summary"],
+	["what changed and why", "summary"],
+	["what changed / why", "summary"],
+	["what changed / why / verification", ["summary", "tests"]],
+	["tests", "tests"],
+	["verification", "tests"],
+	["blast radius", "blast radius"],
+	["class sweep", "class sweep"],
+	["observability", "observability"],
+	["test assessment", "test assessment"],
+]);
+const REVIEW_HEADER_REPAIR_PREFIX =
+	"## Why\nLegacy body normalized for the required review contract.\n\n" +
+	"## Notes for the reviewer\nNone.\n\n" +
+	"## Change outline\n- existing body structure\n";
+
+function sectionMessage(name, detail) {
+	return `PR body ${detail} "## ${name}". See ${TEMPLATE_PATH}.`;
+}
+
+function hasSection(heading, section) {
+	return Array.isArray(heading?.section)
+		? heading.section.includes(section)
+		: heading?.section === section;
+}
+
+function sourceWithoutFencedBlocks(source) {
+	let fenced = false;
+	return String(source ?? "")
+		.split(/\r?\n/)
+		.map((line) => {
+			if (/^\s*```/.test(line)) {
+				fenced = !fenced;
+				return "";
+			}
+			return fenced ? "" : line;
+		})
+		.join("\n");
+}
+
+function templatePlaceholderLines() {
+	const lines = sourceWithoutFencedBlocks(
+		readFileSync(TEMPLATE_FILE, "utf8"),
+	).split(/\r?\n/);
+	const placeholders = new Map();
+	let current;
+	for (const line of lines) {
+		const heading = HEADING.exec(line);
+		if (heading) {
+			current = SECTION_SYNONYMS.get(heading[1].trim().toLowerCase());
+			continue;
+		}
+		const value = line.trim();
+		// Exact placeholder matching is intentionally advisory: paste-and-tweak
+		// residuals can evade it when a contributor changes one word.
+		if (current && value && !/^[-*+] \[ \]/.test(value)) {
+			if (!placeholders.has(current)) placeholders.set(current, new Set());
+			placeholders.get(current).add(value);
+		}
+	}
+	return placeholders;
+}
+
+function hasRealContent(lines, section, placeholders) {
+	const templateLines = placeholders.get(section) ?? new Set();
+	return lines.some((line) => {
+		const value = line.trim();
+		// A nested heading is structure, not content: counting it let an empty
+		// "## Tests" pass on the strength of its own "### Test assessment" line
+		// (#2124 review F1).
+		return (
+			value &&
+			!HEADING.test(value) &&
+			!/^[-*+] \[ \]/.test(value) &&
+			!templateLines.has(value)
+		);
+	});
+}
+
+function blankCommentsAndStrings(source) {
+	let state = "code";
+	let result = "";
+	const strings = [];
+	let stringStart = -1;
+	let previousToken = null;
+	let stringPrefix = "";
+	// ECMAScript's lexical grammar permits a RegularExpressionLiteral where an
+	// expression starts. Classify the preceding token by whether it can end an
+	// expression; this covers expression-start keywords and punctuators without
+	// maintaining a list of individual regex contexts.
+	const expressionEndingPunctuation = new Set([")", "]", "}", "++", "--"]);
+	const expressionStartKeywords = new Set([
+		"await",
+		"case",
+		"delete",
+		"do",
+		"else",
+		"in",
+		"instanceof",
+		"new",
+		"of",
+		"return",
+		"throw",
+		"typeof",
+		"void",
+		"yield",
+	]);
+	const regexMayStart = (token) => {
+		if (token === null || expressionStartKeywords.has(token)) return true;
+		if (expressionEndingPunctuation.has(token)) return false;
+		return !/[$\w]/.test(token);
+	};
+	const decoded = (value) => value.replace(/\\([\s\S])/g, "$1");
+	for (let index = 0; index < source.length; index += 1) {
+		const char = source[index];
+		const next = source[index + 1];
+		if (state === "line-comment") {
+			result += char === "\n" ? "\n" : " ";
+			if (char === "\n") state = "code";
+			continue;
+		}
+		if (state === "block-comment") {
+			result += char === "\n" ? "\n" : " ";
+			if (char === "*" && next === "/") {
+				result += " ";
+				index += 1;
+				state = "code";
+			}
+			continue;
+		}
+		if (state === "regex" || state === "regex-class") {
+			result += char === "\n" ? "\n" : " ";
+			if (char === "\\") {
+				if (next === "\n") result += "\n";
+				else {
+					result += " ";
+					index += 1;
+				}
+			} else if (state === "regex" && char === "[") state = "regex-class";
+			else if (state === "regex-class" && char === "]") state = "regex";
+			else if (state === "regex" && char === "/") {
+				state = "code";
+				previousToken = "value";
+			}
+			continue;
+		}
+		if (state !== "code") {
+			result += char === "\n" ? "\n" : " ";
+			if (char === "\\") {
+				if (next === "\n") result += "\n";
+				else {
+					result += " ";
+					index += 1;
+				}
+			} else if (char === state) {
+				strings.push({
+					start: stringStart,
+					end: index + 1,
+					quote: state,
+					text: decoded(source.slice(stringStart + 1, index)),
+					prefix: stringPrefix,
+				});
+				state = "code";
+				previousToken = "value";
+			}
+			continue;
+		}
+		if (char === "/" && next === "/") {
+			result += "  ";
+			index += 1;
+			state = "line-comment";
+		} else if (char === "/" && next === "*") {
+			result += "  ";
+			index += 1;
+			state = "block-comment";
+		} else if (char === "/" && regexMayStart(previousToken)) {
+			result += " ";
+			state = "regex";
+		} else if (char === "'" || char === '"' || char === "`") {
+			result += " ";
+			stringStart = index;
+			stringPrefix = result.slice(-256).trimEnd();
+			state = char;
+			previousToken = "string";
+		} else {
+			result += char;
+			if (/[$\w]/.test(char)) {
+				let wordEnd = index + 1;
+				while (/[$\w]/.test(source[wordEnd] ?? "")) wordEnd += 1;
+				const word = source.slice(index, wordEnd);
+				result += word.slice(1);
+				index = wordEnd - 1;
+				previousToken = word;
+			} else if (char === next && (char === "+" || char === "-")) {
+				result += next;
+				index += 1;
+				previousToken = char + next;
+			} else if (!/\s/.test(char)) previousToken = char;
+		}
+	}
+	return { text: result, strings };
+}
+
+export { blankCommentsAndStrings };
+
+function isRuntimeObservabilityPath(name) {
+	return (
+		/^(?:clients|tools|mcp)\//.test(name) &&
+		!/(?:^|\/)__tests__(?:\/|$)/.test(name) &&
+		!/\.test\.[^/]+$/.test(name) &&
+		!/\.d\.(?:ts|mts)$/.test(name)
+	);
+}
+
+function runtimeObservabilityFromDiff(diff = "") {
+	const records = new Set();
+	let runtime = false;
+	let added = "";
+	let currentRuntime = false;
+	for (const line of String(diff).split(/\r?\n/)) {
+		const header = /^diff --git a\/(.+) b\/(.+)$/.exec(line);
+		if (header) {
+			currentRuntime = [header[1], header[2]].some(isRuntimeObservabilityPath);
+			runtime ||= currentRuntime;
+			continue;
+		}
+		if (currentRuntime && /^\+(?!\+\+)/.test(line))
+			added += `${line.slice(1)}\n`;
+	}
+	if (!runtime) return { runtime: false, records, failurePath: false };
+	const blanked = blankCommentsAndStrings(added).text;
+	return {
+		runtime: true,
+		records: recordLiteralsFromRuntimeSource(added),
+		failurePath:
+			/\bcatch\b|\brecordDegradationOnce\b|\bthrow\b|\breturn\s+null\b/.test(
+				blanked,
+			),
+	};
+}
+
+function observabilitySectionContent(body, lines, headings) {
+	const heading = headings.find((candidate) =>
+		hasSection(candidate, "observability"),
+	);
+	if (!heading) return "";
+	const next = headings.find(
+		(candidate) =>
+			candidate.index > heading.index && candidate.level <= heading.level,
+	);
+	return lines.slice(heading.index + 1, next?.index ?? lines.length).join("\n");
+}
+
+function recordLiteralsFromRuntimeSource(source) {
+	return new Set(
+		recordLocationsFromRuntimeSource(source).map(({ value }) => value),
+	);
+}
+
+function recordLocationsFromRuntimeSource(source) {
+	const records = [];
+	const blanked = blankCommentsAndStrings(source).text;
+	const calls = [
+		["recordDegradationOnce", ["kind"]],
+		["incrementDegradationCount", ["kind"]],
+		["logExtension", ["subsystem", "message"]],
+		["logLatency", ["phase", "event", "eventName", "name"]],
+		// #3168 F12: `logCascade` (clients/cascade-logger.ts) is a
+		// `createNdjsonLogger` sink with the same `phase` discriminator as
+		// `logLatency`, so a PR whose only new bounded record goes to
+		// cascade.log could not state it in any of the three accepted forms —
+		// the honest section was refused and the only passing wording was the
+		// false "no record added." sentence.
+		["logCascade", ["phase"]],
+		["emitBounded", ["kind", "event", "eventName"]],
+	];
+	for (const [name, fields] of calls) {
+		const callPattern = new RegExp(`${name}\\s*\\(\\s*\\{[\\s\\S]*?\\}`, "g");
+		for (const match of blanked.matchAll(callPattern)) {
+			const original = source.slice(match.index, match.index + match[0].length);
+			for (const field of fields) {
+				const fieldMatch = new RegExp(`${field}\\s*:\\s*["']([^"']+)["']`).exec(
+					original,
+				);
+				const value = fieldMatch?.[1];
+				if (value) {
+					const valueIndex =
+						match.index + fieldMatch.index + fieldMatch[0].indexOf(value);
+					records.push({
+						value,
+						line: source.slice(0, valueIndex).split("\n").length,
+					});
+				}
+			}
+		}
+	}
+	return records;
+}
+
+const CODE_CITATION = /`([^`\s:]+):((?:~?\d+)(?:-\d+)?)`/g;
+const MASTER_CLAIM =
+	/pre-existing|red on master|also fails on origin\/master|environment-specific/i;
+
+function headFileSource(file, options = {}) {
+	if (options.headFiles?.has?.(file)) return options.headFiles.get(file);
+	if (/(?:^|\/)\.\.(?:\/|$)/.test(file) || isAbsolute(file)) return null;
+	if (options.workingTree) {
+		try {
+			return readFileSync(resolve(options.cwd ?? process.cwd(), file), "utf8");
+		} catch {
+			return null;
+		}
+	}
+	try {
+		return String(
+			(options.git ?? gitExecFileSync)(["show", `HEAD:${file}`], {
+				cwd: options.cwd ?? process.cwd(),
+				encoding: "utf8",
+			}),
+		);
+	} catch {
+		return null;
+	}
+}
+
+function sourceLines(source) {
+	return String(source ?? "").split(/\r?\n/);
+}
+
+const HEAD_TEST_CORPUS_CACHE_LIMIT = 8;
+const headTestCorpusCache = new Map();
+
+export function testCorpus(options = {}) {
+	const cwd = options.cwd ?? process.cwd();
+	let cacheKey;
+	if (!options.workingTree) {
+		try {
+			const revision = String(
+				(options.git ?? gitExecFileSync)(["rev-parse", "HEAD"], {
+					cwd,
+					encoding: "utf8",
+				}),
+			).trim();
+			if (revision) cacheKey = `${cwd}:${revision}`;
+		} catch {
+			// A failed revision lookup must not turn a mutable tree into a cache hit.
+		}
+	}
+	if (cacheKey) {
+		const cached = headTestCorpusCache.get(cacheKey);
+		if (cached) return cached;
+	}
+	let files = [];
+	try {
+		const tracked = String(
+			(options.git ?? gitExecFileSync)(["ls-files", "--", "tests"], {
+				cwd,
+				encoding: "utf8",
+			}),
+		);
+		files = tracked.split(/\r?\n/).filter(Boolean);
+		if (options.workingTree) {
+			const untracked = String(
+				(options.git ?? gitExecFileSync)(
+					["ls-files", "--others", "--exclude-standard", "--", "tests"],
+					{ cwd, encoding: "utf8" },
+				),
+			)
+				.split(/\r?\n/)
+				.filter(Boolean);
+			files = [...new Set([...files, ...untracked])];
+		}
+	} catch {
+		const visit = (directory) => {
+			for (const entry of readdirSync(directory, { withFileTypes: true })) {
+				const path = resolve(directory, entry.name);
+				if (entry.isDirectory()) visit(path);
+				else if (path.endsWith(".ts") || path.endsWith(".tsx"))
+					files.push(path.slice(cwd.length + 1).replaceAll("\\", "/"));
+			}
+		};
+		try {
+			visit(resolve(cwd, "tests"));
+		} catch {
+			files = [];
+		}
+	}
+	const paths = new Set(
+		// #3013 (defect shape 47): PR-body fixtures live under the scanned
+		// tests/ root, so without this filter the corpus would resolve a
+		// fixture's own fabricated ids and accept the body under test.
+		files.filter((file) => !file.startsWith("tests/fixtures/ci-pr-bodies/")),
+	);
+	const titles = new Set();
+	for (const file of files) {
+		if (
+			file.startsWith("tests/fixtures/ci-pr-bodies/") ||
+			!/\.(?:[cm]?[jt]sx?)$/.test(file)
+		)
+			continue;
+		// The checker test contributes only its declaration titles. Its fixture
+		// strings and arbitrary prose never enter this corpus.
+		let source;
+		try {
+			source = readFileSync(resolve(cwd, file), "utf8");
+		} catch {
+			continue;
+		}
+		const lexed = blankCommentsAndStrings(source);
+		for (const string of lexed.strings) {
+			const prefix = string.prefix;
+			const opening = prefix.lastIndexOf("(");
+			if (opening < 0) continue;
+			const beforeOpening = prefix.slice(0, opening).trimEnd();
+			const direct = /\b(?:it|test|describe)\s*$/.test(beforeOpening);
+			let depth = 0;
+			let matchingOpening = -1;
+			for (let index = beforeOpening.length - 1; index >= 0; index -= 1) {
+				if (beforeOpening[index] === ")") depth += 1;
+				else if (beforeOpening[index] === "(" && --depth === 0) {
+					matchingOpening = index;
+					break;
+				}
+			}
+			const each =
+				(matchingOpening >= 0 &&
+					/\b(?:it|test|describe)\s*\.each\s*$/.test(
+						beforeOpening.slice(0, matchingOpening).trimEnd(),
+					)) ||
+				/\b(?:it|test|describe)\s*\.each\s*(?:[\s\S]*\)|`[\s\S]*`)$/.test(
+					beforeOpening,
+				);
+			if (!direct && !each) continue;
+			const title = string.text;
+			if (title.trim()) titles.add(title.trim());
+		}
+	}
+	const corpus = { paths, titles };
+	if (cacheKey) {
+		if (headTestCorpusCache.size >= HEAD_TEST_CORPUS_CACHE_LIMIT)
+			headTestCorpusCache.delete(headTestCorpusCache.keys().next().value);
+		headTestCorpusCache.set(cacheKey, corpus);
+	}
+	return corpus;
+}
+
+function markdownBlocks(body) {
+	const lines = String(body ?? "").split(/\r?\n/);
+	const blocks = [];
+	let current = null;
+	let fence = null;
+	const flush = () => {
+		if (current?.lines.length) blocks.push(current);
+		current = null;
+	};
+	for (let index = 0; index < lines.length; index += 1) {
+		const line = lines[index];
+		const marker = line.match(/^\s*(```+)/)?.[1];
+		if (marker || fence) {
+			if (marker && !fence && current && current.lines.length) flush();
+			if (!current) current = { lines: [], start: index, fence: true };
+			current.lines.push(line);
+			if (marker && !fence) fence = marker;
+			else if (fence && marker && marker.length >= fence.length) {
+				fence = null;
+				flush();
+			}
+			continue;
+		}
+		if (!line.trim()) {
+			flush();
+			continue;
+		}
+		if (/^\s*\|/.test(line) && current && !/^\s*\|/.test(current.lines[0]))
+			flush();
+		if (!current) current = { lines: [], start: index, fence: false };
+		current.lines.push(line);
+	}
+	flush();
+	return blocks.map((block) => ({
+		...block,
+		text: block.lines.join("\n"),
+		table: !block.fence && block.lines.every((line) => /^\s*\|/.test(line)),
+	}));
+}
+
+function codeSpanMasked(text) {
+	return String(text).replace(/(`+)([\s\S]*?)\1/g, (span) =>
+		" ".repeat(span.length),
+	);
+}
+
+function endsSentence(text, index) {
+	const char = text[index];
+	if (!".!?".includes(char)) return false;
+	if (char === "." && (text[index - 1] === "." || text[index + 1] === "."))
+		return false;
+	const next = text[index + 1] ?? "";
+	if (next && !/\s/.test(next)) return false;
+	const following = text.slice(index + 1).match(/\S/)?.[0];
+	return following === undefined || /[A-Z]/.test(following);
+}
+
+function splitMarkdownSentences(text) {
+	const sentences = [];
+	let start = 0;
+	const masked = codeSpanMasked(text);
+	for (let index = 0; index < text.length; index += 1) {
+		if (endsSentence(masked, index)) {
+			sentences.push({ text: text.slice(start, index + 1), start });
+			start = index + 1;
+		}
+	}
+	if (text.slice(start).trim())
+		sentences.push({ text: text.slice(start), start });
+	return sentences;
+}
+
+function countSentenceTerminators(lines) {
+	let count = 0;
+	const masked = codeSpanMasked(lines.join("\n").trim());
+	for (let index = 0; index < masked.length; index += 1) {
+		if (endsSentence(masked, index)) count += 1;
+	}
+	return count;
+}
+
+export function splitMarkdownUnits(body = "") {
+	const units = [];
+	for (const block of markdownBlocks(body)) {
+		if (block.fence) {
+			units.push({ kind: "fence", text: block.text });
+			continue;
+		}
+		if (/^\s*#{1,6}\s/.test(block.lines[0])) {
+			units.push({ kind: "heading", text: block.text });
+			continue;
+		}
+		if (/^\s*[-*+]\s+/.test(block.lines[0])) {
+			units.push({ kind: "list", text: block.text });
+			continue;
+		}
+		if (block.table) {
+			for (const line of block.lines) units.push({ kind: "table", text: line });
+			continue;
+		}
+		for (const sentence of splitMarkdownSentences(block.text))
+			units.push({ kind: "sentence", text: sentence.text.trim() });
+	}
+	return units;
+}
+
+function bodyLinesOutsideFences(body) {
+	let fence;
+	return String(body ?? "")
+		.split(/\r?\n/)
+		.map((line) => {
+			const marker = line.match(/^\s*(```+)/)?.[1];
+			if (marker) {
+				if (!fence) fence = marker;
+				else if (marker.length >= fence.length) fence = undefined;
+				return "";
+			}
+			return fence ? "" : line;
+		});
+}
+
+function pathLineReferences(text) {
+	return [...String(text ?? "").matchAll(CODE_CITATION)].map((match) => ({
+		file: match[1],
+		lineText: match[2],
+		line: Number(match[2].replace(/^~/, "").split("-", 1)[0]),
+		end: match[2].includes("-")
+			? Number(match[2].replace(/^~/, "").split("-", 2)[1])
+			: undefined,
+		index: match.index,
+	}));
+}
+
+function sourceQuoteAfter(lines, bodyLine) {
+	let index = bodyLine + 1;
+	while (index < lines.length && !lines[index].trim()) index += 1;
+	const opener = lines[index]?.match(/^\s*(```+)(.*)$/);
+	if (!opener) return null;
+	const fence = opener[1];
+	const end = lines.findIndex(
+		(row, rowIndex) =>
+			rowIndex > index && new RegExp(`^\\s*${fence}\\s*$`).test(row),
+	);
+	if (end === -1) return null;
+	const text = lines.slice(index + 1, end).filter((row) => row.trim());
+	return { end, info: opener[2].trim(), text };
+}
+
+function isTranscriptQuote(quote) {
+	const lines = quote.text.join("\n");
+	return (
+		/^(?:text|console|shell|sh|bash|output)$/i.test(quote.info) &&
+		/^(?:\s*(?:\$|>)\s+(?:git|npm|npx|vitest|tsc)\b|\s*Test Files?\b.*\b(?:failed|passed)\b|\s*Tests?\s+\d+\s+(?:failed|passed)\b|\s*(?:PASS|FAIL)\s+(?:\||$)|\s*npm ERR!|\s*error TS\d+)/im.test(
+			lines,
+		)
+	);
+}
+
+function lintCodeCitations(body, options = {}) {
+	const errors = [];
+	const rawLines = String(body ?? "").split(/\r?\n/);
+	const visibleBody = bodyLinesOutsideFences(body).join("\n");
+	for (const {
+		file,
+		lineText,
+		line: lineNumber,
+		end,
+		index,
+	} of pathLineReferences(visibleBody)) {
+		const bodyLine = visibleBody.slice(0, index).split(/\r?\n/).length - 1;
+		const key = `${file}:${lineText}`;
+		if (end !== undefined && end < lineNumber) {
+			errors.push(`PR body citation ${key} has a malformed backwards range.`);
+			continue;
+		}
+		const source = headFileSource(file, options);
+		if (source === null) {
+			errors.push(`PR body citation ${key} does not exist in the HEAD tree.`);
+			continue;
+		}
+		const sourceRows = sourceLines(source);
+		if (lineNumber < 1 || lineNumber > sourceRows.length) {
+			errors.push(`PR body citation ${key} is outside the HEAD tree.`);
+			continue;
+		}
+		const quote = sourceQuoteAfter(rawLines, bodyLine);
+		if (!quote) continue;
+		if (isTranscriptQuote(quote)) continue;
+		const start = Math.max(0, lineNumber - 1 - 20);
+		const finish = Math.min(sourceRows.length, lineNumber + 20);
+		const window = sourceRows.slice(start, finish).join("\n");
+		if (!quote.text.length || !window.includes(quote.text.join("\n")))
+			errors.push(
+				`PR body quote after citation ${key} does not match HEAD source within ±20 lines.`,
+			);
+	}
+	return errors;
+}
+
+// Positive test-reference recognition (#3013): prose outside a test column
+// only names a test through a recognisable form — an it("…") call, a
+// concrete tests/ path, or a short id. A backticked shell invocation is
+// never a test title. The discriminator is semantic (catalog shape 34): a
+// leading argv-like word plus invocation evidence (a flag, a quoted word,
+// an assignment, or a shell metacharacter) reads as a command, not a title.
+// This replaces the four-prefix command allowlist, which missed the next
+// spelling every time. A bare `argv path…` span stays a citation, so a
+// missing tests/ path there still reds.
+function isArgvLike(word) {
+	return (
+		/^(?:\.{1,2}\/)?[A-Za-z0-9_.$~][A-Za-z0-9_.+:@$-]*$/.test(word) ||
+		/^[A-Za-z_][A-Za-z0-9_]*=[^\s]*$/.test(word)
+	);
+}
+
+function isInvocationEvidence(word) {
+	return (
+		word.startsWith("-") ||
+		/^\/[A-Za-z]/.test(word) ||
+		/^(['"]).*\1$/.test(word) ||
+		/^[A-Za-z_][A-Za-z0-9_]*=/.test(word) ||
+		/[=|$><;&*?`]/.test(word)
+	);
+}
+
+function isCommandLikeSpan(value) {
+	const words = String(value ?? "")
+		.split(/\s+/)
+		.filter(Boolean);
+	return (
+		words.length >= 2 &&
+		isArgvLike(words[0]) &&
+		words.slice(1).some(isInvocationEvidence)
+	);
+}
+
+// A tests/ token that cannot name a file (a glob, a brace expansion, or a
+// quoted/bracketed paste) is never a file reference (#3013).
+function isConcreteTestPathToken(token) {
+	return !/[{}[\]*?"'()<>|&;`]/.test(token);
+}
+
+function extractTestPathTokens(value) {
+	const tokens = [];
+	for (const raw of String(value ?? "").split(/\s+/)) {
+		const token = raw
+			.replace(/^(['"([{<]+)/, "")
+			.replace(/([.,;:!?)\]}'"]+)$/, "");
+		if (token.startsWith("tests/")) tokens.push(token);
+	}
+	return tokens;
+}
+
+function lintTestReferences(
+	body,
+	options = {},
+	corpus = options.testCorpus ?? testCorpus(options),
+) {
+	const references = [];
+	const visibleBody = bodyLinesOutsideFences(body).join("\n");
+	const isExistingDirectory = (pathToken) => {
+		try {
+			return statSync(
+				resolve(options.cwd ?? process.cwd(), pathToken),
+			).isDirectory();
+		} catch {
+			return false;
+		}
+	};
+	const pushMissingPathTokens = (value) => {
+		for (const pathToken of extractTestPathTokens(value)) {
+			// A trailing slash names a suite directory, never a file.
+			if (pathToken.endsWith("/")) continue;
+			if (!isConcreteTestPathToken(pathToken)) continue;
+			if (
+				corpus.paths.has(pathToken) ||
+				corpus.titles.has(pathToken) ||
+				corpus.paths.has(pathToken.match(/^(tests\/[^:]+):\d+$/)?.[1] ?? "")
+			)
+				continue;
+			// A slash-less directory (tests/config) names a suite too.
+			if (isExistingDirectory(pathToken)) continue;
+			references.push(pathToken);
+		}
+	};
+	const addToken = (raw, strict = false, testColumn = false) => {
+		const token = raw.trim();
+		const wrapped = /^it\(\s*(["'])(.*?)\1\s*\)(?:\s*\([^)]*\))?$/.exec(token);
+		const value = wrapped
+			? wrapped[2].replace(/\s*\([^)]*\)\s*$/, "").trim()
+			: token;
+		// Short IDs are references only in an explicitly named test column.
+		// A bare ID in prose is not evidence of a test and must remain inert.
+		if ((/^[A-Z]\d+$/.test(value) && testColumn) || wrapped) {
+			references.push(value);
+			return;
+		}
+		if (strict) {
+			// Test-column placement recognises the reference, so even a
+			// command-shaped span is checked, exactly as before. Pipe lines
+			// outside a valid table share this strictness: without the
+			// separator that makes columns meaningful, a broken separator
+			// must not hide a fabricated reference.
+			if (/\s/.test(value) || value.startsWith("tests/"))
+				references.push(value);
+			return;
+		}
+		if (isCommandLikeSpan(value)) return;
+		// Prose, bullets, and non-test cells: positive recognition only —
+		// anything without a concrete tests/ path is not a test reference
+		// and is never asserted to exist.
+		pushMissingPathTokens(value);
+	};
+	const lines = visibleBody.split(/\r?\n/);
+	let tableHeaders = null;
+	const tableCells = (line) => line.split("|").map((cell) => cell.trim());
+	const isValidSeparator = (line, headers) => {
+		if (!headers) return false;
+		if (!/^\s*\|.*\|\s*$/.test(line)) return false;
+		const cells = tableCells(line);
+		return (
+			cells.length === headers.length &&
+			cells.slice(1, -1).every((cell) => /^:?-{3,}:?$/.test(cell))
+		);
+	};
+	for (let lineIndex = 0; lineIndex < lines.length; lineIndex += 1) {
+		const line = lines[lineIndex];
+		const isBullet = /^\s*[-*+]\s+/.test(line);
+		const table = /^\s*\|.*\|\s*$/.test(line);
+		if (!table) tableHeaders = null;
+		if (
+			table &&
+			lineIndex + 1 < lines.length &&
+			isValidSeparator(lines[lineIndex + 1], tableCells(line))
+		) {
+			tableHeaders = tableCells(line);
+			continue;
+		}
+		const inTable = table && tableHeaders !== null;
+		if (inTable && isValidSeparator(line, tableHeaders)) continue;
+		for (const match of line.matchAll(/`([^`]+)`/g)) {
+			const cellIndex = inTable
+				? line.slice(0, match.index).split("|").length - 1
+				: -1;
+			const inTestColumn = Boolean(
+				// Word-boundary match (#3013): a bare "id" substring qualified
+				// every "Evidence" column as a test column, so claim-matrix
+				// evidence cells holding commands and code read as missing test
+				// references. A column names tests only when it says so as a
+				// word ("Test", "Test id", "Case").
+				inTable &&
+				/\b(?:test|probe|case|witness|id)\b/i.test(
+					tableHeaders[cellIndex] ?? "",
+				),
+			);
+			addToken(match[1], inTestColumn || (table && !inTable), inTestColumn);
+		}
+		for (const match of line.matchAll(/\bit\(\s*(["'])(.*?)\1\s*\)/g))
+			if (isBullet || !inTable) addToken(match[0]);
+	}
+	const exists = (reference) => {
+		const path = reference.match(/^(tests\/[^:]+):\d+$/)?.[1];
+		return (
+			corpus.paths.has(reference) ||
+			corpus.paths.has(path ?? reference) ||
+			corpus.titles.has(reference)
+		);
+	};
+	return [...new Set(references)]
+		.filter((reference) => !exists(reference))
+		.map(
+			(reference) =>
+				`PR body test reference is missing under tests/: ${reference}`,
+		);
+}
+
+function lintMasterClaims(body) {
+	const errors = [];
+	const units = splitMarkdownUnits(body);
+	for (let index = 0; index < units.length; index += 1) {
+		const unit = units[index];
+		if (
+			unit.kind === "fence" ||
+			unit.kind === "table" ||
+			!MASTER_CLAIM.test(unit.text) ||
+			/reviewer\s+(?:wrote|said)/i.test(unit.text)
+		)
+			continue;
+		const next = units[index + 1];
+		if (next?.kind === "fence" && /origin\/master/i.test(next.text)) continue;
+		errors.push(
+			`PR body master/environment claim lacks an origin/master transcript: ${unit.text.trim()}`,
+		);
+	}
+	return errors;
+}
+
+function lintRuntimeObservability(
+	body,
+	lines,
+	headings,
+	diff,
+	cwd = process.cwd(),
+) {
+	const observation = runtimeObservabilityFromDiff(diff);
+	if (!observation.runtime) return [];
+	const content = observabilitySectionContent(body, lines, headings);
+	if ([...observation.records].some((record) => content.includes(record)))
+		return [];
+	const existingRecordCitation = pathLineReferences(content).find(
+		(reference) => {
+			const prefix = content.slice(0, reference.index);
+			return /covered by existing record `[^`]+` at\s*$/.test(prefix);
+		},
+	);
+	const existingRecordPrefix = existingRecordCitation
+		? content
+				.slice(0, existingRecordCitation.index)
+				.match(/covered by existing record `([^`]+)` at\s*$/)
+		: null;
+	if (
+		existingRecordCitation &&
+		existingRecordPrefix &&
+		!/(?:^|\/)\.\.(?:\/|$)/.test(existingRecordCitation.file) &&
+		isRuntimeObservabilityPath(existingRecordCitation.file)
+	) {
+		const [, kind] = existingRecordPrefix;
+		const { file, line: lineNumber } = existingRecordCitation;
+		try {
+			const source = readFileSync(
+				isAbsolute(file) ? file : resolve(cwd, file),
+				"utf8",
+			);
+			if (
+				recordLocationsFromRuntimeSource(source).some(
+					({ value, line }) =>
+						value === kind && Math.abs(line - lineNumber) <= 20,
+				)
+			)
+				return [];
+		} catch {
+			// Fall through to the existing strict error.
+		}
+	}
+	if (
+		!observation.failurePath &&
+		content.includes("No new failure path; no record added.")
+	)
+		return [];
+	if (observation.failurePath)
+		return [
+			`PR body Observability must name a record literal from the runtime diff${observation.records.size ? ` (${[...observation.records].join(", ")})` : ""}; "No new failure path; no record added." is not valid when the added lines contain a failure path.`,
+		];
+	return [
+		'PR body Observability must name a record literal present in the runtime diff, or state exactly "No new failure path; no record added.".',
+	];
+}
+
+/** Detect the high-confidence shape produced when a worker flattens a body. */
+export function detectFlattenedBody(body = "") {
+	const source = String(body ?? "");
+	const newlineCount = (source.match(/\r?\n/g) ?? []).length;
+	if (newlineCount > FLATTENED_BODY_MAX_NEWLINES || source.length < 200)
+		return false;
+	// A flattened body containing these markers has already lost data. It is
+	// safer to report the original lint errors than to write a guessed repair.
+	if (
+		/[\f\t]|\r(?!\n)|\\[ftr]/.test(source) ||
+		/\\n/.test(source) ||
+		new RegExp(
+			`(?:^|[\\s])(?:${CORRUPTED_HEADING_TAILS.join("|")})(?=\\s|$)`,
+			"i",
+		).test(source) ||
+		new RegExp(
+			`(?:^|[\\s` +
+				"\\\"'" +
+				`])(?:${CORRUPTED_IDENTIFIER_TAILS.join("|")})(?=$|[\\s` +
+				"\\\"',.)" +
+				`])`,
+		).test(source)
+	)
+		return false;
+	const inlineHeadings = source.match(
+		new RegExp(
+			`(?<!^)\\s#{2,4}\\s+(?:${REPAIR_HEADING_PATTERN})(?=\\s|$)`,
+			"g",
+		),
+	);
+	return (inlineHeadings?.length ?? 0) >= 2;
+}
+
+const ESCAPED_NEWLINE = /\\r\\n|\\n/g;
+
+function escapedNewlineRangesOutsideCodeSpans(source) {
+	const protectedRanges = [];
+	for (const match of source.matchAll(/(`+)([\s\S]*?)\1/g)) {
+		protectedRanges.push([match.index, match.index + match[0].length]);
+	}
+	return [...source.matchAll(ESCAPED_NEWLINE)]
+		.filter(
+			({ index }) =>
+				!protectedRanges.some(([start, end]) => index >= start && index < end),
+		)
+		.map(({ index, 0: value }) => ({ index, value }));
+}
+
+function replaceEscapedNewlinesOutsideCodeSpans(source) {
+	const replacements = escapedNewlineRangesOutsideCodeSpans(source);
+	if (!replacements.length) return source;
+	let result = "";
+	let cursor = 0;
+	for (const { index, value } of replacements) {
+		result += source.slice(cursor, index) + "\n";
+		cursor = index + value.length;
+	}
+	return result + source.slice(cursor);
+}
+
+/**
+ * Detect the sibling flattening shape from the #2058-era class: a worker
+ * emits the literal two-or-four character sequence "\n" or "\r\n" where a
+ * real line break belongs, instead of collapsing real newlines into spaces
+ * (the shape #2149 already repairs). Restoring this is unambiguous ONLY
+ * when every backslash in the body belongs to one of those joins — a
+ * Windows path like "C:\node_modules\pi" contains a genuine "\n" substring
+ * that a blind replace would split into "C:" + a real newline +
+ * "ode_modules\pi" while still validating (#2145 review F1). Any leftover
+ * backslash after the joins are stripped means real content is present, so
+ * this refuses, mirroring detectFlattenedBody's own data-loss guard.
+ *
+ * A fenced block (``` or ~~~, both valid CommonMark that GitHub renders)
+ * refuses this repair entirely too. Inside a fence a literal backslash-n
+ * can be genuine content, AND a flattened fence's own delimiters can land
+ * on the same logical line, which the unrelated line-based fence scanner
+ * in lintPrBody cannot parse back apart. Rather than guess, any body
+ * carrying a fence is left untouched (fence preservation, issue #2145;
+ * true fence repair stays deferred, per the #2149 round-3 decision).
+ */
+export function detectEscapedNewlineBody(body = "") {
+	const source = String(body ?? "");
+	if (source.length < 200 || source.includes("```") || source.includes("~~~"))
+		return false;
+	const realNewlines = (source.match(/\r\n|\n/g) ?? []).length;
+	if (realNewlines > FLATTENED_BODY_MAX_NEWLINES) return false;
+	const literalNewlines = escapedNewlineRangesOutsideCodeSpans(source);
+	if (literalNewlines.length < 2) return false;
+	const normalized = replaceEscapedNewlinesOutsideCodeSpans(source);
+	const unprotected = source
+		.replace(/(`+)([\s\S]*?)\1/g, (span) => " ".repeat(span.length))
+		.replace(ESCAPED_NEWLINE, "");
+	if (unprotected.includes("\\")) return false;
+	const candidateHeadingLines = normalized
+		.split("\n")
+		.filter((line) =>
+			new RegExp(`^\\s*#{2,4}\\s+(?:${REPAIR_HEADING_PATTERN})\\s*$`, "i").test(
+				line,
+			),
+		);
+	return candidateHeadingLines.length >= 2;
+}
+
+/**
+ * Repair only a body already proven to have the escaped-newline shape.
+ * detectEscapedNewlineBody already refuses any body carrying a fence, so
+ * this plain global replace never runs on fenced content.
+ */
+export function repairEscapedNewlineBody(body = "") {
+	const source = String(body ?? "");
+	if (!detectEscapedNewlineBody(source)) return source;
+	const repaired = replaceEscapedNewlinesOutsideCodeSpans(source);
+	return /^\s*#{2,4}\s+Why\s*$/im.test(repaired)
+		? repaired
+		: `${REVIEW_HEADER_REPAIR_PREFIX}\n${repaired}`;
+}
+
+/**
+ * Normalize only for linting. The body remains unchanged on GitHub: workers
+ * should fix their own PR text, while this read-only path makes a clear
+ * warning when a high-confidence flattened-body repair lets checks proceed.
+ */
+export function normalizePrBodyForChecking(body = "", pullRequestNumber) {
+	const source = String(body ?? "");
+	for (const { detect, repair } of [
+		{ detect: detectFlattenedBody, repair: repairFlattenedBody },
+		{ detect: detectEscapedNewlineBody, repair: repairEscapedNewlineBody },
+	]) {
+		if (!detect(source)) continue;
+		const normalized = repair(source);
+		if (normalized === source) continue;
+		console.warn(
+			`::warning::Normalized flattened PR body for #${pullRequestNumber ?? "?"} for checking only; the original body was not edited.`,
+		);
+		return { body: normalized, normalized: true };
+	}
+	return { body: source, normalized: false };
+}
+
+/** Repair only a body already proven to have the flattened shape. */
+export function repairFlattenedBody(body = "") {
+	const source = String(body ?? "");
+	if (!detectFlattenedBody(source)) return source;
+	let repaired = source.replace(/\r\n?/g, "\n");
+	repaired = repaired.replace(
+		new RegExp(
+			`(^|[.!?])[ \\t]*(#{2,4}\\s+(?:${REPAIR_HEADING_PATTERN}))(?=\\s|$)`,
+			"g",
+		),
+		(_match, sentenceEnd, heading) =>
+			sentenceEnd ? `${sentenceEnd}\n\n${heading}\n` : `${heading}\n`,
+	);
+	const residualInlineHeadings = repaired.match(
+		new RegExp(
+			`(?<!^)[ \\t]#{2,4}\\s+(?:${REPAIR_HEADING_PATTERN})(?=\\s|$)`,
+			"g",
+		),
+	);
+	if (residualInlineHeadings?.length) return source;
+	const repairedHeadings = repaired
+		.split("\n")
+		.map((line) => HEADING.exec(line)?.[1].trim().toLowerCase())
+		.filter(Boolean);
+	const templateHeadings = repairedHeadings.filter((heading) =>
+		new RegExp(`^(?:${REPAIR_HEADING_PATTERN})$`, "i").test(heading),
+	);
+	const distinctTemplateHeadings = new Set(templateHeadings);
+	if (repairedHeadings.length !== distinctTemplateHeadings.size) return source;
+	return /^\s*#{2,4}\s+Why\s*$/im.test(repaired)
+		? repaired
+		: `${REVIEW_HEADER_REPAIR_PREFIX}\n${repaired}`;
+}
+
+/** Check the structural PR-body contract, including answered sections. */
+export function lintPrBody(body = "", options = {}) {
+	const rawLines = String(body ?? "").split(/\r?\n/);
+	const lines = sourceWithoutFencedBlocks(body).split(/\r?\n/);
+	const headings = [];
+	for (let index = 0; index < lines.length; index += 1) {
+		const match = HEADING.exec(lines[index]);
+		if (match)
+			headings.push({
+				index,
+				name: match[1],
+				level: match[0].match(/^#+/)[0].length,
+				section: SECTION_SYNONYMS.get(match[1].trim().toLowerCase()),
+			});
+	}
+	const placeholders = templatePlaceholderLines();
+	const errors = [];
+	const summary = headings.find((heading) => hasSection(heading, "summary"));
+	const firstHeading = headings[0]?.index ?? lines.length;
+	const nextSectionHeading = (heading) =>
+		headings.find(
+			(candidate) =>
+				candidate.index > heading.index && candidate.level <= heading.level,
+		);
+	const summaryEnd = summary
+		? (nextSectionHeading(summary)?.index ?? lines.length)
+		: 0;
+	if (
+		(!summary ||
+			!hasRealContent(
+				lines.slice(summary.index + 1, summaryEnd),
+				"summary",
+				placeholders,
+			)) &&
+		!hasRealContent(lines.slice(0, firstHeading), "summary", placeholders)
+	) {
+		errors.push(`PR body is missing a Summary section. See ${TEMPLATE_PATH}.`);
+	}
+
+	// Value discipline (AGENTS.md "Test assessment and removal"): a PR that
+	// touches tests/ must say, per touched file, what it uniquely pins and
+	// what became redundant. Conditional because docs/production-only PRs owe
+	// nothing here.
+	// The exported structural linter is also used by focused tests and historical
+	// repair fixtures. The repository-facing local gate is the contract that
+	// requires the new header trio; keeping that switch explicit avoids changing
+	// the meaning of lower-level parser tests.
+	const requiredSections = options.workingTree
+		? options.requireTestAssessment
+			? [...REQUIRED_SECTIONS, "Test assessment"]
+			: REQUIRED_SECTIONS
+		: options.requireTestAssessment
+			? [
+					"Tests",
+					"Blast radius",
+					"Class sweep",
+					"Observability",
+					"Test assessment",
+				]
+			: ["Tests", "Blast radius", "Class sweep", "Observability"];
+
+	for (const name of requiredSections) {
+		const heading = headings.find((candidate) =>
+			hasSection(candidate, name.toLowerCase()),
+		);
+		if (!heading) {
+			errors.push(sectionMessage(name, "is missing"));
+			continue;
+		}
+		const nextHeading = nextSectionHeading(heading);
+		const rawContent = rawLines.slice(
+			heading.index + 1,
+			nextHeading?.index ?? lines.length,
+		);
+		if (!hasRealContent(rawContent, name.toLowerCase(), placeholders))
+			errors.push(
+				sectionMessage(name, "has no content before the next heading"),
+			);
+	}
+	const why = headings.find((heading) => hasSection(heading, "why"));
+	if (why) {
+		const nextHeading = nextSectionHeading(why);
+		const whyLines = rawLines.slice(
+			why.index + 1,
+			nextHeading?.index ?? lines.length,
+		);
+		if (countSentenceTerminators(whyLines) !== 1)
+			errors.push(
+				'PR body "## Why" must contain exactly one sentence. See ' +
+					TEMPLATE_PATH +
+					".",
+			);
+	}
+	if (options.diff)
+		errors.push(
+			...lintRuntimeObservability(
+				body,
+				lines,
+				headings,
+				options.diff,
+				options.cwd,
+			),
+		);
+	errors.push(...lintCodeCitations(body, options));
+	errors.push(...lintTestReferences(body, options));
+	errors.push(...lintMasterClaims(body));
+	return { valid: errors.length === 0, errors };
+}
+
+/**
+ * Strict live-body fetch: throws instead of swallowing, on a missing token,
+ * a non-2xx response, or a malformed body. `resolveLivePrBody` below wraps
+ * this for the advisory body LINTER, where degrading to the stale payload
+ * on any hiccup is the right posture. It is the wrong posture for a
+ * post-merge verification GATE (#2267 F2): a gate that silently passes on
+ * a fetch failure is indistinguishable from a gate that actually checked
+ * and found nothing wrong. check-close-keywords.mjs's --verify-merged path
+ * calls this directly and fails closed (exitCode=1, ::error::) instead.
+ *
+ * @param {{ number: number, body?: string | null }} payloadPr
+ * @param {typeof fetch} fetchImpl
+ * @returns {Promise<{body: string, normalized: boolean, title: string | undefined}>}
+ */
+export async function fetchLivePrBody(payloadPr, fetchImpl) {
+	const token = process.env.GITHUB_TOKEN;
+	if (!token) throw new Error("GITHUB_TOKEN is not set");
+	const apiUrl = process.env.GITHUB_API_URL;
+	const repository = process.env.GITHUB_REPOSITORY;
+	if (!apiUrl || !repository)
+		throw new Error("GITHUB_API_URL or GITHUB_REPOSITORY is missing");
+	const response = await fetchImpl(
+		`${apiUrl}/repos/${repository}/pulls/${payloadPr.number}`,
+		{
+			signal: AbortSignal.timeout(10_000),
+			headers: {
+				Accept: "application/vnd.github+json",
+				Authorization: `Bearer ${token}`,
+				"X-GitHub-Api-Version": "2022-11-28",
+			},
+		},
+	);
+	if (!response.ok) throw new Error(`GitHub API returned ${response.status}`);
+	const data = await response.json();
+	if (data.body !== null && typeof data.body !== "string")
+		throw new Error("GitHub API returned no body");
+	return {
+		...normalizePrBodyForChecking(data.body ?? "", payloadPr.number),
+		title: data.title,
+	};
+}
+
+export async function resolveLivePrBody(
+	payloadPr,
+	fetchImpl = globalThis.fetch,
+) {
+	try {
+		return await fetchLivePrBody(payloadPr, fetchImpl);
+	} catch (error) {
+		console.warn(
+			`::warning::Could not fetch the live PR body; using the event payload instead (${error instanceof Error ? error.message : error}).`,
+		);
+		return normalizePrBodyForChecking(payloadPr.body ?? "", payloadPr.number);
+	}
+}
+
+/**
+ * True when the PR touches any file under tests/. Advisory best-effort: one
+ * page of 100 files covers this repo's PR sizes; on any failure (including a
+ * PR larger than the page, detected via the Link header) return null so the
+ * caller SKIPS the conditional check rather than guessing — a lint that can
+ * misfire on fetch trouble teaches people to ignore it.
+ */
+export async function resolveTouchesTests(
+	payloadPr,
+	fetchImpl = globalThis.fetch,
+) {
+	try {
+		const token = process.env.GITHUB_TOKEN;
+		if (!token) throw new Error("GITHUB_TOKEN is not set");
+		const apiUrl = process.env.GITHUB_API_URL;
+		const repository = process.env.GITHUB_REPOSITORY;
+		if (!apiUrl || !repository)
+			throw new Error("GITHUB_API_URL or GITHUB_REPOSITORY is missing");
+		const response = await fetchImpl(
+			`${apiUrl}/repos/${repository}/pulls/${payloadPr.number}/files?per_page=100`,
+			{
+				signal: AbortSignal.timeout(10_000),
+				headers: {
+					Accept: "application/vnd.github+json",
+					Authorization: `Bearer ${token}`,
+					"X-GitHub-Api-Version": "2022-11-28",
+				},
+			},
+		);
+		if (!response.ok) throw new Error(`GitHub API returned ${response.status}`);
+		if (/rel="next"/.test(response.headers.get("link") ?? ""))
+			throw new Error(
+				"PR exceeds one file page; skipping the conditional check",
+			);
+		const files = await response.json();
+		if (!Array.isArray(files))
+			throw new Error("GitHub API returned no file list");
+		return files.some(
+			(file) =>
+				(file.filename ?? "").startsWith("tests/") ||
+				// A rename OUT of tests/ reports only the new path in filename; a
+				// removal PR is exactly what the assessment exists to catch.
+				(file.previous_filename ?? "").startsWith("tests/"),
+		);
+	} catch (error) {
+		console.warn(
+			`::warning::Could not resolve the PR file list; skipping the Test assessment check (${error instanceof Error ? error.message : error}).`,
+		);
+		return null;
+	}
+}
+
+function eventPayload() {
+	const eventPath = process.env.GITHUB_EVENT_PATH;
+	if (!eventPath) throw new Error("GITHUB_EVENT_PATH is required");
+	return JSON.parse(readFileSync(eventPath, "utf8"));
+}
+
+/**
+ * The full live lint: resolve body and file list, then lint. The tri-state
+ * from resolveTouchesTests is consumed HERE: only an affirmative true
+ * requires the Test assessment section — null (fetch trouble) and false
+ * (no tests/ files) both skip it, so a flaky fetch can never misfire the
+ * check (#2124 review F2 pinned this consumption).
+ */
+export async function lintPullRequestEvent(
+	fetchImpl = globalThis.fetch,
+	event = eventPayload(),
+) {
+	const pullRequest = event.pull_request;
+	if (!pullRequest || !process.env.GITHUB_REPOSITORY)
+		throw new Error("Pull request event and GITHUB_REPOSITORY are required");
+	const { body, normalized } = await resolveLivePrBody(pullRequest, fetchImpl);
+	const requireTestAssessment =
+		(await resolveTouchesTests(pullRequest, fetchImpl)) === true;
+	let diff = "";
+	try {
+		diff = localDiff();
+	} catch (error) {
+		if (process.env.GITHUB_ACTIONS) {
+			const reason = error instanceof Error ? error.message : String(error);
+			throw new Error(`diff unavailable: ${reason}`);
+		}
+		// Local callers may not have an upstream ref. Preserve structural lint
+		// outside CI rather than inventing a runtime scope.
+	}
+	const result = lintPrBody(body, {
+		requireTestAssessment,
+		diff,
+		workingTree: true,
+	});
+	if (result.valid) {
+		console.log(`PR body OK: ${pullRequest.number}`);
+		return { valid: true, repaired: normalized };
+	}
+	for (const error of result.errors) console.error(error);
+	return { valid: false, repaired: false };
+}
+
+export function localDiff(cwd = process.cwd(), git = gitExecFileSync) {
+	return git(["diff", "--unified=0", "--no-color", "origin/master...HEAD"], {
+		cwd,
+		encoding: "utf8",
+	});
+}
+
+export function localTouchesTests(cwd = process.cwd(), git = gitExecFileSync) {
+	let names;
+	try {
+		names = git(["diff", "--name-only", "origin/master...HEAD"], {
+			cwd,
+			encoding: "utf8",
+		});
+	} catch {
+		try {
+			names = git(["diff", "--name-only", "HEAD~1"], {
+				cwd,
+				encoding: "utf8",
+			});
+		} catch {
+			// #2904 round 2 recurrence: shallow or single-commit repositories may
+			// have neither range; require assessment because assuming no test changes
+			// would weaken the lint.
+			return true;
+		}
+	}
+	return names.split(/\r?\n/).some((name) => name.startsWith("tests/"));
+}
+
+export function lintLocalPrBody(
+	body,
+	cwd = process.cwd(),
+	git = gitExecFileSync,
+) {
+	let diff;
+	try {
+		diff = localDiff(cwd, git);
+	} catch {
+		// A local preflight must use the same range as CI. If the caller has no
+		// upstream ref, retain structural lint rather than inventing scope.
+		diff = "";
+	}
+	return lintPrBody(body, {
+		requireTestAssessment: localTouchesTests(cwd, git),
+		diff,
+		cwd,
+		workingTree: true,
+	});
+}
+
+if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
+	// Local contract: --lint-local <body-file> remains the preflight form from
+	// #2796. The equivalent --body <body-file> --title <title-file> form keeps
+	// title validation in check-pr-title.mjs while accepting preflight's inputs.
+	const bodyIndex = process.argv.indexOf("--body");
+	const titleIndex = process.argv.indexOf("--title");
+	if (bodyIndex !== -1) {
+		const bodyPath = process.argv[bodyIndex + 1];
+		if (!bodyPath) throw new Error("--body requires a file path");
+		// --title is accepted for preflight parity. Title validation belongs to
+		// check-pr-title.mjs, but preflight passes both local input files.
+		if (titleIndex !== -1 && !process.argv[titleIndex + 1])
+			throw new Error("--title requires a file path");
+		const result = lintLocalPrBody(readFileSync(bodyPath, "utf8"));
+		for (const error of result.errors) console.error(error);
+		process.exitCode = result.valid ? 0 : 1;
+	} else if (process.argv[2] === "--lint-local") {
+		const bodyPath = process.argv[3];
+		if (!bodyPath) throw new Error("--lint-local requires a file path");
+		const result = lintLocalPrBody(readFileSync(bodyPath, "utf8"));
+		for (const error of result.errors) console.error(error);
+		process.exitCode = result.valid ? 0 : 1;
+	} else
+		lintPullRequestEvent()
+			.then((result) => {
+				if (!result.valid) process.exitCode = 1;
+			})
+			.catch((error) => {
+				console.error(error instanceof Error ? error.message : error);
+				process.exitCode = 1;
+			});
+}

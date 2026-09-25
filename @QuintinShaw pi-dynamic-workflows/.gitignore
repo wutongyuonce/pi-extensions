@@ -1,0 +1,14 @@
+node_modules/
+dist/
+.pi/
+.env
+.DS_Store
+*.log
+.hermes/
+*.test-quality-report.md
+
+# Local-only npm clean-room install verifier (not part of the package)
+scripts/verify-npm-install.sh
+__pycache__/
+.context/
+.auto/

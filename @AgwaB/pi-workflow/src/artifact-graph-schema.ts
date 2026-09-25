@@ -8,6 +8,7 @@ import {
 	FAST_MODES,
 	THINKING_LEVELS,
 	TOOL_CLASSIFICATIONS,
+	WORKFLOW_PROFILE_ROLES,
 	WORKTREE_POLICIES,
 	WorkflowValidationError,
 	type ArtifactGraphStageType,
@@ -20,6 +21,7 @@ const TOP_LEVEL_KEYS = new Set([
 	"schemaVersion",
 	"name",
 	"description",
+	"routing",
 	"input",
 	"defaults",
 	"roles",
@@ -29,6 +31,9 @@ const TOP_LEVEL_KEYS = new Set([
 ]);
 // Profile names are display/selection labels, not filesystem identifiers.
 const EXECUTION_PROFILE_NAME_PATTERN = /^(?=.*\S)[^\u0000-\u001f\u007f]+$/;
+const ROUTING_HINT_KEYS = new Set(["useWhen", "avoidWhen", "outputs"]);
+export const WORKFLOW_ROUTING_HINT_MAX_ITEMS = 12;
+export const WORKFLOW_ROUTING_HINT_MAX_UTF8_BYTES = 480;
 const EXECUTION_PROFILE_OVERRIDE_KEYS = new Set([
 	"model",
 	"thinking",
@@ -57,6 +62,7 @@ const STAGE_KEYS = new Set([
 	"injectRuntimeTask",
 	"agent",
 	"role",
+	"profileRole",
 	"cwd",
 	"model",
 	"thinking",
@@ -184,6 +190,7 @@ const DYNAMIC_DECISION_LOOP_KEYS = new Set([
 ]);
 const DYNAMIC_DECISION_LOOP_PROFILE_KEYS = new Set([
 	"agent",
+	"profileRole",
 	"model",
 	"thinking",
 	"tools",
@@ -318,6 +325,7 @@ function validateArtifactGraphTopLevel(
 	rejectUnknownKeys(spec, TOP_LEVEL_KEYS, "$", issues);
 	optionalString(spec.name, "$.name", issues);
 	optionalString(spec.description, "$.description", issues);
+	validateWorkflowRoutingHints(spec.routing, "$.routing", issues);
 	validateDefaults(spec.defaults, "$.defaults", issues);
 	validateRoles(spec.roles, "$.roles", issues);
 	const declaredStages = collectDeclaredProfileStages(spec);
@@ -335,33 +343,76 @@ type DeclaredProfileStages = {
 };
 
 /**
- * Profile targets retain root ids and namespace dag children as `container.child`.
- * Keeping every collision lets validation reject an ambiguous target rather than
- * accidentally applying one raw child id to several nested stages.
+ * Profile targets retain root ids and namespace dag/loop children as
+ * `container.child`. Reserved `$...` suffixes address model-bearing slots that
+ * have no authored stage id. Keeping every collision lets validation reject an
+ * ambiguous target instead of applying it accidentally.
  */
 function collectDeclaredProfileStages(
 	spec: Record<string, unknown>,
 ): DeclaredProfileStages {
 	const byCanonicalId = new Map<string, Record<string, unknown>[]>();
 	const nestedCanonicalIdsByRawId = new Map<string, string[]>();
-	const visit = (stages: unknown, namespace?: string): void => {
-		if (!Array.isArray(stages)) return;
-		for (const stage of stages) {
-			if (!isRecord(stage) || typeof stage.id !== "string") continue;
-			const canonicalId = namespace ? `${namespace}.${stage.id}` : stage.id;
-			const targets = byCanonicalId.get(canonicalId) ?? [];
-			targets.push(stage);
-			byCanonicalId.set(canonicalId, targets);
-			if (namespace) {
-				const nestedTargets = nestedCanonicalIdsByRawId.get(stage.id) ?? [];
-				nestedTargets.push(canonicalId);
-				nestedCanonicalIdsByRawId.set(stage.id, nestedTargets);
+	const addTarget = (
+		canonicalId: string,
+		target: Record<string, unknown>,
+		rawId?: string,
+	): void => {
+		const targets = byCanonicalId.get(canonicalId) ?? [];
+		targets.push(target);
+		byCanonicalId.set(canonicalId, targets);
+		if (rawId !== undefined) {
+			const nestedTargets = nestedCanonicalIdsByRawId.get(rawId) ?? [];
+			nestedTargets.push(canonicalId);
+			nestedCanonicalIdsByRawId.set(rawId, nestedTargets);
+		}
+	};
+	const visitStage = (
+		stage: Record<string, unknown>,
+		canonicalId: string,
+		nestedRawId?: string,
+	): void => {
+		addTarget(canonicalId, stage, nestedRawId);
+		if (
+			(stage.type === "dag" || stage.type === "loop") &&
+			Array.isArray(stage.stages)
+		) {
+			for (const child of stage.stages) {
+				if (!isRecord(child) || typeof child.id !== "string") continue;
+				visitStage(child, `${canonicalId}.${child.id}`, child.id);
 			}
-			if (stage.type === "dag") visit(stage.stages, canonicalId);
+		}
+		if (stage.type === "loop" && isRecord(stage.onExhausted)) {
+			const exhausted = stage.onExhausted;
+			visitStage(
+				exhausted,
+				`${canonicalId}.$onExhausted`,
+				typeof exhausted.id === "string" ? exhausted.id : undefined,
+			);
+		}
+		if (stage.type === "dynamic") {
+			const dynamic = isRecord(stage.dynamic) ? stage.dynamic : undefined;
+			const decisionLoop = isRecord(dynamic?.decisionLoop)
+				? dynamic.decisionLoop
+				: undefined;
+			for (const slot of [
+				"planner",
+				"workerDefaults",
+				"verifier",
+				"synthesis",
+			] as const) {
+				const target = decisionLoop?.[slot];
+				if (isRecord(target)) addTarget(`${canonicalId}.$${slot}`, target);
+			}
 		}
 	};
 	const graph = spec.artifactGraph;
-	if (isRecord(graph)) visit(graph.stages);
+	if (isRecord(graph) && Array.isArray(graph.stages)) {
+		for (const stage of graph.stages) {
+			if (!isRecord(stage) || typeof stage.id !== "string") continue;
+			visitStage(stage, stage.id);
+		}
+	}
 	return { byCanonicalId, nestedCanonicalIdsByRawId };
 }
 
@@ -397,8 +448,7 @@ function validateExecutionProfiles(
 		if (!EXECUTION_PROFILE_NAME_PATTERN.test(name)) {
 			issues.push({
 				path: profilePath,
-				message:
-					"profile name must be non-empty and contain no control characters",
+				message: "profile name must be non-empty and contain no control characters",
 			});
 		}
 		const stageMap = recordAt(mapping, profilePath, issues);
@@ -465,11 +515,7 @@ function validateExecutionProfileForeachBatch(
 	if (batch.maxItems !== 2) {
 		issues.push({ path: `${path}.maxItems`, message: "must be exactly 2" });
 	}
-	validateExecutionProfileBatchGroupBy(
-		batch.groupBy,
-		`${path}.groupBy`,
-		issues,
-	);
+	validateExecutionProfileBatchGroupBy(batch.groupBy, `${path}.groupBy`, issues);
 	if (stage?.type !== "foreach") {
 		issues.push({
 			path,
@@ -687,8 +733,7 @@ function extractDependencyRefs(value: unknown): string[] {
 			dropEmpty: false,
 			dropWhitespaceOnly: false,
 		});
-	if (isRecord(value) && typeof value.source === "string")
-		return [value.source];
+	if (isRecord(value) && typeof value.source === "string") return [value.source];
 	return [];
 }
 
@@ -751,9 +796,7 @@ function collectStageSourceIds(stages: readonly unknown[]): Set<string> {
 
 function stageSourceId(stage: Record<string, unknown>): string | undefined {
 	const id =
-		typeof stage.id === "string" && stage.id.trim() !== ""
-			? stage.id
-			: undefined;
+		typeof stage.id === "string" && stage.id.trim() !== "" ? stage.id : undefined;
 	if (!id) return undefined;
 	if (stage.type !== "dag" || !Array.isArray(stage.stages)) return id;
 	const outputChildId =
@@ -814,6 +857,22 @@ function validateStage(
 	optionalPositiveInteger(stage.maxItems, `${path}.maxItems`, issues);
 	validateSourcePolicy(stage.sourcePolicy, `${path}.sourcePolicy`, issues);
 	validateRole(stage.role, `${path}.role`, issues);
+	optionalEnum(
+		stage.profileRole,
+		WORKFLOW_PROFILE_ROLES,
+		`${path}.profileRole`,
+		issues,
+	);
+	if (
+		stage.profileRole !== undefined &&
+		(stage.support !== undefined || type === "dag" || type === "loop")
+	) {
+		issues.push({
+			path: `${path}.profileRole`,
+			message:
+				"is only valid on model-backed single/foreach/reduce/dynamic stages, not support/dag/loop containers",
+		});
+	}
 	validateWorkflowToolArray(stage.tools, `${path}.tools`, issues);
 	validateArtifactAccessToolPolicy(stage, type, path, issues);
 	validateStageRefs(stage.from, `${path}.from`, siblingIds, issues, {
@@ -1118,10 +1177,7 @@ function validateInputPolicy(
 		});
 	}
 	if (policy.artifactAccess === "none") {
-		if (
-			Array.isArray(policy.requiredReads) &&
-			policy.requiredReads.length > 0
-		) {
+		if (Array.isArray(policy.requiredReads) && policy.requiredReads.length > 0) {
 			issues.push({
 				path: `${path}.requiredReads`,
 				message: 'must be empty when artifactAccess is "none"',
@@ -1159,11 +1215,7 @@ function validateRequiredReads(
 	const seen = new Set<string>();
 	for (const [index, item] of value.entries()) {
 		const itemPath = `${path}[${index}]`;
-		const normalized = normalizeRequiredReadForValidation(
-			item,
-			itemPath,
-			issues,
-		);
+		const normalized = normalizeRequiredReadForValidation(item, itemPath, issues);
 		if (!normalized) continue;
 		const key = [
 			normalized.source,
@@ -1232,12 +1284,8 @@ function normalizeRequiredReadForValidation(
 		source,
 		artifact,
 		...(typeof readPath === "string" ? { path: readPath } : {}),
-		...(typeof record.maxChars === "number"
-			? { maxChars: record.maxChars }
-			: {}),
-		...(typeof record.maxItems === "number"
-			? { maxItems: record.maxItems }
-			: {}),
+		...(typeof record.maxChars === "number" ? { maxChars: record.maxChars } : {}),
+		...(typeof record.maxItems === "number" ? { maxItems: record.maxItems } : {}),
 		...(typeof record.count === "number" ? { count: record.count } : {}),
 	};
 }
@@ -1738,6 +1786,12 @@ function validateDynamicDecisionLoopProfile(
 	if (!profile) return;
 	rejectUnknownKeys(profile, DYNAMIC_DECISION_LOOP_PROFILE_KEYS, path, issues);
 	optionalString(profile.agent, `${path}.agent`, issues);
+	optionalEnum(
+		profile.profileRole,
+		WORKFLOW_PROFILE_ROLES,
+		`${path}.profileRole`,
+		issues,
+	);
 	optionalString(profile.model, `${path}.model`, issues);
 	optionalEnum(profile.thinking, THINKING_LEVELS, `${path}.thinking`, issues);
 	validateWorkflowToolArray(profile.tools, `${path}.tools`, issues);
@@ -1798,11 +1852,7 @@ function validateDynamicDecisionLoopStateIndex(
 		path,
 		issues,
 	);
-	optionalPositiveInteger(
-		stateIndex.maxFindings,
-		`${path}.maxFindings`,
-		issues,
-	);
+	optionalPositiveInteger(stateIndex.maxFindings, `${path}.maxFindings`, issues);
 	validateStringArray(
 		stateIndex.requiredFindingIds,
 		`${path}.requiredFindingIds`,
@@ -1943,8 +1993,8 @@ function validateLoopStage(
 	}
 	validateOptionalJsonPath(stage.progressPath, `${path}.progressPath`, issues);
 	const until = recordAt(stage.until, `${path}.until`, issues);
-	if (until) validateLoopUntil(until, `${path}.until`, issues);
 	if (!Array.isArray(stage.stages)) {
+		if (until) validateLoopUntil(until, `${path}.until`, issues, []);
 		issues.push({
 			path: `${path}.stages`,
 			message: "loop stages must declare child stages",
@@ -1965,26 +2015,7 @@ function validateLoopStage(
 		.filter((id): id is string => typeof id === "string");
 	const finalChildId = childIds.at(-1);
 	if (until) {
-		const untilSource =
-			typeof until.source === "string"
-				? until.source
-				: typeof until.stage === "string"
-					? until.stage
-					: undefined;
-		const untilSourcePath = until.source !== undefined ? "source" : "stage";
-		if (untilSource) {
-			if (!childIds.includes(untilSource)) {
-				issues.push({
-					path: `${path}.until.${untilSourcePath}`,
-					message: `references unknown loop child stage "${untilSource}"`,
-				});
-			} else if (finalChildId && untilSource !== finalChildId) {
-				issues.push({
-					path: `${path}.until.${untilSourcePath}`,
-					message: "must reference the final loop child stage",
-				});
-			}
-		}
+		validateLoopUntil(until, `${path}.until`, issues, childIds, finalChildId);
 	}
 	if (stage.onExhausted !== undefined) {
 		validateStage(
@@ -2001,10 +2032,48 @@ function validateLoopUntil(
 	until: Record<string, unknown>,
 	path: string,
 	issues: ValidationIssue[],
+	childIds: readonly string[],
+	finalChildId?: string,
 ): void {
 	rejectUnknownKeys(until, UNTIL_KEYS, path, issues);
 	optionalString(until.source, `${path}.source`, issues);
 	optionalString(until.stage, `${path}.stage`, issues);
+	if (
+		until.source !== undefined &&
+		until.stage !== undefined &&
+		until.source !== until.stage
+	) {
+		issues.push({
+			path,
+			message: "source and stage aliases must refer to the same loop child stage",
+		});
+	}
+	for (const key of ["source", "stage"] as const) {
+		const source = until[key];
+		if (typeof source !== "string") continue;
+		if (!childIds.includes(source)) {
+			issues.push({
+				path: `${path}.${key}`,
+				message: `references unknown loop child stage "${source}"`,
+			});
+		} else if (finalChildId && source !== finalChildId) {
+			issues.push({
+				path: `${path}.${key}`,
+				message: "must reference the final loop child stage",
+			});
+		}
+	}
+	if (
+		!Array.isArray(until.all) &&
+		!Array.isArray(until.any) &&
+		until.source === undefined &&
+		until.stage === undefined
+	) {
+		issues.push({
+			path,
+			message: "leaf must reference the final loop child with stage or source",
+		});
+	}
 	validateOptionalJsonPath(until.path, `${path}.path`, issues);
 	optionalBoolean(until.exists, `${path}.exists`, issues);
 	if (
@@ -2025,7 +2094,13 @@ function validateLoopUntil(
 		for (const [index, child] of until[key].entries()) {
 			const childUntil = recordAt(child, `${path}.${key}[${index}]`, issues);
 			if (childUntil)
-				validateLoopUntil(childUntil, `${path}.${key}[${index}]`, issues);
+				validateLoopUntil(
+					childUntil,
+					`${path}.${key}[${index}]`,
+					issues,
+					childIds,
+					finalChildId,
+				);
 		}
 	}
 }
@@ -2052,10 +2127,8 @@ function validateLoopChildren(
 		}
 		if (child.from !== undefined || child.after !== undefined) {
 			issues.push({
-				path:
-					child.from !== undefined ? `${childPath}.from` : `${childPath}.after`,
-				message:
-					"loop child stages run serially and must not declare from/after",
+				path: child.from === undefined ? `${childPath}.after` : `${childPath}.from`,
+				message: "loop child stages run serially and must not declare from/after",
 			});
 		}
 	}
@@ -2118,7 +2191,15 @@ function validateDagStage(
 		}
 	}
 	const childIds = collectStageIds(stage.stages, `${path}.stages`, []);
-	if (stage.outputFrom !== undefined) {
+	if (stage.outputFrom === undefined) {
+		const sinks = findSinkStageIds(stage.stages);
+		if (sinks.length !== 1) {
+			issues.push({
+				path: `${path}.outputFrom`,
+				message: `dag stages without outputFrom must have exactly one sink child, found ${sinks.length}`,
+			});
+		}
+	} else {
 		optionalString(stage.outputFrom, `${path}.outputFrom`, issues);
 		const outputFrom =
 			typeof stage.outputFrom === "string" ? stage.outputFrom : undefined;
@@ -2126,14 +2207,6 @@ function validateDagStage(
 			issues.push({
 				path: `${path}.outputFrom`,
 				message: `references unknown child stage "${outputFrom}"`,
-			});
-		}
-	} else {
-		const sinks = findSinkStageIds(stage.stages);
-		if (sinks.length !== 1) {
-			issues.push({
-				path: `${path}.outputFrom`,
-				message: `dag stages without outputFrom must have exactly one sink child, found ${sinks.length}`,
 			});
 		}
 	}
@@ -2172,11 +2245,7 @@ function validateDefaults(
 		`${path}.maxConcurrency`,
 		issues,
 	);
-	optionalPositiveInteger(
-		defaults.maxRuntimeMs,
-		`${path}.maxRuntimeMs`,
-		issues,
-	);
+	optionalPositiveInteger(defaults.maxRuntimeMs, `${path}.maxRuntimeMs`, issues);
 	validateWorkflowToolArray(defaults.tools, `${path}.tools`, issues);
 }
 
@@ -2242,8 +2311,7 @@ function validateWorkflowToolArray(
 
 function workflowToolArrayIncludes(value: unknown, name: string): boolean {
 	return (
-		Array.isArray(value) &&
-		value.some((item) => workflowToolName(item) === name)
+		Array.isArray(value) && value.some((item) => workflowToolName(item) === name)
 	);
 }
 
@@ -2389,6 +2457,57 @@ function validateJsonPathArray(
 				path: itemPath,
 				message: "must be a JSONPath starting with $.",
 			});
+		}
+	}
+}
+
+function validateWorkflowRoutingHints(
+	value: unknown,
+	path: string,
+	issues: ValidationIssue[],
+): void {
+	if (value === undefined) return;
+	const hints = recordAt(value, path, issues);
+	if (!hints) return;
+	rejectUnknownKeys(hints, ROUTING_HINT_KEYS, path, issues);
+	for (const key of ROUTING_HINT_KEYS) {
+		const items = hints[key];
+		if (items === undefined) continue;
+		if (!Array.isArray(items)) {
+			issues.push({ path: `${path}.${key}`, message: "must be an array" });
+			continue;
+		}
+		if (items.length > WORKFLOW_ROUTING_HINT_MAX_ITEMS) {
+			issues.push({
+				path: `${path}.${key}`,
+				message: `must contain at most ${WORKFLOW_ROUTING_HINT_MAX_ITEMS} items`,
+			});
+		}
+		const seen = new Set<string>();
+		for (const [index, item] of items.entries()) {
+			const itemPath = `${path}.${key}[${index}]`;
+			if (typeof item !== "string" || item.trim() === "") {
+				issues.push({ path: itemPath, message: "must be a non-empty string" });
+				continue;
+			}
+			if (/[\u0000-\u001f\u007f-\u009f]/.test(item)) {
+				issues.push({
+					path: itemPath,
+					message: "must not contain control characters",
+				});
+			}
+			if (Buffer.byteLength(item, "utf8") > WORKFLOW_ROUTING_HINT_MAX_UTF8_BYTES) {
+				issues.push({
+					path: itemPath,
+					message: `must be at most ${WORKFLOW_ROUTING_HINT_MAX_UTF8_BYTES} UTF-8 bytes`,
+				});
+			}
+			if (seen.has(item))
+				issues.push({
+					path: itemPath,
+					message: `duplicate value ${JSON.stringify(item)}`,
+				});
+			seen.add(item);
 		}
 	}
 }

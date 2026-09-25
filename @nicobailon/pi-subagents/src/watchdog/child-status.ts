@@ -1,13 +1,14 @@
-import type { ResolvedWatchdogConfig, WatchdogLspConfig } from "./types.ts";
+import type { ChildWatchdogProgress, ChildWatchdogWarningSummary } from "../shared/types.ts";
+import { WATCHDOG_WARNING_CATEGORIES, WATCHDOG_WARNING_IMPORTANCES, type ResolvedWatchdogConfig, type WatchdogCadenceConfig, type WatchdogLspConfig } from "./types.ts";
 
-export const CHILD_WATCHDOG_CONFIG_ENV = "PI_SUBAGENT_WATCHDOG_CHILD_CONFIG";
+export const CHILD_WATCHDOG_WARNING_LIMIT = 20;
+
 export const CHILD_WATCHDOG_STATUS_EVENT = "subagent.watchdog.status";
 
-export const CHILD_WATCHDOG_PHASES = ["idle", "reviewing", "autofollow", "settling", "stale", "failed"] as const;
+export const CHILD_WATCHDOG_PHASES = ["idle", "reviewing", "stale", "failed"] as const;
 export type ChildWatchdogPhase = typeof CHILD_WATCHDOG_PHASES[number];
 
 export interface ChildWatchdogConfig {
-	enabled: boolean;
 	runId?: string;
 	agent?: string;
 	childIndex?: number;
@@ -17,9 +18,9 @@ export interface ChildWatchdogConfig {
 	model?: string;
 	thinking?: string | false;
 	lsp: WatchdogLspConfig;
-	autoFollowBlockers: boolean;
-	autoFollowMaxAttempts: number | null;
 	stalemateRepeats: number;
+	/** Mid-run review cadence; everyNTools null means boundary reviews only. */
+	cadence: WatchdogCadenceConfig;
 }
 
 export interface ChildWatchdogStatusEvent {
@@ -31,18 +32,11 @@ export interface ChildWatchdogStatusEvent {
 	seq: number;
 	phase: ChildWatchdogPhase;
 	ts: number;
-	followUpPending: boolean;
 	reason?: string;
+	warning?: ChildWatchdogWarningSummary;
 }
 
-export interface ChildWatchdogStateSnapshot {
-	phase: ChildWatchdogPhase;
-	seq: number;
-	lastUpdate: number;
-	followUpPending: boolean;
-	reason?: string;
-	timedOut?: boolean;
-}
+export type ChildWatchdogStateSnapshot = ChildWatchdogProgress;
 
 export function resolveChildWatchdogConfig(input: {
 	config: ResolvedWatchdogConfig;
@@ -55,8 +49,8 @@ export function resolveChildWatchdogConfig(input: {
 	if (!enabled) return undefined;
 	const model = override?.model ?? input.config.children.model;
 	const thinking = override?.thinking ?? input.config.children.thinking;
+	const cadence = override?.cadence ?? input.config.children.cadence ?? input.config.cadence;
 	return {
-		enabled: true,
 		...(input.runId ? { runId: input.runId } : {}),
 		...(input.agent ? { agent: input.agent } : {}),
 		...(input.childIndex !== undefined ? { childIndex: input.childIndex } : {}),
@@ -66,14 +60,9 @@ export function resolveChildWatchdogConfig(input: {
 		...(model ? { model } : {}),
 		...(thinking !== undefined ? { thinking } : {}),
 		lsp: { ...input.config.lsp },
-		autoFollowBlockers: input.config.children.autoFollow.blockers,
-		autoFollowMaxAttempts: input.config.children.autoFollow.maxAttempts,
-		stalemateRepeats: input.config.children.autoFollow.stalemateRepeats,
+		stalemateRepeats: input.config.stalemateRepeats,
+		cadence: { everyNTools: cadence.everyNTools ?? null },
 	};
-}
-
-export function encodeChildWatchdogConfig(config: ChildWatchdogConfig | undefined): string | undefined {
-	return config ? JSON.stringify(config) : undefined;
 }
 
 function childConfigObject(value: unknown, field: string): Record<string, unknown> {
@@ -108,10 +97,12 @@ function childConfigNullableNonNegativeInteger(input: Record<string, unknown>, f
 	throw new Error(`Invalid child watchdog config: ${field} must be null or a non-negative integer.`);
 }
 
-function childConfigBoolean(input: Record<string, unknown>, field: string): boolean {
-	const value = input[field];
-	if (typeof value === "boolean") return value;
-	throw new Error(`Invalid child watchdog config: ${field} must be a boolean.`);
+function childConfigCadence(value: unknown): WatchdogCadenceConfig {
+	const input = childConfigObject(value, "cadence");
+	const everyNTools = input.everyNTools;
+	if (everyNTools === null) return { everyNTools: null };
+	if (typeof everyNTools === "number" && Number.isInteger(everyNTools) && everyNTools >= 5) return { everyNTools };
+	throw new Error("Invalid child watchdog config: cadence.everyNTools must be null or an integer >= 5.");
 }
 
 function childConfigLsp(value: unknown): WatchdogLspConfig {
@@ -137,8 +128,11 @@ function childConfigLsp(value: unknown): WatchdogLspConfig {
 export function decodeChildWatchdogConfig(raw: string | undefined): ChildWatchdogConfig | undefined {
 	if (!raw) return undefined;
 	const parsed = childConfigObject(JSON.parse(raw), "root");
+	if (Object.hasOwn(parsed, "fallbackModels")) {
+		throw new Error("Invalid child watchdog config: fallbackModels was removed; configure one model instead.");
+	}
 	if (parsed.enabled === false) return undefined;
-	if (parsed.enabled !== true) throw new Error("Invalid child watchdog config: enabled must be true or false.");
+	if ("enabled" in parsed && parsed.enabled !== true) throw new Error("Invalid child watchdog config: enabled must be true or false.");
 	const thinking = parsed.thinking;
 	if (thinking !== undefined && typeof thinking !== "string" && thinking !== false) {
 		throw new Error("Invalid child watchdog config: thinking must be a string or false.");
@@ -148,7 +142,6 @@ export function decodeChildWatchdogConfig(raw: string | undefined): ChildWatchdo
 	const childIndex = childConfigOptionalIndex(parsed, "childIndex");
 	const model = childConfigOptionalString(parsed, "model");
 	return {
-		enabled: true,
 		...(runId ? { runId } : {}),
 		...(agent ? { agent } : {}),
 		...(childIndex !== undefined ? { childIndex } : {}),
@@ -158,29 +151,37 @@ export function decodeChildWatchdogConfig(raw: string | undefined): ChildWatchdo
 		...(model ? { model } : {}),
 		...(thinking !== undefined ? { thinking: thinking as string | false } : {}),
 		lsp: childConfigLsp(parsed.lsp),
-		autoFollowBlockers: childConfigBoolean(parsed, "autoFollowBlockers"),
-		autoFollowMaxAttempts: childConfigNullableNonNegativeInteger(parsed, "autoFollowMaxAttempts"),
 		stalemateRepeats: childConfigPositiveInteger(parsed, "stalemateRepeats"),
+		cadence: childConfigCadence(parsed.cadence),
 	};
 }
 
 export function isChildWatchdogStatusEvent(value: unknown): value is ChildWatchdogStatusEvent {
 	if (!value || typeof value !== "object") return false;
 	const event = value as Partial<ChildWatchdogStatusEvent>;
+	const warningValue = event.warning;
+	const warning = warningValue as Partial<ChildWatchdogWarningSummary>;
+	const validWarning = warningValue === undefined || (warningValue !== null && typeof warningValue === "object" && !Array.isArray(warningValue)
+		&& (warning.severity === "concern" || warning.severity === "blocker")
+		&& typeof warning.importance === "string" && (WATCHDOG_WARNING_IMPORTANCES as readonly string[]).includes(warning.importance)
+		&& typeof warning.category === "string" && (WATCHDOG_WARNING_CATEGORIES as readonly string[]).includes(warning.category)
+		&& typeof warning.summary === "string" && typeof warning.evidence === "string" && typeof warning.recommendedAction === "string"
+		&& typeof warning.addressed === "boolean" && typeof warning.stalemate === "boolean"
+		&& (warning.displayedAt === undefined || typeof warning.displayedAt === "string"));
 	return event.type === CHILD_WATCHDOG_STATUS_EVENT
 		&& typeof event.seq === "number"
 		&& Number.isInteger(event.seq)
 		&& event.seq >= 0
 		&& typeof event.ts === "number"
 		&& Number.isFinite(event.ts)
-		&& typeof event.followUpPending === "boolean"
 		&& typeof event.phase === "string"
-		&& (CHILD_WATCHDOG_PHASES as readonly string[]).includes(event.phase);
+		&& (CHILD_WATCHDOG_PHASES as readonly string[]).includes(event.phase)
+		&& validWarning;
 }
 
 export function childWatchdogIsActive(snapshot: ChildWatchdogStateSnapshot | undefined): boolean {
 	if (!snapshot) return false;
-	return snapshot.followUpPending || snapshot.phase === "reviewing" || snapshot.phase === "autofollow" || snapshot.phase === "settling";
+	return snapshot.phase === "reviewing";
 }
 
 export function acceptChildWatchdogEvent(input: {
@@ -195,11 +196,30 @@ export function acceptChildWatchdogEvent(input: {
 	const eventIndex = input.event.childIndex ?? input.event.stepIndex;
 	if (input.childIndex !== undefined && eventIndex !== input.childIndex) return undefined;
 	if (input.current && input.event.seq <= input.current.seq) return undefined;
+	const warnings = input.event.warning
+		? [...(input.current?.warnings ?? []), input.event.warning].slice(-CHILD_WATCHDOG_WARNING_LIMIT)
+		: input.current?.warnings;
 	return {
 		phase: input.event.phase,
 		seq: input.event.seq,
 		lastUpdate: input.event.ts,
-		followUpPending: input.event.followUpPending,
 		...(input.event.reason ? { reason: input.event.reason } : {}),
+		...(warnings?.length ? { warnings } : {}),
 	};
+}
+
+/** An assistant turn marks earlier warnings addressed. Undefined when unchanged. */
+export function applyChildWatchdogMessage(current: ChildWatchdogStateSnapshot | undefined, message: unknown): ChildWatchdogStateSnapshot | undefined {
+	if ((message as { role?: unknown } | undefined)?.role !== "assistant" || !current?.warnings?.some((entry) => !entry.addressed)) return undefined;
+	return { ...current, warnings: current.warnings.map((entry) => entry.addressed ? entry : { ...entry, addressed: true }) };
+}
+
+export function unresolvedChildWatchdogBlockers(progress: Pick<ChildWatchdogProgress, "warnings"> | undefined): ChildWatchdogWarningSummary[] {
+	return (progress?.warnings ?? []).filter((warning) => warning.severity === "blocker" && (!warning.addressed || warning.stalemate));
+}
+
+export function childWatchdogProgressForModel(progress: ChildWatchdogProgress | undefined): ChildWatchdogProgress | undefined {
+	if (!progress) return undefined;
+	const warnings = (progress.warnings ?? []).filter((warning) => warning.importance === "high");
+	return { ...progress, warnings: warnings.length ? warnings : undefined };
 }

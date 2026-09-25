@@ -1,0 +1,17 @@
+id: no-http-headers-bracket-access
+valid:
+  - "auth = request.headers.get('Authorization')"
+  - "auth = request.headers.get('Authorization', '')"
+  - |
+    # #3211: a plain assignment through the bracket sets the header —
+    # it cannot raise KeyError, so it is not a read-site false positive.
+    resp.headers["X"] = "v"
+  - |
+    # #3211: augmented assignment is still a write, not a read.
+    resp.headers["X"] += "b"
+  - |
+    # #3211: `del` removes the key; it never raises KeyError either.
+    del resp.headers["Y"]
+invalid:
+  - 'auth = request.headers["Authorization"]'
+  - 'auth = response.headers["X-Request-Id"]'

@@ -1,0 +1,9 @@
+id: hardcoded-url-js
+valid:
+  - 'const url = process.env.API_URL'
+  - 'const x = "hello"'
+  - 'export const BASE_URL_CLINE = "https://api.cline.bot";'
+invalid:
+  - 'const url = "https://api.example.com"'
+  - 'const endpoint = "http://localhost:3000"'
+  - 'const render = () => <a href="http://localhost:3000">Open</a>;'

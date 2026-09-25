@@ -1,0 +1,29 @@
+id: reducible-list-comprehension
+language: Python
+severity: warning
+message: "A list comprehension is unnecessary here; use a generator expression"
+note: |
+  `any`, `all`, and `sum` consume iterables directly, so the list allocation
+  can be removed without changing the operation's result. The generator
+  expression can short-circuit, so evaluation counts differ; apply this fix
+  only when the element expression is side-effect-free.
+rule:
+  pattern: $FN([$X for $Y in $Z])
+  not:
+    any:
+      - pattern: $FN([$X async for $Y in $Z])
+      - pattern: $FN([await $X for $Y in $Z])
+      - has:
+          pattern: await $$$
+          stopBy: end
+constraints:
+  FN:
+    regex: "^(any|all|sum)$"
+fix: "$FN($X for $Y in $Z)"
+tags:
+  - python
+  - performance
+  - modernization
+examples:
+  bad: "total = sum([price for price in prices])"
+  good: "total = sum(price for price in prices)"

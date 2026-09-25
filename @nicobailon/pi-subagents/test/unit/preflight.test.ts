@@ -4,10 +4,10 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import { registerSubagentCapabilityCeiling, resolveSubagentCapabilityCeiling } from "../../src/api/capability-ceiling.ts";
+import { registerRequiredChildExtensions } from "../../src/api/required-child-extensions.ts";
 import { resolveSubagentLaunchContract, SUBAGENT_LAUNCH_CONTRACT_VERSION } from "../../src/api/preflight.ts";
 import { clearSkillCache } from "../../src/agents/skills.ts";
 import { computeMcpServerHash } from "../../src/runs/shared/mcp-direct-tool-allowlist.ts";
-import { clearExclusions, recordModelFailure } from "../../src/runs/shared/model-exclusions.ts";
 import { TEMP_ARTIFACTS_DIR } from "../../src/shared/types.ts";
 
 let tempDir = "";
@@ -60,12 +60,10 @@ describe("public launch contract preflight", () => {
 		process.env.USERPROFILE = home;
 		process.env.PI_CODING_AGENT_DIR = path.join(home, ".pi", "agent");
 		clearSkillCache();
-		clearExclusions();
 	});
 
 	afterEach(() => {
 		clearSkillCache();
-		clearExclusions();
 		if (previousHome === undefined) delete process.env.HOME;
 		else process.env.HOME = previousHome;
 		if (previousUserProfile === undefined) delete process.env.USERPROFILE;
@@ -73,6 +71,22 @@ describe("public launch contract preflight", () => {
 		if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
 		else process.env.PI_CODING_AGENT_DIR = previousAgentDir;
 		fs.rmSync(tempDir, { recursive: true, force: true });
+	});
+
+	it("exposes required host IDs without exposing their private paths", async () => {
+		const cwd = path.join(tempDir, "repo");
+		fs.mkdirSync(path.join(cwd, ".pi", "agents"), { recursive: true });
+		writeAgent(path.join(cwd, ".pi", "agents", "required.md"), "---\nname: required\ndescription: Required extension fixture\n---\nFixture.\n");
+		const extensionPath = path.join(tempDir, "required-provider.mjs");
+		fs.writeFileSync(extensionPath, "export default () => {};\n");
+		const registration = registerRequiredChildExtensions({ sessionId: "preflight-required", extensions: [{ id: "safe-provider", path: extensionPath }] });
+		try {
+			const result = await resolveSubagentLaunchContract({ agent: "required", cwd, parentSessionId: "preflight-required" });
+			assert.equal(result.ok, true);
+			if (!result.ok) return;
+			assert.deepEqual(result.contract.tools.requiredExtensionIds, ["safe-provider"]);
+			assert.equal(result.contract.tools.extensionArgs.includes(fs.realpathSync(extensionPath)), false);
+		} finally { registration.dispose(); }
 	});
 
 	it("resolves an ordinary single-agent contract without creating launch directories", async () => {
@@ -87,8 +101,6 @@ tools:
   - write
   - /tmp/private-tool.ts
 model: test/primary
-fallbackModels:
-  - test/fallback
 thinking: high
 skills:
   - project-skill
@@ -116,18 +128,19 @@ Project prompt.
 			assert.equal(result.ok, true);
 			assert.equal(result.contract.version, SUBAGENT_LAUNCH_CONTRACT_VERSION);
 			assert.equal(result.contract.agent.source, "project");
-			assert.equal(result.contract.agent.definitionProjectionVersion, 1);
+			assert.equal(result.contract.agent.definitionProjectionVersion, 2);
 			assert.match(result.contract.agent.definitionDigest, /^[a-f0-9]{64}$/);
 			assert.match(result.contract.launchContractDigest, /^[a-f0-9]{64}$/);
 			assert.ok(result.contract.agent.shadowedCandidates.some((candidate) => candidate.name === "worker" && candidate.source === "builtin"));
 			assert.equal(result.contract.model, "test/primary:high");
-			assert.deepEqual(result.contract.modelCandidates, ["test/primary:high", "test/fallback:high"]);
 			assert.equal(result.contract.thinking, "high");
 			assert.deepEqual(result.contract.skills.requested, ["project-skill"]);
 			assert.equal(result.contract.skills.resolved[0]?.name, "project-skill");
 			assert.deepEqual(result.contract.tools.effectiveAllowlist, ["read"]);
-			assert.deepEqual(result.contract.tools.capabilityAudit?.removedTools, ["write"]);
+			// The bridge adds contact_supervisor before the ceiling applies, exactly as execution does.
+			assert.deepEqual(result.contract.tools.capabilityAudit?.removedTools, ["write", "contact_supervisor"]);
 			assert.equal(result.contract.tools.capabilityAudit?.removedExtensionCount, 1);
+			assert.deepEqual(result.contract.intercomBridge, { mode: "always", active: true });
 			assert.equal(result.contract.tools.disableAmbientExtensions, true);
 			assert.equal(result.contract.roots.sessionFile, path.join(sessionRoot, "run-123", "run-0", "session.jsonl"));
 			assert.equal(result.contract.roots.outputPath, path.join(TEMP_ARTIFACTS_DIR, "outputs", "run-123", "report.md"));
@@ -154,6 +167,43 @@ Project prompt.
 			assert.equal(fs.existsSync(path.join(cwd, ".pi/subagents")), false);
 		} finally {
 			handle.dispose();
+		}
+	});
+
+	it("projects concurrent children under distinct run-id roots for an explicit sessionDir", async () => {
+		const cwd = path.join(tempDir, "repo-session-dir-keying");
+		fs.mkdirSync(cwd, { recursive: true });
+		writeAgent(path.join(cwd, ".pi", "agents", "worker.md"), `---\nname: worker\ndescription: Project worker\n---\nWorker.\n`);
+		const sessionDir = path.join(tempDir, "caller-sessions");
+		const runIds = ["run-123", "run-456"];
+
+		const projected = await Promise.all(runIds.map((runId) => resolveSubagentLaunchContract({
+			agent: "worker",
+			cwd,
+			task: "Inspect the repo",
+			runId,
+			sessionDir,
+		})));
+		assert.ok(projected.every((result) => result.ok));
+		for (const [index, result] of projected.entries()) {
+			if (!result.ok) continue;
+			const runId = runIds[index]!;
+			assert.equal(result.contract.roots.sessionFile, path.join(sessionDir, runId, "run-0", "session.jsonl"));
+			assert.equal(result.contract.roots.sessionDir, path.join(sessionDir, runId, "run-0"));
+			assert.equal(result.contract.roots.sessionRoot, path.join(sessionDir, runId));
+		}
+		assert.notEqual(projected[0]!.contract?.roots.sessionFile, projected[1]!.contract?.roots.sessionFile);
+
+		const withoutRunId = await resolveSubagentLaunchContract({
+			agent: "worker",
+			cwd,
+			task: "Inspect the repo",
+			sessionDir,
+		});
+		assert.equal(withoutRunId.ok, true);
+		if (withoutRunId.ok) {
+			assert.equal(withoutRunId.contract.roots.sessionFile, path.join(sessionDir, "preflight", "run-0", "session.jsonl"));
+			assert.equal(withoutRunId.contract.roots.sessionDir, path.join(sessionDir, "preflight", "run-0"));
 		}
 	});
 
@@ -302,105 +352,25 @@ Project prompt.
 		);
 	});
 
-	it("uses an available configured fallback when the agent primary is unavailable", async () => {
-		const cwd = path.join(tempDir, "repo-unavailable-primary");
-		fs.mkdirSync(cwd, { recursive: true });
-		writeAgent(path.join(cwd, ".pi", "agents", "scout.md"), `---
-name: scout
-description: Project scout
-model: test/missing-primary
-fallbackModels:
-  - test/fallback
----
-Project prompt.
-`);
-
-		const result = await resolveSubagentLaunchContract({
-			agent: "scout",
-			cwd,
-			availableModels: [{ provider: "test", id: "fallback", fullId: "test/fallback" }],
-		});
-
-		assert.equal(result.ok, true);
-		assert.deepEqual(result.contract.modelCandidates, ["test/fallback"]);
-	});
-
-	it("rejects an explicit unknown per-call model even when a fallback is configured", async () => {
+	it("rejects an explicit per-call unknown model before launch", async () => {
 		const cwd = path.join(tempDir, "repo-explicit-unknown-model");
 		fs.mkdirSync(cwd, { recursive: true });
-		writeAgent(path.join(cwd, ".pi", "agents", "scout.md"), `---
-name: scout
-description: Project scout
-model: test/missing-primary
-fallbackModels:
-  - test/fallback
----
-Project prompt.
-`);
-
-		await assert.rejects(
-			resolveSubagentLaunchContract({
-				agent: "scout",
-				cwd,
-				model: "test/does-not-exist",
-				availableModels: [{ provider: "test", id: "fallback", fullId: "test/fallback" }],
-			}),
-			/Unknown subagent model 'test\/does-not-exist'/,
-		);
-	});
-
-	it("fails closed when every configured candidate is unavailable", async () => {
-		const cwd = path.join(tempDir, "repo-all-unavailable-models");
-		fs.mkdirSync(cwd, { recursive: true });
-		writeAgent(path.join(cwd, ".pi", "agents", "scout.md"), `---
-name: scout
-description: Project scout
-model: test/missing-primary
-fallbackModels:
-  - test/missing-fallback
----
-Project prompt.
-`);
-
-		await assert.rejects(
-			resolveSubagentLaunchContract({
-				agent: "scout",
-				cwd,
-				availableModels: [{ provider: "test", id: "other", fullId: "test/other" }],
-			}),
-			/Unknown subagent model 'test\/missing-primary'/,
-		);
-	});
-
-	it("fails closed when cached exclusions leave zero launch candidates", async () => {
-		const cwd = path.join(tempDir, "repo-cached-excluded-models");
-		fs.mkdirSync(cwd, { recursive: true });
-		writeAgent(path.join(cwd, ".pi", "agents", "scout.md"), `---
-name: scout
-description: Project scout
+		writeAgent(path.join(cwd, ".pi", "agents", "worker.md"), `---
+name: worker
+description: Project worker
 model: test/primary
-fallbackModels:
-  - test/fallback
 ---
 Project prompt.
 `);
-		recordModelFailure({ modelId: "primary", provider: "test", reason: "sk-secret-token-xyz" });
-		recordModelFailure({ modelId: "fallback", provider: "test", reason: "sk-secret-token-xyz" });
 
 		await assert.rejects(
 			resolveSubagentLaunchContract({
-				agent: "scout",
+				agent: "worker",
 				cwd,
-				availableModels: [
-					{ provider: "test", id: "primary", fullId: "test/primary" },
-					{ provider: "test", id: "fallback", fullId: "test/fallback" },
-				],
+				model: "test/unknown",
+				availableModels: [{ provider: "test", id: "primary", fullId: "test/primary" }],
 			}),
-			(error: unknown) => {
-				const message = String(error);
-				return /No usable subagent models remain after registry, scope, and cached-exclusion filtering/.test(message)
-					&& !message.includes("sk-secret-token-xyz");
-			},
+			/Unknown subagent model 'test\/unknown'/,
 		);
 	});
 
@@ -423,7 +393,6 @@ Project prompt.
 
 		assert.equal(result.ok, true);
 		assert.equal(result.contract.model, "gateway/parent-model");
-		assert.deepEqual(result.contract.modelCandidates, ["gateway/parent-model"]);
 	});
 
 	it("uses subagents.defaultProvider when resolving launch model ids", async () => {
@@ -452,7 +421,6 @@ Project prompt.
 
 		assert.equal(result.ok, true);
 		assert.equal(result.contract.model, "gpu-b/gpt-5-mini");
-		assert.deepEqual(result.contract.modelCandidates, ["gpu-b/gpt-5-mini"]);
 	});
 
 	it("bypasses native model validation for external CLI runners", async () => {
@@ -479,7 +447,6 @@ Project prompt.
 
 		assert.equal(result.ok, true);
 		assert.equal(result.contract.model, undefined);
-		assert.deepEqual(result.contract.modelCandidates, []);
 	});
 
 	it("resolves agent aliases to the canonical launch contract agent", async () => {
@@ -790,7 +757,7 @@ Project prompt.
 		assert.equal(result.ok, true);
 		assert.equal(result.contract.context, "fork");
 		assert.ok(result.contract.diagnostics.some((diagnostic) => diagnostic.code === "host_required"));
-		assert.deepEqual(result.contract.tools.declaredBuiltin, ["read", "subagent"]);
+		assert.deepEqual(result.contract.tools.declaredBuiltin, ["read", "subagent", "contact_supervisor"]);
 		assert.equal(result.contract.tools.explicitAllowlist, true);
 		assert.equal(result.contract.tools.fanoutAuthorized, true);
 		assert.deepEqual(result.contract.tools.internalTools, ["structured_output"]);
@@ -802,6 +769,27 @@ Project prompt.
 		assert.ok(result.contract.tools.runtimeExtensions.some((extensionPath) => extensionPath.endsWith("fanout-child.ts")));
 		assert.ok(result.contract.tools.extensionArgs.includes("/tmp/config-ext.ts"));
 		assert.ok(result.contract.tools.extensionArgs.includes("/tmp/subagent-only.ts"));
+	});
+
+	it("inherits agent structured output and honors false for native and external runners", async () => {
+		const cwd = path.join(tempDir, "schema-default-repo");
+		fs.mkdirSync(cwd, { recursive: true });
+		writeAgent(path.join(cwd, ".pi", "agents", "typed.md"), `---\nname: typed\ndescription: Typed\noutputSchema: {"type":"object","required":["ok"]}\n---\nPrompt.\n`);
+		const inherited = await resolveSubagentLaunchContract({ agent: "typed", cwd, task: "Inspect" });
+		assert.equal(inherited.ok, true);
+		if (!inherited.ok) return;
+		assert.deepEqual(inherited.contract.tools.internalTools, ["structured_output"]);
+		const disabled = await resolveSubagentLaunchContract({ agent: "typed", cwd, task: "Inspect", outputSchema: false });
+		assert.equal(disabled.ok, true);
+		if (!disabled.ok) return;
+		assert.deepEqual(disabled.contract.tools.internalTools, []);
+		assert.notEqual(inherited.contract.launchContractDigest, disabled.contract.launchContractDigest);
+
+		writeAgent(path.join(cwd, ".pi", "agents", "external.md"), `---\nname: external\ndescription: External\noutputSchema: {"type":"object"}\nrunner:\n  type: external-cli\n  command: ${JSON.stringify(process.execPath)}\n---\nPrompt.\n`);
+		const rejected = await resolveSubagentLaunchContract({ agent: "external", cwd });
+		assert.equal(rejected.ok, false);
+		assert.equal(rejected.code, "unsupported_mode");
+		assert.equal((await resolveSubagentLaunchContract({ agent: "external", cwd, outputSchema: false })).ok, true);
 	});
 
 	it("projects per-agent tool exclusions and binds them into launch identity", async () => {
@@ -820,8 +808,101 @@ Project prompt.
 		assert.equal(result.ok, true);
 		if (!result.ok) return;
 		assert.deepEqual(result.contract.tools.excludeTools, ["write", "unknown_tool"]);
-		assert.deepEqual(result.contract.tools.effectiveAllowlist, ["read"]);
+		assert.deepEqual(result.contract.tools.effectiveAllowlist, ["read", "contact_supervisor"]);
 		assert.match(result.contract.launchContractDigest, /^[a-f0-9]{64}$/);
+	});
+
+	it("binds Intercom bridge activation into launch identity without touching definition identity", async () => {
+		const cwd = path.join(tempDir, "bridge-repo");
+		fs.mkdirSync(cwd, { recursive: true });
+		writeAgent(path.join(cwd, ".pi", "agents", "worker.md"), `---
+name: worker
+description: Project worker
+tools: read
+---
+Project prompt.
+`);
+		const input = { agent: "worker", cwd, task: "Inspect" };
+
+		const base = await resolveSubagentLaunchContract(input);
+		assert.equal(base.ok, true);
+		if (!base.ok) return;
+		assert.deepEqual(base.contract.intercomBridge, { mode: "always", active: true });
+		assert.ok(base.contract.tools.effectiveAllowlist.includes("contact_supervisor"));
+		assert.equal(base.contract.diagnostics.some((diagnostic) => /orchestratorTarget/.test(diagnostic.message)), false);
+
+		// The default template never names the parent session, so a host that
+		// supplies its real target gets the same digest as one that does not.
+		const withTarget = await resolveSubagentLaunchContract({ ...input, orchestratorTarget: "subagent-chat-1234" });
+		assert.equal(withTarget.ok, true);
+		if (!withTarget.ok) return;
+		assert.equal(withTarget.contract.launchContractDigest, base.contract.launchContractDigest);
+
+		const off = await resolveSubagentLaunchContract({ ...input, intercomBridge: { mode: "off" } });
+		assert.equal(off.ok, true);
+		if (!off.ok) return;
+		assert.deepEqual(off.contract.intercomBridge, { mode: "off", active: false });
+		assert.equal(off.contract.tools.effectiveAllowlist.includes("contact_supervisor"), false);
+		assert.notEqual(off.contract.launchContractDigest, base.contract.launchContractDigest);
+		assert.equal(off.contract.agent.definitionDigest, base.contract.agent.definitionDigest);
+
+		// Inactive fork-only for a fresh launch hashes exactly like off: activation, not the mode label, is bound.
+		const forkOnly = await resolveSubagentLaunchContract({ ...input, context: "fresh", intercomBridge: { mode: "fork-only" } });
+		assert.equal(forkOnly.ok, true);
+		if (!forkOnly.ok) return;
+		assert.deepEqual(forkOnly.contract.intercomBridge, { mode: "fork-only", active: false });
+		assert.equal(forkOnly.contract.launchContractDigest, off.contract.launchContractDigest);
+	});
+
+	it("requires a host target only when the bridge instruction file names the session", async () => {
+		const cwd = path.join(tempDir, "bridge-template-repo");
+		fs.mkdirSync(cwd, { recursive: true });
+		writeAgent(path.join(cwd, ".pi", "agents", "worker.md"), `---
+name: worker
+description: Project worker
+---
+Project prompt.
+`);
+		const instructionFile = path.join(tempDir, "bridge.md");
+		fs.writeFileSync(instructionFile, "Custom bridge for {orchestratorTarget}\nUse ask then send.\n", "utf-8");
+		const input = { agent: "worker", cwd, task: "Inspect", intercomBridge: { mode: "always" as const, instructionFile } };
+
+		const withoutTarget = await resolveSubagentLaunchContract(input);
+		assert.equal(withoutTarget.ok, true);
+		if (!withoutTarget.ok) return;
+		assert.ok(withoutTarget.contract.diagnostics.some((diagnostic) => diagnostic.code === "host_required" && /orchestratorTarget/.test(diagnostic.message)));
+
+		const withTarget = await resolveSubagentLaunchContract({ ...input, orchestratorTarget: "main" });
+		assert.equal(withTarget.ok, true);
+		if (!withTarget.ok) return;
+		assert.equal(withTarget.contract.diagnostics.some((diagnostic) => /orchestratorTarget/.test(diagnostic.message)), false);
+		assert.notEqual(withTarget.contract.launchContractDigest, withoutTarget.contract.launchContractDigest);
+	});
+
+	it("fails closed for an invalid intercomBridge override", async () => {
+		const cwd = path.join(tempDir, "bridge-invalid-repo");
+		fs.mkdirSync(cwd, { recursive: true });
+		writeAgent(path.join(cwd, ".pi", "agents", "worker.md"), `---
+name: worker
+description: Project worker
+---
+Project prompt.
+`);
+		for (const intercomBridge of [{ mode: "loud" }, { extra: true }, "always"]) {
+			const result = await resolveSubagentLaunchContract({ agent: "worker", cwd, intercomBridge: intercomBridge as never });
+			assert.equal(result.ok, false);
+			if (!result.ok) assert.equal(result.code, "invalid_intercom_bridge");
+		}
+		// Execution never has an empty target, so accepting one would silently
+		// deactivate the bridge in preflight only.
+		for (const orchestratorTarget of ["", "   ", 7]) {
+			const result = await resolveSubagentLaunchContract({ agent: "worker", cwd, orchestratorTarget: orchestratorTarget as never });
+			assert.equal(result.ok, false);
+			if (!result.ok) {
+				assert.equal(result.code, "invalid_intercom_bridge");
+				assert.match(result.message, /orchestratorTarget/);
+			}
+		}
 	});
 
 	it("falls back implicit default fork to fresh when the parent session is not forkable", async () => {

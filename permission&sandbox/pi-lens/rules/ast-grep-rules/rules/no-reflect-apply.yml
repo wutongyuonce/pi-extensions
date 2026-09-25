@@ -1,0 +1,30 @@
+id: no-reflect-apply
+language: TypeScript
+severity: error
+message: "Reflect.apply() — use a typed call (fn.apply(...) or fn(...args)) instead"
+metadata:
+  category: pi-lens-self-scan
+note: |
+  Reflect.apply reaches for reflection where a typed call already works.
+  Prefer Function#apply or a direct call with spread arguments.
+
+  This rule has no autofix because a function can have a shadowed own `.apply`
+  property. The semantically exact `Function.prototype.apply.call` rewrite is
+  worse than the diagnostic.
+
+  2026-08-20 (refs #1856): PROMOTED from `warning` to `error`. Standard
+  forwarding inside an inline `new Proxy` apply trap is excluded
+  structurally; a method merely named `apply` elsewhere remains in scope.
+rule:
+  all:
+    - pattern: Reflect.apply($$$ARGS)
+    - not:
+        inside:
+          kind: method_definition
+          stopBy: end
+          has:
+            field: name
+            regex: "^apply$"
+          inside:
+            pattern: new Proxy($TARGET, $HANDLER)
+            stopBy: end

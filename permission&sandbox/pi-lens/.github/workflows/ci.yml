@@ -1,0 +1,1133 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  repository_dispatch:
+    types: [merge-train-post-merge]
+  pull_request:
+    branches: [master]
+
+# A merge made with GITHUB_TOKEN suppresses its push event. Replayed
+# repository_dispatch runs must validate the exact merge commit, and duplicate
+# events for that commit must not run concurrently.
+concurrency:
+  group: ci-${{ github.event_name == 'repository_dispatch' && github.event.client_payload.sha || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate-merge-train-dispatch:
+    name: Validate merge-train dispatch
+    runs-on: ubuntu-latest
+    # refs #3123: bounds a hang against GitHub's 360-min default.
+    # Measured max over last 10 successful master runs: 9s; timeout = floor of
+    # 10 min.
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        if: github.event_name == 'repository_dispatch'
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Validate merge-train dispatch ancestry
+        if: github.event_name == 'repository_dispatch'
+        env:
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          GITHUB_TOKEN: ${{ github.token }}
+          PAYLOAD_REPOSITORY: ${{ github.event.client_payload.repository }}
+          PAYLOAD_SHA: ${{ github.event.client_payload.sha }}
+          PAYLOAD_PR_NUMBER: ${{ github.event.client_payload.pr_number }}
+        run: node scripts/lib/merge-train-dispatch-validation.mjs
+
+  dependency-boundaries:
+    name: Dependency boundaries
+    needs: validate-merge-train-dispatch
+    runs-on: ubuntu-latest
+    # refs #3123: bounds a hang against GitHub's 360-min default.
+    # Measured max over last 10 successful master runs: 23s; timeout = floor of
+    # 10 min.
+    timeout-minutes: 10
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.sha || github.ref }}
+          persist-credentials: false
+
+
+      - name: Validate merge-train dispatch payload
+        if: github.event_name == 'repository_dispatch'
+        env:
+          PAYLOAD_REPOSITORY: ${{ github.event.client_payload.repository }}
+          PAYLOAD_SHA: ${{ github.event.client_payload.sha }}
+        run: |
+          set -euo pipefail
+          if [[ "$PAYLOAD_REPOSITORY" != "$GITHUB_REPOSITORY" ]]; then
+            echo "::error::repository_dispatch repository does not match this repository"
+            exit 1
+          fi
+          if [[ ! "$PAYLOAD_SHA" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "::error::repository_dispatch SHA must be a 40-hex commit"
+            exit 1
+          fi
+          checked_sha="$(git rev-parse --verify HEAD)"
+          if [[ "${PAYLOAD_SHA,,}" != "$checked_sha" ]]; then
+            echo "::error::checkout does not match the repository_dispatch SHA"
+            exit 1
+          fi
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
+        with:
+          node-version: '22'
+
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund --ignore-scripts
+
+      - name: Build compiled clients
+        run: npm run build
+
+      - name: Check client dependency boundaries
+        run: npm run depcruise:check
+
+  # #1844: the changelog-fragment format error hit four PRs in one day, each
+  # costing a full ~4-minute Unit-tests lap to discover. This job runs ONLY
+  # the fragment parser (no `npm install`, no `npm run build` -- it is pure
+  # Node against .changelog/*.md) so a bad fragment fails in seconds. It is
+  # additive early signal, not a replacement for the Unit-tests job below,
+  # which still runs the full changelog-entries.test.ts as part of the suite.
+  changelog-fragment-fastfail:
+    name: Changelog fragment (fast-fail)
+    needs: validate-merge-train-dispatch
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    # refs #3123: bounds a hang against GitHub's 360-min default. This job runs
+    # on pull_request so --branch master matched no runs; measured max over 6
+    # successful runs regardless of branch: 10s; timeout = floor of 10 min.
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.sha || github.ref }}
+          persist-credentials: false
+
+
+      - name: Validate merge-train dispatch payload
+        if: github.event_name == 'repository_dispatch'
+        env:
+          PAYLOAD_REPOSITORY: ${{ github.event.client_payload.repository }}
+          PAYLOAD_SHA: ${{ github.event.client_payload.sha }}
+        run: |
+          set -euo pipefail
+          if [[ "$PAYLOAD_REPOSITORY" != "$GITHUB_REPOSITORY" ]]; then
+            echo "::error::repository_dispatch repository does not match this repository"
+            exit 1
+          fi
+          if [[ ! "$PAYLOAD_SHA" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "::error::repository_dispatch SHA must be a 40-hex commit"
+            exit 1
+          fi
+          checked_sha="$(git rev-parse --verify HEAD)"
+          if [[ "${PAYLOAD_SHA,,}" != "$checked_sha" ]]; then
+            echo "::error::checkout does not match the repository_dispatch SHA"
+            exit 1
+          fi
+
+      - name: Validate changelog fragments
+        run: node scripts/check-changelog-fragments.mjs
+
+  lint-and-typecheck:
+    name: Lint & type-check
+    needs: validate-merge-train-dispatch
+    runs-on: ubuntu-latest
+    # refs #3123: bounds a hang against GitHub's 360-min default.
+    # Measured max over last 10 successful master runs: 32s; timeout = floor of
+    # 10 min.
+    timeout-minutes: 10
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.sha || github.ref }}
+          persist-credentials: false
+
+
+      - name: Validate merge-train dispatch payload
+        if: github.event_name == 'repository_dispatch'
+        env:
+          PAYLOAD_REPOSITORY: ${{ github.event.client_payload.repository }}
+          PAYLOAD_SHA: ${{ github.event.client_payload.sha }}
+        run: |
+          set -euo pipefail
+          if [[ "$PAYLOAD_REPOSITORY" != "$GITHUB_REPOSITORY" ]]; then
+            echo "::error::repository_dispatch repository does not match this repository"
+            exit 1
+          fi
+          if [[ ! "$PAYLOAD_SHA" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "::error::repository_dispatch SHA must be a 40-hex commit"
+            exit 1
+          fi
+          checked_sha="$(git rev-parse --verify HEAD)"
+          if [[ "${PAYLOAD_SHA,,}" != "$checked_sha" ]]; then
+            echo "::error::checkout does not match the repository_dispatch SHA"
+            exit 1
+          fi
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
+        with:
+          node-version: '22'
+
+      - name: Lockfile complete under the CI npm pin
+        run: npm run check:lockfile -- --complete
+
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Lockfile in sync with package.json
+        run: npm run check:lockfile
+
+      # `npm install` above ran `prepare` → downloaded the core grammars into
+      # grammars/ with provenance sidecars. Verify their bytes/versions match the
+      # committed manifest so a stale or tampered/ABI-mismatched wasm can't slip in
+      # against the pinned web-tree-sitter (#177).
+      - name: Grammar provenance in sync with manifest
+        run: npm run check:grammars
+
+      # Fail on known-vulnerable PRODUCTION deps (what actually ships to users via
+      # `npm install --omit=dev`). Scoped to high/critical to avoid blocking PRs on
+      # fix-less moderate advisories; transitive moderate ones are handled by
+      # Dependabot security updates. DevDeps are excluded — they never reach users.
+      # Bounded + retried (scripts/audit-prod-deps.mjs): a registry outage
+      # (2026-09-04: ~5 min hang then 400 from the retired quick endpoint) must
+      # not red the job the way a real high/critical finding does. The script
+      # fails only on findings, retries transport errors, and on exhaustion
+      # passes with a visible warning annotation.
+      - name: Audit production dependencies
+        run: node scripts/audit-prod-deps.mjs
+
+      # `npm run lint` chains tsc (the TS project) with `lint:js` (oxlint over
+      # scripts/**/*.mjs, root *.mjs, tests/**/*.mjs, and other non-TS JS) —
+      # #2439: tsc alone never covered plain .mjs, so an undefined identifier
+      # there passed both this step and CI.
+      - name: TypeScript & JS lint
+        run: npm run lint
+
+      # Catches accidental duplicate ast-grep rule bodies across language
+      # tags (#657) — e.g. a `-js` twin whose language tag never got updated
+      # off its copy-pasted `TypeScript` value, so both rules always fired
+      # under the SAME language and the twin's JS coverage was silently dead.
+      - name: ast-grep rule pair audit
+        run: npm run audit:astgrep-rule-pairs
+
+  targeted-tests-advisory:
+    name: Targeted tests (advisory)
+    needs: validate-merge-train-dispatch
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    timeout-minutes: 15
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.sha || github.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
+        with:
+          node-version: '22'
+
+      # Lockfile-locked and script-free (SonarCloud githubactions:S8543 /
+      # S6505 flagged the copied `npm install` here); the one piece of
+      # `prepare` the targeted vitest files need is the grammar download, run
+      # explicitly below. The Unit job keeps `npm install` because its
+      # lockfile-in-sync check depends on it.
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund --ignore-scripts
+
+      - name: Download core grammars
+        run: node scripts/download-grammars.js --core --dest grammars
+
+      - name: Build
+        run: npm run build
+
+      - name: Run targeted tests
+        # --include-ci-only admits the real-spawn suites that exceed the local
+        # pre-push budget (#3426 H3432-1); this job is their CI row.
+        run: node scripts/pre-push-targeted-tests.mjs --skip-build --include-ci-only
+
+  test:
+    name: Unit tests
+    needs: validate-merge-train-dispatch
+    runs-on: ubuntu-latest
+    # Bounds the job so a reader that is alive but never drains (e.g. an
+    # unbounded stdout stall in the mem-watch wrapper, #3106) cannot hold the
+    # runner for GitHub's 360-minute default. Sized at measured-max x2 plus margin
+    # headroom: the longest Unit job over 9 successful master runs
+    # (2026-09-15/16) was 12m42s; 26m would sit exactly on a 2x-slow runner, so 30m (refs #3111).
+    timeout-minutes: 30
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.sha || github.ref }}
+          persist-credentials: false
+
+
+      - name: Validate merge-train dispatch payload
+        if: github.event_name == 'repository_dispatch'
+        env:
+          PAYLOAD_REPOSITORY: ${{ github.event.client_payload.repository }}
+          PAYLOAD_SHA: ${{ github.event.client_payload.sha }}
+        run: |
+          set -euo pipefail
+          if [[ "$PAYLOAD_REPOSITORY" != "$GITHUB_REPOSITORY" ]]; then
+            echo "::error::repository_dispatch repository does not match this repository"
+            exit 1
+          fi
+          if [[ ! "$PAYLOAD_SHA" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "::error::repository_dispatch SHA must be a 40-hex commit"
+            exit 1
+          fi
+          checked_sha="$(git rev-parse --verify HEAD)"
+          if [[ "${PAYLOAD_SHA,,}" != "$checked_sha" ]]; then
+            echo "::error::checkout does not match the repository_dispatch SHA"
+            exit 1
+          fi
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
+        with:
+          node-version: '22'
+
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+
+      # The #448 CI-loud ast-grep-CLI guard (ast-grep-rule-tests.test.ts's
+      # "ast-grep CLI is installed in CI") depends on `ast-grep` resolving off
+      # PATH, which it does only implicitly today via `npm test`. Make that
+      # dependency explicit so a PATH regression fails here with a legible
+      # error instead of surfacing as an oblique test failure downstream.
+      - name: Verify ast-grep CLI is on PATH
+        run: npx ast-grep --version
+
+      - name: Build
+        run: npm run build
+
+      # #1718: dogfoods the pi-lens-self-scan ast-grep rule subset (recurring
+      # AI-authorship defect shapes from #1158) against pi-lens's own
+      # clients/ + tests/ trees. ~3.5s on 1073 files — cheap enough for every
+      # PR rather than nightly. Fails on any finding not already triaged into
+      # the committed rules/ast-grep-rules/self-scan-baseline.json. The
+      # registered-or-fail proof that this scan mechanism actually executes
+      # lives in tests/support/astgrep-self-scan.test.ts (Run tests, below).
+      - name: Ast-grep self-scan
+        run: npm run astgrep:self-scan
+
+      # #2042: the size of the box the fork pool is budgeted against. The suite
+      # was OOM-killed here repeatedly and no log line said how much memory the
+      # runner actually had, so every diagnosis started from a guess.
+      - name: Runner capacity
+        run: |
+          echo "nproc=$(nproc)"
+          free -m
+          # 2026-09-15: this read the ROOT cgroup's memory.max, which cgroup v2
+          # never populates, so it printed nothing on every run in the dataset
+          # the 2026-09-15 diagnosis assembled — the same defect the sibling
+          # kernel-kill-evidence step further down was fixed for (#2230 round 2
+          # F1), four lines away, and never swept onto this one. Walk to this
+          # process's own cgroup the same way that step does.
+          cg=$(awk -F: '$1=="0"{print $3}' /proc/self/cgroup 2>/dev/null || true)
+          p="$cg"
+          found=""
+          while [ -n "$p" ]; do
+            f="/sys/fs/cgroup${p%/}/memory.max"
+            if [ -r "$f" ]; then
+              echo "cgroup=${p} file=${f}"
+              cat "$f"
+              found=1
+              break
+            fi
+            if [ "$p" = "/" ]; then break; fi
+            p=$(dirname "$p")
+          done
+          if [ -z "$found" ]; then
+            echo "(memory.max absent or unreadable from '${cg:-unknown}' up to root)"
+          fi
+
+      - name: Run tests
+        env:
+          # Spawn-heavy MCP smokes retain a 20s local deadline but need room
+          # for loaded shared runners (#860).
+          PI_LENS_TEST_TIMEOUT_SCALE: '3'
+          # The #1101 machine-wide test-suite lock (scripts/with-test-lock.mjs)
+          # exists to serialize concurrent full-suite runs on a SHARED dev
+          # machine. CI runners are isolated (one job per VM), so there is
+          # never contention to serialize — skip it explicitly rather than
+          # relying on it being harmless.
+          PI_LENS_TEST_NO_LOCK: '1'
+          # #2042 2026-09-15 cheapest probe: a 2s MemAvailable poll cannot see a
+          # sub-2-second spike, so sample five times faster. The env var already
+          # existed for exactly this; only the value is new.
+          PI_LENS_MEM_WATCH_INTERVAL_MS: '200'
+          # Shared with the "Memory sample tail" step below so both read/write
+          # the same file. runner.temp, not the checkout, so it never shows up
+          # in `git status` and is cleaned up with the rest of the job's scratch
+          # space regardless of how the job ends.
+          PI_LENS_MEM_WATCH_SAMPLE_FILE: ${{ runner.temp }}/pi-lens-mem-watch-samples.log
+        # #2042: the wrapper changes nothing about what runs and forwards the
+        # child's exit code unchanged. It prints the host's memory low-water
+        # mark and a verdict line, so the next `Killed npm test` / exit 137 —
+        # which carries no failing assertion and reads as infrastructure noise —
+        # arrives with a number attached.
+        run: node scripts/with-memory-watch.mjs -- npm test -- --reporter=default --reporter=json --outputFile=${{ runner.temp }}/vitest-results.json
+
+      # Listener input for #3215. The default reporter remains explicit above,
+      # so this adds a file reporter in the same invocation and preserves the
+      # existing result sections and npm/vitest exit status. Vitest also emits
+      # one `JSON report written to <path>` line; that additive console
+      # contract is pinned in `tests/scripts/test-history-rollup.test.ts` by
+      # driving the installed vitest JsonReporter directly, and the local
+      # `npm test` script adds no JSON reporter at all.
+      #
+      # The metadata basename below is `METADATA_FILENAME` from
+      # `scripts/test-history-rollup.mjs` — the consumer's own constant.
+      # `tests/config/test-history-workflow.test.ts` asserts this step against
+      # it, because a producer/consumer basename drift made the nightly rollup
+      # exit 2 on every real artifact (round 3, F8).
+      - name: Write test-history artifact metadata
+        if: always()
+        env:
+          HEAD_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.sha || github.sha }}
+        run: 'node -e "require(\"node:fs\").writeFileSync(process.env.RUNNER_TEMP + \"/test-history-metadata.json\", JSON.stringify({headSha: process.env.HEAD_SHA, runId: process.env.GITHUB_RUN_ID, lane: \"linux\", recordedAt: new Date().toISOString()}))"'
+
+      - name: Upload per-file test results
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: unit-test-results-linux
+          path: |
+            ${{ runner.temp }}/vitest-results.json
+            ${{ runner.temp }}/test-history-metadata.json
+          if-no-files-found: warn
+
+      # #2042 2026-09-15: the wrapper's console line is a step-crossing summary
+      # of host memory only — it cannot show per-cgroup RSS, PID-count churn, or
+      # PSI stall, and the 1701d01 red proved the console line can be lost
+      # entirely when the wrapper itself is the kill's victim. The wrapper
+      # appends every sample (per-cgroup memory.current/memory.peak/pids.current
+      # plus PSI) to the file below regardless; `if: always()` reads it even
+      # when the job never reaches a later step, so a killed run still yields
+      # its samples. Round-2 review F2: the file itself is unbounded (append-
+      # only, so an earlier low-water sample can never be scrolled out by a
+      # rewrite); `tail` bounds only what THIS step prints.
+      - name: Memory sample tail
+        if: always()
+        env:
+          PI_LENS_MEM_WATCH_SAMPLE_FILE: ${{ runner.temp }}/pi-lens-mem-watch-samples.log
+        run: |
+          f="$PI_LENS_MEM_WATCH_SAMPLE_FILE"
+          if [ -r "$f" ]; then
+            total=$(wc -l < "$f")
+            echo "--- mem-sample tail (last 300 of ${total} lines) ---"
+            tail -n 300 "$f"
+          else
+            echo "(no sample file at $f - the wrapper wrote nothing before the job ended)"
+          fi
+
+      # #2042 round 2: the low-water mark falsified the memory story (three
+      # kills at 13.0-13.3 GB available of 16 GB, a green run LOWER at 13.1 GB)
+      # but it cannot name what sent the SIGKILL. The kernel can. `dmesg` says
+      # in one line whether the OOM killer fired and on whom; systemd-oomd
+      # kills on PSI pressure while memory still reads available, so it is the
+      # other authority worth asking. Every command is best-effort: this step
+      # must add evidence to a failure, never change its cause.
+      - name: Kernel kill evidence
+        if: failure()
+        run: |
+          set +e
+          # Round-2 review F2: an empty arm must distinguish "asked, nothing
+          # there" from "could not ask". Silence alone reads as the first and
+          # can be the second.
+          echo "--- kernel OOM/kill records ---"
+          dm=$(sudo dmesg -T 2>/dev/null)
+          if [ -z "$dm" ]; then
+            echo "(dmesg unavailable or empty - no evidence either way)"
+          else
+            hits=$(printf '%s\n' "$dm" |
+              grep -iE 'out of memory|oom-kill|oom_reaper|killed process' |
+              tail -40)
+            if [ -z "$hits" ]; then
+              echo "(dmesg readable, zero OOM/kill records - the kernel OOM killer did not fire)"
+            else
+              printf '%s\n' "$hits"
+            fi
+          fi
+          echo "--- systemd-oomd ---"
+          sudo journalctl -u systemd-oomd --no-pager -n 40 2>/dev/null ||
+            echo "(journalctl unavailable)"
+          # Round-2 review F1: reading /sys/fs/cgroup/memory.events reads the
+          # ROOT cgroup, which cgroup v2 does not populate. It printed nothing
+          # whether or not an event had occurred, so it could never support a
+          # claim either way. Resolve this process's OWN cgroup and walk up to
+          # the first ancestor that actually has the file.
+          echo "--- cgroup memory.events ---"
+          cg=$(awk -F: '$1=="0"{print $3}' /proc/self/cgroup 2>/dev/null)
+          p="$cg"
+          found=""
+          while [ -n "$p" ]; do
+            f="/sys/fs/cgroup${p%/}/memory.events"
+            if [ -r "$f" ]; then
+              echo "cgroup=${p} file=${f}"
+              cat "$f"
+              found=1
+              break
+            fi
+            if [ "$p" = "/" ]; then break; fi
+            p=$(dirname "$p")
+          done
+          if [ -z "$found" ]; then
+            echo "(memory.events absent or unreadable from '${cg:-unknown}' up to root - no cgroup evidence either way)"
+          fi
+          echo "--- memory now ---"
+          free -m
+          exit 0
+
+  # Windows coverage starts as advisory because the repository has no prior Windows Vitest signal.
+  # Promote this job to gating once the Run Windows Vitest subset step outcome has been success
+  # on 7 consecutive master/PR runs.
+  unit-tests-windows:
+    name: Unit tests Windows (advisory)
+    needs: validate-merge-train-dispatch
+    runs-on: windows-latest
+    outputs:
+      windows_vitest: ${{ steps.windows-vitest.outcome }}
+    timeout-minutes: 25
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.sha || github.ref }}
+          persist-credentials: false
+
+      - name: Validate merge-train dispatch payload
+        if: github.event_name == 'repository_dispatch'
+        env:
+          PAYLOAD_REPOSITORY: ${{ github.event.client_payload.repository }}
+          PAYLOAD_SHA: ${{ github.event.client_payload.sha }}
+        run: |
+          set -euo pipefail
+          if [[ "$PAYLOAD_REPOSITORY" != "$GITHUB_REPOSITORY" ]]; then
+            echo "::error::repository_dispatch repository does not match this repository"
+            exit 1
+          fi
+          if [[ ! "$PAYLOAD_SHA" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "::error::repository_dispatch SHA must be a 40-hex commit"
+            exit 1
+          fi
+          checked_sha="$(git rev-parse --verify HEAD)"
+          if [[ "${PAYLOAD_SHA,,}" != "$checked_sha" ]]; then
+            echo "::error::checkout does not match the repository_dispatch SHA"
+            exit 1
+          fi
+
+      # actionlint: the `runner` context is not available in job-level `env`,
+      # so the probe home is pinned from a step (same value, exported for the
+      # rest of the job).
+      - name: Pin PI_LENS_HOME under the runner temp dir
+        shell: bash
+        run: echo "PI_LENS_HOME=$RUNNER_TEMP/pi-lens-home" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
+        with:
+          node-version: '22'
+
+      - name: Install dependencies
+        run: npm ci --no-audit --no-fund
+
+      - name: Build
+        run: npm run build
+
+      # Keep this population derived from the source tree. A new Windows path
+      # or platform-gated test joins the lane without a hand-maintained list.
+      - name: Enumerate Windows Vitest subset
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t FILES < <(node scripts/lib/win32-gate-population.mjs --files)
+          [[ ${#FILES[@]} -eq 0 ]] && { echo "::error::enumeration empty"; exit 1; }
+          printf '%s\n' "${FILES[@]}" | sort -u | tee "$RUNNER_TEMP/windows-vitest-files.txt"
+          printf 'Windows Vitest subset: %s files\n' "$(sort -u "$RUNNER_TEMP/windows-vitest-files.txt" | wc -l)"
+
+      - name: Run Windows Vitest subset
+        id: windows-vitest
+        continue-on-error: true
+        shell: bash
+        env:
+          PI_LENS_TEST_TIMEOUT_SCALE: '3'
+        run: |
+          set -euo pipefail
+          mapfile -t FILES < "$RUNNER_TEMP/windows-vitest-files.txt"
+          node_modules/.bin/vitest run "${FILES[@]}" --configLoader runner
+
+      - name: Record Windows Vitest outcome
+        if: always()
+        shell: bash
+        run: |
+          outcome="${{ steps.windows-vitest.outcome }}"
+          node scripts/lib/win32-gate-population.mjs --summary --executed-file-list "$RUNNER_TEMP/windows-vitest-files.txt" | tee -a "$GITHUB_STEP_SUMMARY"
+          echo "Windows Vitest subset step outcome: $outcome" >> "$GITHUB_STEP_SUMMARY"
+          echo "windows_vitest=$outcome" >> "$GITHUB_STEP_SUMMARY"
+
+  # Simulates pi's real install path: a `git:` install runs `npm install
+  # --omit=dev`, which triggers `prepare` → `build:dist` FROM SOURCE with the
+  # dev-only @types/node ABSENT. That's the path that broke with TS2688 (#193)
+  # and that the tarball-based install-test never exercises (#194) — the tarball
+  # ships pre-built dist/, so it never re-runs the build under --omit=dev.
+  prod-install-build:
+    name: Production install build (--omit=dev, from source)
+    needs: validate-merge-train-dispatch
+    runs-on: ubuntu-latest
+    # refs #3123: bounds a hang against GitHub's 360-min default.
+    # Measured max over last 10 successful master runs: 72s; timeout = floor of
+    # 10 min.
+    timeout-minutes: 10
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.sha || github.ref }}
+          persist-credentials: false
+
+
+      - name: Validate merge-train dispatch payload
+        if: github.event_name == 'repository_dispatch'
+        env:
+          PAYLOAD_REPOSITORY: ${{ github.event.client_payload.repository }}
+          PAYLOAD_SHA: ${{ github.event.client_payload.sha }}
+        run: |
+          set -euo pipefail
+          if [[ "$PAYLOAD_REPOSITORY" != "$GITHUB_REPOSITORY" ]]; then
+            echo "::error::repository_dispatch repository does not match this repository"
+            exit 1
+          fi
+          if [[ ! "$PAYLOAD_SHA" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "::error::repository_dispatch SHA must be a 40-hex commit"
+            exit 1
+          fi
+          checked_sha="$(git rev-parse --verify HEAD)"
+          if [[ "${PAYLOAD_SHA,,}" != "$checked_sha" ]]; then
+            echo "::error::checkout does not match the repository_dispatch SHA"
+            exit 1
+          fi
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
+        with:
+          node-version: '22'
+
+      # npm 11.11 restored libc descriptors in lockfile v3 (#9025). Older npm
+      # silently removes them and installs both glibc and musl optional binaries.
+      # Keep this version in sync with the pin in release.yml (publish-npm job).
+      - name: Pin npm with libc-aware lockfile metadata
+        run: |
+          npm_pin="$(node -p "require('./package.json').packageManager.replace(/^npm@/, '')")"
+          test "$(npx -y "npm@${npm_pin}" --version)" = "${npm_pin}"
+
+      # #437: typescript is a devDependency (#402), so --omit=dev omits it. pi builds
+      # the GitHub install from source under --omit=dev, so `build:dist` must resolve
+      # tsc WITHOUT a local typescript. GitHub runners ship typescript GLOBALLY, which
+      # would let a bare `tsc` leak off PATH and hide the regression — so remove it
+      # first, forcing build:dist to resolve tsc itself (npx -p typescript). If this
+      # step ever fails, the from-source --omit=dev build is broken for real users.
+      - name: Remove global typescript (kill the PATH leak that hid #437)
+        run: |
+          npm rm -g typescript 2>/dev/null || true
+          if command -v tsc >/dev/null 2>&1; then
+            echo "note: a tsc still on PATH at $(command -v tsc) — build must not depend on it"
+          else
+            echo "no global tsc — clean"
+          fi
+
+      - name: Install without devDeps (--omit=dev)
+        run: |
+          npm_pin="$(node -p "require('./package.json').packageManager.replace(/^npm@/, '')")"
+          npx -y "npm@${npm_pin}" install --omit=dev --no-audit --no-fund
+
+      - name: Build dist from source under --omit=dev (the prepare path)
+        run: npm run build:dist
+
+      # #1926: pi supplies the host-provided packages from its own runtime, so a
+      # production install must not vendor a private second copy. One vendored
+      # copy cost the git install 760ms of extra module evaluation at load.
+      - name: Verify no host-provided package was vendored (#1926)
+        run: node scripts/check-prod-install-shape.mjs
+
+      # ...and now put them there. `node dist/index.js` is not pi, so without
+      # these two the entry throws on the FIRST one it imports and the load
+      # check below never reaches a genuinely missing dep like minimatch —
+      # which is the regression this job exists to catch (#1926).
+      - name: Supply host-provided packages the way pi does (#1926)
+        run: | # zizmor: ignore[adhoc-packages]
+          SUPPLY=scripts/supply-host-provided-deps.mjs
+          HOST_PKGS=()
+          while IFS= read -r pkg; do
+            [ -n "$pkg" ] && HOST_PKGS+=("$pkg")
+          done < <(node "$SUPPLY" --install-args)
+          echo "Supplying: ${HOST_PKGS[*]}"
+          npm install --no-save --no-audit --no-fund "${HOST_PKGS[@]}"
+
+      - name: Verify dist built and the compiled entry loads
+        run: |
+          test -f dist/index.js || \
+            (echo "ERROR: dist/index.js not built under --omit=dev (TS2688? prepare/build:dist failed)" && exit 1)
+          # ERR_MODULE_NOT_FOUND = a runtime dep was wrongly in devDependencies.
+          # Only the TYPE-ONLY host SDK may be missing here: the step above
+          # supplied the runtime ones, so if one of THOSE is still missing the
+          # grep must fail. That is what keeps this check able to fail at all.
+          # The allowlist derives from scripts/lib/host-provided-deps.mjs, so it
+          # cannot drift from the dependency shape (#1926).
+          ALLOW=$(node scripts/supply-host-provided-deps.mjs --allow-pattern)
+          node dist/index.js 2>&1 | tee /tmp/load.txt || true
+          if grep -q "ERR_MODULE_NOT_FOUND\|Cannot find module" /tmp/load.txt \
+             && ! grep -Eq "$ALLOW" /tmp/load.txt; then
+            echo "FAILED: missing runtime module under --omit=dev"
+            echo "(host-provided allowlist: $ALLOW)"
+            cat /tmp/load.txt
+            exit 1
+          fi
+          echo "Production --omit=dev build + load OK"
+
+      # The faithful reproduction of `pi install git:github.com/apmantza/pi-lens`
+      # (#437): pi CLONES the repo and runs `npm install --omit=dev` in a PRISTINE
+      # tree (no pre-existing node_modules / dev artifacts), which runs the WHOLE
+      # `prepare` — build:dist (npx-resolved tsc, since typescript is a devDep and
+      # global tsc was removed above) AND the grammar download. This catches the
+      # from-source install class end-to-end, the way a real user hits it.
+      - name: Simulate `pi install git:…` (clean clone + --omit=dev)
+        run: |
+          set -e
+          rm -rf "$RUNNER_TEMP/gh-install"
+          git clone --quiet . "$RUNNER_TEMP/gh-install"
+          cd "$RUNNER_TEMP/gh-install"
+          npm_pin="$(node -p "require('./package.json').packageManager.replace(/^npm@/, '')")"
+          npx -y "npm@${npm_pin}" install --omit=dev --no-audit --no-fund
+          if [[ -n "$(git status --porcelain --untracked-files=no)" ]]; then
+            echo "ERROR: npm install --omit=dev changed tracked source files"
+            git status --short --untracked-files=no
+            git diff
+            exit 1
+          fi
+          test -f dist/index.js || \
+            (echo "ERROR: dist/index.js not built from a clean clone under --omit=dev" && exit 1)
+          # #1926: the clean clone is the shape real users get. Assert pi's
+          # host-provided packages were not vendored into it.
+          node scripts/check-prod-install-shape.mjs
+          # Then supply them, as pi does, so the load check can still see a
+          # genuinely missing dep instead of stopping at the first host package.
+          SUPPLY=scripts/supply-host-provided-deps.mjs
+          HOST_PKGS=()
+          while IFS= read -r pkg; do
+            [ -n "$pkg" ] && HOST_PKGS+=("$pkg")
+          done < <(node "$SUPPLY" --install-args)
+          echo "Supplying: ${HOST_PKGS[*]}"
+          npm install --no-save --no-audit --no-fund "${HOST_PKGS[@]}"
+          ALLOW=$(node scripts/supply-host-provided-deps.mjs --allow-pattern)
+          node dist/index.js 2>&1 | tee /tmp/gh-load.txt || true
+          if grep -q "ERR_MODULE_NOT_FOUND\|Cannot find module" /tmp/gh-load.txt \
+             && ! grep -Eq "$ALLOW" /tmp/gh-load.txt; then
+            echo "FAILED: missing runtime module from a clean GitHub-style install"
+            cat /tmp/gh-load.txt
+            exit 1
+          fi
+          echo "GitHub-style install (clean clone + --omit=dev) OK"
+
+      # #2700 (refs #2587): #2587's manifest entry escaped four releases
+      # because nothing inspected the published tarball. `npm pack` runs the
+      # repo's own prepack/postpack (scripts/strip-dev-deps-for-pack.mjs --
+      # strips devDependencies from package.json/package-lock.json for the
+      # pack, restores them after), so the packed tarball is exactly what
+      # `npm publish` would ship.
+      - name: Pack the built package
+        run: |
+          set -eu
+          mkdir -p "$RUNNER_TEMP/pack"
+          npm pack --pack-destination "$RUNNER_TEMP/pack"
+          tarball="$RUNNER_TEMP/pack/$(ls "$RUNNER_TEMP/pack")"
+          echo "PACK_TARBALL=$tarball" >> "$GITHUB_ENV"
+
+      # publint is a devDependency, but this job installed --omit=dev above
+      # (the shape under test), so it is fetched here as a single pinned
+      # binary -- same pattern as lint.yml's oxfmt job: version read from the
+      # devDependency pin (single source of truth), --no-save keeps it off
+      # package.json/package-lock.json, --ignore-scripts blocks lifecycle
+      # script execution (SonarCloud S6505, the #1923 posture).
+      - name: Install publint (version pinned by the devDependency)
+        run: |
+          set -eu
+          version=$(node -p "require('./package.json').devDependencies.publint")
+          npm install --no-save --no-audit --no-fund --ignore-scripts "publint@${version}"
+
+      # Gating: publint's findings are packaging errors (wrong `files`,
+      # unresolvable `main`/`exports`, etc.), not style. Exit code read
+      # directly, no pipe -- a `| tee`/`| cat` would hide a non-zero status
+      # behind the pipeline's last command.
+      #
+      # attw (arethetypeswrong, #2700 acceptance) is deliberately NOT run
+      # here: the package ships no `.d.ts` at all (tsconfig.dist.json sets
+      # `"declaration": false`, package.json has neither `types` nor
+      # `exports`, and a fresh `npm run build:dist` produces zero `*.d.ts`
+      # files under dist/ -- confirmed on this PR's branch and quoted in the
+      # PR body). attw's whole job is grading a typed package's resolution
+      # across node10/node16/bundler; against an untyped package it can only
+      # ever report "no types found", which restates the manifest shape
+      # above rather than checking anything -- the "pull-only observability"
+      # shape (AGENTS.md) a no-op step would add. Re-add it, gating (a first
+      # clean run would already be trivially clean), the day this package
+      # publishes types.
+      - name: publint the packed tarball
+        run: node_modules/.bin/publint "$PACK_TARBALL"
+
+  record-post-merge-validation:
+    name: Record post-merge validation
+    if: always() && github.event_name == 'repository_dispatch' && needs.validate-merge-train-dispatch.result == 'success'
+    needs:
+      [validate-merge-train-dispatch, dependency-boundaries, lint-and-typecheck, test, prod-install-build, install-test]
+    runs-on: ubuntu-latest
+    # refs #3123: bounds a hang against GitHub's 360-min default.
+    # No successful run found (job requires github.event_name ==
+    # 'repository_dispatch'; 0 repository_dispatch-triggered runs of this
+    # workflow exist in the last 300 runs) -- defaulted to the floor of 10 min
+    # for this single-step job.
+    timeout-minutes: 10
+    permissions:
+      issues: write
+    steps:
+      - name: Record exact-SHA terminal state
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          PAYLOAD_SHA: ${{ github.event.client_payload.sha }}
+          PAYLOAD_PR_NUMBER: ${{ github.event.client_payload.pr_number }}
+          DEPENDENCY_RESULT: ${{ needs.dependency-boundaries.result }}
+          LINT_RESULT: ${{ needs.lint-and-typecheck.result }}
+          TEST_RESULT: ${{ needs.test.result }}
+          INSTALL_RESULT: ${{ needs.prod-install-build.result }}
+          MATRIX_RESULT: ${{ needs.install-test.result }}
+        run: |
+          set -euo pipefail
+          state=succeeded
+          unknown=0
+          for result in "$DEPENDENCY_RESULT" "$LINT_RESULT" "$TEST_RESULT" "$INSTALL_RESULT" "$MATRIX_RESULT"; do
+            case "$result" in
+              success) ;;
+              failure) state=failed ;;
+              *) unknown=1 ;;
+            esac
+          done
+          if [[ "$state" != failed && "$unknown" == 1 ]]; then exit 0; fi
+          marker="<!-- merge-train-post-merge:sha=$PAYLOAD_SHA:workflow=ci.yml:state=$state -->"
+          body="Post-merge validation $state for $PAYLOAD_SHA.\n\n$marker"
+          curl --fail-with-body --silent --show-error \
+            --request POST \
+            --header "Authorization: Bearer $GITHUB_TOKEN" \
+            --header "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/issues/$PAYLOAD_PR_NUMBER/comments" \
+            --data "$(jq -n --arg body "$body" '{body:$body}')"
+
+  install-test:
+    name: Install test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    # refs #3123: bounds a hang against GitHub's 360-min default.
+    # Measured max leg over last 10 successful master runs (30 matrix legs,
+    # windows-latest slowest): 272s (4m32s); sized at ~2x + margin.
+    # refs #3098: that 272s PREDATES the macOS-only build + Vitest step below,
+    # which is not covered by the measurement above. The value is left alone
+    # and re-measured from the first green macOS legs before it is resized.
+    timeout-minutes: 15
+    needs: [validate-merge-train-dispatch, lint-and-typecheck, test]
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.event_name == 'repository_dispatch' && github.event.client_payload.sha || github.ref }}
+          persist-credentials: false
+
+
+      - name: Validate merge-train dispatch payload
+        if: github.event_name == 'repository_dispatch'
+        env:
+          PAYLOAD_REPOSITORY: ${{ github.event.client_payload.repository }}
+          PAYLOAD_SHA: ${{ github.event.client_payload.sha }}
+        run: |
+          set -euo pipefail
+          if [[ "$PAYLOAD_REPOSITORY" != "$GITHUB_REPOSITORY" ]]; then
+            echo "::error::repository_dispatch repository does not match this repository"
+            exit 1
+          fi
+          if [[ ! "$PAYLOAD_SHA" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "::error::repository_dispatch SHA must be a 40-hex commit"
+            exit 1
+          fi
+          checked_sha="$(git rev-parse --verify HEAD)"
+          payload_sha_lower="$(printf '%s' "$PAYLOAD_SHA" | tr '[:upper:]' '[:lower:]')"
+          if [[ "$payload_sha_lower" != "$checked_sha" ]]; then
+            echo "::error::checkout does not match the repository_dispatch SHA"
+            exit 1
+          fi
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v6
+        with:
+          node-version: '22'
+
+      - name: Install dependencies
+        run: npm install --no-audit --no-fund
+
+      # refs #3098: the ONLY case-insensitive POSIX filesystem in CI is this
+      # leg's macOS APFS. The cross-case anchor cases in these two files
+      # manufacture their fixture with a case-variant symlink on the
+      # case-sensitive ubuntu lane; here they exercise the real aliasing, which
+      # is where #1024 was actually live. No extra install cost: `npm install`
+      # above already ran `prepare`, so devDependencies and the core grammars
+      # the vitest globalSetup pre-warms are already present.
+      # ADVISORY for now (`continue-on-error`), like the Windows Vitest subset
+      # above: this job's install/pack/smoke steps gate, and a macOS-only unit
+      # flake must not block an unrelated PR on its first outings. Promotion to
+      # gating is a separate decision after several green legs (#3159 round 3).
+      - name: POSIX case-insensitive anchors (APFS)
+        if: matrix.os == 'macos-latest'
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -euo pipefail
+          npm run build
+          node_modules/.bin/vitest run tests/clients/path-utils.test.ts tests/clients/diagnostic-dispositions.test.ts --configLoader runner
+
+      - name: Rule catalog report (non-blocking)
+        continue-on-error: true
+        run: npm run audit:rule-catalog
+
+      - name: Pack tarball
+        run: npm pack
+
+      - name: Verify required files in tarball
+        shell: bash
+        run: |
+          TARBALL=$(ls pi-lens-*.tgz)
+          echo "Checking tarball: $TARBALL"
+          REQUIRED_RE="scripts/download-grammars\.js"
+          REQUIRED_RE="${REQUIRED_RE}|dist/index\.js|package\.json"
+          tar -tzf "$TARBALL" | grep -E "$REQUIRED_RE" | sort
+          tar -tzf "$TARBALL" | grep "scripts/download-grammars.js" || {
+            echo "ERROR: scripts/download-grammars.js missing"
+            exit 1
+          }
+          # The published entry is compiled JS (prepare builds dist/); pi loads
+          # it directly instead of jiti-transpiling source on startup (#182).
+          tar -tzf "$TARBALL" | grep "package/dist/index.js" || {
+            echo "ERROR: dist/index.js missing from tarball"
+            exit 1
+          }
+          # Skills ship at package root (skills/), and pi.skills is "./skills":
+          # pi resolves a non-glob manifest entry against the PACKAGE ROOT
+          # (collectFilesFromManifestEntries), so anything with ../ escapes the
+          # published package and loads nothing (#2587).
+          tar -tzf "$TARBALL" | grep "package/skills/" || {
+            echo "ERROR: skills/ missing from tarball"
+            exit 1
+          }
+          # Guard against shipping TS source again (jiti startup cost).
+          SOURCE_RE="package/(index\.ts|clients/.*\.ts)"
+          if tar -tzf "$TARBALL" | grep -E "$SOURCE_RE"; then
+            echo "ERROR: TypeScript source leaked into the tarball"
+            exit 1
+          fi
+
+      - name: Verify package.json entry points exist in tarball
+        shell: bash
+        run: |
+          TARBALL=$(ls pi-lens-*.tgz)
+          TMPDIR=$(mktemp -d)
+          tar -xzf "$TARBALL" -C "$TMPDIR"
+
+          check_field() {
+            local field="$1" value="$2"
+            if [ ! -f "$TMPDIR/package/$value" ]; then
+              echo "ERROR: package.json '$field' points to missing '$value'"
+              exit 1
+            fi
+            echo "OK: $field -> $value"
+          }
+
+          # Pass package paths via env vars for cross-platform Node calls.
+          export PI_LENS_PKG_DIR="$TMPDIR/package"
+          export PI_LENS_PKG_JSON="$TMPDIR/package/package.json"
+          MAIN=$(node -p "require(process.env.PI_LENS_PKG_JSON).main || ''")
+          [ -n "$MAIN" ] && check_field "main" "$MAIN"
+
+          # Check pi.extensions entries — this is what pi actually loads.
+          node <<'NODE'
+          const path = require("path");
+          const fs = require("fs");
+          const pkgDir = process.env.PI_LENS_PKG_DIR;
+          const pkg = require(path.join(pkgDir, "package.json"));
+          const exts = (pkg.pi && pkg.pi.extensions) || [];
+          if (exts.length === 0) {
+            console.error("ERROR: no pi.extensions declared");
+            process.exit(1);
+          }
+          for (const e of exts) {
+            if (!fs.existsSync(path.join(pkgDir, e))) {
+              console.error("ERROR: pi.extensions entry missing: " + e);
+              process.exit(1);
+            }
+            console.log("OK: pi.extensions -> " + e);
+          }
+          NODE
+
+          # Check exports map entries (string values only).
+          node <<'NODE'
+          const path = require("path");
+          const fs = require("fs");
+          const pkgDir = process.env.PI_LENS_PKG_DIR;
+          const pkg = require(path.join(pkgDir, "package.json"));
+          const exp = pkg.exports;
+          if (!exp) process.exit(0);
+          const collect = (v) => {
+            if (typeof v === "string") return [v];
+            if (v && typeof v === "object") {
+              return Object.values(v).flatMap(collect);
+            }
+            return [];
+          };
+          collect(exp).forEach((f) => {
+            const full = path.join(pkgDir, f);
+            if (!fs.existsSync(full)) {
+              console.error("ERROR: exports entry missing: " + f);
+              process.exit(1);
+            }
+            console.log("OK: exports -> " + f);
+          });
+          NODE
+          rm -rf "$TMPDIR"
+
+      # Intentional: this job verifies the package installs like pi installs it.
+      - name: Install from tarball (simulates pi install npm:pi-lens)
+        shell: bash
+        run: | # zizmor: ignore[adhoc-packages]
+          TARBALL=$(ls pi-lens-*.tgz)
+          npm install -g "$TARBALL"
+
+      - name: Verify bundled core grammars shipped in the tarball
+        shell: bash
+        run: |
+          # Core grammars ship bundled in pi-lens/grammars (via prepare + files[]);
+          # the tail lazy-fetches at runtime. There is no postinstall now.
+          GLOBAL_MODULES=$(npm root -g)
+          GRAMMARS_DIR="$GLOBAL_MODULES/pi-lens/grammars"
+          echo "Checking bundled core grammars at: $GRAMMARS_DIR"
+          ls "$GRAMMARS_DIR"
+          test -f "$GRAMMARS_DIR/tree-sitter-typescript.wasm" || \
+            (echo "ERROR: bundled tree-sitter-typescript.wasm missing from tarball" && exit 1)
+          echo "Bundled core grammar checks passed"
+
+      - name: Load each extension entry point (catches missing files)
+        shell: bash
+        run: |
+          INSTALL_DIR=$(npm root -g)/pi-lens
+          node scripts/check-extensions.mjs "$INSTALL_DIR"
+
+      # #1926: the tarball must not vendor a package pi already supplies. This
+      # runs from the checkout against the GLOBAL install the earlier step made,
+      # so it inspects what a real `pi install npm:pi-lens` produces.
+      - name: Verify no host-provided package shipped in the tarball (#1926)
+        shell: bash
+        run: node scripts/check-prod-install-shape.mjs "$(npm root -g)/pi-lens"
+
+      # ...and having proved they are absent, put them there, because the next
+      # step is a bare `node` and bare node is not pi. pi resolves these two
+      # specifiers from its own runtime; without them the entry throws at import
+      # and neither the load check nor the #182 dist check below proves
+      # anything. Names and ranges come from scripts/lib/host-provided-deps.mjs,
+      # never hardcoded here. The type-only host SDK is deliberately NOT
+      # installed (Windows MAX_PATH, #1334 S6).
+      - name: Supply host-provided packages the way pi does (#1926)
+        shell: bash
+        run: | # zizmor: ignore[adhoc-packages]
+          INSTALL_DIR=$(npm root -g)/pi-lens
+          SUPPLY=scripts/supply-host-provided-deps.mjs
+          HOST_PKGS=()
+          while IFS= read -r pkg; do
+            [ -n "$pkg" ] && HOST_PKGS+=("$pkg")
+          done < <(node "$SUPPLY" --install-args)
+          echo "Supplying: ${HOST_PKGS[*]}"
+          npm install --no-save --no-audit --no-fund \
+            --prefix "$INSTALL_DIR" "${HOST_PKGS[@]}"
+
+      - name: Verify extension entry loads (catches missing node_modules deps)
+        shell: bash
+        run: |
+          # Build the allowlist BEFORE leaving the checkout: the global install
+          # ships no scripts/, so the module is only reachable from here.
+          ALLOW=$(node scripts/supply-host-provided-deps.mjs --allow-pattern)
+          INSTALL_DIR=$(npm root -g)/pi-lens
+          cd "$INSTALL_DIR"
+          # Simulate how pi loads the extension: compiled entry, loaded by node.
+          # ERR_MODULE_NOT_FOUND = missing dep (e.g. 'minimatch') → fail. That
+          # is this check's whole job, so a miss OUTSIDE the host-provided list
+          # still fails. Any other error is expected in CI (no pi API) → pass.
+          ENTRY=$(node -p "require('./package.json').pi.extensions[0]")
+          echo "Loading entry: $ENTRY"
+          echo "Host-provided allowlist: $ALLOW"
+          node "$ENTRY" 2>&1 | tee /tmp/load-output.txt || true
+          if grep -q "ERR_MODULE_NOT_FOUND\|Cannot find module" \
+               /tmp/load-output.txt \
+             && ! grep -Eq "$ALLOW" /tmp/load-output.txt; then
+            echo "FAILED: missing module dependency detected"
+            cat /tmp/load-output.txt
+            exit 1
+          fi
+          echo "Extension import check passed"
+
+      - name: Startup not weakened — entry loads from precompiled dist (#182)
+        shell: bash
+        run: |
+          # Loading the entry above made pi-lens self-report its load source to
+          # ~/.pi-lens/sessionstart.log.
+          # A source/jiti regression (or missing dist) would weaken cold start.
+          START_LOG="$HOME/.pi-lens/sessionstart.log"
+          START_LINE=$(
+            grep "pi-lens loaded:" "$START_LOG" 2>/dev/null \
+              | tail -1 \
+              || true
+          )
+          echo "Startup line: ${START_LINE:-<none>}"
+          if [ -z "$START_LINE" ]; then
+            echo "ERROR: no startup line logged"
+            exit 1
+          fi
+          echo "$START_LINE" | grep -q "from dist" || {
+            echo "ERROR: extension loaded from source, not dist"
+            exit 1
+          }
+          echo "Startup loads from dist ✓"

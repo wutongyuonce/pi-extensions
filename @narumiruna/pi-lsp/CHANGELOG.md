@@ -1,5 +1,17 @@
 # @narumitw/pi-lsp
 
+## 0.49.8
+
+### Patch Changes
+
+- 8abd5b7: Keep generated extension runtime graphs inside Pi's Jiti-loaded TypeScript path to avoid duplicate peer-runtime evaluation during startup. Add measured generated runtimes for Context Management, Herdr, and TypeSafe Search.
+
+## 0.49.7
+
+### Patch Changes
+
+- 756e1e2: Cancel and drain session-owned LSP calls during shutdown and reload, including partially initialized servers. Keep resource cleanup independent of status UI failures, preserve original operation errors, and prevent cancelled continuations from writing fixes or starting another diagnostics route. Share client lifetime handling between diagnostics and fixes.
+
 ## 0.49.6
 
 ### Patch Changes

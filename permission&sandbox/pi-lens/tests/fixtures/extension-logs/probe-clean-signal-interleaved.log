@@ -1,0 +1,4 @@
+{"subsystem":"lsp-pub","message":"server=server-a pubVersion=1 docVersion=1 diags=1"}
+{"subsystem":"lsp-pub","message":"server=server-b pubVersion=2 docVersion=2 diags=7"}
+{"subsystem":"lsp-pub","message":"server=server-a pubVersion=3 docVersion=3 diags=0"}
+{"subsystem":"lsp-pub","message":"server=server-b pubVersion=4 docVersion=4 diags=6"}

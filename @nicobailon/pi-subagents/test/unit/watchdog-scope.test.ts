@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { describe, it } from "node:test";
-import { WatchdogScopeArtifact, isWatchdogAutoFollowPromptEvent, markWatchdogAutoFollowPromptEvent } from "../../src/watchdog/scope.ts";
+import { WatchdogScopeArtifact } from "../../src/watchdog/scope.ts";
 
 describe("watchdog scope artifact", () => {
 	it("keeps bounded prompts in newest-last order", () => {
@@ -11,6 +11,9 @@ describe("watchdog scope artifact", () => {
 		assert.equal(entries.length, 8);
 		assert.deepEqual(entries.map((entry) => entry.prompt), ["prompt-2", "prompt-3", "prompt-4", "prompt-5", "prompt-6", "prompt-7", "prompt-8", "prompt-9"]);
 		assert.match(scope.render(), /newest last/);
+		assert.match(scope.render(), /Side questions are additive/);
+		assert.match(scope.render(), /evidence-backed reminders/);
+		assert.match(scope.render(), /not dependencies still pending or explicit holds/);
 		assert.match(scope.render(), /prompt-9/);
 	});
 
@@ -22,12 +25,5 @@ describe("watchdog scope artifact", () => {
 		scope.reset();
 		assert.deepEqual(scope.snapshot(), []);
 		assert.equal(scope.render(), "");
-	});
-
-	it("marks auto-follow prompt events without string sniffing", () => {
-		const event = markWatchdogAutoFollowPromptEvent({ prompt: "Watchdog auto-follow: address this blocker" });
-
-		assert.equal(isWatchdogAutoFollowPromptEvent(event), true);
-		assert.equal(isWatchdogAutoFollowPromptEvent({ prompt: "Watchdog auto-follow: address this blocker" }), false);
 	});
 });

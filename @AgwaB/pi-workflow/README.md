@@ -70,23 +70,38 @@ For a one-off adaptive workflow that should plan, fan out, and synthesize withou
 /workflow dynamic "Research this repository and summarize the architecture tradeoffs."
 ```
 
-Interactive slash-command launches use Pi's cancellable foreground loader while routing, validating, and completing the initial scheduling pass. Once at least one backend task is actually running, the command returns and Pi shows an `Active workflows` widget below the editor plus a compact footer status. The widget excludes launch/preparation states and stale `running` records with no running task, tracks top-level run progress, survives session reload by rebuilding from `.pi/workflows`, and disappears when no workflow remains active. Open `/workflow` for the full board.
+When you want a recommendation instead of choosing a path yourself, use the bounded comparison command:
+
+```text
+/workflow auto "Review the current diff for reliability and test coverage."
+```
+
+`/workflow auto` compares dynamic and discoverable named workflows only; it does not offer a current-conversation choice. In the TUI it requires a candidate choice and a separate final confirmation before it starts a workflow; in print/RPC/headless mode it only prints the recommendation and follow-up commands. `/workflow run` always starts the named workflow and `/workflow dynamic` always starts the direct dynamic runtime.
+
+Interactive slash-command launches use Pi's cancellable foreground loader while validating and completing the initial scheduling pass; `/workflow auto` uses it while comparing candidates. Once at least one backend task is actually running, the command returns and Pi shows an `Active workflows` widget below the editor plus a compact footer status. The widget excludes launch/preparation states and stale `running` records with no running task, tracks top-level run progress, survives session reload by rebuilding from `.pi/workflows`, and disappears when no workflow remains active. Open `/workflow` for the full board.
 
 ### Execution profiles
 
-A workflow may optionally declare custom-named `executionProfiles` and a
-`defaultExecutionProfile`. Use `/workflow run --profile <name> ...` (or the
-optional `profile` field of `workflow_run`) to select one. If omitted,
-interactive runs offer the declared profiles plus the base workflow;
-non-interactive launches (including tool execution without a selector) use the
-declared default, or the base workflow when there is no default. They do not
-infer a profile called `medium`. `low`, `medium`, and `high` are conventions,
-not reserved names. See [the execution-profile reference](./docs/usage.md#execution-profiles)
-for override precedence and batching constraints.
+Use `/workflow profile [workflow]` in Pi's TUI to preview and privately save
+Codex, Codex High, Claude, Mixed, or a per-stage Custom model/thinking setup.
+Without a workflow argument, the picker shows each workflow's saved profile
+instead of its path; previews use colored stage/role/model/thinking columns.
+The same exact workflow definition reuses that preference across projects;
+subsequent interactive, headless, auto-confirmed, and `workflow_run` launches capture
+its effective values at run start. Missing model capabilities or a stale
+workflow definition block with an explanation rather than silently substituting.
+
+A workflow may separately declare custom-named `executionProfiles` and a
+`defaultExecutionProfile`. An explicit `/workflow run --profile <name> ...` (or
+`workflow_run.profile`) wins over a saved user profile. With neither, the prior
+interactive selector/default/Base behavior is unchanged. Authors add semantic
+`profileRole` values independently from agent-context `role`; see
+[the execution-profile reference](./docs/usage.md#execution-profiles) for the
+exact role matrix, persistence contract, precedence, and batching constraints.
 
 ## Usage: choose an execution mode
 
-Use the bundled `execution-router` skill when you are not sure whether a task should be handled directly, by a targeted verifier/subagent, by an existing workflow, or by a new workflow:
+Use the bundled `execution-router` skill when you want a recommendation about whether a task should be handled directly, by a targeted verifier/subagent, by an existing workflow, or through a separate workflow-authoring request. The skill is advisory: it does not launch, validate, author, or redirect a workflow.
 
 ```text
 /skill:execution-router decide whether this repository review should use a single-agent pass, deep-review, or a targeted verifier.
@@ -111,6 +126,8 @@ Save it as a reusable project workflow.
 /skill:workflow-guide create a backend API review workflow.
 It should check concurrency, transaction safety, error handling, observability, and test risk.
 ```
+
+When the caller has already fixed a small document inventory, the `fixed-inventory` scaffold can bind it with static code instead of spending a model stage restating known IDs and paths. See [usage](docs/usage.md#authoring-workflows) for its editorial-only boundary and initializer.
 
 ## Workflow architecture
 
@@ -139,11 +156,13 @@ A small workflow definition looks like this:
       {
         "id": "plan",
         "type": "single",
+        "profileRole": "planning",
         "prompt": "Put machine-readable JSON in <control> with an items array."
       },
       {
         "id": "inspect",
         "type": "foreach",
+        "profileRole": "research-execution",
         "from": { "source": "plan", "path": "$.items" },
         "each": { "prompt": "Inspect this item: ${item}" }
       },
@@ -156,6 +175,7 @@ A small workflow definition looks like this:
       {
         "id": "report",
         "type": "reduce",
+        "profileRole": "synthesis",
         "from": ["plan", "prepare"],
         "prompt": "Use upstream workflow artifacts to write the final report."
       }
@@ -185,7 +205,7 @@ The package includes four bundled workflows for common research and review jobs.
 
 | Workflow | Best for | What it does |
 |---|---|---|
-| `deep-research` | Deep, source-grounded research when breadth, verification, and cited recommendations matter. | Plans research questions by depth, fans out question-level research, normalizes and ranks claims, verifies selected claims against evidence, and renders a result-only completion summary plus an audited `final-report.md`. |
+| `deep-research` | Deep, source-grounded research when breadth, verification, and cited recommendations matter. | Plans research questions by depth, fans out question-level research, normalizes and ranks claims, verifies selected claims against evidence, and renders an evidence-qualified completion summary plus an audited `final-report.md`; side-by-side tasks preserve a concise comparison snapshot. |
 | `deep-review` | Code or design review when one reviewer pass is not enough. | Triage selects review lenses, reviewers produce findings, a deterministic helper deduplicates them, a challenge pass tests the survivors, and deterministic helpers partition verdicts and render a result-only completion summary plus `final-report.md`; legacy `review.md` remains byte-identical. |
 | `spec-review` | Requirements-to-implementation traceability for an existing spec, API contract, or acceptance criteria. | Extracts testable requirements, maps implementation and tests, verifies candidate gaps, preserves every final/dropped/needs-human disposition, and renders a conformance-focused completion summary plus `final-report.md`. |
 | `impact-review` | Side-effect and risk review for proposed or applied changes. | Maps change scope and affected surfaces, joins contract, regression, and ship-readiness ledgers conservatively, and renders a risk-focused completion summary plus `final-report.md`. |

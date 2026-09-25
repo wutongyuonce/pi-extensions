@@ -1,5 +1,6 @@
 import {
 	type AgentListEntry,
+	type AgentListRenderOptions,
 	getAgentListEntries,
 	getAgentListSignature,
 	renderAgentListReminder,
@@ -48,6 +49,7 @@ import {
 	resolveAvailableModelRef,
 	splitModelRefThinking,
 } from "../launch/prep.ts";
+import { getSkillVisibilitySpec } from "../launch/skill-visibility.ts";
 import { writeResumeTaskArtifact, writeSystemPromptArtifact } from "../launch/prompt-artifacts.ts";
 import {
 	buildResumePiArgs,
@@ -104,8 +106,8 @@ export function getAgentListEntriesForTest(baseCwd = process.cwd()) {
 	);
 }
 
-export function renderAgentListReminderForTest(entries: AgentListEntry[]) {
-	return renderAgentListReminder(entries);
+export function renderAgentListReminderForTest(entries: AgentListEntry[], options?: AgentListRenderOptions) {
+	return renderAgentListReminder(entries, options);
 }
 
 export function getAgentListSignatureForTest(entries: AgentListEntry[]) {
@@ -430,6 +432,9 @@ export function getBaseSubagentEnvVarsForTest(agentDefs: AgentDefaults | null) {
 			runtimePaths: {},
 			subagentSessionFile: "child.jsonl",
 			sessionFile: "parent.jsonl",
+			// Minimal stand-in for the plan the real launcher builds; the env
+			// forwarder only reads the validated visibility spec off it.
+			skillLaunchPlan: { visibilitySpec: getSkillVisibilitySpec(agentDefs?.skills) },
 		} as PreparedSubagentLaunch,
 		{ agent: "tester", name: "child", title: "Child task", task: "Task" },
 		() => "lineage-only",

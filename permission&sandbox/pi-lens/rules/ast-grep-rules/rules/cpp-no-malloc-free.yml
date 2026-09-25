@@ -1,0 +1,45 @@
+# C++ No malloc/free
+# Detects manual heap allocation via malloc/calloc/realloc/free in C++.
+# Ported from vinhnx/VTCode rules/cpp/no-malloc-free.yml (#2201, refs #2195).
+id: cpp-no-malloc-free
+language: cpp
+severity: warning
+message: "Manual malloc/calloc/realloc/free in C++; consider RAII (new/unique_ptr/vector)"
+note: |
+  C++ has RAII, smart pointers, and standard containers that pair allocation
+  with automatic, exception-safe deallocation. malloc/free bypass
+  constructors/destructors entirely, which is unsafe for anything but a
+  trivial type.
+  Detection-only: migrating a call site to RAII requires knowing the
+  object's lifetime and whether it crosses an API boundary that expects a
+  raw pointer (a C interop layer, a custom allocator), which this rule
+  cannot verify.
+rule:
+  kind: call_expression
+  has:
+    field: function
+    any:
+      # A bare call: malloc(...).
+      - kind: identifier
+        regex: "^(malloc|calloc|realloc|free)$"
+      # A namespace-qualified call: std::malloc(...) or ::malloc(...). C++
+      # inherits these into std:: via <cstdlib>, and the global-scope form
+      # is common in code that also has a project-local `malloc` overload.
+      # The qualifier itself (`std`/empty) isn't part of the identifier
+      # node's text, so it's unconstrained here; only the trailing name is
+      # checked, which is exactly the function being called either way.
+      - kind: qualified_identifier
+        has:
+          field: name
+          kind: identifier
+          regex: "^(malloc|calloc|realloc|free)$"
+tags:
+  - cpp
+  - idiom
+  - memory-safety
+examples:
+  bad: |
+    int* buf = static_cast<int*>(malloc(sizeof(int) * count));
+    free(buf);
+  good: |
+    auto buf = std::make_unique<int[]>(count);

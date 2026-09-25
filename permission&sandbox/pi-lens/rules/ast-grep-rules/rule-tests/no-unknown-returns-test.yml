@@ -1,0 +1,16 @@
+id: no-unknown-returns
+valid:
+  - "function f(x: unknown): string { return String(x); }"
+  - "const g = (x: unknown): number => 1;"
+  - "class C { m(): void {} }"
+  # #1824: a function_type is a TYPE-POSITION annotation (a callback
+  # signature or type alias), not a value returning unknown — "the
+  # caller ignores my result" is a legitimate contract, so it must not
+  # flag. Covers both a standalone alias and a parameter position use.
+  - "type H = () => unknown;"
+  - "interface I { on(cb: () => unknown): void; }"
+invalid:
+  - "function f(): unknown { return 1; }"
+  - "const g = (): unknown => 1;"
+  - "class C { m(): unknown { return 1; } }"
+  - "interface I { m(): unknown; }"

@@ -1,0 +1,20 @@
+{
+	"provenance": {
+		"runner": "stylelint",
+		"tool": "stylelint",
+		"version": "17.8.0",
+		"command": "stylelint --formatter json bad.css",
+		"argv": [
+			"--formatter",
+			"json",
+			"bad.css"
+		],
+		"workspace": "tests/fixtures/tool-smoke/css",
+		"platform": "win32-x64",
+		"capturedAt": "2026-08-21"
+	},
+	"file": "bad.css",
+	"exitCode": 2,
+	"stdout": "",
+	"stderr": "[{\"source\":\"__WORKSPACE__\\\\bad.css\",\"deprecations\":[],\"invalidOptionWarnings\":[],\"parseErrors\":[],\"errored\":true,\"warnings\":[{\"line\":3,\"column\":10,\"endLine\":3,\"endColumn\":14,\"rule\":\"color-no-invalid-hex\",\"severity\":\"error\",\"text\":\"Invalid hex color \\\"#zzz\\\" (color-no-invalid-hex)\"}]}]"
+}

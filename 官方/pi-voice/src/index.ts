@@ -1,0 +1,114 @@
+import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import { existsSync } from "node:fs";
+import { registerFileTranscriptionTool } from "./file-transcription.js";
+import {
+  claimLegacyGitNotice,
+  findLegacyGitInstall,
+  legacyGitMigrationMessage,
+} from "./install-migration.js";
+import type { PiVoiceRuntime } from "./runtime.js";
+import { displayShortcut, STATUS_WIDGET_KEY } from "./shortcut-core.js";
+import { legacySettingsPath, settingsPath } from "./settings-path.js";
+import { readShortcutForRegistration } from "./startup-shortcut.js";
+
+// Pi awaits extension module evaluation before continuing startup. Keep this
+// entry point registration-only and load feature implementations on first use.
+export default function piVoice(pi: ExtensionAPI): void {
+  const registeredShortcut = readShortcutForRegistration();
+  let runtimePromise: Promise<PiVoiceRuntime> | undefined;
+  let shuttingDown = false;
+
+  function loadRuntime(): Promise<PiVoiceRuntime> {
+    if (shuttingDown) return Promise.reject(new Error("Pi Voice is shutting down"));
+    if (runtimePromise) return runtimePromise;
+
+    const loading = import("./runtime.js").then(({ createPiVoiceRuntime }) =>
+      createPiVoiceRuntime(pi, registeredShortcut),
+    );
+    runtimePromise = loading;
+    void loading.catch(() => {
+      if (runtimePromise === loading) runtimePromise = undefined;
+    });
+    return loading;
+  }
+
+  pi.on("session_start", async (_event, ctx) => {
+    let showedMigrationNotice = false;
+    if (ctx.mode === "tui") {
+      const legacyInstall = findLegacyGitInstall(pi.getCommands());
+      if (legacyInstall && await claimLegacyGitNotice()) {
+        ctx.ui.notify(legacyGitMigrationMessage(legacyInstall), "warning");
+        showedMigrationNotice = true;
+      }
+    }
+
+    if (
+      !showedMigrationNotice &&
+      !existsSync(settingsPath()) &&
+      !existsSync(legacySettingsPath())
+    ) {
+      ctx.ui.notify(
+        `Pi Voice installed · press ${displayShortcut(registeredShortcut)} or run /voice-settings to set up`,
+        "info",
+      );
+    }
+  });
+
+  const fileTranscription = registerFileTranscriptionTool(pi, {
+    getSettings: async () => (await loadRuntime()).requireConfiguredSettingsForTool(),
+    getService: async () => (await loadRuntime()).service,
+  });
+
+  pi.registerShortcut(
+    registeredShortcut as Parameters<ExtensionAPI["registerShortcut"]>[0],
+    {
+      description: "Toggle microphone transcription",
+      handler: async (ctx) => {
+        // The first press pays deferred module loading before the runtime can
+        // show anything; paint feedback synchronously. Later presses reach the
+        // memoized runtime in a microtask and it paints its own status.
+        if (!runtimePromise && ctx.hasUI) {
+          ctx.ui.setWidget(STATUS_WIDGET_KEY, [
+            ctx.ui.theme.fg("muted", "Starting microphone…"),
+          ]);
+        }
+        try {
+          await (await loadRuntime()).toggleCapture(ctx);
+        } catch (error) {
+          if (ctx.hasUI) ctx.ui.setWidget(STATUS_WIDGET_KEY, undefined);
+          throw error;
+        }
+      },
+    },
+  );
+
+  const openSettings = async (
+    _args: string,
+    ctx: ExtensionCommandContext,
+  ): Promise<void> => (await loadRuntime()).showSettings(ctx);
+
+  pi.registerCommand("voice-settings", {
+    description: "Open Pi Voice settings",
+    handler: openSettings,
+  });
+  pi.registerCommand("transcribe", {
+    description: "Open Pi Voice settings (alias for /voice-settings)",
+    handler: openSettings,
+  });
+
+  if (process.env.PI_VOICE_DEBUG === "1") {
+    pi.registerCommand("voice-onboarding", {
+      description: "Replay Pi Voice onboarding (debug)",
+      handler: async (_args, ctx) => (await loadRuntime()).replayOnboarding(ctx),
+    });
+  }
+
+  pi.on("session_shutdown", async (_event, ctx) => {
+    shuttingDown = true;
+    await fileTranscription.shutdown().catch(() => undefined);
+    const loading = runtimePromise;
+    if (!loading) return;
+    const runtime = await loading.catch(() => undefined);
+    await runtime?.shutdown(ctx).catch(() => undefined);
+  });
+}

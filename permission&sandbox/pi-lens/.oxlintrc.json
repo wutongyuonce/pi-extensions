@@ -1,0 +1,39 @@
+{
+  "$schema": "https://raw.githubusercontent.com/oxc-project/oxc/main/npm/oxlint/configuration_schema.json",
+  "ignorePatterns": [
+    "tests/fixtures/autofix-smoke/**",
+    "tests/fixtures/format-smoke/**",
+    "tests/fixtures/tool-smoke/**",
+    "tests/fixtures/call-graph/javascript/**",
+    "tests/fixtures/function-facts/javascript-parameter.js"
+  ],
+  "overrides": [
+    {
+      "files": ["tests/**/*.ts", "tests/**/*.tsx"],
+      "rules": {
+        "typescript/no-floating-promises": "error",
+        "typescript/await-thenable": "error",
+        "eslint/no-unsafe-optional-chaining": "error"
+      }
+    },
+    {
+      "files": ["*.mjs", "*.cjs", "*.js"],
+      "env": {
+        "node": true
+      },
+      "rules": {
+        "no-undef": "error"
+      }
+    },
+    {
+      "files": ["*.mjs"],
+      "globals": {
+        "require": "off",
+        "__dirname": "off",
+        "__filename": "off",
+        "module": "off",
+        "exports": "off"
+      }
+    }
+  ]
+}

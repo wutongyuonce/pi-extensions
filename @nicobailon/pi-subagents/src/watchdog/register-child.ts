@@ -1,16 +1,17 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { captureWatchdogDiffBaseline, type WatchdogDiffBaseline } from "./diff-tool.ts";
 import { MainWatchdogRuntime } from "./runtime.ts";
 import { createMainWatchdogReview } from "./review.ts";
 import { DEFAULT_WATCHDOG_CONFIG } from "./settings.ts";
 import { createWatchdogWarningMessage } from "./warning-format.ts";
 import {
-	CHILD_WATCHDOG_CONFIG_ENV,
 	CHILD_WATCHDOG_STATUS_EVENT,
-	decodeChildWatchdogConfig,
 	type ChildWatchdogConfig,
 	type ChildWatchdogPhase,
+	type ChildWatchdogStatusEvent,
 } from "./child-status.ts";
-import type { ResolvedWatchdogConfig, WatchdogWarningDetails } from "./types.ts";
+import type { ChildWatchdogWarningSummary } from "../shared/types.ts";
+import { SUBAGENT_WATCHDOG_WARNING_TYPE, type ResolvedWatchdogConfig, type WatchdogWarningDetails } from "./types.ts";
 
 export function childResolvedConfig(config: ChildWatchdogConfig): ResolvedWatchdogConfig {
 	return {
@@ -23,11 +24,8 @@ export function childResolvedConfig(config: ChildWatchdogConfig): ResolvedWatchd
 			...(config.model ? { model: config.model } : {}),
 			...(config.thinking !== undefined ? { thinking: config.thinking } : {}),
 		},
-		autoFollow: {
-			blockers: config.autoFollowBlockers,
-			maxAttempts: config.autoFollowMaxAttempts,
-			stalemateRepeats: config.stalemateRepeats,
-		},
+		stalemateRepeats: config.stalemateRepeats,
+		cadence: { ...config.cadence },
 		children: {
 			...DEFAULT_WATCHDOG_CONFIG.children,
 			watchdogTailTimeoutMs: config.watchdogTailTimeoutMs,
@@ -45,20 +43,24 @@ function childWarningDetails(details: WatchdogWarningDetails, config: ChildWatch
 	};
 }
 
-function writeStatus(event: unknown): void {
-	try {
-		process.stdout.write(`${JSON.stringify(event)}\n`);
-	} catch {
-		// Child watchdog status is advisory; stdout failures are handled by the child process itself.
-	}
-}
-
-export function registerChildWatchdog(pi: ExtensionAPI, rawConfig = process.env[CHILD_WATCHDOG_CONFIG_ENV]): MainWatchdogRuntime | undefined {
-	const childConfig = decodeChildWatchdogConfig(rawConfig);
-	if (!childConfig?.enabled) return undefined;
+/**
+ * Register the child-side watchdog. Status events go to the sink the hosting
+ * process passed in the child runtime config; the host folds them into the
+ * child's event stream.
+ */
+export function registerChildWatchdog(
+	pi: ExtensionAPI,
+	childConfig: ChildWatchdogConfig | undefined,
+	writeStatus: ((event: ChildWatchdogStatusEvent) => void) | undefined,
+	structuredTerminal?: { captured: boolean },
+): MainWatchdogRuntime | undefined {
+	if (!childConfig) return undefined;
+	if (!writeStatus) throw new Error("Child watchdog status sink is missing; the host must pass ChildRuntimeConfig.watchdogStatus.");
 	let currentContext: ExtensionContext | undefined;
+	let diffBaseline: WatchdogDiffBaseline | undefined;
+	let agentSettled = false;
 	let seq = 0;
-	const emitStatus = (phase: ChildWatchdogPhase, followUpPending = false, reason?: string): void => {
+	const emitStatus = (phase: ChildWatchdogPhase, reason?: string, warning?: ChildWatchdogWarningSummary): void => {
 		writeStatus({
 			type: CHILD_WATCHDOG_STATUS_EVENT,
 			...(childConfig.runId ? { runId: childConfig.runId } : {}),
@@ -67,19 +69,27 @@ export function registerChildWatchdog(pi: ExtensionAPI, rawConfig = process.env[
 			seq: ++seq,
 			phase,
 			ts: Date.now(),
-			followUpPending,
 			...(reason ? { reason } : {}),
+			...(warning ? { warning } : {}),
 		});
 	};
 	const resolved = childResolvedConfig(childConfig);
 	const runtime = new MainWatchdogRuntime({
 		resolveConfig: () => ({ ok: true, config: resolved, errors: [], sources: [{ scope: "session", exists: true }] }),
-		review: createMainWatchdogReview(() => currentContext, { getThinkingLevel: () => pi.getThinkingLevel() }),
+		review: createMainWatchdogReview(() => currentContext, { getThinkingLevel: () => pi.getThinkingLevel(), diffBaseline: () => diffBaseline }),
 		reviewDescription: "child model review",
 		reviewChangesOnly: true,
-		displayWarning: (details) => {
+		displayWarning: (details, options) => {
 			const childDetails = childWarningDetails(details, childConfig);
-			pi.sendMessage(createWatchdogWarningMessage(childDetails, { display: true, details: childDetails }));
+			emitStatus("reviewing", undefined, { severity: childDetails.severity, importance: childDetails.importance, category: childDetails.category, summary: childDetails.summary, evidence: childDetails.evidence, recommendedAction: childDetails.recommendedAction, ...(childDetails.displayedAt ? { displayedAt: childDetails.displayedAt } : {}), addressed: false, stalemate: childDetails.state === "stalemate" });
+			const message = createWatchdogWarningMessage(childDetails, { display: true, details: childDetails });
+			if (agentSettled) pi.appendEntry(SUBAGENT_WATCHDOG_WARNING_TYPE, childDetails);
+			else pi.sendMessage(message, options);
+		},
+		displayUserWarning: (details) => {
+			const childDetails = childWarningDetails(details, childConfig);
+			emitStatus("reviewing", undefined, { severity: childDetails.severity, importance: childDetails.importance, category: childDetails.category, summary: childDetails.summary, evidence: childDetails.evidence, recommendedAction: childDetails.recommendedAction, ...(childDetails.displayedAt ? { displayedAt: childDetails.displayedAt } : {}), addressed: false, stalemate: childDetails.state === "stalemate" });
+			pi.appendEntry(SUBAGENT_WATCHDOG_WARNING_TYPE, childDetails);
 		},
 	});
 	const rememberContext = (ctx: ExtensionContext) => {
@@ -88,25 +98,34 @@ export function registerChildWatchdog(pi: ExtensionAPI, rawConfig = process.env[
 	const onRuntimeEvent = pi.on as unknown as (event: string, handler: (event: unknown, ctx: ExtensionContext) => unknown) => void;
 	onRuntimeEvent("session_start", (_event, ctx) => {
 		rememberContext(ctx);
+		diffBaseline = captureWatchdogDiffBaseline(ctx.cwd);
 		runtime.bindSession(ctx);
 		emitStatus("idle");
 	});
 	onRuntimeEvent("before_agent_start", (event, ctx) => {
+		agentSettled = false;
 		rememberContext(ctx);
 		runtime.handleBeforeAgentStart(event, ctx);
 	});
 	onRuntimeEvent("turn_end", (event, ctx) => {
 		rememberContext(ctx);
-		runtime.handleTurnEnd(event, ctx);
+		runtime.handleTurnEnd(event, ctx, structuredTerminal?.captured === true);
+	});
+	onRuntimeEvent("tool_result", (_event, ctx) => {
+		rememberContext(ctx);
+		runtime.handleToolResult(ctx);
 	});
 	onRuntimeEvent("agent_end", async (event, ctx) => {
 		rememberContext(ctx);
 		emitStatus("reviewing");
 		await runtime.handleAgentEnd(event, ctx);
 		const snapshot = runtime.getSnapshot(ctx.cwd);
-		if (snapshot.status === "failed") emitStatus("failed", false, snapshot.lastError);
-		else if (snapshot.status === "stale") emitStatus("stale", false, "review stale");
+		if (snapshot.status === "failed") emitStatus("failed", snapshot.lastError);
+		else if (snapshot.status === "stale") emitStatus("stale", "review stale");
 		else emitStatus("idle");
+	});
+	onRuntimeEvent("agent_settled", () => {
+		agentSettled = true;
 	});
 	onRuntimeEvent("session_shutdown", () => {
 		currentContext = undefined;

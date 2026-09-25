@@ -7,10 +7,213 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- MCP stdio server commands, arguments, and working directories support home-relative paths. Thanks to [@FRFlo](https://github.com/FRFlo) for [PR #655](https://github.com/nicobailon/pi-mcp-adapter/pull/655).
+- Set `MCP_UI_VIEWER=orca` to open MCP UI windows in Orca. Thanks to [@jaesimio](https://github.com/jaesimio) for [PR #654](https://github.com/nicobailon/pi-mcp-adapter/pull/654).
+
 ### Fixed
-- Hardened MCP 2026 multi-round input flows across proxy, direct, resource, and UI-resource calls, with actionable no-UI errors and cancellation cleanup.
-- Hardened MCP 2026-07-28 catalog listens with visible drop/recovery state, bounded re-listen on activity, resource update signals for open UIs, and quiet metadata/cache refreshes. (#468)
+
+- Metadata refreshes respect host removal of the `mcp` gateway unless the adapter actually removed it through active-set fallback and still owns that deactivation. On hosts without `unregisterTool`, the gateway is hidden when direct tools cover the server and restored when needed; observing it active relinquishes fallback ownership. An unobserved host reactivation and removal between syncs cannot be distinguished from the adapter's deactivation. Thanks to [@xulongwu4](https://github.com/xulongwu4) for [PR #665](https://github.com/nicobailon/pi-mcp-adapter/pull/665).
+- `mcpScript` no longer asks models to load its intentionally hidden manual skill. Thanks to [@k03mad](https://github.com/k03mad) for [#659](https://github.com/nicobailon/pi-mcp-adapter/issues/659).
+- OAuth credential reads now reuse a healthy keyring Entry without retaining secret values, avoiding repeated native sessions while still observing external updates. Thanks to [@mmarabel](https://github.com/mmarabel) for [#657](https://github.com/nicobailon/pi-mcp-adapter/issues/657).
+- Suppressing MCP UI windows with `MCP_UI_VIEWER=none` / `off` / `disabled` no longer prints raw output into the TUI. Thanks to [@andreafspeziale](https://github.com/andreafspeziale) for [#656](https://github.com/nicobailon/pi-mcp-adapter/issues/656).
+- The published package now includes the OAuth guide linked from the README. Thanks to [@dajiaohuang](https://github.com/dajiaohuang) for [PR #653](https://github.com/nicobailon/pi-mcp-adapter/pull/653).
+- OpenCode v2 configs now import. Servers under `mcp.servers` are picked up, `disabled: true` servers are skipped, and the snake_case OAuth fields `client_id`, `client_secret`, and `auth_server_metadata_url` are mapped. OpenCode v1 configs keep working. Thanks to [@sleroq](https://github.com/sleroq) for [PR #650](https://github.com/nicobailon/pi-mcp-adapter/pull/650).
+- Tools from Rust MCP servers, such as DBX, no longer print Ajv `unknown format "uint64" ignored` warnings on every call. Number formats like `uint64`, `uint32`, `uint`, and `uint8` are now recognized, and `type`/`minimum` still validate the values. Thanks to [@nightlitten](https://github.com/nightlitten) for [#649](https://github.com/nicobailon/pi-mcp-adapter/issues/649).
+
+## [2.37.0] - 2026-09-23
+
+### Highlights
+
+- Use Jev semantic search with other System One providers, such as OpenCode Zen, Command Code, or OpenRouter, by setting `SYSTEMONE_ENDPOINT`.
+- Stop agents from installing new MCP servers with `settings.allowInstall: false`.
+- Turn off resource tools for every server with one `settings.exposeResources: false` setting.
+- Start Pi without waiting on MCP servers even when cached tool metadata is missing, with `settings.deferWithMissingMetadata`.
+
+### Added
+
+- Jev can send System One requests to any HTTPS provider endpoint set in `SYSTEMONE_ENDPOINT`. TypeSafe stays the default. API keys are stored per endpoint, and an invalid endpoint turns Jev off instead of quietly falling back to TypeSafe. Thanks to [@jagaliano](https://github.com/jagaliano) for [PR #645](https://github.com/nicobailon/pi-mcp-adapter/pull/645).
+- `settings.deferWithMissingMetadata: true` lets Pi start without connecting to MCP servers even when their cached metadata is missing or out of date. Those servers show no tools until the first MCP call loads them. Thanks to [@j62268781-alt](https://github.com/j62268781-alt) for [#641](https://github.com/nicobailon/pi-mcp-adapter/issues/641).
+- `settings.allowInstall: false` blocks agents from installing remote MCP servers with `mcp({ action: "install" })`, for headless or locked-down setups. Thanks to [@gastmaier](https://github.com/gastmaier) for [#638](https://github.com/nicobailon/pi-mcp-adapter/issues/638).
+- `settings.exposeResources: false` hides resource tools for every server. A server's own `exposeResources` setting still wins. Thanks to [@rakesh-vs](https://github.com/rakesh-vs) for [PR #636](https://github.com/nicobailon/pi-mcp-adapter/pull/636).
+
+### Changed
+
+- The Jev key command is now `pi-mcp-adapter key set systemone`, and the environment variable is `SYSTEMONE_API_KEY`. The old `key set typesafe` command still works, and `TYPESAFE_API_KEY` still works with the default TypeSafe endpoint.
+- Supports Pi 0.87.
+
+### Fixed
+
+- `getMcpOAuthTokensForUrl` no longer returns an expired access token when no refresh token is stored, so other extensions see a signed-out server instead of sending a dead token. Thanks to [@benjaminsirb](https://github.com/benjaminsirb) for [#644](https://github.com/nicobailon/pi-mcp-adapter/issues/644).
+- Tools in `directTools: "search"` mode now stay inactive until a search selects them, even if another extension turns them back on. Tools a search activates stay on until the session ends. Thanks to [@VoidInTheShell](https://github.com/VoidInTheShell) for [PR #640](https://github.com/nicobailon/pi-mcp-adapter/pull/640).
+
+## [2.36.0] - 2026-09-21
+
+### Highlights
+
+- Set up TypeSafe semantic search from Pi with `/mcp jev setup`.
+- Search every enabled MCP tool automatically when a TypeSafe key is available.
+- Use regex safety checks reliably on Windows with both native and Java backends.
+- Get clearer, non-duplicated guidance when tool catalogs are large or semantic search finds no match.
+
+### Added
+
+- `/mcp jev setup` checks for a TypeSafe credential, lets you restrict which MCP servers may share semantic-search data, saves the project policy, and reloads Pi automatically.
+
+### Changed
+
+- A valid TypeSafe key now enables semantic search across every enabled MCP tool by default, while script evaluation remains opt-in. Search now explains when an allowlist permits no servers, when permitted servers have no cached tools, and when none of the available tools match the request.
+
+### Fixed
+
+- Regex safety checks on Windows resolve recheck's native executable and JAR fallback correctly. `recheck` is intentionally pinned to `4.6.0-beta.3` until a stable fixed release is available. Thanks to [@LCubero](https://github.com/LCubero) for reporting [#623](https://github.com/nicobailon/pi-mcp-adapter/issues/623), and [@Kristinita](https://github.com/Kristinita) and [@makenowjust](https://github.com/makenowjust) for the upstream reproduction and fix.
+- Large direct-tool advisories now use Pi's renderer in interactive sessions, avoiding raw console output and duplicate warnings. Thanks to [@grivper](https://github.com/grivper) for issue [#633](https://github.com/nicobailon/pi-mcp-adapter/issues/633).
+- Windows contributors can run `npm test` again; the runner now launches npm through `cross-spawn` so hardened Node versions can execute `npm.cmd`. Thanks @insuffer for the fix.
+
+## [2.35.0] - 2026-09-20
+
+### Highlights
+
+- Describe what you want to do and let Jev find the MCP tools that best match your request.
+- Run long-lived MCP Tasks with progress polling, interactive input, and cancellation.
+- Edit shared MCP configuration without leaving Pi and approve a server for the rest of the session.
+- Reconnect to OAuth and bearer-token servers more reliably, including after expired credentials or authorization failures.
+- Find and use tools more accurately across CJK queries, namespaced catalogs, structured results, and ambiguous names.
+
+### Added
+
+- Opt-in TypeSafe Jev support can understand a request, rank MCP tools by how well they match, and evaluate intermediate `mcpScript` results. Credentials stay in the OS keyring or environment, sharing MCP data requires an explicit server allowlist, and requests have configurable limits. In a live test across 95 local tools and resources, Jev chose the expected result first in 10 of 11 answerable cases and second once, compared with 5 first-place matches from regular text search. Part of [#611](https://github.com/nicobailon/pi-mcp-adapter/issues/611).
+- `/mcp edit [project|global]` opens the shared MCP config in an editor (Ctrl+G opens `$EDITOR`), refuses text that is not a JSONC object, and reloads after a save. Closes #593. Thanks to [@turisanapo](https://github.com/turisanapo) for PR #594.
+- Support for MCP Tasks. Long-running tool calls are polled to completion, interactive questions use the normal Pi interface, cancellation is forwarded to the server, and failures are reported like ordinary tool-call errors. Task support activates only when the server advertises it and can be disabled per server with `tasks: false`. Thanks to [@rgarcia](https://github.com/rgarcia) for PR #620.
+- Users can grant runtime-only approval for all tools and arguments on a server for the current session. Thanks to [@derdossi](https://github.com/derdossi) for PR #618.
+
+### Changed
+
+- Development and peer dependency coverage now includes Pi 0.86.
+- Self-namespaced MCP tools no longer receive duplicate prefixes, and proxy calls now resolve unique canonical-name candidates while failing closed on collisions and ambiguity. Fixes [#609](https://github.com/nicobailon/pi-mcp-adapter/issues/609). Thanks to [@elkaix](https://github.com/elkaix) for the report.
+- Namespace proxy tools can now be disabled with `settings.namespaceProxyTools: false`. Thanks to [@k03mad](https://github.com/k03mad) for PR #592.
+- The bundled `mcp-scripting` skill is now discovered alongside the default-on `mcpScript` tool and hidden with it when `settings.scriptMode` is `false`. Thanks to [@zhangyoufu](https://github.com/zhangyoufu) for PR #583.
+
+### Fixed
+
+- HTTP streams authenticated with `requestHeadersCommand` remain cancellable after garbage collection. Thanks to [@zaini](https://github.com/zaini) for PR #619.
+- Bearer-token and TypeSafe key storage now retry revoked Linux session-keyring operations through the packaged `keyctl` helper, without special launch commands or plaintext fallback. Set `PI_MCP_ADAPTER_DISABLE_KEYRING_RECOVERY=1` to disable recovery. Thanks to [@magoz](https://github.com/magoz) for PR #621.
+- OAuth-enabled MCP servers now reconnect reliably after explicit OAuth, stored-token, and 401 authentication paths. Thanks to [@jaresty](https://github.com/jaresty) for PR #624.
+- Direct tools now recover stringified array and object arguments declared through type arrays and schema unions without coercing values that are valid strings. Thanks to [@sashkachan](https://github.com/sashkachan) for issue [#606](https://github.com/nicobailon/pi-mcp-adapter/issues/606).
+- Default tool search now supports CJK text, including unseparated mixed-script queries and configured search keywords, while retaining bounded lexical matching. Thanks to [@wjunhere](https://github.com/wjunhere) for issue [#607](https://github.com/nicobailon/pi-mcp-adapter/issues/607).
+- Command-backed bearer tokens now refresh through a TTL cache, and keep-alive bearer connections reconnect after a 401. Thanks to [@kesor](https://github.com/kesor) for PR #608.
+- Tool results now preserve `structuredContent` alongside ordinary content in direct and proxy calls. Thanks to [@civcode](https://github.com/civcode) for issue #588.
+- Restored the MCP footer status during cache-backed deferred startup without eagerly loading or connecting the runtime. Thanks to [@pkulyn](https://github.com/pkulyn) for issue #586.
+- Oversized object `structuredContent` summaries now identify themselves as omitted and account for preserved and dropped fields, so extension consumers do not mistake a partial preview for an empty payload. Thanks to [@Batchputz](https://github.com/Batchputz) for issue #585.
+- Server-scoped tool describe and call requests now fail closed when a name exactly identifies different displayed and upstream tools. Thanks to [@sheurich](https://github.com/sheurich) for PR #587.
+- Config writes now preserve resolvable existing symlinks by atomically replacing their targets. Thanks to [@peedrr](https://github.com/peedrr) for #597.
+- Server-returned MCP tool errors no longer include misleading input-schema guidance, while invalid proxy arguments are rejected before dispatch. Thanks to [@jaresty](https://github.com/jaresty) for PR #596.
+
+## [2.34.0] - 2026-09-14
+
+### Highlights
+
+- Start Pi faster while keeping cached MCP tools, prompts, and commands immediately available.
+- Connect to more OAuth servers with Client ID Metadata Documents.
+- Store OAuth credentials securely in encrypted files when Windows OpenSSH or a headless session cannot use the OS credential store.
+- Load shared configuration and Agent Plugin MCP servers more reliably.
+- Use MCP Apps, private HTTPS servers, and frequently changing tool catalogs with fewer connection problems.
+
+### Added
+
+- Windows OpenSSH/network logons can explicitly select externally keyed AES-256-GCM OAuth credential files with `settings.oauthCredentialStore: "encrypted-file"`; error 1312 now points to this option, while the OS store remains the default with no automatic fallback. Thanks to [@pierreh](https://github.com/pierreh) for issue #574.
+- OAuth servers can explicitly opt into operator-hosted Client ID Metadata Documents (SEP-991) with `oauth.clientMetadataUrl`; URL-only/default configurations continue using Dynamic Client Registration. Existing DCR refresh credentials get their normal refresh attempt before migration to CIMD after invalidation. Thanks to [@dsluo](https://github.com/dsluo) for PR #571.
+- User-global or explicitly selected config can opt in to bounded ancestor `.mcp.json` and `<configDir>/mcp.json` discovery with `settings.ancestorConfigRoots`. Discovery is off by default; project files cannot enable or widen it, and the deepest matching existing directory under `$HOME` bounds farthest-first loading. Thanks to [@johnhenaot](https://github.com/johnhenaot) for PR #555.
+
+### Changed
+
+- Runtime-heavy MCP modules now load only when first needed, while cached tools, prompts, and commands remain immediately available. Thanks to [@thefakepaulgg](https://github.com/thefakepaulgg) for PR #576.
+- OAuth dependencies now use published MCP SDK releases again, restoring normal npm installs and removing the standalone native-addon dependency. Cross-process OAuth transaction serialization remains unavailable until the official SDK exposes the required support.
+
+### Fixed
+
+- Built-in Agent Plugin MCP definitions now preserve literal values through connection and cache handling, validate manifest field types, resolve contained paths through symlinks, and expand plugin placeholders once. Thanks to [@cheetahbyte](https://github.com/cheetahbyte) for #570.
+- Empty, whitespace-only, or comments-only optional MCP config layers are now treated as absent, allowing other precedence layers to load without a warning. Thanks to [@RobertoNegro](https://github.com/RobertoNegro) for PR #567.
+- macOS Keychain and Linux Secret Service now keep ordinary OAuth records in one credential item and compact existing chunks on ordinary reads; Windows Credential Manager retains chunking. Thanks to [@jploskonka](https://github.com/jploskonka) for PR #560.
+- Configured direct tools now hot-load from fresh live catalogs even when a server advertises `ttlMs: 0`, while persisted zero-TTL metadata remains non-cacheable. Thanks to [@dsluo](https://github.com/dsluo) for PR #562. (#561)
+- Switching a server between transports (HTTP to stdio command or socket) now drops an inherited `bearerTokenStore` flag alongside the other URL-bound credential fields. Thanks to [@zhulinchng](https://github.com/zhulinchng) for PR #552.
+- Per-origin `caFile` trust now routes same-origin requests through the bundled undici fetch so the custom CA dispatcher matches the fetch implementation on newer Node releases (Node 26 ships undici v8 while the dependency pins undici v6); previously every `caFile` connection failed with `UND_ERR_INVALID_ARG`. Thanks to [@zhulinchng](https://github.com/zhulinchng) for PR #550.
+- MCP Apps now load provider-declared asset, connection, and frame domains through a session-bound sandbox resource navigation with response-level CSP enforcement. Thanks to [@tekumara](https://github.com/tekumara) for #548.
+
+## [2.33.0] - 2026-09-10
+
+### Highlights
+- Install MCP servers from a URL and complete browser OAuth without leaving the scripting workflow.
+- Keep large tool catalogs out of context until search activates the tools you need.
+- Use OAuth more reliably across multiple Pi processes, private gateways, stalled providers, and dynamic loopback callbacks.
+- Connect to private HTTPS servers with custom CA bundles and run stdio servers with tighter environment isolation.
+- Inspect richer tool schemas and filter larger intermediate results safely in MCP scripts.
+
+### Added
+- HTTPS MCP servers can use an origin-scoped `caFile` PEM trust bundle for Streamable HTTP and SSE without disabling certificate verification. Thanks to [@desmonna](https://github.com/desmonna) for #527.
+- `directTools: "search"` keeps direct tools inactive until `mcp({ search })` finds and activates them. Search-mode tools do not count toward the 75-tool advisory. Thanks to [@chiptoe-svg](https://github.com/chiptoe-svg) for PR #525.
+- Install MCP servers from a URL with `mcp({ action: "install", url: "..." })`. Thanks to [@exoulster](https://github.com/exoulster) for PR #532.
+- Script `tools.describe()` now exposes server-advertised output schemas for `data.structuredContent`, including after metadata refreshes. (#522)
+- Stdio MCP servers can set `inheritEnv: false` while retaining platform defaults and explicit `env` values. Thanks to [@zenolam](https://github.com/zenolam) for #509.
+- Local Claude plugin bundles can now be loaded from trusted configured directories, including bundled MCP servers and skills. Thanks to [@gugu91](https://github.com/gugu91) for PR #493.
+- OAuth loopback redirects can use `{port}` with `localhost`, `127.0.0.1`, or `::1` when a provider permits RFC 8252 dynamic ports. Thanks to [@nrutman](https://github.com/nrutman) for PR #483.
+- Runtime MCP status now includes each server's registered direct-tool count, including resource tools. Thanks to [@FischLu](https://github.com/FischLu) for #482.
+
+### Changed
+- Approval brokers now observe and can gate cached MCP calls; session grants apply only on abstention or no claim. Thanks to [@yanqianglu](https://github.com/yanqianglu) for #534.
+- MCP setup and server panels now follow Pi's active theme and TUI components. (#488)
+- MCP sampling requests now route through Pi's `ModelRegistry.complete`, leaving provider authentication, environment, and base URL handling to the host.
+- `mcp({ connect })` now activates newly discovered direct tools from the connection result, so they become available at the correct point in the transcript. (#490) Thanks to [@chiptoe-svg](https://github.com/chiptoe-svg) for PR #494.
+- OAuth transaction support uses pinned MCP SDK preview builds until the supporting SDK release is available on npm.
+
+### Fixed
+- macOS HTTP connection failures to literal private/link-local IPs now retain network details and suggest Local Network Privacy checks without assuming a privacy denial. Thanks to [@tdhooghe](https://github.com/tdhooghe) for #543.
+- OAuth credential updates now coordinate across Pi processes, release cleanly after failures and cancellation, and keep callback tokens bound to the client that requested them. Optional `PI_MCP_OAUTH_LOG` diagnostics identify transactions without logging credentials. Thanks to [@CharlesMcMillan](https://github.com/CharlesMcMillan) for PR #528.
+- MCP runtime cancellation now works on Node 20.0.0 when `AbortSignal.any` is unavailable. (#537)
+- OAuth now forwards configured service headers to same-origin discovery, registration, token exchange, and refresh requests, enabling authentication behind service-token gateways without leaking credentials to other origins. Thanks to [@ethanbrown3](https://github.com/ethanbrown3) for PR #533 and [@Davasny](https://github.com/Davasny) for reporting #530.
+- Script `mcp({ action: "auth-start" })` now opens the authorization URL and watches the loopback callback to complete OAuth automatically, while retaining pasted `auth-complete` as a fallback. Thanks to [@exoulster](https://github.com/exoulster) for PR #532.
+- Namespace proxy tool names now stay within provider limits without creating collisions for long server names. Thanks to [@saikpr](https://github.com/saikpr) for PR #529.
+- Script calls now preserve intermediate data for filtering within a fixed 16 MiB cumulative transfer budget while retaining final-output limits. (#520)
+- Namespace proxy argument guidance now uses exact search-result tool names for schema inspection. Thanks to [@r1ckyIn](https://github.com/r1ckyIn) for PR #519.
+- Script `tools.describe()` now retains documented input field guidance alongside compact parameter shapes, including formats and units. (#521)
+- Early MCP tool discovery now honors `--mcp-config=<path>`, including paths containing `=`. (#512)
+- Updated `qs` to patched version 6.16.0. (#517)
+- The optional `@earendil-works/pi-ai` peer now supports Pi 0.85 alongside 0.84.1, avoiding npm resolution conflicts. Thanks to [@dyld-w](https://github.com/dyld-w) for #507.
+- Session-scoped MCP tool approvals and MCP App iframe consent now persist on and restore from the active Pi session branch. (#492)
+- The `/mcp` panel no longer marks reconnects as cached when no cache entry was restored. Thanks to [@fyq163](https://github.com/fyq163) for #497.
+- MCP output truncation now uses Pi host truncation semantics and formatting while preserving MCP artifact spill behavior.
+- Updated Ajv's transitive `fast-uri` dependency to patched version 3.1.7. Thanks to [@escuelallenquen](https://github.com/escuelallenquen) for #513.
+- Exclusive mode now honors an explicit `--mcp-config` override instead of always loading the agent-global configuration. Thanks to [@willem445](https://github.com/willem445) for #496.
+- OAuth discovery, dynamic registration, token exchange, and token refresh requests now have a timeout and honor cancellation instead of hanging the agent on stalled providers. Thanks to [@west-david](https://github.com/west-david) for #485 and PR #486.
+- OAuth redirect URI mismatches now preserve refreshable credentials and re-register stale dynamic clients after `invalid_grant`. Thanks to [@CharlesMcMillan](https://github.com/CharlesMcMillan) for PR #495.
+
+## [2.32.1] - 2026-09-01
+
+### Fixed
+- The published package now includes the updated public helper build artifacts for the `2.32.0` config and MCP Apps changes.
+
+## [2.32.0] - 2026-09-01
+
+### Highlights
+- You can now enable and disable MCP servers directly from the `/mcp` panel.
+- `/mcp setup` is clearer about where new shared servers will be saved.
+- MCP App views that use browser storage now render reliably without exposing host session access.
+- Long-running sessions handle MCP 2026 input flows, catalog updates, and UI resource refreshes more reliably.
+- OAuth reuse and per-server status messages are less confusing.
+
+### Added
+- The `/mcp` panel now supports enabling and disabling servers in place with `ctrl+d` on a server row. Saving persists the `disabled` flag to the project Pi layer and reloads the session, matching `/mcp disable` and `/mcp enable`. Thanks to [@ericykim](https://github.com/ericykim) for PR #479.
+
+### Changed
+- `/mcp setup` now lets you choose project `.mcp.json` or global `~/.config/mcp/mcp.json` as the write target for new shared MCP servers, while keeping Pi-owned files and compatibility inputs in the advanced flow. The bundled `mcp-scripting` skill is manual-only by default. Thanks to [@w-winter](https://github.com/w-winter) for #477.
+
+### Fixed
+- MCP 2026 multi-round input flows now work more reliably across proxy, direct, resource, and UI-resource calls, with clearer no-UI errors and cancellation cleanup.
+- MCP 2026-07-28 catalog listens now recover from dropped listens, refresh quietly when catalogs change, and notify open UIs when resources update. (#468)
+- MCP App views now load through a separate loopback sandbox proxy origin so storage APIs work without exposing host session capabilities. Thanks to [@drewbitt](https://github.com/drewbitt) for #480.
 - Implicit OAuth now reuses URL-bound stored credentials while preserving anonymous fallback. Thanks to [@wilt00](https://github.com/wilt00) for #471.
+- Per-server proxy lists now distinguish cached lazy tools from servers that need authentication while preserving active failure backoff. Thanks to [@inattendu](https://github.com/inattendu) for PR #474.
 
 ## [2.31.0] - 2026-08-28
 

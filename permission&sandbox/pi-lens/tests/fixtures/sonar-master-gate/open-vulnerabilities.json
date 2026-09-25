@@ -1,0 +1,1 @@
+{"total":1,"issues":[{"rule":"squid:S3649","component":"apmantza_pi-lens:src/auth.ts","line":42,"message":"Change this code to not log credentials."}]}

@@ -16,6 +16,7 @@ import {
   INTERCOM_EXTENSION_REGISTRY_READY_EVENT,
   INTERCOM_OUTBOX_REQUEST_EVENT,
   INTERCOM_OUTBOX_RESULT_EVENT,
+  INTERCOM_SESSION_IDENTITY_EVENT,
   type IntercomExtensionChannel,
   type IntercomExtensionEvent,
   type IntercomExtensionOwner,
@@ -25,6 +26,7 @@ import {
   type IntercomOutboxResultCode,
   type IntercomOutboxResultStatus,
   type IntercomOutboxResultV1,
+  type IntercomSessionIdentityRequestV1,
 } from "./extension-api.ts";
 import { ReplyTracker } from "./reply-tracker.ts";
 import { resolve as resolvePath } from "node:path";
@@ -517,6 +519,14 @@ function currentTmuxPane(): string | undefined {
   const pane = process.env.TMUX_PANE?.trim();
   return pane ? pane : undefined;
 }
+// Herdr exports a launch-time pane alias to hosted processes. Its visible,
+// workspace-qualified id can change when the pane moves, so registration also
+// carries the stable Pi session file and the broker resolves both against a
+// fresh snapshot. Workspace and tab ids are intentionally never registered.
+function currentHerdrPane(): string | undefined {
+  const pane = process.env.HERDR_PANE_ID?.trim();
+  return pane ? pane : undefined;
+}
 function formatIntercomContactSnippet(sessionId: string): string {
   return `Use pi-intercom: intercom({ action: "send", to: "${sessionId}", message: "..." })`;
 }
@@ -528,13 +538,22 @@ function formatSessionLabel(session: SessionInfo, duplicates: Set<string>): stri
     ? `${session.name} (${session.id.slice(0, 8)})`
     : session.name;
 }
+function formatHerdrLocation(session: SessionInfo): string {
+  const location = session.herdrLocation;
+  if (!location) return "";
+  if (location.status === "not_hosted") return "not under Herdr";
+  if (location.status === "unavailable") return `Herdr location unavailable: ${location.reason} (pane ${location.paneId})`;
+  return `Herdr ${location.workspace.label} [${location.workspace.id}] / ${location.tab.label} [${location.tab.id}] / pane ${location.paneId}`;
+}
 function formatSessionListRow(session: SessionInfo, currentCwd: string, isSelf: boolean, idPrefix: string): string {
   const name = session.name || "Unnamed session";
   const tags = [isSelf ? "self" : session.cwd === currentCwd ? "same cwd" : undefined, session.status]
     .filter((tag): tag is string => Boolean(tag));
   const suffix = tags.length ? ` [${tags.join(", ")}]` : "";
   const pane = session.tmuxPane ? ` · tmux ${session.tmuxPane}` : "";
-  return `• ${name} (${idPrefix}) — ${session.cwd} (${session.model}${formatContextUsage(session)}${pane})${suffix}`;
+  const herdrLocation = formatHerdrLocation(session);
+  const herdr = herdrLocation ? ` · ${herdrLocation}` : "";
+  return `• ${name} (${idPrefix}) — ${session.cwd} (${session.model}${formatContextUsage(session)}${pane})${herdr}${suffix}`;
 }
 function previewText(value: unknown, maxLength = 72): string | undefined {
   if (typeof value !== "string") {
@@ -606,6 +625,22 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
   let runtimeStarted = false;
   let runtimeGeneration = 0;
   let agentRunning = false;
+  const heldInboundMessages: InboundMessageEntry[] = [];
+  let heldInboundTimer: NodeJS.Timeout | null = null;
+  function dropHeldInboundMessage(messageId: string, receipt: { status: MessageReceiptStatus; detail?: string }): boolean {
+    const index = heldInboundMessages.findIndex((entry) => entry.message.id === messageId);
+    if (index < 0) return false;
+    heldInboundMessages.splice(index, 1);
+    if (heldInboundMessages.length === 0) clearHeldInboundTimer();
+    emitMessageReceipt(messageId, receipt.status, receipt.detail);
+    return true;
+  }
+  function expireHeldInboundMessages(detail: string): void {
+    for (const entry of heldInboundMessages.splice(0)) {
+      emitMessageReceipt(entry.message.id, "expired", detail);
+    }
+    clearHeldInboundTimer();
+  }
   const activeTools = new Map<string, string>();
   const replyTracker = new ReplyTracker();
 
@@ -615,6 +650,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
   const pendingOutboxRequests = new Map<string, PendingOutboxRequest>();
   function dismissIncomingAsk(messageId: string): void {
     replyTracker.dismissPendingAsk(messageId);
+    dropHeldInboundMessage(messageId, { status: "acknowledged", detail: "answered before injection" });
   }
   function hasSeenInboundMessage(from: SessionInfo, message: Message, now = Date.now()): boolean {
     for (const [key, seenAt] of seenInboundMessages) {
@@ -648,11 +684,15 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
   }
   function handleMessageControl(control: MessageControl): void {
     replyTracker.dismissPendingAsk(control.messageId);
+    const supersededDetail = control.supersededBy ? `superseded by ${control.supersededBy}` : undefined;
+    if (dropHeldInboundMessage(control.messageId, control.action === "cancel"
+      ? { status: "cancelled", detail: "dropped before injection" }
+      : { status: "superseded", detail: supersededDetail })) return;
     if (control.action === "cancel") {
       emitMessageReceipt(control.messageId, "cancellation_requested", "message may already be injected or processed");
       return;
     }
-    emitMessageReceipt(control.messageId, "superseded", control.supersededBy ? `superseded by ${control.supersededBy}` : undefined);
+    emitMessageReceipt(control.messageId, "superseded", supersededDetail);
   }
   function latestDeliveryState(messageId: string | null, fallback: string): string {
     if (!messageId) {
@@ -869,6 +909,8 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
 
     const identity = buildPresenceIdentity(pi, currentIntercomSessionId ?? currentSessionId);
     const tmuxPane = currentTmuxPane();
+    const herdrPaneId = currentHerdrPane();
+    const herdrSessionPath = herdrPaneId ? liveContext.sessionManager.getSessionFile() : undefined;
     return {
       ...identity,
       cwd: liveContext.cwd,
@@ -878,6 +920,8 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
       lastActivity: Date.now(),
       status: currentStatus(),
       ...(tmuxPane ? { tmuxPane } : {}),
+      ...(herdrPaneId ? { herdrPaneId } : {}),
+      ...(herdrSessionPath ? { herdrSessionPath } : {}),
       ...(localExtensions.size > 0
         ? {
             extensions: currentExtensionCapabilities(),
@@ -1179,7 +1223,6 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
       return;
     }
     const injectedMessage = { ...entry.message, injectedAt: Date.now() };
-    emitMessageReceipt(injectedMessage.id, "injected");
     const replyCommand = delivery === "steer" && entry.replyCommand && entry.message.expectsReply
       ? `intercom({ action: "reply", replyTo: ${JSON.stringify(entry.message.id)}, message: "..." })`
       : entry.replyCommand;
@@ -1199,9 +1242,62 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
         ? { triggerTurn: true }
         : { deliverAs: "steer" }
     );
+    emitMessageReceipt(injectedMessage.id, "injected");
   }
   function sendIncomingBrokerMessage(entry: InboundMessageEntry, delivery: "trigger" | "steer", generation = runtimeGeneration): void {
     sendIncomingMessage(entry, delivery, generation);
+  }
+  function deliverIncomingBrokerMessage(entry: InboundMessageEntry, ctx: ExtensionContext, generation: number): void {
+    const activeContext = getLiveContext(ctx, generation);
+    if (!activeContext) return;
+    if (!activeContext.isIdle()) {
+      if (!activeContext.hasUI) {
+        const activeClient = client;
+        if (!entry.message.replyTo && activeClient?.isConnected()) {
+          void (async () => {
+            try {
+              const result = await activeClient.send(entry.from.id, {
+                text: "This agent is running in non-interactive mode and cannot respond to intercom messages while it is working. It will continue its current task and exit when done.",
+                replyTo: entry.message.id,
+              });
+              if (result.delivered && getLiveContext(ctx, generation)) dismissIncomingAsk(entry.message.id);
+            } catch {
+              // Best-effort reply; keep the busy non-interactive session running either way.
+            }
+          })();
+        }
+        return;
+      }
+      sendIncomingBrokerMessage(entry, "steer", generation);
+      return;
+    }
+    sendIncomingBrokerMessage(entry, "trigger", generation);
+  }
+  function flushHeldInboundMessages(ctx: ExtensionContext, generation: number): void {
+    if (!getLiveContext(ctx, generation)) return;
+    if (config.busyDelivery === "human-first" && ctx.hasUI) {
+      if (ctx.isIdle() && heldInboundMessages.length > 0) {
+        deliverIncomingBrokerMessage(heldInboundMessages.shift()!, ctx, generation);
+      }
+      if (heldInboundMessages.length === 0) clearHeldInboundTimer();
+      return;
+    }
+    while (heldInboundMessages.length > 0 && (ctx.isIdle() || agentRunning) && getLiveContext(ctx, generation)) {
+      deliverIncomingBrokerMessage(heldInboundMessages.shift()!, ctx, generation);
+    }
+    if (heldInboundMessages.length === 0) clearHeldInboundTimer();
+  }
+  function clearHeldInboundTimer(): void {
+    if (heldInboundTimer) clearInterval(heldInboundTimer);
+    heldInboundTimer = null;
+  }
+  function holdIncomingBrokerMessage(entry: InboundMessageEntry, ctx: ExtensionContext, generation: number): void {
+    heldInboundMessages.push(entry);
+    emitMessageReceipt(entry.message.id, "queued", "held until delivery is safe");
+    if (!heldInboundTimer) {
+      heldInboundTimer = setInterval(() => flushHeldInboundMessages(ctx, generation), 100);
+      heldInboundTimer.unref();
+    }
   }
   function handleIncomingMessage(ctx: ExtensionContext, from: SessionInfo, message: Message): void {
     const messageGeneration = runtimeGeneration;
@@ -1237,36 +1333,12 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     replyTracker.recordIncomingMessage(from, receivedMessage, receiverReceivedAt);
     emitMessageReceipt(receivedMessage.id, "acknowledged", "accepted by receiver");
     const entry = { from, message: receivedMessage, replyCommand, bodyText };
-    void (async () => {
-      const activeContext = getLiveContext(liveContext, messageGeneration);
-      if (!activeContext) {
-        return;
-      }
-      if (!activeContext.isIdle()) {
-        if (!activeContext.hasUI) {
-          const activeClient = client;
-          if (!message.replyTo && activeClient?.isConnected()) {
-            try {
-              const result = await activeClient.send(from.id, {
-                text: "This agent is running in non-interactive mode and cannot respond to intercom messages while it is working. It will continue its current task and exit when done.",
-                replyTo: message.id,
-              });
-              if (result.delivered && getLiveContext(liveContext, messageGeneration)) {
-                dismissIncomingAsk(message.id);
-              }
-            } catch {
-              // Best-effort reply; keep the busy non-interactive session running either way.
-            }
-          }
-          return;
-        }
-        sendIncomingBrokerMessage(entry, "steer");
-        return;
-      }
-      if (getLiveContext(liveContext, messageGeneration)) {
-        sendIncomingBrokerMessage(entry, "trigger", messageGeneration);
-      }
-    })();
+    // Busy without an agent run cannot steer; manual compaction can discard an appended custom entry.
+    if (heldInboundMessages.length > 0 || (!liveContext.isIdle() && (!agentRunning || (config.busyDelivery === "human-first" && liveContext.hasUI)))) {
+      holdIncomingBrokerMessage(entry, liveContext, messageGeneration);
+    } else {
+      deliverIncomingBrokerMessage(entry, liveContext, messageGeneration);
+    }
   }
   function attachClientHandlers(nextClient: IntercomClient): void {
     nextClient.onBrokerMessage((message: BrokerMessage) => {
@@ -1570,7 +1642,15 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     }
     runtimeContext = ctx;
     currentSessionId = ctx.sessionManager.getSessionId();
-    currentIntercomSessionId = resolveConfiguredIntercomSessionId(currentSessionId, config);
+    let claimedIntercomSessionId: string | undefined;
+    const identityRequest: IntercomSessionIdentityRequestV1 = {
+      version: 1,
+      claim: (stableId) => {
+        claimedIntercomSessionId ??= (typeof stableId === "string" && stableId.trim()) || undefined;
+      },
+    };
+    pi.events.emit(INTERCOM_SESSION_IDENTITY_EVENT, identityRequest);
+    currentIntercomSessionId = claimedIntercomSessionId ?? resolveConfiguredIntercomSessionId(currentSessionId, config);
     publishIntercomSessionId(currentIntercomSessionId);
     currentModel = ctx.model?.id ?? "unknown";
     sessionStartedAt = Date.now();
@@ -1578,6 +1658,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     lastPresenceName = initialPresenceIdentity.name;
     lastPresenceRuntimeFallbackAlias = initialPresenceIdentity.runtimeFallbackAlias;
     agentRunning = false;
+    expireHeldInboundMessages("session replaced before injection");
     activeTools.clear();
     startNamePoll();
     const startupGeneration = runtimeGeneration;
@@ -1715,6 +1796,7 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     rejectReplyWaiter(new Error("Session shutting down"));
     replyTracker.reset();
     agentRunning = false;
+    expireHeldInboundMessages("session shut down before injection");
     activeTools.clear();
     if (client) {
       await client.disconnect();
@@ -1725,17 +1807,26 @@ export default function piIntercomExtension(pi: ExtensionAPI) {
     currentIntercomSessionId = null;
     sessionStartedAt = null;
   });
-  pi.on("turn_end", () => {
+  pi.on("turn_end", (event, ctx) => {
     if (!getLiveContext()) {
       return;
     }
     replyTracker.endTurn();
+    // Aborted/error turns cannot consume a steer; leave their peers for the idle trigger.
+    if (config.busyDelivery === "human-first" && ctx.hasUI && event.message.role === "assistant"
+      && event.message.stopReason !== "aborted" && event.message.stopReason !== "error"
+      && heldInboundMessages.length > 0 && agentRunning
+      && !ctx.isIdle() && !ctx.hasPendingMessages() && getLiveContext(ctx)) {
+      sendIncomingBrokerMessage(heldInboundMessages.shift()!, "steer", runtimeGeneration);
+      if (heldInboundMessages.length === 0) clearHeldInboundTimer();
+    }
   });
   pi.on("agent_start", () => {
     if (!getLiveContext()) {
       return;
     }
     agentRunning = true;
+    if (runtimeContext) flushHeldInboundMessages(runtimeContext, runtimeGeneration);
     activeTools.clear();
     syncPresenceStatus();
   });
@@ -2186,7 +2277,7 @@ Usage:
 
             return {
               content: [{ type: "text", text: `${currentSection}\n\n${otherSection}` }],
-              details: {},
+              details: { roster: { peers: otherSessions.length, total: sessions.length } },
             };
           } catch (error) {
             return {
@@ -2240,7 +2331,7 @@ Usage:
 
             return {
               content: [{ type: "text", text: `${currentSection}\n\n${otherSection}` }],
-              details: {},
+              details: { roster: { peers: otherSessions.length, total: sessions.length, cwd: filterCwd } },
             };
           } catch (error) {
             return {
@@ -2633,9 +2724,17 @@ Usage:
       if (isPartial) {
         return new Text(theme.fg("warning", "Intercom working..."), 0, 0);
       }
-      const details = result.details as { delivered?: boolean; error?: boolean; messageId?: string; reason?: string } | undefined;
+      const details = result.details as { delivered?: boolean; error?: boolean; messageId?: string; reason?: string; roster?: { peers: number; total: number; cwd?: string } } | undefined;
       const failed = Boolean(context.isError || details?.error === true || details?.delivered === false);
       let text = failed ? theme.fg("error", "✗ ") : theme.fg("success", "✓ ");
+      if (details?.roster && !failed && !context.expanded) {
+        // Collapsed rows are display-only; the model still receives the full roster text.
+        const { peers, total, cwd: rosterCwd } = details.roster;
+        const where = rosterCwd ? ` in ${rosterCwd}` : "";
+        text += theme.fg("text", peers === 0 ? `no other sessions${where}` : `${peers} other session${peers === 1 ? "" : "s"}${where}`);
+        text += theme.fg("dim", ` (${total} connected)`);
+        return new Text(text, 0, 0);
+      }
       text += theme.fg(failed ? "error" : "text", firstTextContent(result));
       if (details?.messageId && !context.expanded) {
         text += theme.fg("dim", ` (${details.messageId.slice(0, 8)})`);

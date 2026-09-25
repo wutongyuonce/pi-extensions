@@ -1,0 +1,89 @@
+{
+	"global": {
+		"dispatch": {
+			"runnerTimeoutFloorMs": 60000
+		},
+		"ignore": [
+			"*.snap"
+		],
+		"turnSummary": {
+			"enabled": true
+		},
+		"widget": {
+			"visible": false
+		}
+	},
+	"lsp": {
+		"disabledServers": [
+			"marksman"
+		],
+		"ignore": [
+			"dist/**"
+		],
+		"serverOverrides": {
+			"rust": {
+				"initializationOptions": {
+					"check": true
+				}
+			}
+		},
+		"servers": {
+			"globalOnly": {
+				"args": [
+					"--stdio"
+				],
+				"command": "custom-lsp",
+				"extensions": [
+					".custom"
+				],
+				"name": "GlobalOnly",
+				"rootMarkers": [
+					"package.json"
+				]
+			},
+			"projectOnly": {
+				"args": [
+					"--stdio"
+				],
+				"command": "custom-lsp",
+				"extensions": [
+					".custom"
+				],
+				"name": "ProjectOnly",
+				"rootMarkers": [
+					"package.json"
+				]
+			}
+		},
+		"warmFiles": [
+			"global.rs"
+		]
+	},
+	"project": {
+		"configPath": "<HOME>/proj/.pi-lens.json",
+		"ignore": [
+			"dist/**"
+		],
+		"raw": {
+			"ignore": [
+				"dist/**"
+			],
+			"servers": {
+				"projectOnly": {
+					"args": [
+						"--stdio"
+					],
+					"command": "custom-lsp",
+					"extensions": [
+						".custom"
+					],
+					"name": "ProjectOnly",
+					"rootMarkers": [
+						"package.json"
+					]
+				}
+			}
+		},
+		"rules": {}
+	}
+}

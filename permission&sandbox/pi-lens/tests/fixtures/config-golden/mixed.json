@@ -1,0 +1,53 @@
+{
+	"global": null,
+	"lsp": {
+		"disabledServers": [
+			"typos"
+		],
+		"servers": {
+			"legacy": {
+				"args": [
+					"--stdio"
+				],
+				"command": "custom-lsp",
+				"extensions": [
+					".custom"
+				],
+				"name": "FromLspJson",
+				"rootMarkers": [
+					"package.json"
+				]
+			}
+		}
+	},
+	"project": {
+		"configPath": "<HOME>/proj/.pi-lens.json",
+		"ignore": [
+			"dist/**"
+		],
+		"raw": {
+			"ignore": [
+				"dist/**"
+			],
+			"servers": {
+				"canonical": {
+					"args": [
+						"--stdio"
+					],
+					"command": "custom-lsp",
+					"extensions": [
+						".custom"
+					],
+					"name": "FromPiLensJson",
+					"rootMarkers": [
+						"package.json"
+					]
+				}
+			},
+			"warmFiles": [
+				"src/main.rs"
+			]
+		},
+		"rules": {}
+	}
+}

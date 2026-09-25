@@ -11,6 +11,7 @@ import {
 	type BuiltinAgentOverrideBase,
 } from "../agents/agents.ts";
 import { serializeAgent } from "../agents/agent-serializer.ts";
+import { mergeRuntimeAgents, type RuntimeAgentOwner } from "../agents/runtime-agent-registry.ts";
 import { editableAgentConfig, preservedAgentFrontmatterFields } from "../agents/agent-management.ts";
 import { findModelInfo, getSupportedThinkingLevels, toModelInfo } from "../shared/model-info.ts";
 import { SelectorComponent, type SelectorItem, type SelectorResult } from "./selector.ts";
@@ -28,11 +29,13 @@ function sourceRank(source: AgentConfig["source"]): number {
 	return 3;
 }
 
-function allVisibleAgents(cwd: string): AgentConfig[] {
-	const d = discoverAgentsAll(cwd);
-	return [...d.project, ...d.user, ...d.package, ...d.builtin]
-		.filter((agent) => !agent.disabled)
-		.sort((a, b) => a.name.localeCompare(b.name) || sourceRank(a.source) - sourceRank(b.source));
+function allVisibleAgents(pi: RuntimeAgentOwner, cwd: string, preferredModelProvider?: string): AgentConfig[] {
+	const d = discoverAgentsAll(cwd, preferredModelProvider);
+	const allConfigured = [...d.project, ...d.user, ...d.package, ...d.builtin];
+	const visibleConfigured = allConfigured.filter((agent) => !agent.disabled);
+	// Disabled definitions remain in collision checks even though the panel hides them.
+	const agents = mergeRuntimeAgents(pi, { agents: visibleConfigured }, allConfigured, { cwd, scope: "both", preferredModelProvider }).agents;
+	return agents.sort((a, b) => a.name.localeCompare(b.name) || sourceRank(a.source) - sourceRank(b.source));
 }
 
 function agentLabel(agent: AgentConfig): string {
@@ -71,9 +74,16 @@ function modelFullId(model: ModelInfo): string {
 	return `${model.provider}/${model.id}`;
 }
 
-function liveAvailableModels(ctx: ExtensionContext) {
+async function liveAvailableModels(ctx: ExtensionContext) {
 	try {
-		ctx.modelRegistry.refresh?.();
+		// Reload local configuration and cached catalogs without network discovery on picker open.
+		const result = await ctx.modelRegistry.refresh?.({ allowNetwork: false, signal: AbortSignal.timeout(5_000) });
+		const firstError = result?.errors.entries().next().value;
+		if (firstError) {
+			ctx.ui.notify(`Could not refresh ${firstError[0]}; using the currently loaded choices. ${firstError[1].message}`, "warning");
+		} else if (result?.aborted) {
+			ctx.ui.notify("Model registry refresh timed out; using the currently loaded choices.", "warning");
+		}
 	} catch (error) {
 		const message = error instanceof Error ? error.message : String(error);
 		ctx.ui.notify(`Could not refresh the model registry; using the last loaded choices. ${message}`, "warning");
@@ -84,7 +94,6 @@ function liveAvailableModels(ctx: ExtensionContext) {
 function buildBuiltinBase(agent: AgentConfig): BuiltinAgentOverrideBase {
 	return {
 		...(agent.model !== undefined ? { model: agent.model } : {}),
-		...(agent.fallbackModels !== undefined ? { fallbackModels: [...agent.fallbackModels] } : {}),
 		...(agent.thinking !== undefined ? { thinking: agent.thinking } : {}),
 		systemPromptMode: agent.systemPromptMode,
 		inheritProjectContext: agent.inheritProjectContext,
@@ -100,7 +109,6 @@ function buildBuiltinBase(agent: AgentConfig): BuiltinAgentOverrideBase {
 		...(agent.mcpDirectTools !== undefined ? { mcpDirectTools: [...agent.mcpDirectTools] } : {}),
 		...(agent.subagentOnlyExtensions !== undefined ? { subagentOnlyExtensions: [...agent.subagentOnlyExtensions] } : {}),
 		...(agent.mutationTools !== undefined ? { mutationTools: [...agent.mutationTools] } : {}),
-		...(agent.completionGuard !== undefined ? { completionGuard: agent.completionGuard } : {}),
 		...(agent.toolBudget !== undefined ? { toolBudget: agent.toolBudget } : {}),
 	};
 }
@@ -139,6 +147,9 @@ function isReadOnlyExtraAgent(agent: AgentConfig): boolean {
 }
 
 function readOnlyAgentMessage(agent: AgentConfig, field: EditableOverrideField): string | undefined {
+	if (agent.source === "runtime") {
+		return `Cannot update '${agent.name}' ${field} because that agent is runtime-registered by an extension; edit its source definition instead.`;
+	}
 	if (agent.source === "package") {
 		return `Cannot update '${agent.name}' ${field} because that field is owned by its read-only package definition.`;
 	}
@@ -147,8 +158,8 @@ function readOnlyAgentMessage(agent: AgentConfig, field: EditableOverrideField):
 		: undefined;
 }
 
-async function selectAgent(ctx: ExtensionContext, args: string): Promise<AgentSelection> {
-	const agents = allVisibleAgents(ctx.cwd);
+async function selectAgent(pi: RuntimeAgentOwner, ctx: ExtensionContext, args: string): Promise<AgentSelection> {
+	const agents = allVisibleAgents(pi, ctx.cwd, ctx.model?.provider);
 	const requestedName = args.trim().split(/\s+/)[0] ?? "";
 	if (agents.length === 0) return { kind: "not-found", agents, requestedName: requestedName || undefined };
 
@@ -182,7 +193,6 @@ function metadataFor(agent: AgentConfig): string {
 		lines.push(`Package: ${agent.packageName}`);
 	}
 	lines.push(`Model: ${agent.model ?? "default / inherit"}`);
-	if (agent.fallbackModels?.length) lines.push(`Fallback models: ${agent.fallbackModels.join(", ")}`);
 	if (agent.thinking !== undefined) lines.push(`Thinking: ${agent.thinking === false ? "off" : agent.thinking}`);
 	if (tools.length) lines.push(`Tools: ${tools.join(", ")}`);
 	if (agent.excludeTools?.length) lines.push(`Excluded tools: ${agent.excludeTools.join(", ")}`);
@@ -217,7 +227,7 @@ async function selectFromList(ctx: ExtensionContext, title: string, subtitle: st
 }
 
 async function chooseModel(ctx: ExtensionContext, agent: AgentConfig): Promise<string | undefined | null> {
-	const models = liveAvailableModels(ctx);
+	const models = await liveAvailableModels(ctx);
 	const current = agent.model ?? INHERIT_MODEL_CHOICE;
 	const items: SelectorItem[] = [{ value: INHERIT_MODEL_CHOICE, label: INHERIT_MODEL_CHOICE, current: !agent.model }];
 	if (agent.model && !models.some((model) => modelFullId(model) === agent.model)) {
@@ -233,7 +243,7 @@ async function chooseModel(ctx: ExtensionContext, agent: AgentConfig): Promise<s
 }
 
 async function chooseThinking(ctx: ExtensionContext, agent: AgentConfig): Promise<string | undefined | null> {
-	const availableModels = liveAvailableModels(ctx).map(toModelInfo);
+	const availableModels = (await liveAvailableModels(ctx)).map(toModelInfo);
 	const effectiveModel = agent.model ?? (ctx.model ? modelFullId(ctx.model) : undefined);
 	const modelInfo = findModelInfo(effectiveModel, availableModels, ctx.model?.provider);
 	const levels = getSupportedThinkingLevels(modelInfo);
@@ -383,7 +393,7 @@ async function editSystemPrompt(ctx: ExtensionContext, agent: AgentConfig): Prom
 }
 
 export async function openSubagentsAdmin(pi: ExtensionAPI, ctx: ExtensionContext, args = ""): Promise<void> {
-	const selection = await selectAgent(ctx, args);
+	const selection = await selectAgent(pi, ctx, args);
 	if (selection.kind === "cancelled") return;
 	if (selection.kind === "ambiguous") {
 		sendAdminMessage(pi, `Subagent '${selection.requestedName}' is ambiguous. Choose a scope in interactive mode:\n${selection.matches.map((agent) => `- ${agent.source}: ${agent.filePath}`).join("\n")}`);

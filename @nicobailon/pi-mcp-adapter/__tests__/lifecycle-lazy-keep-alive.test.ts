@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { SdkErrorCode, SdkHttpError } from "@modelcontextprotocol/client";
+import { SdkErrorCode, SdkHttpError, StreamableHTTPClientTransport } from "@modelcontextprotocol/client";
 import { lazyConnect } from "../init.ts";
 import { McpLifecycleManager } from "../lifecycle.ts";
 import { executeCall } from "../proxy-modes.ts";
@@ -211,6 +211,54 @@ describe("lazy-keep-alive lifecycle", () => {
     await lifecycle.ensureConverged();
 
     expect(fake.reconnectCalls).toEqual([{ name: "srv", staleConnection }]);
+  });
+
+  it("reconnects on a 401 refresh so a stale bearer token forces a fresh connect", async () => {
+    const def: ServerDefinition = { url: "https://example.test/mcp", auth: "bearer", lifecycle: "keep-alive" };
+    lifecycle.markKeepAlive("srv", def);
+    const staleConnection = fake.setConnection("srv", "connected", "stale-session")!;
+    const transport = new StreamableHTTPClientTransport(new URL("https://example.test/mcp"), {
+      requestInit: { headers: { Authorization: "Bearer expired" } },
+      fetch: async () => new Response("expired", { status: 401 }),
+    });
+    await transport.start();
+    try {
+      await transport.send({ jsonrpc: "2.0", id: 1, method: "tools/list" });
+    } catch (error) {
+      fake.refreshToolsError = error;
+    } finally {
+      await transport.close();
+    }
+    expect(fake.refreshToolsError).toEqual(expect.objectContaining({
+      status: 401,
+      message: "Error POSTing to endpoint: expired",
+    }));
+
+    await lifecycle.ensureConverged();
+
+    expect(fake.reconnectCalls).toEqual([{ name: "srv", staleConnection }]);
+  });
+
+  it("reconnects for the pinned SDK's plain bearer 401 error variant", async () => {
+    const def: ServerDefinition = { url: "https://example.test/mcp", auth: "bearer", lifecycle: "keep-alive" };
+    lifecycle.markKeepAlive("srv", def);
+    const staleConnection = fake.setConnection("srv", "connected", "stale-session")!;
+    fake.refreshToolsError = new Error("Error POSTing to endpoint (HTTP 401): expired");
+
+    await lifecycle.ensureConverged();
+
+    expect(fake.reconnectCalls).toEqual([{ name: "srv", staleConnection }]);
+  });
+
+  it("does not turn a non-bearer HTTP 401 into a reconnect loop", async () => {
+    const def: ServerDefinition = { url: "https://example.test/mcp", auth: false, lifecycle: "keep-alive" };
+    lifecycle.markKeepAlive("srv", def);
+    fake.setConnection("srv", "connected", "stale-session");
+    fake.refreshToolsError = new Error("Error POSTing to endpoint (HTTP 401): denied");
+
+    await lifecycle.ensureConverged();
+
+    expect(fake.reconnectCalls).toEqual([]);
   });
 
   it("publishes metadata when a concurrent recovery replaces the connection during refresh", async () => {

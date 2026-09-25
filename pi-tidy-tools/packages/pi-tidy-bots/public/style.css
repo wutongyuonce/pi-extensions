@@ -148,6 +148,15 @@ body {
   overflow: hidden;
   text-overflow: ellipsis;
 }
+.bot-desc {
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.35;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
 .bot-ts {
   color: var(--muted);
   font-size: 11px;
@@ -895,4 +904,19 @@ body {
   color: var(--muted);
   font-size: 12px;
   margin-top: 6px;
+}
+
+/* Issue 176: persisted entry images — the console twin of the app bubble. */
+.entry-images {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 8px;
+}
+.entry-image {
+  max-height: 160px;
+  max-width: 100%;
+  border-radius: 10px;
+  border: 1px solid var(--surface-2, #232a38);
+  object-fit: contain;
 }

@@ -118,7 +118,11 @@ export function resolveClaudeCodeLaunch(input: {
 			versionArgs: [...prefix, "--version"],
 			helpArgs: [...prefix, "--help"],
 			validate(result) {
-				if (!/^\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)? \(Claude Code\)$/.test(result.version)) throw new Error(`Unsupported Claude Code version response: ${JSON.stringify(result.version)}.`);
+				// Claude Code now publishes both semver (`2.1.259 (Claude Code)`) and
+				// calendar/platform (`2026.4.24 macos-arm64 (2026-04-27)`) versions.
+				// The launch flags are validated from --help below, so only require a
+				// recognizable release identifier here rather than one display format.
+				if (!/^(?:\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.-]+)? \(Claude Code\)|\d{4}\.\d{1,2}\.\d{1,2} [A-Za-z0-9._-]+ \(\d{4}-\d{2}-\d{2}\))$/.test(result.version)) throw new Error(`Unsupported Claude Code version response: ${JSON.stringify(result.version)}.`);
 				for (const required of ["Claude Code - starts an interactive session", "--print", "--input-format", "stream-json", "--verbose", "--permission-mode", writer ? "acceptEdits" : "plan", "--tools", "--strict-mcp-config", "--mcp-config", "--setting-sources", "--no-session-persistence", "--disable-slash-commands", "--no-chrome"]) {
 					if (!result.help.includes(required)) throw new Error(`Claude Code help does not document required option ${JSON.stringify(required)}.`);
 				}

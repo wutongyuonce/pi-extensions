@@ -1,0 +1,16 @@
+id: no-bare-object-param
+valid:
+  - "function f(x: string) {}"
+  - "function f(x: Record<string, unknown>) {}"
+  - "function f(x: { a: string }) {}"
+  - "function f(x: Object) {}"
+  - "function f(x: object | null) {}"
+  - "function f(...rest: object[]) {}"
+  - "type H = (entry: Record<string, unknown>) => void;"
+invalid:
+  - "function f(x: object) {}"
+  - "const g = (x: object) => {};"
+  - "class C { m(x: object) {} }"
+  - "interface I { m(x: object): void; }"
+  - "type H = (entry: object) => void;"
+  - "function f(x?: object) {}"

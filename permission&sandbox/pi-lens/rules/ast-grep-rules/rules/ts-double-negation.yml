@@ -1,0 +1,10 @@
+id: ts-double-negation
+language: typescript
+severity: warning
+message: "!!value to coerce boolean - use Boolean(value) or truthiness directly"
+metadata:
+  weight: 2
+  category: slop
+rule:
+  kind: unary_expression
+  pattern: "!!$X"

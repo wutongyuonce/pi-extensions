@@ -1,0 +1,30 @@
+{
+	"global": null,
+	"lsp": {
+		"ignore": [
+			"fixtures/**"
+		],
+		"lsp": {
+			"warmFiles": [
+				"src/a.ts"
+			]
+		}
+	},
+	"project": {
+		"configPath": "<HOME>/proj/packages/a/.pi-lens.json",
+		"ignore": [
+			"fixtures/**"
+		],
+		"raw": {
+			"ignore": [
+				"fixtures/**"
+			],
+			"lsp": {
+				"warmFiles": [
+					"src/a.ts"
+				]
+			}
+		},
+		"rules": {}
+	}
+}

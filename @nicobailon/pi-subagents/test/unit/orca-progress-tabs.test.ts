@@ -53,18 +53,6 @@ async function waitForFile(file: string, timeoutMs = 5_000): Promise<void> {
 	}
 }
 
-async function readManifestWithState(file: string, state: string, timeoutMs = 5_000): Promise<Record<string, unknown>> {
-	const deadline = Date.now() + timeoutMs;
-	let lastState: unknown;
-	while (Date.now() < deadline) {
-		const manifest = JSON.parse(fs.readFileSync(file, "utf-8")) as Record<string, unknown>;
-		lastState = manifest.state;
-		if (lastState === state) return manifest;
-		await new Promise((resolve) => setTimeout(resolve, 20));
-	}
-	throw new Error(`Timed out waiting for ${file} state ${state}; last state ${String(lastState)}`);
-}
-
 function progressFile(prefix: string, suffix: ".log" | ".done"): string {
 	const root = path.join(TEMP_ROOT_DIR, "orca-progress");
 	const name = fs.readdirSync(root).find((candidate) => candidate.startsWith(prefix) && candidate.endsWith(suffix));
@@ -193,11 +181,19 @@ test("malformed optional observer metadata cannot break child execution", { skip
 		env: { ...process.env, ORCA_TEST_CAPTURE: capture },
 	} as never);
 	assert.ok(tab);
-	tab.finish("completed");
-	await waitForFile(capture);
+	await tab.finish("completed");
+	// Capture precedes the watchdog's final manifest/queue writes; wait for its close.
+	await tab.creationSettled;
 	const args = JSON.parse(fs.readFileSync(capture, "utf-8")) as string[];
 	assert.equal(args[args.indexOf("--title") + 1], "subagents · subagent · 1");
-	removeProgressFiles("run-0-");
+	const manifestDir = path.join(dir, ".pi", "subagents", "views", "orca");
+	const [manifestName] = fs.readdirSync(manifestDir);
+	const manifest = JSON.parse(fs.readFileSync(path.join(manifestDir, manifestName!), "utf-8"));
+	assert.equal(manifest.state, "open");
+	const viewer = args[args.indexOf("--command") + 1]!;
+	assert.match(await captureCommand(viewer, dir), /completed/);
+	assert.equal(fs.existsSync(manifest.logPath), false);
+	assert.equal(fs.existsSync(manifest.logPath.replace(/\.log$/, ".done")), false);
 });
 
 test("disabled Orca progress tabs do not invoke Orca", async () => {
@@ -216,6 +212,44 @@ test("disabled Orca progress tabs do not invoke Orca", async () => {
 	assert.equal(tab, undefined);
 	await new Promise((resolve) => setTimeout(resolve, 100));
 	assert.equal(fs.existsSync(capture), false);
+});
+
+test("creationSettled publishes the final manifest after capture and finish", { skip: process.platform === "win32" ? "Orca progress tabs are not supported on Windows" : undefined }, async () => {
+	const dir = tempDir();
+	const capture = path.join(dir, "capture.json");
+	const release = path.join(dir, "release");
+	const fakeOrca = writeNodeCommand(dir, "orca", [
+		"const fs=require('fs');",
+		"fs.writeFileSync(process.env.ORCA_TEST_CAPTURE, JSON.stringify(process.argv.slice(2)));",
+		"const gate=setInterval(()=>{if(fs.existsSync(process.env.ORCA_TEST_RELEASE))clearInterval(gate)},20);",
+	].join(""));
+	const tab = createOrcaProgressTab({
+		cwd: dir,
+		runId: "progress-settlement",
+		agent: "worker",
+		index: 0,
+		config: { enabled: true },
+		command: fakeOrca,
+		env: { ...process.env, ORCA_TEST_CAPTURE: capture, ORCA_TEST_RELEASE: release },
+	});
+	assert.ok(tab);
+	let settled = false;
+	void tab.creationSettled.then(() => { settled = true; });
+	const manifestDir = path.join(dir, ".pi", "subagents", "views", "orca");
+	const [manifestName] = fs.readdirSync(manifestDir);
+	const manifestPath = path.join(manifestDir, manifestName!);
+	try {
+		await waitForFile(capture);
+		await tab.finish("completed");
+		assert.equal(settled, false, "capture and log completion do not settle terminal creation");
+		assert.equal(JSON.parse(fs.readFileSync(manifestPath, "utf-8")).state, "opening");
+	} finally {
+		fs.writeFileSync(release, "");
+		await tab.creationSettled;
+		await tab.finish("completed");
+	}
+	assert.equal(settled, true);
+	assert.equal(JSON.parse(fs.readFileSync(manifestPath, "utf-8")).state, "open");
 });
 
 test("enabled tabs use a worktree sequence and successful Pi sessions get cleanup guidance", { skip: process.platform === "win32" ? "Orca progress tabs are not supported on Windows" : undefined }, async () => {
@@ -243,9 +277,9 @@ test("enabled tabs use a worktree sequence and successful Pi sessions get cleanu
 	fs.writeFileSync(sessionFile, `${JSON.stringify({ type: "session", version: 3, id: sessionId })}\n`);
 	assert.equal(resolvePiSessionId(sessionFile), sessionId);
 	assert.equal(resolvePiSessionId(path.join(dir, `missing_${sessionId}.jsonl`)), undefined);
-	tab.finish("completed", sessionFile);
-
-	await waitForFile(capture);
+	await tab.finish("completed", sessionFile);
+	// Capture precedes the watchdog's final manifest/queue writes; wait for its close.
+	await tab.creationSettled;
 	const args = JSON.parse(fs.readFileSync(capture, "utf-8")) as string[];
 	assert.deepEqual(args.slice(0, 2), ["terminal", "create"]);
 	assert.equal(args[args.indexOf("--worktree") + 1], `path:${path.resolve(dir)}`);
@@ -259,7 +293,7 @@ test("enabled tabs use a worktree sequence and successful Pi sessions get cleanu
 	const manifestDir = path.join(dir, ".pi", "subagents", "views", "orca");
 	const manifestName = fs.readdirSync(manifestDir).find((name) => name.startsWith(`${runId}-2-`) && name.endsWith(".json"));
 	assert.ok(manifestName);
-	const manifest = await readManifestWithState(path.join(manifestDir, manifestName), "open");
+	const manifest = JSON.parse(fs.readFileSync(path.join(manifestDir, manifestName), "utf-8")) as Record<string, unknown>;
 	assert.equal(manifest.kind, "orca-observer-view");
 	assert.equal(manifest.role, "run");
 	assert.equal(manifest.title, "subagents · worker · 1");
@@ -286,8 +320,8 @@ test("enabled tabs use a worktree sequence and successful Pi sessions get cleanu
 		env: { ...process.env, ORCA_TEST_CAPTURE: secondCapture },
 	});
 	assert.ok(secondTab);
-	secondTab.finish("failed", sessionFile);
-	await waitForFile(secondCapture);
+	await secondTab.finish("failed", sessionFile);
+	await secondTab.creationSettled;
 	const secondArgs = JSON.parse(fs.readFileSync(secondCapture, "utf-8")) as string[];
 	assert.equal(secondArgs[secondArgs.indexOf("--title") + 1], "subagents · worker · 2");
 	const secondLog = fs.readdirSync(progressDir).find((name) => name.startsWith(`${runId}-second-0-`) && name.endsWith(".log"));
@@ -321,11 +355,36 @@ test("viewer strips split terminal control sequences across poll ticks", { skip:
 	await new Promise((resolve) => setTimeout(resolve, 200));
 	tab.append("31mred OSC \u001b]0;secret");
 	await new Promise((resolve) => setTimeout(resolve, 200));
-	tab.append(" title\u0007visible\u0000\u0001\r\t\u007f\n");
+	tab.append(" title\u0007visible OSC-ST \u001b]0;hidden\u001b\\after-osc DCS-ST \u001bPpayload\u001b\\after-dcs\u0000\u0001\r\t\u007f\n");
 	tab.finish("failed");
 	const output = await outputPromise;
-	assert.match(output, /safe CSI red OSC visible\n/);
-	assert.doesNotMatch(output, /\u001b|31m|secret|title|\u0000|\u0001|\r|\t|\u007f/);
+	assert.match(output, /safe CSI red OSC visible OSC-ST after-osc DCS-ST after-dcs\n/);
+	assert.doesNotMatch(output, /\u001b|31m|secret|title|hidden|payload|\u0000|\u0001|\r|\t|\u007f/);
+});
+
+test("viewer one-liner survives shells that collapse backslashes inside single quotes", { skip: process.platform === "win32" ? "Orca progress tabs are not supported on Windows" : undefined }, async () => {
+	const dir = tempDir();
+	const capture = path.join(dir, "capture.json");
+	const fakeOrca = writeCaptureOrca(dir);
+	const tab = createOrcaProgressTab({
+		cwd: dir,
+		runId: "progress-fish-quoting",
+		agent: "worker",
+		index: 0,
+		config: { enabled: true },
+		command: fakeOrca,
+		env: { ...process.env, ORCA_TEST_CAPTURE: capture },
+	});
+	assert.ok(tab);
+	await waitForFile(capture);
+	const args = JSON.parse(fs.readFileSync(capture, "utf-8")) as string[];
+	const viewer = args[args.indexOf("--command") + 1]!;
+	// Orca runs --command through the user's login shell. fish collapses `\\`
+	// inside single quotes to `\`, so a backslash in the viewer one-liner reaches
+	// `node -e` as different source (unterminated string literal) and every progress
+	// tab opens on a SyntaxError instead of the mirror.
+	assert.equal(viewer.includes("\\"), false);
+	await tab.finish("failed");
 });
 
 test("mirror output keeps small writes that hit stream backpressure before the byte limit", { skip: process.platform === "win32" ? "Orca progress tabs are not supported on Windows" : undefined }, async () => {
@@ -387,6 +446,7 @@ test("same-worktree Orca creates wait for the previous numbered tab", { skip: pr
 	assert.ok(first);
 	assert.ok(second);
 	await waitForFile(secondCapture);
+	await Promise.all([first.creationSettled, second.creationSettled]);
 	const titles = fs.readFileSync(order, "utf-8").trim().split("\n");
 	assert.deepEqual(titles, ["subagents · worker · 1", "subagents · reviewer · 2"]);
 	first.finish("failed");
@@ -516,6 +576,22 @@ test("queued tabs defer cleanup until their terminal create settles", { skip: pr
 		if (originalCleanupLog === undefined) delete process.env.ORCA_TEST_CLEANUP_LOG;
 		else process.env.ORCA_TEST_CLEANUP_LOG = originalCleanupLog;
 	}
+});
+
+test("create stdout preserves pretty-printed JSON in the observer manifest", { skip: process.platform === "win32" ? "Orca progress tabs are not supported on Windows" : undefined }, async () => {
+	const dir = tempDir();
+	const fakeOrca = writeNodeCommand(dir, "orca", "process.stdout.write(JSON.stringify({terminal:{handle:'term-pretty'}},null,2)+'\\n');");
+	const runId = `progress-pretty-json-${Date.now()}`;
+	const tab = createOrcaProgressTab({ cwd: dir, runId, agent: "worker", index: 0, config: { enabled: true }, command: fakeOrca });
+	assert.ok(tab);
+	await tab.creationSettled;
+	const manifestDir = path.join(dir, ".pi", "subagents", "views", "orca");
+	const manifestName = fs.readdirSync(manifestDir).find((name) => name.startsWith(`${runId}-0-`) && name.endsWith(".json"));
+	assert.ok(manifestName);
+	const manifest = JSON.parse(fs.readFileSync(path.join(manifestDir, manifestName), "utf-8")) as Record<string, unknown>;
+	assert.deepEqual(manifest.orca, { terminal: { handle: "term-pretty" } });
+	assert.equal(manifest.orcaRaw, undefined);
+	tab.finish("failed");
 });
 
 test("mirror output truncates at a finite byte bound", { skip: process.platform === "win32" ? "Orca progress tabs are not supported on Windows" : undefined }, async () => {

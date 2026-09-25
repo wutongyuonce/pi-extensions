@@ -1,5 +1,26 @@
 # @narumitw/pi-chrome-devtools
 
+## 0.53.4
+
+### Patch Changes
+
+- 8abd5b7: Keep generated extension runtime graphs inside Pi's Jiti-loaded TypeScript path to avoid duplicate peer-runtime evaluation during startup. Add measured generated runtimes for Context Management, Herdr, and TypeSafe Search.
+
+## 0.53.3
+
+### Patch Changes
+
+- 67a3049: Adapt provider, transcript, usage, deferred-tool, and telemetry behavior to Pi's current runtime contracts, including accurate cache-warming accounting and exclusion from ordinary generation traces.
+
+## 0.53.2
+
+### Patch Changes
+
+- 961f004: Keep expanded tool output bounded for wide, malformed, or zero-width Unicode text and sanitize untrusted terminal controls without blocking rendering.
+- Updated dependencies [4485b49]
+- Updated dependencies [6b1e009]
+  - @narumitw/pi-tui-kit@0.62.0
+
 ## 0.53.1
 
 ### Patch Changes

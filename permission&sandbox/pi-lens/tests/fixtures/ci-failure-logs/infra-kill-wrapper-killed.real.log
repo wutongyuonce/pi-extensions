@@ -1,0 +1,67 @@
+2026-08-25T22:58:45.0389672Z ##[group]Run node scripts/with-memory-watch.mjs -- npm test
+2026-08-25T22:58:45.0390036Z [36;1mnode scripts/with-memory-watch.mjs -- npm test[0m
+2026-08-25T22:58:45.0406002Z shell: /usr/bin/bash -e {0}
+2026-08-25T22:58:45.0406293Z env:
+2026-08-25T22:58:45.0406586Z   PI_LENS_TEST_TIMEOUT_SCALE: 3
+2026-08-25T22:58:45.0406833Z   PI_LENS_TEST_NO_LOCK: 1
+2026-08-25T22:58:45.0407070Z ##[endgroup]
+2026-08-25T22:58:45.1563888Z [mem-watch] host cpus=4 totalMb=15989 availableMb=14602 source=meminfo intervalMs=2000
+2026-08-25T22:58:45.3353076Z 
+2026-08-25T22:58:45.3353414Z > pi-lens@4.1.2 test
+2026-08-25T22:58:45.3353805Z > node scripts/with-test-lock.mjs -- vitest run
+2026-08-25T22:58:45.3354150Z 
+2026-08-25T22:58:45.5843041Z [test-budget] cpus=4 totalMemMb=15989 cpuCap=3 memCap=6 maxWorkers=3 heavyMaxWorkers=1 workerHeapMb=3072
+2026-08-25T22:58:45.6452432Z 
+2026-08-25T22:58:45.6453869Z [1m[30m[46m RUN [49m[39m[22m [36mv4.1.11 [39m[90m/home/runner/work/pi-lens/pi-lens[39m
+2026-08-25T22:58:45.6454484Z 
+2026-08-25T22:58:47.1589631Z [mem-watch] 22:58:47 availableMb=14160 of 15989
+2026-08-25T22:58:49.0804780Z  [32m✓[39m [30m[42m default [49m[39m tests/tools/lens-diagnostics.test.ts [2m([22m[2m109 tests[22m[2m)[22m[33m 384[2mms[22m[39m
+2026-08-25T22:58:50.3578675Z  [32m✓[39m [30m[42m default [49m[39m tests/clients/cascade-compute.test.ts [2m([22m[2m56 tests[22m[2m)[22m[33m 3363[2mms[22m[39m
+2026-08-25T22:58:50.3579436Z      [33m[2m✓[22m[39m reads jsts neighbors from passive snapshot instead of active touching [33m 1313[2mms[22m[39m
+2026-08-25T22:58:51.2288808Z  [32m✓[39m [30m[42m default [49m[39m tests/clients/test-runner-client.test.ts [2m([22m[2m160 tests[22m[2m)[22m[33m 1862[2mms[22m[39m
+2026-08-25T22:58:51.2290099Z        [33m[2m✓[22m[39m caps each runner at the newest 32 failed targets [33m 674[2mms[22m[39m
+2026-08-25T22:58:51.2291335Z        [33m[2m✓[22m[39m evicts the globally oldest target after a cross-root refresh [33m 703[2mms[22m[39m
+2026-08-25T22:58:52.5116246Z  [32m✓[39m [30m[42m default [49m[39m tests/clients/runtime-turn-session.test.ts [2m([22m[2m48 tests[22m[2m)[22m[33m 693[2mms[22m[39m
+2026-08-25T22:58:53.7267621Z  [32m✓[39m [30m[42m default [49m[39m tests/clients/lsp/service-aux-grace.test.ts [2m([22m[2m40 tests[22m[2m)[22m[33m 1038[2mms[22m[39m
+2026-08-25T22:58:54.3764362Z  [32m✓[39m [30m[42m default [49m[39m tests/tools/lsp-diagnostics.test.ts [2m([22m[2m57 tests[22m[2m)[22m[32m 184[2mms[22m[39m
+2026-08-25T22:58:54.4419446Z  [32m✓[39m [30m[42m default [49m[39m tests/clients/lsp/client-internals.test.ts [2m([22m[2m116 tests[22m[2m)[22m[33m 6715[2mms[22m[39m
+2026-08-25T22:58:54.4420911Z      [33m[2m✓[22m[39m applies and correlates solicited edits, but refuses unsolicited edits [33m 424[2mms[22m[39m
+2026-08-25T22:58:54.4422666Z      [33m[2m✓[22m[39m does not bind a late publish from an earlier reopen-resync as current (monotonic reopen) [33m 352[2mms[22m[39m
+2026-08-25T22:58:55.1670693Z [mem-watch] 22:58:55 availableMb=12999 of 15989
+2026-08-25T22:58:55.6336322Z  [32m✓[39m [30m[42m default [49m[39m tests/clients/runtime-tool-result.test.ts [2m([22m[2m39 tests[22m[2m)[22m[33m 758[2mms[22m[39m
+2026-08-25T22:59:51.0274062Z  [32m✓[39m [30m[42m default [49m[39m tests/clients/lsp/pull-diagnostic-timeout-telemetry.test.ts [2m([22m[2m9 tests[22m[2m)[22m[33m 844[2mms[22m[39m
+2026-08-25T22:59:51.1210123Z  [32m✓[39m [30m[42m default [49m[39m tests/clients/safe-spawn-windows-classification.test.ts [2m([22m[2m15 tests[22m[2m)[22m[32m 12[2mms[22m[39m
+2026-08-25T22:59:51.2474054Z  [32m✓[39m [30m[42m default [49m[39m tests/clients/review-graph/qualified-name-resolution.test.ts [2m([22m[2m8 tests[22m[2m)[22m[33m 338[2mms[22m[39m
+2026-08-25T22:59:51.4770635Z  [32m✓[39m [30m[42m default [49m[39m tests/clients/tool-render.test.ts [2m([22m[2m14 tests[22m[2m)[22m[32m 34[2mms[22m[39m
+2026-08-25T22:59:51.5151275Z  [32m✓[39m [30m[42m default [49m[39m tests/clients/lsp/launch.test.ts [2m([22m[2m12 tests[22m[2m | [22m[33m5 skipped[39m[2m)[22m[32m 221[2mms[22m[39m
+2026-08-25T22:59:51.5236809Z /home/runner/work/_temp/5a3fd468-5615-4f9a-a18c-73fa6da90221.sh: line 1:  2464 Killed                  node scripts/with-memory-watch.mjs -- npm test
+2026-08-25T22:59:51.6765201Z  [32m✓[39m [30m[42m default [49m[39m tests/clients/bounded-telemetry.test.ts [2m([22m[2m16 tests[22m[2m)[22m[32m 10[2mms[22m[39m
+2026-08-25T22:59:51.6815630Z  [32m✓[39m [30m[42m default [49m[39m tests/clients/sgconfig.test.ts [2m([22m[2m8 tests[22m[2m)[22m[33m 407[2mms[22m[39m
+2026-08-25T22:59:51.7946349Z  [32m✓[39m [30m[42m default [49m[39m tests/clients/performance-report.test.ts [2m([22m[2m13 tests[22m[2m)[22m[32m 84[2mms[22m[39m
+2026-08-25T22:59:51.9037365Z  [32m✓[39m [30m[42m default [49m[39m tests/clients/security-scan-probe-telemetry.test.ts [2m([22m[2m17 tests[22m[2m)[22m[32m 31[2mms[22m[39m
+2026-08-25T22:59:51.9767273Z  [32m✓[39m [30m[42m default [49m[39m tests/clients/dispatch/runners/actionlint.test.ts [2m([22m[2m19 tests[22m[2m)[22m[32m 14[2mms[22m[39m
+2026-08-25T22:59:52.2853559Z  [32m✓[39m [30m[42m default [49m[39m tests/clients/grammar-truncation.test.ts [2m([22m[2m7 tests[22m[2m)[22m[32m 51[2mms[22m[39m
+2026-08-25T22:59:52.4423771Z  [32m✓[39m [30m[42m default [49m[39m tests/tools/lens-diagnostic-mark.test.ts [2m([22m[2m11 tests[22m[2m)[22m[32m 27[2mms[22m[39m
+2026-08-25T22:59:52.8670517Z  [32m✓[39m [30m[42m default [49m[39m tests/clients/lsp/cascade-tier-backlog.test.ts [2m([22m[2m15 tests[22m[2m)[22m[32m 241[2mms[22m[39m
+2026-08-25T22:59:53.1007346Z  [32m✓[39m [30m[42m default [49m[39m tests/scripts/changelog.test.ts [2m([22m[2m21 tests[22m[2m)[22m[32m 110[2mms[22m[39m
+2026-08-25T22:59:53.2544252Z  [32m✓[39m [30m[42m default [49m[39m tests/scripts/compat-contracts.test.ts [2m([22m[2m26 tests[22m[2m)[22m[32m 13[2mms[22m[39m
+2026-08-25T22:59:53.6407542Z  [32m✓[39m [30m[42m default [49m[39m tests/index-lsp-idle-reset.test.ts [2m([22m[2m4 tests[22m[2m)[22m[33m 669[2mms[22m[39m
+2026-08-25T22:59:53.6409241Z      [33m[2m✓[22m[39m does not touch a stale event ctx when the detached idle timer fires [33m 422[2mms[22m[39m
+2026-08-25T22:59:53.7262668Z  [32m✓[39m [30m[42m default [49m[39m tests/clients/language-profile.test.ts [2m([22m[2m15 tests[22m[2m)[22m[32m 31[2mms[22m[39m
+2026-08-25T22:59:53.9395859Z Expected at least one target file. All matched files may have been excluded by ignore rules.
+2026-08-25T22:59:53.9844041Z  [32m✓[39m [30m[42m default [49m[39m tests/clients/review-graph/import-resolvers.test.ts [2m([22m[2m26 tests[22m[2m)[22m[32m 40[2mms[22m[39m
+2026-08-25T22:59:54.0564234Z No files found matching the given patterns.
+2026-08-25T22:59:54.5778753Z  [32m✓[39m [30m[42m default [49m[39m tests/clients/debug-handles.test.ts [2m([22m[2m11 tests[22m[2m)[22m[32m 239[2mms[22m[39m
+2026-08-25T22:59:54.5954103Z  [32m✓[39m [30m[42m default [49m[39m tests/clients/dispatch/oxfmt-ignored-file-noop.test.ts [2m([22m[2m6 tests[22m[2m)[22m[33m 741[2mms[22m[39m
+2026-08-25T22:59:54.8559594Z  [32m✓[39m [30m[42m default [49m[39m tests/clients/cascade-budget.test.ts [2m([22m[2m14 tests[22m[2m)[22m[32m 13[2mms[22m[39m
+2026-08-25T22:59:55.4398278Z  [32m✓[39m [30m[42m default [49m[39m tests/clients/ext-gate-before-ignore.test.ts [2m([22m[2m8 tests[22m[2m)[22m[32m 122[2mms[22m[39m
+2026-08-25T22:59:55.4936237Z  [32m✓[39m [30m[42m default [49m[39m tests/clients/tree-sitter-symbols.test.ts [2m([22m[2m29 tests[22m[2m)[22m[33m 3577[2mms[22m[39m
+2026-08-25T22:59:55.4953297Z      [33m[2m✓[22m[39m extracts symbols for cpp [33m 600[2mms[22m[39m
+2026-08-25T22:59:55.4954542Z      [33m[2m✓[22m[39m extracts symbols for csharp [33m 382[2mms[22m[39m
+2026-08-25T22:59:55.4955264Z      [33m[2m✓[22m[39m extracts symbols for swift [33m 571[2mms[22m[39m
+2026-08-25T22:59:55.4956054Z      [33m[2m✓[22m[39m extracts symbols for ocaml [33m 447[2mms[22m[39m
+2026-08-25T22:59:55.9223324Z  [32m✓[39m [30m[42m default [49m[39m tests/clients/dispatch/rules/high-fan-out-complexity-test-noise.test.ts [2m([22m[2m11 tests[22m[2m)[22m[32m 169[2mms[22m[39m
+2026-08-25T22:59:56.0924437Z  [32m✓[39m [30m[42m default [49m[39m tests/clients/write-autofix-attachment-message.test.ts [2m([22m[2m4 tests[22m[2m)[22m[32m 52[2mms[22m[39m
+2026-08-25T22:59:56.2562525Z  [32m✓[39m [30m[42m default [49m[39m tests/clients/codebase-model.test.ts [2m([22m[2m19 tests[22m[2m)[22m[32m 32[2mms[22m[39m
+2026-08-25T22:59:56.5323567Z ##[error]Process completed with exit code 137.
+2026-08-25T22:59:56.5631511Z Post job cleanup.

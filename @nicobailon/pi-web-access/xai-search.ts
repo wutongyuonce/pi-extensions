@@ -1,12 +1,13 @@
 import { existsSync, readFileSync } from "node:fs";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { activityMonitor } from "./activity.ts";
+import { normalizeDomain } from "./domain-filter-normalization.ts";
 import type { SearchOptions, SearchResponse, SearchResult } from "./perplexity.ts";
 import { hasCredentialSource, redactCredential, resolveCredential } from "./credential-source.ts";
 import { getWebSearchConfigPath } from "./utils.ts";
 
-// xAI's Agent Tools API: a hosted `web_search` tool on an OpenAI-compatible
-// Responses endpoint. The search runs inside xAI's own inference, so — unlike
+// xAI's Agent Tools API: hosted `web_search` and opt-in `x_search` tools on an
+// OpenAI-compatible Responses endpoint. The search runs inside xAI's own inference, so — unlike
 // every keyed backend here — it is paid for by whatever credential answers for
 // the model, including a SuperGrok / X Premium subscription resolved through
 // pi's model registry.
@@ -19,8 +20,8 @@ import { getWebSearchConfigPath } from "./utils.ts";
 // is the shape verified against a live subscription account. `stream`,
 // `include`, `tool_choice` and `parallel_tool_calls` are all sent by the OpenAI
 // backend but were NOT verified here, and a 400 from an unsupported field would
-// cost the user their search. Sources come back in `web_search_call.action.sources`
-// without asking for them via `include`.
+// cost the user their search. Responses API inline citations are enabled by
+// default; sources may also come back in a search call's `action.sources`.
 
 const XAI_RESPONSES_URL = "https://api.x.ai/v1/responses";
 const CONFIG_PATH = getWebSearchConfigPath();
@@ -29,11 +30,18 @@ const SEARCH_TIMEOUT_MS = 60_000;
 // Ordered best-first. pi's builtin xai catalog is small and xAI retires models
 // briskly, so this is a preference list, not an assumption: the first one the
 // registry actually knows wins, and an unknown id is skipped rather than sent.
-const AUTH_MODEL_CANDIDATES = ["grok-4.5", "grok-4.3", "grok-build-0.1"] as const;
+// xAI's current X Search docs use grok-4.6. Keep the existing web-only default
+// unchanged, while preferring the documented model when X Search is opted in.
+const WEB_SEARCH_AUTH_MODEL_CANDIDATES = ["grok-4.5", "grok-4.3", "grok-build-0.1"] as const;
+const X_SEARCH_AUTH_MODEL_CANDIDATES = ["grok-4.6", ...WEB_SEARCH_AUTH_MODEL_CANDIDATES] as const;
+
+type XaiSearchTool = "web_search" | "x_search";
+const DEFAULT_XAI_SEARCH_TOOLS = ["web_search"] as const satisfies readonly XaiSearchTool[];
 
 interface WebSearchConfig {
 	xaiApiKey?: unknown;
 	xaiSearchModel?: unknown;
+	xaiSearchTools?: unknown;
 }
 
 type ProviderHeaders = Record<string, string | null>;
@@ -71,6 +79,29 @@ function resolveConfiguredSearchModel(value: unknown): string | undefined {
 	return value.trim();
 }
 
+function resolveConfiguredSearchTools(value: unknown): XaiSearchTool[] {
+	if (value === undefined) return [...DEFAULT_XAI_SEARCH_TOOLS];
+	if (!Array.isArray(value) || value.length === 0) {
+		throw new Error(`xaiSearchTools in ${CONFIG_PATH} must be a non-empty array containing only web_search or x_search`);
+	}
+
+	const tools: XaiSearchTool[] = [];
+	for (const tool of value) {
+		if (tool !== "web_search" && tool !== "x_search") {
+			throw new Error(`xaiSearchTools in ${CONFIG_PATH} may only contain web_search or x_search`);
+		}
+		if (tools.includes(tool)) {
+			throw new Error(`xaiSearchTools in ${CONFIG_PATH} must not contain duplicates: ${tool}`);
+		}
+		tools.push(tool);
+	}
+	return tools;
+}
+
+function modelCandidatesForTools(tools: readonly XaiSearchTool[]): readonly string[] {
+	return tools.includes("x_search") ? X_SEARCH_AUTH_MODEL_CANDIDATES : WEB_SEARCH_AUTH_MODEL_CANDIDATES;
+}
+
 function toRequestHeaders(headers: ProviderHeaders): Record<string, string> {
 	const requestHeaders: Record<string, string> = {};
 	for (const [name, value] of Object.entries(headers)) {
@@ -84,8 +115,12 @@ function toRequestHeaders(headers: ProviderHeaders): Record<string, string> {
  * its own searches and no api key has to be configured at all. Mirrors how the
  * OpenAI backend picks up a Codex sign-in.
  */
-async function resolvePiAuth(ctx: ExtensionContext, modelOverride?: string): Promise<XaiAuth | undefined> {
-	for (const modelId of AUTH_MODEL_CANDIDATES) {
+async function resolvePiAuth(
+	ctx: ExtensionContext,
+	modelOverride: string | undefined,
+	tools: readonly XaiSearchTool[],
+): Promise<XaiAuth | undefined> {
+	for (const modelId of modelCandidatesForTools(tools)) {
 		try {
 			const model = ctx.modelRegistry.find("xai", modelId);
 			if (!model) continue;
@@ -102,8 +137,9 @@ async function resolvePiAuth(ctx: ExtensionContext, modelOverride?: string): Pro
 export async function resolveXaiAuth(ctx?: ExtensionContext, signal?: AbortSignal): Promise<XaiAuth | undefined> {
 	const config = loadConfig();
 	const modelOverride = resolveConfiguredSearchModel(config.xaiSearchModel);
+	const tools = resolveConfiguredSearchTools(config.xaiSearchTools);
 	if (ctx) {
-		const auth = await resolvePiAuth(ctx, modelOverride);
+		const auth = await resolvePiAuth(ctx, modelOverride, tools);
 		if (auth) return auth;
 	}
 
@@ -119,32 +155,24 @@ export async function resolveXaiAuth(ctx?: ExtensionContext, signal?: AbortSigna
 		environmentValue: process.env.XAI_API_KEY,
 		signal,
 	});
-	return apiKey ? { apiKey, model: modelOverride ?? AUTH_MODEL_CANDIDATES[0], headers: {} } : undefined;
+	return apiKey ? { apiKey, model: modelOverride ?? modelCandidatesForTools(tools)[0], headers: {} } : undefined;
 }
 
 export async function isXaiSearchAvailable(ctx?: ExtensionContext): Promise<boolean> {
-	if (ctx && await resolvePiAuth(ctx)) return true;
-	const config = loadConfig();
+	let config: WebSearchConfig;
+	let tools: XaiSearchTool[];
+	try {
+		config = loadConfig();
+		tools = resolveConfiguredSearchTools(config.xaiSearchTools);
+	} catch {
+		return false;
+	}
+	if (ctx && await resolvePiAuth(ctx, undefined, tools)) return true;
 	return hasCredentialSource({
 		provider: "xAI",
 		configuredValue: config.xaiApiKey,
 		environmentValue: process.env.XAI_API_KEY,
 	});
-}
-
-function normalizeDomain(value: string): string | null {
-	let input = value.trim().toLowerCase();
-	if (!input) return null;
-	if (input.startsWith("-")) input = input.slice(1).trim();
-	if (!input) return null;
-	try {
-		const parsed = input.includes("://") ? new URL(input) : new URL(`https://${input}`);
-		input = parsed.hostname;
-	} catch {
-		input = input.split("/")[0]?.split(":")[0] ?? "";
-	}
-	input = input.replace(/^\.+|\.+$/g, "");
-	return /^[a-z0-9][a-z0-9.-]*\.[a-z]{2,}$/i.test(input) ? input : null;
 }
 
 /**
@@ -153,9 +181,17 @@ function normalizeDomain(value: string): string | null {
  * an unknown field risks a 400 that costs the whole search; steering through
  * the instruction text degrades to "the model ignored it" instead.
  */
-function buildInput(query: string, options: SearchOptions): string {
+function buildInput(query: string, options: SearchOptions, tools: readonly XaiSearchTool[]): string {
+	let searchInstruction: string;
+	if (tools.includes("x_search") && tools.includes("web_search")) {
+		searchInstruction = "Search the web and X and answer using only what the search results say.";
+	} else if (tools.includes("x_search")) {
+		searchInstruction = "Search X and answer using only what the X results say.";
+	} else {
+		searchInstruction = "Search the web and answer using only what the web results say.";
+	}
 	const lines = [
-		"Search the web and answer using only what the web results say.",
+		searchInstruction,
 		"Cite your sources inline.",
 	];
 
@@ -198,6 +234,21 @@ function addResult(results: SearchResult[], seen: Set<string>, url: unknown, tit
 	});
 }
 
+function addSource(results: SearchResult[], seen: Set<string>, source: unknown): void {
+	if (typeof source === "string") {
+		addResult(results, seen, source, undefined);
+		return;
+	}
+	if (!source || typeof source !== "object") return;
+	const record = source as Record<string, unknown>;
+	addResult(results, seen, record.url ?? record.source_website_url, record.title ?? record.caption);
+}
+
+function addSources(results: SearchResult[], seen: Set<string>, sources: unknown): void {
+	if (!Array.isArray(sources)) return;
+	for (const source of sources) addSource(results, seen, source);
+}
+
 function extractSnippetAround(text: string, start: unknown, end: unknown): string {
 	if (typeof start !== "number" || typeof end !== "number" || !text) return "";
 	const before = Math.max(0, start - 100);
@@ -222,13 +273,13 @@ function extractAnswer(output: unknown[]): string {
 }
 
 /**
- * Sources live in two places and neither is a top-level `citations` array:
- * `url_citation` annotations on the answer text (these carry titles and offsets,
- * so they go first and win the dedupe), and the raw `sources` each
- * `web_search_call` visited. A third-party extension that reads `data.citations`
- * silently returns answers with no sources at all — hence both paths here.
+ * Keep annotation sources first because they carry titles and offsets and must
+ * win URL deduplication. Raw source lists from web/X search calls are next,
+ * followed by xAI's response-level `citations` URL list. The latter is usually
+ * strings, but object entries are tolerated when a compatible gateway adds
+ * metadata.
  */
-function extractSearchResults(output: unknown[], numResults: number | undefined): SearchResult[] {
+function extractSearchResults(output: unknown[], citations: unknown, numResults: number | undefined): SearchResult[] {
 	const results: SearchResult[] = [];
 	const seenUrls = new Set<string>();
 
@@ -256,20 +307,17 @@ function extractSearchResults(output: unknown[], numResults: number | undefined)
 	}
 
 	for (const item of output) {
-		if (!item || typeof item !== "object" || (item as { type?: unknown }).type !== "web_search_call") continue;
+		if (!item || typeof item !== "object") continue;
+		const type = (item as { type?: unknown }).type;
+		if (type !== "web_search_call" && type !== "x_search_call") continue;
 		const value = item as { action?: unknown; sources?: unknown; results?: unknown };
 		const actionSources = value.action && typeof value.action === "object"
 			? (value.action as { sources?: unknown }).sources
 			: undefined;
-		for (const group of [actionSources, value.sources, value.results]) {
-			if (!Array.isArray(group)) continue;
-			for (const source of group) {
-				if (!source || typeof source !== "object") continue;
-				const record = source as Record<string, unknown>;
-				addResult(results, seenUrls, record.url ?? record.source_website_url, record.title ?? record.caption);
-			}
-		}
+		for (const group of [actionSources, value.sources, value.results]) addSources(results, seenUrls, group);
 	}
+
+	addSources(results, seenUrls, citations);
 
 	if (typeof numResults === "number" && Number.isFinite(numResults) && numResults > 0) {
 		return results.slice(0, Math.min(Math.floor(numResults), 20));
@@ -282,10 +330,11 @@ export async function searchWithXai(
 	options: SearchOptions = {},
 	ctx?: ExtensionContext,
 ): Promise<SearchResponse> {
+	const tools = resolveConfiguredSearchTools(loadConfig().xaiSearchTools);
 	const auth = await resolveXaiAuth(ctx, options.signal);
 	if (!auth) {
 		throw new Error(
-			"xAI web search unavailable. Either:\n" +
+			"xAI search unavailable. Either:\n" +
 			"  1. Use /login to sign in with a SuperGrok or X Premium subscription\n" +
 			`  2. Create ${CONFIG_PATH} with { "xaiApiKey": "your-key" }\n` +
 			"  3. Set XAI_API_KEY environment variable",
@@ -303,8 +352,8 @@ export async function searchWithXai(
 			},
 			body: JSON.stringify({
 				model: auth.model,
-				input: buildInput(query, options),
-				tools: [{ type: "web_search" }],
+				input: buildInput(query, options, tools),
+				tools: tools.map((type) => ({ type })),
 			}),
 			signal: options.signal
 				? AbortSignal.any([AbortSignal.timeout(SEARCH_TIMEOUT_MS), options.signal])
@@ -326,10 +375,10 @@ export async function searchWithXai(
 		}
 		const output = Array.isArray(parsed.output) ? parsed.output : [];
 		const answer = extractAnswer(output);
-		const results = extractSearchResults(output, options.numResults);
+		const results = extractSearchResults(output, parsed.citations, options.numResults);
 
 		if (!answer && results.length === 0) {
-			throw new Error("xAI web_search returned no answer or sources");
+			throw new Error(`xAI ${tools.join("+")} returned no answer or sources`);
 		}
 
 		activityMonitor.logComplete(activityId, response.status);

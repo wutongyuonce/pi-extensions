@@ -1,5 +1,31 @@
 # @narumitw/pi-stamp
 
+## 0.51.2
+
+### Patch Changes
+
+- 67a3049: Adapt provider, transcript, usage, deferred-tool, and telemetry behavior to Pi's current runtime contracts, including accurate cache-warming accounting and exclusion from ordinary generation traces.
+
+## 0.51.1
+
+### Patch Changes
+
+- bae6fea: Reuse bounded date-time formatters and memoized stamp rendering to prevent transcript redraws from causing severe native memory growth.
+
+## 0.51.0
+
+### Minor Changes
+
+- c798497: Add an optional since-user cost total to final assistant stamps.
+
+## 0.50.1
+
+### Patch Changes
+
+- 5372f87: Use the dependency-free Kit terminal-text sanitizer for display labels while retaining the existing persisted metadata normalization and lazy menu boundary.
+- Updated dependencies [317f7bd]
+  - @narumitw/pi-tui-kit@0.61.0
+
 ## 0.50.0
 
 ### Minor Changes

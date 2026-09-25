@@ -1,0 +1,17 @@
+// Tool-smoke fixture for #209 — the Prisma language server flags the `name`
+// field that is missing a type.
+//
+// #3217: the datasource deliberately carries NO `url`. Prisma 7 reports
+// `url = env(...)` in a schema file as an error of its own ("The datasource
+// property `url` is no longer supported in schema files"), which made this
+// fixture's gate row green for a reason that has nothing to do with the
+// seeded defect — and left it green with the defect removed. Without the
+// `url` line the clean variant publishes nothing and the row falsifies.
+datasource db {
+  provider = "postgresql"
+}
+
+model User {
+  id   Int @id
+  name
+}

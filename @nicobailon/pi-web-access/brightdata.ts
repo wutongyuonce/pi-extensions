@@ -1,5 +1,8 @@
 import { existsSync, readFileSync } from "node:fs";
 import { activityMonitor } from "./activity.ts";
+import { normalizeDomain } from "./domain-filter-normalization.ts";
+import { formatSearchResultsAsAnswer } from "./search-answer-formatting.ts";
+import { normalizeSearchResultCount } from "./search-result-count-normalization.ts";
 import type { SearchOptions, SearchResponse } from "./perplexity.ts";
 import { hasCredentialSource, redactCredential, resolveCredential } from "./credential-source.ts";
 import { getWebSearchConfigPath } from "./utils.ts";
@@ -180,26 +183,6 @@ function requireSerpZone(): string {
 		"The zone must be of Bright Data type `serp`; a Web Unlocker zone is a different product and does not return SERP JSON.\n" +
 		"Create one at https://brightdata.com/cp/zones",
 	);
-}
-
-function normalizeCount(value: number | undefined): number {
-	if (typeof value !== "number" || !Number.isFinite(value)) return 5;
-	return Math.max(1, Math.min(Math.floor(value), 20));
-}
-
-function normalizeDomain(value: string): string | null {
-	let input = value.trim().toLowerCase();
-	if (!input) return null;
-	if (input.startsWith("-")) input = input.slice(1).trim();
-	if (!input) return null;
-	try {
-		const parsed = input.includes("://") ? new URL(input) : new URL(`https://${input}`);
-		input = parsed.hostname;
-	} catch {
-		input = input.split("/")[0]?.split(":")[0] ?? "";
-	}
-	input = input.replace(/^\.+|\.+$/g, "");
-	return /^[a-z0-9][a-z0-9.-]*\.[a-z]{2,}$/i.test(input) ? input : null;
 }
 
 interface DomainFilters {
@@ -436,16 +419,6 @@ function mapResults(
 	return mapped;
 }
 
-// A SERP zone returns ranked links, never a synthesized answer, so one is
-// assembled from the sources — the same shape brave.ts and searxng.ts produce.
-function buildAnswer(results: SearchResponse["results"]): string {
-	return results
-		.map((result) => result.snippet
-			? `${result.snippet}\nSource: ${result.title} (${result.url})`
-			: `Source: ${result.title} (${result.url})`)
-		.join("\n\n");
-}
-
 // Both halves are required: a token with no zone cannot make a request, and a
 // zone with no token cannot either. Availability therefore checks the config this
 // surface actually needs rather than merely a key, the way firecrawl.ts's
@@ -477,7 +450,7 @@ export async function searchWithBrightData(query: string, options: BrightDataSea
 	// resolver, and must not reach a billable endpoint.
 	const zone = requireSerpZone();
 	const apiKey = await requireApiKey(options.signal);
-	const numResults = normalizeCount(options.numResults);
+	const numResults = normalizeSearchResultCount(options.numResults);
 	const filters = parseDomainFilter(options.domainFilter);
 	const searchQuery = buildSearchQuery(query, filters);
 	const body: Record<string, unknown> = {
@@ -560,5 +533,5 @@ export async function searchWithBrightData(query: string, options: BrightDataSea
 
 	activityMonitor.logComplete(activityId, response.status);
 	const results = mapResults(data.organic, numResults, filters);
-	return { answer: buildAnswer(results), results };
+	return { answer: formatSearchResultsAsAnswer(results), results };
 }

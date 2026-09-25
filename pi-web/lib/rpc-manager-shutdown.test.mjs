@@ -7,6 +7,7 @@ const jiti = createJiti(import.meta.url, {
   moduleCache: false,
 });
 const { AgentSessionWrapper } = await jiti.import("./rpc-manager.ts");
+const { registerSessionLivenessProvider } = await jiti.import("./session-liveness.ts");
 
 const nextTurn = () => new Promise((resolve) => setImmediate(resolve));
 
@@ -152,6 +153,34 @@ test("completion notification covers extension-injected runs without an SSE clie
   inner.isStreaming = false;
   sdkListener({ type: "agent_settled" });
   assert.deepEqual(completed, ["session-1"]);
+});
+
+test("new event listeners receive the latest active tool update", (t) => {
+  let sdkListener;
+  const inner = makePromptInner(() => Promise.resolve());
+  inner.subscribe = (listener) => {
+    sdkListener = listener;
+    return () => {};
+  };
+
+  const wrapper = new AgentSessionWrapper(inner);
+  t.after(() => wrapper.destroy());
+  wrapper.start();
+
+  sdkListener({ type: "tool_execution_start", toolCallId: "tool-1", toolName: "bash" });
+  sdkListener({ type: "tool_execution_update", toolCallId: "tool-1", toolName: "bash", partialResult: { content: [{ type: "text", text: "one" }] } });
+  const latest = { type: "tool_execution_update", toolCallId: "tool-1", toolName: "bash", partialResult: { content: [{ type: "text", text: "one\ntwo" }] } };
+  sdkListener(latest);
+
+  const replayed = [];
+  const unsubscribe = wrapper.onEvent((event) => replayed.push(event));
+  assert.deepEqual(replayed, [latest]);
+
+  unsubscribe();
+  sdkListener({ type: "tool_execution_end", toolCallId: "tool-1", toolName: "bash" });
+  const afterEnd = [];
+  wrapper.onEvent((event) => afterEnd.push(event));
+  assert.deepEqual(afterEnd, []);
 });
 
 test("suppressed sessions do not emit completion notifications", (t) => {
@@ -495,6 +524,43 @@ test("direct destruction still disposes when session_shutdown throws synchronous
   assert.equal(wrapper.isAlive(), false);
 });
 
+test("idle timer preserves extension-owned session work until it becomes inactive", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
+  const calls = [];
+  let active = true;
+  const inner = makePromptInner(() => Promise.resolve());
+  inner.subscribe = () => () => {};
+  inner.extensionRunner = {
+    async emit(event) {
+      calls.push(["emit", event]);
+    },
+  };
+  inner.dispose = () => calls.push(["dispose"]);
+  const release = registerSessionLivenessProvider({
+    name: "test-extension",
+    sessionId: "session-1",
+    isActive: () => active,
+  });
+  const wrapper = new AgentSessionWrapper(inner);
+  t.after(release);
+  t.after(() => wrapper.destroy());
+  wrapper.start();
+
+  t.mock.timers.tick(10 * 60 * 1000);
+  await nextTurn();
+  assert.equal(wrapper.isAlive(), true);
+  assert.deepEqual(calls, []);
+
+  active = false;
+  t.mock.timers.tick(10 * 60 * 1000);
+  await nextTurn();
+  assert.equal(wrapper.isAlive(), false);
+  assert.deepEqual(calls, [
+    ["emit", { type: "session_shutdown", reason: "quit" }],
+    ["dispose"],
+  ]);
+});
+
 test("idle timer preserves active work but reaps a run stuck after Stop", async (t) => {
   t.mock.timers.enable({ apis: ["setTimeout"] });
   const calls = [];
@@ -512,7 +578,13 @@ test("idle timer preserves active work but reaps a run stuck after Stop", async 
     },
   };
   inner.dispose = () => calls.push(["dispose"]);
+  const release = registerSessionLivenessProvider({
+    name: "test-extension",
+    sessionId: "session-1",
+    isActive: () => true,
+  });
   const wrapper = new AgentSessionWrapper(inner);
+  t.after(release);
   t.after(() => wrapper.destroy());
   wrapper.start();
 

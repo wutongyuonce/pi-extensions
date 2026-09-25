@@ -1,0 +1,283 @@
+import type { RunnerGroup } from "./dispatch/types.js";
+import type { FileKind } from "./file-kinds.js";
+
+export interface ProjectLanguageProfile {
+	present: Record<FileKind, boolean>;
+	configured: Partial<Record<FileKind, boolean>>;
+	counts: Partial<Record<FileKind, number>>;
+	detectedKinds: FileKind[];
+}
+
+interface StartupPolicy {
+	defaults?: string[];
+	heavyScansRequireConfig?: boolean;
+}
+
+interface LanguagePolicy {
+	lspCapable: boolean;
+	startup?: StartupPolicy;
+}
+
+export const LANGUAGE_POLICY: Record<FileKind, LanguagePolicy> = {
+	jsts: {
+		lspCapable: true,
+		startup: {
+			defaults: ["typescript-language-server", "biome"],
+			heavyScansRequireConfig: true,
+		},
+	},
+	python: {
+		lspCapable: true,
+		startup: {
+			defaults: ["pyright", "ruff"],
+		},
+	},
+	go: { lspCapable: true },
+	rust: { lspCapable: true },
+	cxx: { lspCapable: true },
+	cmake: { lspCapable: true },
+	fish: { lspCapable: true },
+	shell: { lspCapable: true, startup: { defaults: ["shellcheck"] } },
+	json: { lspCapable: true },
+	markdown: { lspCapable: true },
+	css: { lspCapable: true },
+	yaml: {
+		lspCapable: true,
+		startup: {
+			defaults: ["yamllint"],
+			heavyScansRequireConfig: true,
+		},
+	},
+	sql: {
+		lspCapable: false,
+		startup: {
+			defaults: ["sqlfluff"],
+			heavyScansRequireConfig: true,
+		},
+	},
+	ruby: {
+		lspCapable: true,
+		startup: {
+			defaults: ["rubocop"],
+			heavyScansRequireConfig: true,
+		},
+	},
+	html: { lspCapable: true },
+	docker: { lspCapable: true },
+	php: { lspCapable: true },
+	powershell: { lspCapable: true },
+	prisma: { lspCapable: true },
+	csharp: { lspCapable: true },
+	fsharp: { lspCapable: true },
+	java: { lspCapable: true },
+	kotlin: { lspCapable: true, startup: { defaults: ["ktlint"] } },
+	swift: { lspCapable: true },
+	dart: { lspCapable: true },
+	lua: { lspCapable: true },
+	zig: { lspCapable: true },
+	haskell: { lspCapable: true },
+	"helm-template": { lspCapable: false },
+	elixir: { lspCapable: true },
+	gleam: { lspCapable: true },
+	ocaml: { lspCapable: true },
+	clojure: { lspCapable: true },
+	cue: { lspCapable: true },
+	terraform: { lspCapable: true },
+	terragrunt: { lspCapable: false },
+	nix: { lspCapable: true },
+	toml: { lspCapable: true, startup: { defaults: ["taplo"] } },
+};
+
+const PRIMARY_DISPATCH_GROUPS: Partial<Record<FileKind, RunnerGroup>> = {
+	jsts: {
+		mode: "fallback",
+		runnerIds: ["lsp"],
+		filterKinds: ["jsts"],
+	},
+	python: {
+		mode: "all",
+		runnerIds: ["lsp", "pyright"],
+		filterKinds: ["python"],
+	},
+	go: { mode: "all", runnerIds: ["lsp", "go-vet"], filterKinds: ["go"] },
+	rust: {
+		mode: "all",
+		runnerIds: ["lsp", "rust-clippy"],
+		filterKinds: ["rust"],
+	},
+	ruby: {
+		mode: "all",
+		runnerIds: ["lsp", "rubocop"],
+		filterKinds: ["ruby"],
+	},
+	cxx: {
+		mode: "all",
+		runnerIds: ["lsp", "cpp-check"],
+		filterKinds: ["cxx"],
+	},
+	cmake: { mode: "fallback", runnerIds: ["lsp"], filterKinds: ["cmake"] },
+	fish: {
+		mode: "all",
+		runnerIds: ["lsp", "fish-indent"],
+		filterKinds: ["fish"],
+	},
+	shell: {
+		mode: "all",
+		runnerIds: ["lsp", "shellcheck"],
+		filterKinds: ["shell"],
+	},
+	json: { mode: "fallback", runnerIds: ["lsp"], filterKinds: ["json"] },
+	markdown: {
+		// marksman (primary LSP) adds cross-file checks the cold spellcheck/vale
+		// runners can't see; all three run so prose + structural coverage coexist.
+		mode: "all",
+		runnerIds: ["lsp", "spellcheck", "vale"],
+		filterKinds: ["markdown"],
+	},
+	css: {
+		mode: "all",
+		runnerIds: ["lsp", "stylelint"],
+		filterKinds: ["css"],
+	},
+	yaml: {
+		mode: "all",
+		runnerIds: ["lsp", "yamllint", "trivy-config", "helm-lint", "helm-render"],
+		filterKinds: ["yaml"],
+	},
+	sql: {
+		mode: "fallback",
+		runnerIds: ["sqlfluff"],
+		filterKinds: ["sql"],
+	},
+	html: {
+		mode: "all",
+		runnerIds: ["lsp", "htmlhint"],
+		filterKinds: ["html"],
+	},
+	docker: {
+		mode: "all",
+		runnerIds: ["lsp", "hadolint", "trivy-config"],
+		filterKinds: ["docker"],
+	},
+	php: {
+		mode: "fallback",
+		runnerIds: ["lsp", "php-lint", "phpstan"],
+		filterKinds: ["php"],
+	},
+	powershell: {
+		mode: "all",
+		runnerIds: ["lsp", "psscriptanalyzer"],
+		filterKinds: ["powershell"],
+	},
+	prisma: {
+		mode: "all",
+		runnerIds: ["lsp", "prisma-validate"],
+		filterKinds: ["prisma"],
+	},
+	csharp: {
+		mode: "fallback",
+		runnerIds: ["lsp", "dotnet-build"],
+		filterKinds: ["csharp"],
+	},
+	fsharp: { mode: "fallback", runnerIds: ["lsp"], filterKinds: ["fsharp"] },
+	java: {
+		mode: "fallback",
+		runnerIds: ["lsp", "javac"],
+		filterKinds: ["java"],
+	},
+	kotlin: {
+		mode: "all",
+		runnerIds: ["lsp", "ktlint"],
+		filterKinds: ["kotlin"],
+	},
+	swift: {
+		mode: "all",
+		runnerIds: ["lsp", "swiftlint"],
+		filterKinds: ["swift"],
+	},
+	dart: {
+		mode: "all",
+		runnerIds: ["lsp", "dart-analyze"],
+		filterKinds: ["dart"],
+	},
+	lua: { mode: "fallback", runnerIds: ["lsp"], filterKinds: ["lua"] },
+	zig: { mode: "all", runnerIds: ["lsp", "zig-check"], filterKinds: ["zig"] },
+	haskell: { mode: "fallback", runnerIds: ["lsp"], filterKinds: ["haskell"] },
+	"helm-template": {
+		mode: "all",
+		// helm-render is opt-in (`helm.renderValidation.enabled`) and skips itself
+		// when the switch is absent, so it costs nothing when unconfigured (#1283).
+		runnerIds: ["helm-lint", "helm-render"],
+		filterKinds: ["helm-template"],
+	},
+	elixir: {
+		mode: "all",
+		runnerIds: ["lsp", "elixir-check", "credo"],
+		filterKinds: ["elixir"],
+	},
+	gleam: {
+		mode: "all",
+		runnerIds: ["lsp", "gleam-check"],
+		filterKinds: ["gleam"],
+	},
+	ocaml: { mode: "fallback", runnerIds: ["lsp"], filterKinds: ["ocaml"] },
+	clojure: { mode: "fallback", runnerIds: ["lsp"], filterKinds: ["clojure"] },
+	// #1522: cuelsp reports syntax/parse errors only; cue-vet covers the
+	// evaluation-error class the language server deliberately doesn't publish.
+	cue: { mode: "all", runnerIds: ["lsp", "cue-vet"], filterKinds: ["cue"] },
+	terraform: {
+		mode: "all",
+		runnerIds: ["lsp", "tflint", "trivy-config"],
+		filterKinds: ["terraform"],
+	},
+	terragrunt: {
+		mode: "all",
+		runnerIds: ["terragrunt"],
+		filterKinds: ["terragrunt"],
+	},
+	nix: { mode: "fallback", runnerIds: ["lsp"], filterKinds: ["nix"] },
+	toml: {
+		mode: "all",
+		runnerIds: ["lsp", "taplo"],
+		filterKinds: ["toml"],
+	},
+};
+
+export function getLspCapableKinds(): FileKind[] {
+	return (Object.keys(LANGUAGE_POLICY) as FileKind[]).filter(
+		(kind) => LANGUAGE_POLICY[kind].lspCapable,
+	);
+}
+
+export function getPrimaryDispatchGroup(
+	kind: FileKind,
+	lspEnabled: boolean,
+): RunnerGroup | undefined {
+	const base = PRIMARY_DISPATCH_GROUPS[kind];
+	if (!base) return undefined;
+
+	const ids = lspEnabled
+		? [...base.runnerIds]
+		: base.runnerIds.filter((id) => id !== "lsp");
+	if (ids.length === 0) return undefined;
+
+	return {
+		mode: base.mode,
+		runnerIds: ids,
+		filterKinds: base.filterKinds,
+		semantic: base.semantic,
+	};
+}
+
+// Note: getStartupDefaultsForProfile has been moved to language-profile.ts as getDefaultStartupTools
+// Import from there if needed: import { getDefaultStartupTools } from "./language-profile.js"
+
+export function canRunStartupHeavyScans(
+	profile: ProjectLanguageProfile,
+	kind: FileKind,
+): boolean {
+	if (!profile.present[kind]) return false;
+	const needsConfig = LANGUAGE_POLICY[kind].startup?.heavyScansRequireConfig;
+	if (!needsConfig) return true;
+	return !!profile.configured[kind];
+}

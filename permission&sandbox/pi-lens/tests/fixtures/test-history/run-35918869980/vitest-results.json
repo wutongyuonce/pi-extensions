@@ -1,0 +1,97 @@
+{
+ "numTotalTestSuites": 4127,
+ "numPassedTestSuites": 4127,
+ "numFailedTestSuites": 0,
+ "numPendingTestSuites": 0,
+ "numTotalTests": 16355,
+ "numPassedTests": 16236,
+ "numFailedTests": 0,
+ "numPendingTests": 119,
+ "numTodoTests": 0,
+ "snapshot": {
+  "added": 0,
+  "failure": false,
+  "filesAdded": 0,
+  "filesRemoved": 0,
+  "filesRemovedList": [],
+  "filesUnmatched": 0,
+  "filesUpdated": 0,
+  "matched": 1,
+  "total": 1,
+  "unchecked": 0,
+  "uncheckedKeysByFile": [],
+  "unmatched": 0,
+  "updated": 0,
+  "didUpdate": false
+ },
+ "startTime": 1790197049531,
+ "success": true,
+ "testResults": [
+  {
+   "assertionResults": [
+    {
+     "ancestorTitles": [
+      "real pi harness: child lifecycle"
+     ],
+     "fullName": "real pi harness: child lifecycle rejects a governed wait immediately when pi is killed",
+     "status": "passed",
+     "title": "rejects a governed wait immediately when pi is killed",
+     "duration": 1051.0914619999999,
+     "failureMessages": [],
+     "meta": {},
+     "tags": [],
+     "benchmarks": []
+    }
+   ],
+   "startTime": 1790197837975,
+   "endTime": 1790197839026.0916,
+   "status": "passed",
+   "message": "",
+   "name": "/home/runner/work/pi-lens/pi-lens/tests/real-harness/child-exit.test.ts"
+  },
+  {
+   "assertionResults": [
+    {
+     "ancestorTitles": [
+      "test-history-rollup real entry point"
+     ],
+     "fullName": "test-history-rollup real entry point writes one row per test file and identifies same-head pass/fail evidence",
+     "status": "passed",
+     "title": "writes one row per test file and identifies same-head pass/fail evidence",
+     "duration": 17.701527,
+     "failureMessages": [],
+     "meta": {},
+     "tags": [],
+     "benchmarks": []
+    }
+   ],
+   "startTime": 1790197443585,
+   "endTime": 1790197443605.7087,
+   "status": "passed",
+   "message": "",
+   "name": "/home/runner/work/pi-lens/pi-lens/tests/scripts/test-history-rollup.test.ts"
+  },
+  {
+   "assertionResults": [
+    {
+     "ancestorTitles": [
+      "#3215 durable test-history workflow contract"
+     ],
+     "fullName": "#3215 durable test-history workflow contract pins the reporter console contract and Linux artifact",
+     "status": "passed",
+     "title": "pins the reporter console contract and Linux artifact",
+     "duration": 16.20792799999998,
+     "failureMessages": [],
+     "meta": {},
+     "tags": [],
+     "benchmarks": []
+    }
+   ],
+   "startTime": 1790197468618,
+   "endTime": 1790197468637.0786,
+   "status": "passed",
+   "message": "",
+   "name": "/home/runner/work/pi-lens/pi-lens/tests/config/test-history-workflow.test.ts"
+  }
+ ]
+}

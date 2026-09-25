@@ -5,15 +5,50 @@ import { endedUnderContextPressure } from "../session/completion-reason.ts";
 import { readSubagentTimeoutSidecar } from "../session/timeout-sidecar.ts";
 import { type ResumeServiceRuntime, resumeSubagentSession } from "../runtime/resume-service.ts";
 import { shouldAwaitSubagentLaunch } from "../runtime/running-registry.ts";
-import { getSubagentBatchStopMetadata, requestSubagentBatchStop } from "../runtime/state.ts";
+import { getSubagentBatchStopMetadata, markSubagentBatchBlocking, requestSubagentBatchStop } from "../runtime/state.ts";
 import { readSubagentLaunchMetadata } from "../session/session-files.ts";
 import type { RunningSubagent, SubagentResult } from "../types.ts";
 import { formatTaskPreview, renderSubagentCompletionText } from "./message-renderers.ts";
+import { shouldForceSynchronousLaunch } from "./subagent-tools.ts";
 import { SUBAGENT_RESUME_TOOL_NAME } from "./tool-names.ts";
 
 export interface ResumeToolRuntime extends ResumeServiceRuntime {
 	wireSubagentSteerBack(pi: ExtensionAPI, running: RunningSubagent, promise: Promise<SubagentResult>): void;
 	getLaunchedSubagentResult(running: RunningSubagent, signal?: AbortSignal): Promise<AgentToolResult<unknown>>;
+}
+
+function assertResumeAllowed(sessionFile: string): void {
+	// The child ended on instruction from its context-warning policy, so its
+	// window is spent. Resuming buys no room and only repeats the wrap-up.
+	// Operators can still resume it deliberately from the /subagents overlay.
+	if (endedUnderContextPressure(sessionFile)) {
+		throw new Error(
+			"This sub-agent stopped early as instructed by its context-warning policy, and its context window is spent. " +
+				"Resuming gives it no room to work. Launch a fresh sub-agent with the remaining work instead.",
+		);
+	}
+
+	// A budget kill is recoverable by default — a resume re-arms the same
+	// budget, so it cannot run away again. Only an agent that opted into
+	// `on-timeout: block-resume` refuses, because a second partial run of a
+	// non-idempotent child is not safe to attempt.
+	const timedOut = readSubagentTimeoutSidecar(sessionFile);
+	if (!timedOut?.blocksResume) return;
+	const limitDescription = timedOut.kind === "idle-timeout" ? "limit for time without output" : "time limit";
+	throw new Error(
+		`The system stopped this sub-agent because it went past its ${limitDescription}. ` +
+			"Its agent file does not allow a resume after that. Start a new sub-agent with a smaller task instead.",
+	);
+}
+
+function forceSynchronousResumeIfNeeded(running: RunningSubagent, hasUI: boolean): void {
+	// Same rule as a fresh launch: a print/prompt-style parent has no durable
+	// turn for a later steer, so a detached resume would end the turn and
+	// leave the resumed child reporting to a parent that has already exited.
+	if (!shouldForceSynchronousLaunch(hasUI)) return;
+	running.async = false;
+	running.blocking = true;
+	markSubagentBatchBlocking();
 }
 
 export function registerSubagentResumeTool(
@@ -116,32 +151,14 @@ export function registerSubagentResumeTool(
 			component.setText(theme.fg("dim", text));
 			return component;
 		},
-		async execute(_toolCallId, params, signal) {
-			if (!params.sessionFile) throw new Error("Session file is required.");
-			// The child ended on instruction from its context-warning policy, so its
-			// window is spent. Resuming buys no room and only repeats the wrap-up.
-			// Operators can still resume it deliberately from the /subagents overlay.
-			if (endedUnderContextPressure(params.sessionFile)) {
-				throw new Error(
-					"This sub-agent stopped early as instructed by its context-warning policy, and its context window is spent. " +
-						"Resuming gives it no room to work. Launch a fresh sub-agent with the remaining work instead.",
-				);
-			}
-			// A budget kill is recoverable by default — a resume re-arms the same
-			// budget, so it cannot run away again. Only an agent that opted into
-			// `on-timeout: block-resume` refuses, because a second partial run of a
-			// non-idempotent child is not safe to attempt.
-			const timedOut = readSubagentTimeoutSidecar(params.sessionFile);
-			if (timedOut?.blocksResume) {
-				throw new Error(
-					`The system stopped this sub-agent because it went past its ${timedOut.kind === "idle-timeout" ? "limit for time without output" : "time limit"}. ` +
-						"Its agent file does not allow a resume after that. Start a new sub-agent with a smaller task instead.",
-				);
-			}
+		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+			const sessionFile = params.sessionFile;
+			if (!sessionFile) throw new Error("Session file is required.");
+			assertResumeAllowed(sessionFile);
 
 			const running = await resumeSubagentSession(
 				{
-					sessionFile: params.sessionFile,
+					sessionFile,
 					task: params.task,
 					name: params.name,
 					agent: params.agent,
@@ -153,6 +170,8 @@ export function registerSubagentResumeTool(
 			);
 
 			runtime.wireSubagentSteerBack(pi, running, running.completionPromise!);
+
+			forceSynchronousResumeIfNeeded(running, ctx.hasUI);
 
 			const shouldAwait = shouldAwaitSubagentLaunch(running);
 			if (shouldAwait) {

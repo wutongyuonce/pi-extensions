@@ -1,0 +1,68 @@
+id: no-shape-in-symbol-names
+language: TypeScript
+severity: hint
+message: "Symbol name contains 'shape' — name it for its domain role, not its structure"
+note: |
+  Adapted from dmmulroy/anti-slop's `no-shape-in-symbol-names`
+  (src/rules/no-shape-in-symbol-names.ts, MIT). Upstream bans the
+  case-insensitive substring "shape" in every identifier, private
+  identifier, and JSX identifier: "shape" describes the STRUCTURE of a
+  value, not what it MEANS, and a name that only says "this has some
+  shape" (`PackageJsonShape`, `windowsShaped`) is filler a domain term
+  would replace (`PackageJsonManifest`, `usesWindowsSeparators`).
+
+  Explicitly NOT self-applied: AGENTS.md's own "Recurring defect shapes"
+  catalog uses "shape" as load-bearing review vocabulary, and pi-lens's
+  own code mirrors it — `ProbeFailureShape`, `windowsShaped`,
+  `basenameForShape`, 27 distinct identifiers / 291 occurrences in the
+  2026-08-19 audit. Banning the word in THIS repo would fight the
+  convention its own review process runs on. That is a reason not to
+  wire this rule into pi-lens's self-scan (#1718's decision to make),
+  not a reason to withhold it from the catalog — a repo without that
+  convention gets real signal from it. Self-scan note: do NOT try to
+  make pi-lens's own tree clean against this rule; the adopting PR
+  records the 2026-08-19 hit count instead.
+
+  Scope: `identifier`, `property_identifier`, `private_property_identifier`,
+  and `type_identifier` nodes whose text contains "shape"
+  case-insensitively, anywhere in the name (matches upstream's
+  substring semantics, so `reshape`/`Shapeless` are in scope too, not
+  just whole-word `shape`). `jsx_identifier` is dropped — this repo
+  ships no `.tsx`, so it has nothing to match (same call as
+  `no-unknown-laundering.yml`'s "no JS variant" note).
+
+  2026-08-20 (refs #1727, #1777): CONSIDERED for promotion to `error`,
+  KEPT at `hint`. Four-corpus census, ast-grep CLI 0.45:
+
+  | corpus | hits |
+  |---|---:|
+  | pi-lens `clients/` | 48 (13 distinct identifiers) |
+  | pi-lens `tests/` | 140 |
+  | pi core `packages/` | 5 (5 outside test paths, 1 file) |
+  | opencode `packages/` | 88 (76) |
+  | oh-my-pi `packages/` | 837 (608, 65 files) |
+
+  Verdict: structural scoping was applied and was not enough. Excluding
+  test paths — the mechanism this catalog now uses for
+  `require-safety-comment-for-as-unknown-as.yml` — removes pi-lens's 140
+  `tests/` hits and leaves all 48 `clients/` hits, because they are not a
+  test idiom. They are 13 production identifiers, several of them the
+  review vocabulary this repo runs on (`ProbeFailureShape`,
+  `basenameForShape`, `windowsShaped`, `checkManifestShape`,
+  `validateInputShape`) and one that is upstream's own headline example
+  (`PackageJsonShape`). The only ways to zero are an allowlist of pi-lens
+  identifiers baked into a rule that ships to other repositories — a
+  hand-maintained parallel list, which AGENTS.md forbids — or renaming 13
+  exported production symbols, which is a refactor with its own blast
+  radius and its own issue, not a severity change. Left at `hint` and
+  still NOT tagged for the self-scan.
+rule:
+  any:
+    - kind: identifier
+      regex: "(?i)shape"
+    - kind: property_identifier
+      regex: "(?i)shape"
+    - kind: private_property_identifier
+      regex: "(?i)shape"
+    - kind: type_identifier
+      regex: "(?i)shape"

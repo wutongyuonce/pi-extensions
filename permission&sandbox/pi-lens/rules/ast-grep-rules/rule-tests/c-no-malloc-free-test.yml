@@ -1,0 +1,20 @@
+id: c-no-malloc-free
+valid:
+  - |
+    int sum(const int *values, int count) {
+        int total = 0;
+        for (int i = 0; i < count; i++) {
+            total += values[i];
+        }
+        return total;
+    }
+invalid:
+  - |
+    int *make_buffer(int count) {
+        int *buf = malloc(sizeof(int) * count);
+        return buf;
+    }
+  - |
+    void release(int *buf) {
+        free(buf);
+    }

@@ -45,11 +45,12 @@ export function resolveControlConfig(
 	const enabled = override?.enabled ?? globalConfig?.enabled ?? DEFAULT_CONTROL_CONFIG.enabled;
 	const overrideNeedsAttentionAfterMs = parsePositiveInt(override?.needsAttentionAfterMs);
 	const globalNeedsAttentionAfterMs = parsePositiveInt(globalConfig?.needsAttentionAfterMs);
+	const globalNeedsAttentionAfterMsIsExplicit = (globalConfig as Partial<ResolvedControlConfig> | undefined)?.needsAttentionAfterMsIsExplicit ?? globalNeedsAttentionAfterMs !== undefined;
 	const needsAttentionAfterMs = overrideNeedsAttentionAfterMs
 		?? globalNeedsAttentionAfterMs
 		?? DEFAULT_CONTROL_CONFIG.needsAttentionAfterMs;
 	const needsAttentionAfterMsIsExplicit = overrideNeedsAttentionAfterMs !== undefined
-		|| globalNeedsAttentionAfterMs !== undefined;
+		|| globalNeedsAttentionAfterMsIsExplicit;
 	const activeNoticeAfterMs = parsePositiveInt(override?.activeNoticeAfterMs)
 		?? parsePositiveInt(globalConfig?.activeNoticeAfterMs)
 		?? DEFAULT_CONTROL_CONFIG.activeNoticeAfterMs;
@@ -98,11 +99,12 @@ export function deriveActivityState(input: {
 	config: ResolvedControlConfig;
 	startedAt: number;
 	lastActivityAt?: number;
+	turnCount?: number;
 	currentTool?: string;
 	thinking?: string | false;
 	now?: number;
 }): ActivityState | undefined {
-	if (!input.config.enabled || input.currentTool) return undefined;
+	if (!input.config.enabled || input.currentTool || (input.turnCount ?? 0) === 0) return undefined;
 	const now = input.now ?? Date.now();
 	const lastActivity = input.lastActivityAt ?? input.startedAt;
 	const ageMs = Math.max(0, now - lastActivity);
@@ -136,6 +138,7 @@ export function buildControlEvent(input: {
 	tokens?: number;
 	toolCount?: number;
 	currentTool?: string;
+	toolCallId?: string;
 	currentToolDurationMs?: number;
 	currentPath?: string;
 	elapsedMs?: number;
@@ -168,6 +171,7 @@ export function buildControlEvent(input: {
 		...(input.tokens !== undefined ? { tokens: input.tokens } : {}),
 		...(input.toolCount !== undefined ? { toolCount: input.toolCount } : {}),
 		...(input.currentTool ? { currentTool: input.currentTool } : {}),
+		...(input.toolCallId ? { toolCallId: input.toolCallId } : {}),
 		...(input.currentToolDurationMs !== undefined ? { currentToolDurationMs: input.currentToolDurationMs } : {}),
 		...(input.currentPath ? { currentPath: input.currentPath } : {}),
 		...(elapsedMs !== undefined ? { elapsedMs } : {}),
@@ -221,16 +225,6 @@ export function formatControlNudge(event: ControlEvent): string {
 
 export function formatControlNoticeMessage(event: ControlEvent, childIntercomTarget?: string): string {
 	const runTarget = event.runId;
-	if (event.reason === "completion_guard") {
-		return [
-			`Subagent failed: ${event.agent}`,
-			`Run: ${runTarget}${event.index !== undefined ? ` step ${event.index + 1}` : ""}`,
-			`Signal: ${event.message}`,
-			"Next: read the output artifact or session from the subagent result, then retry with a more explicit implementation prompt or handle the fix directly.",
-			childIntercomTarget ? `Run intercom target (may be inactive): ${childIntercomTarget}` : undefined,
-		].filter((line): line is string => Boolean(line)).join("\n");
-	}
-
 	const nudgeMessage = formatControlNudge(event);
 	const steerCommand = `subagent({ action: "steer", id: "${runTarget}", ${event.index !== undefined ? `index: ${event.index}, ` : ""}message: ${JSON.stringify(nudgeMessage)} })`;
 	const nestedResumeCommand = `subagent({ action: "resume", id: "${runTarget}", message: ${JSON.stringify(nudgeMessage)} })`;
@@ -271,17 +265,13 @@ export function formatControlNoticeMessage(event: ControlEvent, childIntercomTar
 }
 
 export function formatControlIntercomMessage(event: ControlEvent, childIntercomTarget?: string): string {
-	const statusLabel = event.reason === "completion_guard"
-		? "subagent failed"
-		: event.type === "active_long_running"
+	const statusLabel = event.type === "active_long_running"
 			? "subagent active but long-running"
 			: "subagent needs attention";
 	return [
 		statusLabel,
 		"",
-		event.reason === "completion_guard"
-			? `${event.agent} failed in run ${event.runId}.`
-			: event.type === "active_long_running"
+		event.type === "active_long_running"
 				? `${event.agent} is still active but long-running in run ${event.runId}.`
 				: `${event.agent} needs attention in run ${event.runId}.`,
 		"",

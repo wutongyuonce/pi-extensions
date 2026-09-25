@@ -1,0 +1,45 @@
+2026-08-26T00:08:59.2659749Z  [32m✓[39m [30m[46m wall-clock-budget [49m[39m tests/clients/startup-overhead.test.ts [2m([22m[2m7 tests[22m[2m)[22m[32m 49[2mms[22m[39m
+2026-08-26T00:09:00.1651886Z  [32m✓[39m [30m[46m wall-clock-budget [49m[39m tests/clients/read-expansion-enrichment.test.ts [2m([22m[2m3 tests[22m[2m)[22m[32m 170[2mms[22m[39m
+2026-08-26T00:09:00.9084760Z  [32m✓[39m [30m[46m wall-clock-budget [49m[39m tests/clients/pipeline-lsp-sync.test.ts [2m([22m[2m7 tests[22m[2m)[22m[32m 242[2mms[22m[39m
+2026-08-26T00:09:00.9325002Z 
+2026-08-26T00:09:00.9326005Z [31m⎯⎯⎯⎯⎯⎯⎯[39m[1m[41m Failed Tests 1 [49m[22m[31m⎯⎯⎯⎯⎯⎯⎯[39m
+2026-08-26T00:09:00.9326321Z 
+2026-08-26T00:09:00.9329487Z [41m[1m FAIL [22m[49m [30m[42m default [49m[39m tests/clients/word-index-lifecycle.test.ts[2m > [22mword-index lifecycle — full mode (#348)[2m > [22mreuses a fresh persisted snapshot without rebuilding
+2026-08-26T00:09:00.9335940Z [31m[1mAssertionError[22m: expected false to be true // Object.is equality[39m
+2026-08-26T00:09:00.9336298Z 
+2026-08-26T00:09:00.9336443Z [32m- Expected[39m
+2026-08-26T00:09:00.9336907Z [31m+ Received[39m
+2026-08-26T00:09:00.9337155Z 
+2026-08-26T00:09:00.9337367Z [32m- true[39m
+2026-08-26T00:09:00.9337620Z [31m+ false[39m
+2026-08-26T00:09:00.9337738Z 
+2026-08-26T00:09:00.9338150Z [36m [2m❯[22m tests/clients/word-index-lifecycle.test.ts:[2m268:6[22m[39m
+2026-08-26T00:09:00.9402550Z     [90m266|[39m      [33mString[39m(msg)[33m.[39m[34mincludes[39m([32m"word-index: incremental"[39m)[33m,[39m
+2026-08-26T00:09:00.9403396Z     [90m267|[39m     )[33m,[39m
+2026-08-26T00:09:00.9404279Z     [90m268|[39m    )[33m.[39m[34mtoBe[39m([35mtrue[39m)[33m;[39m
+2026-08-26T00:09:00.9405166Z     [90m   |[39m      [31m^[39m
+2026-08-26T00:09:00.9405931Z     [90m269|[39m    [34mexpect[39m(
+2026-08-26T00:09:00.9407204Z     [90m270|[39m     dbg2[33m.[39mmock[33m.[39mcalls[33m.[39m[34msome[39m(([msg]) [33m=>[39m
+2026-08-26T00:09:00.9407804Z 
+2026-08-26T00:09:00.9408228Z [31m[2m⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯⎯[1/1]⎯[22m[39m
+2026-08-26T00:09:00.9408582Z 
+2026-08-26T00:09:00.9411154Z 
+2026-08-26T00:09:00.9440638Z [2m Test Files [22m [1m[31m1 failed[39m[22m[2m | [22m[1m[32m775 passed[39m[22m[2m | [22m[33m12 skipped[39m[90m (788)[39m
+2026-08-26T00:09:00.9503907Z [2m      Tests [22m [1m[31m1 failed[39m[22m[2m | [22m[1m[32m9837 passed[39m[22m[2m | [22m[33m48 skipped[39m[90m (9886)[39m
+2026-08-26T00:09:00.9505324Z [2m   Start at [22m 00:04:33
+2026-08-26T00:09:00.9519301Z [2m   Duration [22m 267.89s[2m (transform 24.70s, setup 10.44s, import 172.62s, tests 393.36s, environment 112ms)[22m
+2026-08-26T00:09:00.9520064Z 
+2026-08-26T00:09:00.9599789Z 
+2026-08-26T00:09:00.9632000Z ##[error]AssertionError: expected false to be true // Object.is equality
+
+- Expected
++ Received
+
+- true
++ false
+
+ ❯ tests/clients/word-index-lifecycle.test.ts:268:6
+
+
+2026-08-26T00:09:01.1439731Z [mem-watch] done. exitCode=1 totalMb=15994 lowWaterAvailableMb=13095 lowWaterAt=00:04:46
+2026-08-26T00:09:01.1477356Z ##[error]Process completed with exit code 1.

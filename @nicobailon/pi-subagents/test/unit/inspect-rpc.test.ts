@@ -136,12 +136,12 @@ describe("inspect-rpc resolution and ownership", () => {
 		const reply = buildInspectReply({ requestId: "r3", asyncId: "run-x" }, makeDeps(root, resultsDir, makeState(root, null)));
 		assert.equal(reply.error?.code, "no_active_session");
 	});
-	it("returns stale when artifacts are gone", () => {
+	it("does not infer a run from a directory without status or result evidence", () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-inspect-stale-"));
 		const asyncRoot = path.join(root, "runs");
 		fs.mkdirSync(path.join(asyncRoot, "run-stale"), { recursive: true });
 		const reply = buildInspectReply({ requestId: "r4", asyncId: "run-stale" }, makeDeps(root, path.join(root, "results")));
-		assert.equal(reply.error?.code, "stale");
+		assert.equal(reply.error?.code, "not_found");
 	});
 });
 

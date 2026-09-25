@@ -1,0 +1,71 @@
+id: no-known-value-widening
+language: TypeScript
+severity: hint
+message: "const initialized from an object literal, widened by a Record<...> annotation — prefer inference or 'satisfies'"
+note: |
+  Narrowed port of dmmulroy/anti-slop's `no-known-value-widening`
+  (src/rules/no-known-value-widening.ts, MIT). Upstream is a full
+  data-flow rule: it resolves `const` variable references transitively,
+  walks return statements, assignments, property definitions, and type
+  assertions, and flags ANY syntactically-known value (object/array/
+  function/literal, or a stable `const` binding that resolves to one)
+  flowing into an explicitly broad target type (`unknown`, `object`, an
+  open `Record<...>`/mapped-type dictionary, or an anonymous object
+  type). None of that data-flow — resolving a variable back to its
+  declaration, walking a return path — is something ast-grep's
+  structural matcher does; building a fake version of it would be
+  exactly the "vacuous guard" failure mode this repo's own review
+  process screens for.
+
+  This port keeps ONE syntactically self-contained sub-case: a `const`
+  declared with an object-literal initializer AND a `Record<K, V>`
+  annotation, matched in the same statement (`const x: Record<K, V> =
+  { ... }`). That is exactly what the 2026-08-19 audit measured (87
+  hits repo-wide vs. only 30 `satisfies` uses) and is the shape upstream
+  cites as the primary example: the object literal's own key/value
+  types are already known at the declaration site, and `Record<K, V>`
+  throws that evidence away in favor of a uniform key type — `satisfies
+  Record<K, V>` (or no annotation at all, letting inference stand) keeps
+  the literal's precise keys and value types AND still gets the
+  dictionary-shape check.
+
+  Everything else upstream covers — return-type widening, assignment
+  widening, transitively-resolved `const` references, `as`/type-literal
+  targets — is out of scope for this port. Shipped at `hint`: this is a
+  readability/precision rule, not a defect-prevention one (this repo's
+  audit explicitly ranked it below the top 5 for that reason), and an
+  annotated `Record<K, V>` initializer is frequently deliberate (a
+  lookup table whose value type is genuinely uniform across keys).
+  Self-scan note: do NOT try to make pi-lens's own tree clean against
+  this rule; the adopting PR records the 2026-08-19 hit count instead.
+
+  2026-08-20 (refs #1727, #1777): CONSIDERED for promotion to `error`,
+  KEPT at `hint`. AGENTS.md's severity policy admits a rule to `error`
+  only with a documented zero-false-positive audit, and `error` is the
+  only tier that maps to semantic `blocking`, so promoting it stops an
+  agent mid-turn on any file carrying a hit. Four-corpus census, ast-grep
+  CLI 0.45:
+
+  | corpus | hits |
+  |---|---:|
+  | pi-lens `clients/` | 90 |
+  | pi-lens `tests/` | 55 |
+  | pi core `packages/` | 74 (64 outside test paths) |
+  | opencode `packages/` | 193 (173) |
+  | oh-my-pi `packages/` | 828 (687) |
+
+  Verdict: no structural narrowing found. Every one of the 90 `clients/`
+  hits is a module-level lookup table whose value type genuinely IS
+  uniform (`LANGUAGE_TO_GRAMMAR`, `DELIVERY_SURFACES`, `EMOJI`,
+  `TREE_SITTER_EXT_TO_LANG`) — the exact deliberate use this note already
+  names. `Record<K, V>` on a lookup table and `Record<K, V>` on a value
+  whose keys were known and thrown away are the SAME syntax; the
+  difference is intent, which no relational constraint can read. Splitting
+  by `export const` at module scope versus a local `const` was probed and
+  rejected: it would encode "module-level tables are fine" as a rule of
+  the language, which it is not. Promotion needs a `satisfies` migration
+  of pi-lens's own tables, not a rule change.
+rule:
+  pattern:
+    context: "const $NAME: Record<$K, $V> = { $$$PROPS };"
+    selector: variable_declarator

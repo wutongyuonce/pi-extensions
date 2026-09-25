@@ -4,6 +4,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { spawnSync } from "node:child_process";
 import { describe, it } from "node:test";
+import { fileURLToPath } from "node:url";
 import {
 	ASYNC_DIR,
 	CHAIN_RUNS_DIR,
@@ -78,6 +79,74 @@ describe("shared temp paths", () => {
 		}
 	});
 
+	it("isolates agent-dir profile writes from an inherited PI_CODING_AGENT_DIR", () => {
+		const fixture = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-agent-isolation-"));
+		const tempRoot = path.join(fixture, "temp-root");
+		const callerAgentDir = path.join(fixture, "caller-agent");
+		try {
+			const loaderUrl = new URL("../support/isolated-temp-root.mjs", import.meta.url).href;
+			const profilesUrl = new URL("../../src/profiles/profiles.ts", import.meta.url).href;
+			const utilsUrl = new URL("../../src/shared/utils.ts", import.meta.url).href;
+			const script = `
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import { applySubagentProfile, getSubagentProfilesDir } from ${JSON.stringify(profilesUrl)};
+import { getAgentDir } from ${JSON.stringify(utilsUrl)};
+
+const profilesDir = getSubagentProfilesDir();
+fs.mkdirSync(profilesDir, { recursive: true });
+fs.writeFileSync(path.join(profilesDir, "isolated.json"), JSON.stringify({ subagents: { agentOverrides: { worker: { thinking: "high" } } } }));
+const result = applySubagentProfile("isolated");
+console.log(JSON.stringify({ agentDir: getAgentDir(), profilePath: path.join(profilesDir, "isolated.json"), settingsPath: result.settingsPath, tempDir: os.tmpdir(), testParentPid: process.env.PI_SUBAGENTS_TEST_PARENT_PID }));
+`;
+			const env = {
+				...process.env,
+				PI_CODING_AGENT_DIR: callerAgentDir,
+				PI_SUBAGENTS_TEMP_ROOT: tempRoot,
+			};
+			delete env.PI_SUBAGENTS_TEST_LOADER;
+			const result = spawnSync(process.execPath, [
+				"--experimental-strip-types",
+				"--import", loaderUrl,
+				"--input-type=module",
+				"--eval", script,
+			], {
+				cwd: process.cwd(),
+				encoding: "utf-8",
+				env,
+			});
+			assert.equal(result.status, 0, result.stderr);
+			const output = JSON.parse(result.stdout.trim()) as { agentDir: string; profilePath: string; settingsPath: string; tempDir: string; testParentPid: string };
+			const isolatedAgentDir = path.join(tempRoot, "home", ".pi", "agent");
+			assert.equal(output.agentDir, isolatedAgentDir);
+			assert.equal(output.profilePath, path.join(isolatedAgentDir, "profiles", "pi-subagents", "isolated.json"));
+			assert.equal(output.settingsPath, path.join(isolatedAgentDir, "settings.json"));
+			assert.equal(output.tempDir, tempRoot);
+			assert.equal(output.testParentPid, String(result.pid));
+			if (process.platform === "darwin") assert.equal(fs.existsSync(path.join(tempRoot, ".metadata_never_index")), true);
+			assert.equal(fs.existsSync(output.profilePath), true);
+			assert.equal(fs.existsSync(output.settingsPath), true);
+			assert.equal(fs.existsSync(callerAgentDir), false);
+		} finally {
+			fs.rmSync(fixture, { recursive: true, force: true });
+		}
+	});
+
+	it("records a nested test process as the runner parent", () => {
+		const loaderUrl = new URL("../support/isolated-temp-root.mjs", import.meta.url).href;
+		const result = spawnSync(process.execPath, [
+			"--import", loaderUrl,
+			"--input-type=module",
+			"--eval", "console.log(process.env.PI_SUBAGENTS_TEST_PARENT_PID)",
+		], {
+			encoding: "utf-8",
+			env: { ...process.env, PI_SUBAGENTS_TEST_LOADER: "loaded", PI_SUBAGENTS_TEST_PARENT_PID: String(process.pid) },
+		});
+		assert.equal(result.status, 0, result.stderr);
+		assert.equal(result.stdout.trim(), String(result.pid));
+	});
+
 	it("anchors shared temp directories under one scoped root", () => {
 		assert.equal(path.dirname(RESULTS_DIR), TEMP_ROOT_DIR);
 		assert.equal(path.dirname(ASYNC_DIR), TEMP_ROOT_DIR);
@@ -88,6 +157,27 @@ describe("shared temp paths", () => {
 		assert.equal(path.basename(ASYNC_DIR), "async-subagent-runs");
 		assert.equal(path.basename(CHAIN_RUNS_DIR), "chain-runs");
 		assert.equal(path.basename(TEMP_ARTIFACTS_DIR), "artifacts");
+	});
+
+	it("stops a test runner before consuming config when its test parent is gone", () => {
+		const configPath = path.join(os.tmpdir(), "orphan-check.json");
+		fs.writeFileSync(configPath, "{}", "utf-8");
+		try {
+			const result = spawnSync(process.execPath, [
+				"--experimental-strip-types",
+				"--import", new URL("../support/register-loader.mjs", import.meta.url).href,
+				fileURLToPath(new URL("../../src/runs/background/subagent-runner-bootstrap.ts", import.meta.url)),
+				configPath,
+			], {
+				env: { ...process.env, PI_SUBAGENTS_TEST_PARENT_PID: "2147483647" },
+				encoding: "utf-8",
+				timeout: 10_000,
+			});
+			assert.equal(result.status, 1, result.stderr);
+			assert.equal(fs.existsSync(configPath), true);
+		} finally {
+			fs.rmSync(configPath, { force: true });
+		}
 	});
 
 	it("writes async config files under the same scoped temp root", () => {

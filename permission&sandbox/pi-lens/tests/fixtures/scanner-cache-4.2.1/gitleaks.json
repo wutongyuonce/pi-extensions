@@ -1,0 +1,22 @@
+{
+  "success": true,
+  "scannedAt": "2026-08-18T07:00:00.000Z",
+  "analyzed": true,
+  "summary": "1 finding",
+  "findings": [
+    {
+      "ruleId": "aws-access-token",
+      "description": "Identified a pattern that may indicate AWS credentials",
+      "file": "__PROJECT_ROOT__/src/config.ts",
+      "startLine": 397,
+      "endLine": 397,
+      "match": "AKIA****************",
+      "secret": "AKIA****************",
+      "tags": ["key", "AWS"],
+      "commit": "",
+      "author": "",
+      "date": "",
+      "pathStatus": "tracked"
+    }
+  ]
+}

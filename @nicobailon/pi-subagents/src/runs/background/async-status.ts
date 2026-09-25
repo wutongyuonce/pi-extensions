@@ -3,7 +3,7 @@ import * as path from "node:path";
 import { formatDuration, formatModelThinking, formatTokens, shortenPath } from "../../shared/formatters.ts";
 import { previewDisplayText } from "../../shared/display-text.ts";
 import { formatActivityLabel, formatParallelOutcome } from "../../shared/status-format.ts";
-import { type ActivityState, type AsyncJobStep, type AsyncParallelGroupStatus, type AsyncStatus, type CostSummary, type Details, type HostStepNodeV1, type HostStepState, type LaunchResolvedChildExtensionsV1, type RuntimeAcknowledgedChildExtensionsV1, type NestedRunSummary, type SteeringStatus, type SubagentRunMode, type TimeoutRecoveryProjection, type TokenUsage, type TurnBudgetState, type UsageBudgetState, type WorktreeNaming, type WorkflowPreflightV1, type WorkflowGraphSnapshot } from "../../shared/types.ts";
+import { type ActivityState, type AsyncJobStep, type AsyncParallelGroupStatus, type AsyncStatus, type CostSummary, type Details, type HostStepNode, type HostStepState, type LaunchResolvedChildExtensions, type RuntimeAcknowledgedChildExtensions, type NestedRunSummary, type SteeringStatus, type SubagentRunMode, type TimeoutRecoveryProjection, type TokenUsage, type TurnBudgetState, type UsageBudgetState, type WorktreeNaming, type WorkflowPreflight, type WorkflowGraphSnapshot } from "../../shared/types.ts";
 import type { ResolvedSubagentCapabilityCeiling, SubagentCapabilityAudit } from "../shared/capability-ceiling.ts";
 import { readStatus } from "../../shared/utils.ts";
 import { attachRootChildrenToSteps, buildNestedRouteIndex, findNestedRouteForRootId, type NestedRoute, projectNestedEvents } from "../shared/nested-events.ts";
@@ -24,6 +24,9 @@ import { validateAsyncStatusLaneMetadata } from "../shared/lane-metadata.ts";
 import { formatWorkflowPreflightPlanSummary, formatWorkflowPreflightWarningSummary } from "../../workflows/workflow-preflight.ts";
 import { workflowGraphStageNodes } from "../shared/workflow-graph.ts";
 import { formatTimeoutRecoveryLines, projectTimeoutRecovery } from "../shared/mutation-evidence.ts";
+import { formatWorkflowChecklistText, projectWorkflowChecklist } from "../../workflows/workflow-checklist.ts";
+import type { RawDrainStatusObserver } from "../shared/readonly-drain-observation.ts";
+import { childWatchdogProgressForModel } from "../../watchdog/child-status.ts";
 
 interface AsyncRunStepSummary {
 	index: number;
@@ -46,6 +49,7 @@ interface AsyncRunStepSummary {
 	structured?: boolean;
 	status: AsyncJobStep["status"];
 	runner?: AsyncJobStep["runner"];
+	externalProcess?: AsyncJobStep["externalProcess"];
 	activityState?: ActivityState;
 	lastActivityAt?: number;
 	currentTool?: string;
@@ -64,7 +68,7 @@ interface AsyncRunStepSummary {
 	model?: string;
 	contextLimit?: number;
 	thinking?: string;
-	attemptedModels?: string[];
+	requestedModel?: string;
 	sessionFile?: string;
 	transcriptPath?: string;
 	error?: string;
@@ -81,8 +85,8 @@ interface AsyncRunStepSummary {
 	effects?: AsyncJobStep["effects"];
 	processTerminal?: AsyncJobStep["processTerminal"];
 	timeoutRecovery?: TimeoutRecoveryProjection;
-	launchResolvedExtensions?: LaunchResolvedChildExtensionsV1;
-	runtimeAcknowledgedExtensions?: RuntimeAcknowledgedChildExtensionsV1;
+	launchResolvedExtensions?: LaunchResolvedChildExtensions;
+	runtimeAcknowledgedExtensions?: RuntimeAcknowledgedChildExtensions;
 	capabilityCeiling?: ResolvedSubagentCapabilityCeiling;
 	capabilityAudit?: SubagentCapabilityAudit;
 	children?: NestedRunSummary[];
@@ -121,7 +125,7 @@ export interface AsyncRunSummary {
 	chainStepCount?: number;
 	pendingAppends?: number;
 	parallelGroups?: AsyncParallelGroupStatus[];
-	hostSteps?: HostStepNodeV1[];
+	hostSteps?: HostStepNode[];
 	workflowGraph?: AsyncStatus["workflowGraph"];
 	steps: AsyncRunStepSummary[];
 	sessionDir?: string;
@@ -134,8 +138,8 @@ export interface AsyncRunSummary {
 	nestedWarnings?: string[];
 	processTerminal?: AsyncStatus["processTerminal"];
 	runFanoutBudget?: AsyncStatus["runFanoutBudget"];
-	launchResolvedExtensions?: LaunchResolvedChildExtensionsV1;
-	runtimeAcknowledgedExtensions?: RuntimeAcknowledgedChildExtensionsV1;
+	launchResolvedExtensions?: LaunchResolvedChildExtensions;
+	runtimeAcknowledgedExtensions?: RuntimeAcknowledgedChildExtensions;
 	capabilityCeiling?: ResolvedSubagentCapabilityCeiling;
 	capabilityAudit?: SubagentCapabilityAudit;
 	parentWorkflowRunId?: string;
@@ -143,7 +147,7 @@ export interface AsyncRunSummary {
 	lane?: AsyncStatus["lane"];
 	workflow?: Details["workflow"];
 	workflowChildren?: Details["workflowChildren"];
-	preflight?: WorkflowPreflightV1;
+	preflight?: WorkflowPreflight;
 }
 
 interface AsyncRunListOptions {
@@ -346,6 +350,7 @@ function statusToSummary(asyncDir: string, status: AsyncStatus & { cwd?: string 
 			...(step.structured ? { structured: step.structured } : {}),
 			status: step.status,
 			...(step.runner ? { runner: step.runner } : {}),
+			...(step.externalProcess ? { externalProcess: step.externalProcess } : {}),
 			...(stepActivityState ? { activityState: stepActivityState } : {}),
 			...(stepLastActivityAt ? { lastActivityAt: stepLastActivityAt } : {}),
 			...(step.currentTool ? { currentTool: step.currentTool } : {}),
@@ -365,7 +370,7 @@ function statusToSummary(asyncDir: string, status: AsyncStatus & { cwd?: string 
 			...(step.contextLimit !== undefined ? { contextLimit: step.contextLimit } : {}),
 			...(step.thinking ? { thinking: step.thinking } : {}),
 			...(step.thinkingCeiling ? { thinkingCeiling: step.thinkingCeiling } : {}),
-			...(step.attemptedModels ? { attemptedModels: step.attemptedModels } : {}),
+			...(step.requestedModel ? { requestedModel: step.requestedModel } : {}),
 			...(step.sessionFile ? { sessionFile: step.sessionFile } : {}),
 			...(step.transcriptPath ? { transcriptPath: step.transcriptPath } : {}),
 			...(step.error ? { error: step.error } : {}),
@@ -385,7 +390,7 @@ function statusToSummary(asyncDir: string, status: AsyncStatus & { cwd?: string 
 			...(step.execution ? { execution: step.execution } : {}),
 			...(step.review ? { review: step.review } : {}),
 			...(step.effects ? { effects: step.effects } : {}),
-			...(step.watchdog ? { watchdog: step.watchdog } : {}),
+			...(step.watchdog ? { watchdog: childWatchdogProgressForModel(step.watchdog) } : {}),
 			...(step.processTerminal ? { processTerminal: sanitizeProcessTerminal(step.processTerminal, { runId: status.runId, runnerProcessInstanceId: step.processTerminal.runnerProcessInstanceId }, `${path.join(asyncDir, "status.json")} step ${index}`) } : {}),
 			...(timeoutRecovery ? { timeoutRecovery } : {}),
 			...(step.capabilityCeiling ? { capabilityCeiling: step.capabilityCeiling } : {}),
@@ -480,7 +485,7 @@ function sortRuns(runs: AsyncRunSummary[]): AsyncRunSummary[] {
 	});
 }
 
-export function listAsyncRuns(asyncDirRoot: string, options: AsyncRunListOptions = {}): AsyncRunSummary[] {
+export function listAsyncRuns(asyncDirRoot: string, options: AsyncRunListOptions = {}, observeStatus?: RawDrainStatusObserver): AsyncRunSummary[] {
 	let entries: string[];
 	const activeEntries = new Set<string>();
 	const wantsActive = options.states === undefined || options.states.some(isActiveAsyncState);
@@ -507,6 +512,7 @@ export function listAsyncRuns(asyncDirRoot: string, options: AsyncRunListOptions
 						indexed.add(entry);
 						activeEntries.add(entry);
 					} else {
+						observeStatus?.(null);
 						updateActiveRunIndex(path.join(asyncDirRoot, entry), "failed");
 					}
 				}
@@ -518,6 +524,7 @@ export function listAsyncRuns(asyncDirRoot: string, options: AsyncRunListOptions
 		}
 	} catch (error) {
 		if (isNotFoundError(error)) return [];
+		observeStatus?.(null);
 		throw new Error(`Failed to list async runs in '${asyncDirRoot}': ${getErrorMessage(error)}`, {
 			cause: error instanceof Error ? error : undefined,
 		});
@@ -541,22 +548,35 @@ export function listAsyncRuns(asyncDirRoot: string, options: AsyncRunListOptions
 		const asyncDir = path.join(asyncDirRoot, entry);
 		let status: (AsyncStatus & { cwd?: string }) | null;
 		try {
+			// Reconciliation can rewrite state; session-scoped discovery does not own foreign runs.
+			if (options.sessionId !== undefined) {
+				const stored = readStatus(asyncDir);
+				if (stored && stored.sessionId !== options.sessionId) {
+					observeStatus?.(stored);
+					continue;
+				}
+			}
 			const reconciliation = options.reconcile === false
 				? undefined
-				: reconcileAsyncRun(asyncDir, { resultsDir: options.resultsDir, kill: options.kill, now: options.now });
+				: reconcileAsyncRun(asyncDir, { resultsDir: options.resultsDir, kill: options.kill, now: options.now }, observeStatus);
 			status = (reconciliation?.status ?? readStatus(asyncDir)) as (AsyncStatus & { cwd?: string }) | null;
+			if (options.reconcile === false) observeStatus?.(status);
 		} catch (error) {
+			observeStatus?.(null);
 			if (!activeEntries.has(entry) || !isAsyncStatusIsolationError(asyncDir, error)) throw error;
 			isolateCorruptActiveRun(asyncDir, entry, error, options.now);
 			continue;
 		}
 		if (!status) {
+			observeStatus?.(null);
 			if (activeEntries.has(entry)) updateActiveRunIndex(asyncDir, "failed");
 			continue;
 		}
 		if (activeEntries.has(entry) && !isActiveAsyncState(status.state)) {
 			const processTerminal = readProcessTerminal(asyncDir, { runId: status.runId, runnerProcessInstanceId: status.processTerminal?.runnerProcessInstanceId });
-			if (processTerminal?.state === "observed" || (activeRunMarkerAgeMs(asyncDir, options.now?.()) ?? 0) > DEFAULT_STALE_TERMINAL_ACTIVE_MARKER_MS) releaseActiveRunIndex(asyncDir);
+			if (processTerminal?.state === "observed" || (activeRunMarkerAgeMs(asyncDir, options.now?.()) ?? 0) > DEFAULT_STALE_TERMINAL_ACTIVE_MARKER_MS) {
+				updateActiveRunIndex(asyncDir, status.state, status.toolCallId, { terminalIndexBeforeRelease: true });
+			}
 		}
 		if (status.displayDismissedAt !== undefined) continue;
 		// Filter before the nested-route lookup: the lookup builds an index over
@@ -572,6 +592,7 @@ export function listAsyncRuns(asyncDirRoot: string, options: AsyncRunListOptions
 				nestedRoute = resolveNestedRoute(status.runId || path.basename(asyncDir));
 				if (nestedRoute) reconcileNestedAsyncDescendants(nestedRoute, { resultsDir: options.resultsDir, kill: options.kill, now: options.now });
 			} catch (error) {
+				observeStatus?.(null);
 				nestedWarnings.push(`Nested status unavailable: ${getErrorMessage(error)}`);
 			}
 		}
@@ -579,6 +600,7 @@ export function listAsyncRuns(asyncDirRoot: string, options: AsyncRunListOptions
 		try {
 			summary = statusToSummary(asyncDir, status, nestedWarnings, nestedRoute);
 		} catch (error) {
+			observeStatus?.(null);
 			if (!activeEntries.has(entry) || !isAsyncStatusIsolationError(asyncDir, error)) throw error;
 			isolateCorruptActiveRun(asyncDir, entry, error, options.now);
 			continue;
@@ -711,6 +733,17 @@ export function formatAsyncRunList(runs: AsyncRunSummary[], heading = "Active as
 		if (run.preflight) lines.push(formatWorkflowPreflightPlanSummary(run.preflight, { indent: "  " }));
 		const preflightWarning = formatWorkflowPreflightWarningSummary(run.workflow?.preflightWarnings, { indent: "  " });
 		if (preflightWarning) lines.push(preflightWarning);
+		if (run.mode === "workflow") {
+			const checklist = projectWorkflowChecklist({
+				graph: run.workflowGraph,
+				steps: run.steps,
+				hostSteps: run.hostSteps,
+				preflight: run.preflight,
+				trace: run.workflow?.trace,
+				now: run.lastUpdate ?? run.endedAt ?? Date.now(),
+			});
+			lines.push(...formatWorkflowChecklistText(checklist, "  ", { includeItems: false }));
+		}
 		for (const step of run.steps) {
 			lines.push(`  ${formatStepLine(step)}`);
 			lines.push(...formatTimeoutRecoveryLines(step.timeoutRecovery, "    "));

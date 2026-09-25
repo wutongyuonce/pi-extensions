@@ -916,6 +916,7 @@ describe("subagents-view registration", () => {
 				registerShortcut(_shortcut: string, opts: any) {
 					shortcutHandler = opts.handler;
 				},
+				sendUserMessage() {},
 				on() {},
 			} as any,
 			mockRuntime,

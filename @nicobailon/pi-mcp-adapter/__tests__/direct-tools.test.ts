@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { DIRECT_TOOLS_ADVISORY_THRESHOLD, buildProxyDescription, resolveDirectTools } from "../direct-tools.ts";
+import { DIRECT_TOOLS_ADVISORY_THRESHOLD, buildProxyDescription, getLargeDirectToolsAdvisory, resolveDirectTools } from "../direct-tools.ts";
 import {
   computeServerHash,
   getMissingConfiguredDirectToolServers,
@@ -375,7 +375,7 @@ describe("direct tool metadata bootstrap", () => {
     ]);
   });
 
-  it("keeps duplicate direct names reserved by failed-backoff servers", () => {
+  it("keeps duplicate direct names fail-closed when one server is in backoff", () => {
     vi.spyOn(console, "warn").mockImplementation(() => {});
     const config: McpConfig = {
       settings: { toolPrefix: "none", directTools: true, warnOnLargeDirectTools: false },
@@ -402,9 +402,7 @@ describe("direct tool metadata bootstrap", () => {
       },
     };
 
-    expect(resolveDirectTools(config, cache, "none").map(tool => [tool.serverName, tool.prefixedName])).toEqual([
-      ["failed", "search"],
-    ]);
+    expect(resolveDirectTools(config, cache, "none")).toEqual([]);
     expect(resolveDirectTools(config, cache, "none", undefined, new Set(["failed"]))).toEqual([]);
   });
 
@@ -682,7 +680,7 @@ describe("excludeTools filtering", () => {
     ]);
   });
 
-  it("keeps the first raw tool when sanitized live metadata names collide", () => {
+  it("omits all raw tools when sanitized live metadata names collide", () => {
     const { metadata } = buildToolMetadata(
       [
         { name: "namespace.tool", description: "Dotted" },
@@ -695,13 +693,10 @@ describe("excludeTools filtering", () => {
       "server",
     );
 
-    expect(metadata.map((tool) => [tool.name, tool.originalName, tool.description])).toEqual([
-      ["demo_namespace_tool", "namespace.tool", "Dotted"],
-      ["demo_read_namespace_tool", "read_namespace.tool", "Tool before colliding resource"],
-    ]);
+    expect(metadata).toEqual([]);
   });
 
-  it("keeps the first raw tool when sanitized cached metadata names collide", () => {
+  it("omits all raw tools when sanitized cached metadata names collide", () => {
     const reconstructed = reconstructToolMetadata(
       "demo",
       {
@@ -718,10 +713,21 @@ describe("excludeTools filtering", () => {
       { command: "npx", args: ["-y", "demo"] },
     );
 
-    expect(reconstructed.map((tool) => [tool.name, tool.originalName, tool.description])).toEqual([
-      ["demo_namespace_tool", "namespace.tool", "Dotted"],
-      ["demo_read_namespace_tool", "read_namespace.tool", "Tool before colliding resource"],
-    ]);
+    expect(reconstructed).toEqual([]);
+  });
+
+  it("does not register either owner of a self-prefix collision", () => {
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const definition = { command: "demo", directTools: true };
+    const config = { mcpServers: { demo: definition } };
+    const cache: MetadataCache = { version: 1, servers: { demo: {
+      configHash: computeServerHash(definition),
+      cachedAt: Date.now(),
+      tools: [{ name: "search" }, { name: "demo_search" }],
+      resources: [],
+    } } };
+
+    expect(resolveDirectTools(config, cache, "server")).toEqual([]);
   });
 
   it("filters excluded tools during direct tool registration from cache", () => {
@@ -815,9 +821,8 @@ describe("excludeTools filtering", () => {
     expect(resolveDirectTools(config, cache, "server").map((spec) => [spec.serverName, spec.prefixedName])).toEqual([
       ["my_server", "my_server_get"],
       ["my-server", "my-server_get"],
-      ["my server", "my_20_server_get"],
     ]);
-    expect(warn).toHaveBeenCalledWith('MCP: skipping duplicate direct tool "my_20_server_get" from "my_20_server"');
+    expect(warn).toHaveBeenCalledWith('MCP: skipping colliding direct name "my_20_server_get" from "my server", "my_20_server"');
   });
 
   it("honors per-server toolPrefix during direct tool registration from cache", () => {
@@ -850,7 +855,7 @@ describe("excludeTools filtering", () => {
     expect(specs.map((spec) => spec.prefixedName)).toEqual(["github_search"]);
   });
 
-  it("warns by default without capping when resolved direct tools exceed the README threshold", () => {
+  it("resolves tools deterministically and reports the advisory at the eager-tool threshold", () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     const tools = Array.from({ length: DIRECT_TOOLS_ADVISORY_THRESHOLD }, (_, index) => ({
       name: `tool_${index}`,
@@ -880,8 +885,11 @@ describe("excludeTools filtering", () => {
     const specs = resolveDirectTools(config, cache, "server");
 
     expect(specs).toHaveLength(DIRECT_TOOLS_ADVISORY_THRESHOLD);
-    expect(warn).toHaveBeenCalledWith(expect.stringContaining("75+ direct tools"));
-    expect(warn).toHaveBeenCalledWith(expect.stringContaining("settings.warnOnLargeDirectTools to false"));
+    expect(warn).not.toHaveBeenCalled();
+    expect(getLargeDirectToolsAdvisory(config, specs)).toEqual(expect.stringContaining("75+ direct tools"));
+    expect(getLargeDirectToolsAdvisory(config, specs)).toEqual(expect.stringContaining("settings.warnOnLargeDirectTools to false"));
+    expect(getLargeDirectToolsAdvisory(config, specs.slice(0, -1))).toBeUndefined();
+    expect(getLargeDirectToolsAdvisory(config, specs.map((spec) => ({ ...spec, lazy: true })))).toBeUndefined();
   });
 
   it("suppresses the large direct-tools advisory when configured", () => {
@@ -916,6 +924,7 @@ describe("excludeTools filtering", () => {
 
     expect(specs).toHaveLength(DIRECT_TOOLS_ADVISORY_THRESHOLD);
     expect(warn).not.toHaveBeenCalled();
+    expect(getLargeDirectToolsAdvisory(config, specs)).toBeUndefined();
   });
 
   it("filters included tools during direct tool registration from cache", () => {

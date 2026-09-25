@@ -1,0 +1,9 @@
+# Tool-smoke fixture rule (#1937). Self-contained so the fixture needs no
+# package download: `vale sync` is a network step, and a capture must be
+# reproducible offline.
+extends: existence
+message: "Drop 'please' — state the instruction directly."
+level: error
+ignorecase: true
+tokens:
+  - please

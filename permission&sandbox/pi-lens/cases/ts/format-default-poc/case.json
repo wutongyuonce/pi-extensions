@@ -1,0 +1,25 @@
+{
+	"name": "ts-format-default-poc",
+	"description": "Validate TypeScript smart-default formatting in a no-config workspace while preserving pipeline/dispatch behavior.",
+	"model": "opencode/minimax-m2.5-free",
+	"startupMode": "full",
+	"allowedTools": ["read", "write", "edit", "bash"],
+	"expectedFiles": ["src/main.ts"],
+	"expectedToolCalls": ["read", "edit"],
+	"forbiddenChangedFiles": ["package.json", "tsconfig.json"],
+	"expectedRuntimeMarkers": ["modified by auto-format/fix"],
+	"expectedWorkflow": {
+		"readBeforeFirstMutation": true,
+		"autoformatNoticeSeen": true,
+		"fileChangedNoticeSeen": true,
+		"readGuardTriggered": false,
+		"lspUsed": false
+	},
+	"maxFailedToolCalls": 1,
+	"maxToolCallCount": 12,
+	"allowedFailureKinds": [
+		"file_changed_notice",
+		"edit_mismatch",
+		"autofix_notice"
+	]
+}

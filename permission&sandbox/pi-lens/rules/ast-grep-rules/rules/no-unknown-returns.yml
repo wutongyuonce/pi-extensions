@@ -1,0 +1,106 @@
+id: no-unknown-returns
+language: TypeScript
+severity: error
+message: "Function returns 'unknown' — parse the value at its boundary and return a named domain type"
+metadata:
+  category: pi-lens-self-scan
+note: |
+  Adapted from dmmulroy/anti-slop's `no-unknown-returns`
+  (src/rules/no-unknown-returns.ts, MIT). Upstream also resolves
+  `Promise<unknown>` and same-file type aliases that resolve to
+  `unknown`; both are dropped here — same-file alias/generic resolution
+  is out of ast-grep's reach (the `no-bare-object-param.yml` precedent).
+
+  Shipped at `hint`, not `error`: AGENTS.md smell 3 records that this
+  arm was dropped from `no-unknown-laundering.yml` after an FP-scan
+  found 192 legitimate `unknown` return types in pi-lens's own tree
+  (parsers, and a `ProxyHandler.get` trap whose signature TypeScript
+  itself requires). That's a finding about this repo's own code, not a
+  reason to withhold the pattern from the catalog, so it ships as a
+  discoverable hint. Self-scan note: do NOT try to make pi-lens's own
+  tree clean against this rule (#1718's baseline problem); the adopting
+  PR records the 2026-08-19 hit count instead.
+
+  Scope: a direct `unknown` return-type annotation, matched
+  structurally. Most function-like nodes wrap their return type in a
+  `type_annotation` node that is a DIRECT child of the function node
+  (function declaration/expression, arrow function, method signature/
+  definition, call/construct signature) — that is exactly the
+  return-type position; a parameter's `type_annotation` is nested one
+  level deeper, inside `required_parameter`/`optional_parameter`, so
+  the two never collide. `function_type` (`(x: T) => R`, used in
+  function-type aliases) was the one exception in
+  tree-sitter-typescript's grammar: its return type sits directly after
+  `=>` with no `type_annotation` wrapper at all, so it needed its own
+  branch. The #1824 scope correction removed that branch because callback
+  result types describe what callers consume, not an unparsed value crossing
+  a boundary. See the 2026-08-20 #1824 entry below for why that branch is
+  now gone.
+
+  2026-08-20 (refs #1727, #1777): CONSIDERED for promotion to `error`,
+  KEPT at `hint`. Four-corpus census, ast-grep CLI 0.45:
+
+  | corpus | hits |
+  |---|---:|
+  | pi-lens `clients/` | 19 |
+  | pi-lens `tests/` | 58 |
+  | pi core `packages/` | 17 (14 outside test paths) |
+  | opencode `packages/` | 111 (105) |
+  | oh-my-pi `packages/` | 288 (226) |
+
+  Verdict: the closest of the six to promotable, and still not there. A
+  probed narrowing — drop the `function_type` arm (a callback TYPE
+  declaring `=> unknown` says "the caller ignores my result", not "a
+  boundary went unparsed") plus a parser-name suppression — takes pi-lens
+  from 77 hits to 16, and `clients/` from 19 to 3. The residual 3 are
+  generic pass-through wrappers (`clients/extension-log.ts`'s console
+  capture and proxy wrapper) whose return value genuinely IS the wrapped
+  function's, so `unknown` is correct. Reaching zero needed a third
+  suppression shaped around those three sites specifically, which is
+  overfitting to one tree, so nothing was changed here. The
+  `function_type` scope question is worth its own issue on its own merits;
+  it is a scope correction, not a tier change, and this PR does not make
+  it.
+
+  2026-08-20 (#1824, refs #1727, #1815, review round 1 N4): dropped
+  the `function_type` arm named above. A TYPE-POSITION `unknown`
+  return is a legitimate contract ("the caller ignores my result"),
+  not a value-position return that skipped parsing at a boundary. This
+  is a scope correction, not a severity change. Same scan setup,
+   before → after: pi-lens full tree 79 → 23; pi-lens `clients/` +
+   `index.ts` 21 → 9 (see the adopting PR for the four-corpus
+   before/after on the same narrow scope). The value-position arm below
+   is unchanged and is what the rule now exclusively targets.
+  2026-08-20 (refs #1856): PROMOTED from `hint` to `error` after the
+  remaining value-position returns were given named domain types or made
+  generic so their pass-through contract stays exact. The pi-lens
+  self-scan is clean at promotion time.
+  Test paths stay excluded: mocks and interleaving controls intentionally
+  return opaque sentinel values, while this rule governs production
+  boundaries whose domain shape is knowable.
+ignores:
+  - "**/*.test.ts"
+  - "**/*.test.tsx"
+  - "**/*.test.mts"
+  - "**/*.test.cts"
+  - "**/*.spec.ts"
+  - "**/*.spec.tsx"
+  - "**/tests/**"
+  - "**/test/**"
+  - "**/__tests__/**"
+rule:
+  kind: predefined_type
+  regex: "^unknown$"
+  inside:
+    kind: type_annotation
+    inside:
+      any:
+        - kind: function_declaration
+        - kind: function_expression
+        - kind: generator_function_declaration
+        - kind: arrow_function
+        - kind: method_signature
+        - kind: method_definition
+        - kind: construct_signature
+        - kind: constructor_type
+        - kind: call_signature

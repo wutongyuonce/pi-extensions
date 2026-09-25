@@ -1,3 +1,5 @@
+import { buildSynthesisPages } from "./synthesis-pages.mjs";
+
 // Deterministic compact input packet for deep-research final-audit.
 //
 // This helper performs mechanical joins only: it copies plan metadata,
@@ -53,25 +55,59 @@ function compactStrings(values, limit = 5) {
 	return out;
 }
 
-function truncateText(value, limit = 240) {
-	const text = stringOf(value);
-	if (!text) return undefined;
-	const normalized = text.replace(/\s+/g, " ").trim();
-	if (normalized.length <= limit) return normalized;
-	return `${normalized.slice(0, Math.max(0, limit - 1)).trimEnd()}…`;
+const EVIDENCE_FIELDS = [
+	"source",
+	"url",
+	"sourceRef",
+	"file",
+	"repo",
+	"line",
+	"lineStart",
+	"lineEnd",
+	"lines",
+	"excerptLocation",
+	"dateOrYear",
+	"quote",
+	"relevance",
+	"matchType",
+	"matchedTerms",
+	"missingTerms",
+	"coverageRatio",
+	"candidateOnly",
+];
+
+function compactEvidenceRow(row) {
+	const item = asObject(row);
+	const result = {};
+	for (const field of EVIDENCE_FIELDS) {
+		const value = item[field];
+		if (typeof value === "string" && value.trim()) result[field] = value;
+		else if (typeof value === "number" && Number.isFinite(value))
+			result[field] = value;
+		else if (typeof value === "boolean") result[field] = value;
+		else if (Array.isArray(value)) result[field] = compactStrings(value, 12);
+	}
+	return result;
+}
+
+function compactEvidenceRows(rows) {
+	return asArray(rows).slice(0, 5).map(compactEvidenceRow);
 }
 
 function compactClaimDigest(claim) {
 	const digest = asObject(claim);
+	const evidence = compactEvidenceRows(digest.evidence);
 	return {
 		id: idOf(digest),
 		claim: stringOf(digest.claim),
 		status: stringOf(digest.status ?? digest.verdict),
 		confidence: stringOf(digest.confidence),
 		factSlotIds: compactStrings(digest.factSlotIds, 12),
-		sourceRefs: compactStrings(digest.sourceRefs, 8),
-		sourceUrls: compactStrings(digest.sourceUrls, 8),
-		...(digest.verifierOwner ? { verifierOwner: compactOwner(digest.verifierOwner) } : {}),
+		sourceRefs: compactStrings(digest.sourceRefs, Infinity),
+		sourceUrls: compactStrings(digest.sourceUrls, Infinity),
+		...(digest.verifierOwner
+			? { verifierOwner: compactOwner(digest.verifierOwner) }
+			: {}),
 		support: stringOf(
 			digest.verdictDigest?.support ??
 				digest.verdictDigest?.summary ??
@@ -79,6 +115,10 @@ function compactClaimDigest(claim) {
 		),
 		caveat: stringOf(digest.verdictDigest?.caveat ?? digest.caveat),
 		correctionOrCounterclaim: stringOf(digest.correctionOrCounterclaim),
+		...(evidence.length > 0 ? { evidence } : {}),
+		...(Array.isArray(digest.localQuoteGate)
+			? { localQuoteGate: digest.localQuoteGate }
+			: {}),
 		...(digest.evidenceGate ? { evidenceGate: digest.evidenceGate } : {}),
 	};
 }
@@ -90,16 +130,60 @@ function compactSlot(slot) {
 		label: stringOf(item.label),
 		status: stringOf(item.status),
 		bestValue: item.bestValue,
-		sourceUrls: compactStrings(item.sourceUrls, 6),
+		sourceUrls: compactStrings(item.sourceUrls, Infinity),
+		sourceRefs: compactStrings(item.sourceRefs, Infinity),
 		sourceQuality: stringOf(item.sourceQuality),
-		verificationCandidateIds: compactStrings(item.verificationCandidateIds, 8),
+		verificationCandidateIds: compactStrings(item.verificationCandidateIds, 64),
 		gapReason: stringOf(item.gapReason),
 		parentImpact: stringOf(item.parentImpact),
 	};
 }
 
-function reconcileFactSlotCoverageWithAudit(factSlots, claimDigests) {
+function reconcileFactSlotCoverageWithAudit(
+	factSlots,
+	claimDigests,
+	candidateIds = [],
+) {
 	const claimsBySlot = new Map();
+	const slotById = new Map(factSlots.map((slot) => [slot.slotId, slot]));
+	const candidateSet = new Set(candidateIds);
+	const addedReverseBindings = [];
+	const invalidCanonicalMemberships = [];
+	const canonicalBindings = new Set();
+	for (const claim of claimDigests) {
+		const claimId = idOf(claim);
+		if (!claimId || (candidateSet.size > 0 && !candidateSet.has(claimId)))
+			continue;
+		for (const slotId of compactStrings(claim.factSlotIds, 12)) {
+			const slot = slotById.get(slotId);
+			if (!slot) {
+				invalidCanonicalMemberships.push({ claimId, slotId });
+				continue;
+			}
+			canonicalBindings.add(`${slotId}\u0000${claimId}`);
+			const current = Array.isArray(slot.verificationCandidateIds)
+				? slot.verificationCandidateIds
+				: [];
+			if (!current.includes(claimId)) {
+				slot.verificationCandidateIds = [...current, claimId];
+				addedReverseBindings.push({ claimId, slotId });
+			}
+		}
+	}
+	const preservedReverseBindings = [];
+	for (const slot of factSlots) {
+		for (const candidateId of Array.isArray(slot.verificationCandidateIds)
+			? slot.verificationCandidateIds
+			: []) {
+			if (!canonicalBindings.has(`${slot.slotId}\u0000${candidateId}`))
+				preservedReverseBindings.push({
+					slotId: slot.slotId,
+					candidateId,
+					reason: "reverse hint is absent from canonical claim factSlotIds",
+				});
+		}
+	}
+
 	for (const claim of claimDigests) {
 		for (const slotId of compactStrings(claim.factSlotIds, 12)) {
 			const claims = claimsBySlot.get(slotId) ?? [];
@@ -107,9 +191,18 @@ function reconcileFactSlotCoverageWithAudit(factSlots, claimDigests) {
 			claimsBySlot.set(slotId, claims);
 		}
 	}
-	return factSlots.map((slot) => {
+	const reconciledFactSlots = factSlots.map((slot) => {
 		const claims = claimsBySlot.get(slot.slotId) ?? [];
-		if (claims.length === 0) return slot;
+		if (claims.length === 0) {
+			return slot.status === "filled"
+				? {
+						...slot,
+						status: "partial",
+						gapReason:
+							slot.gapReason || "no audited claim was available for this filled slot",
+					}
+				: slot;
+		}
 		const statuses = new Set(claims.map((claim) => stringOf(claim.status)));
 		const claimIds = compactStrings(claims.map(idOf), 12);
 		if (statuses.has("conflicting")) {
@@ -126,9 +219,7 @@ function reconcileFactSlotCoverageWithAudit(factSlots, claimDigests) {
 				bestValue:
 					corrections.join(" | ") ||
 					"Verifier evidence conflicts with the normalized value; see claim ledger.",
-				gapReason: slot.gapReason
-					? `${slot.gapReason}; ${reason}`
-					: reason,
+				gapReason: slot.gapReason ? `${slot.gapReason}; ${reason}` : reason,
 			};
 		}
 		if (
@@ -142,13 +233,20 @@ function reconcileFactSlotCoverageWithAudit(factSlots, claimDigests) {
 			return {
 				...slot,
 				status: "partial",
-				gapReason: slot.gapReason
-					? `${slot.gapReason}; ${reason}`
-					: reason,
+				gapReason: slot.gapReason ? `${slot.gapReason}; ${reason}` : reason,
 			};
 		}
 		return slot;
 	});
+	return {
+		factSlots: reconciledFactSlots,
+		reconciliation: {
+			source: "canonical normalized claim factSlotIds",
+			addedReverseBindings,
+			preservedReverseBindings,
+			invalidCanonicalMemberships,
+		},
+	};
 }
 
 function compactGap(gap) {
@@ -160,7 +258,8 @@ function compactGap(gap) {
 		evidenceState: stringOf(item.evidenceState),
 		reason: stringOf(item.reason ?? item.gapReason),
 		nextStep: stringOf(item.nextStep),
-		sourceUrls: compactStrings(item.sourceUrls, 6),
+		sourceUrls: compactStrings(item.sourceUrls, Infinity),
+		sourceRefs: compactStrings(item.sourceRefs, Infinity),
 		relatedFactSlotIds: compactStrings(item.relatedFactSlotIds, 8),
 		scopeItem: stringOf(item.scopeItem),
 		whyItMatters: stringOf(item.whyItMatters),
@@ -181,7 +280,9 @@ function compactVerifierIssue(issue) {
 function compactInvalidNormalizedCandidate(row) {
 	const item = asObject(row);
 	return {
-		index: Number.isSafeInteger(Number(item.index)) ? Number(item.index) : undefined,
+		index: Number.isSafeInteger(Number(item.index))
+			? Number(item.index)
+			: undefined,
 		claimId: stringOf(item.claimId),
 		reason: stringOf(item.reason),
 		nextStep: stringOf(item.nextStep),
@@ -213,6 +314,8 @@ function compactDuplicateVerifierRow(row) {
 		statusInputs: compactStrings(item.statusInputs, 8),
 		selectedStatus: stringOf(item.selectedStatus),
 		statusConflict: item.statusConflict === true,
+		sourceRefs: compactStrings(item.sourceRefs, Infinity),
+		sourceUrls: compactStrings(item.sourceUrls, Infinity),
 		action: stringOf(item.action),
 	};
 }
@@ -256,105 +359,6 @@ function withGeneratedIds(items, prefix) {
 	}));
 }
 
-function synthesisClaimDigest(claim) {
-	const item = compactClaimDigest(claim);
-	return {
-		id: item.id,
-		claim: truncateText(item.claim, 260),
-		status: item.status,
-		confidence: item.confidence,
-		factSlotIds: compactStrings(item.factSlotIds, 8),
-		support: truncateText(item.support, 240),
-		caveat: truncateText(item.caveat, 180),
-		correctionOrCounterclaim: truncateText(item.correctionOrCounterclaim, 180),
-		hasSourceUrls: compactStrings(item.sourceUrls, 1).length > 0,
-		hasSourceRefs: compactStrings(item.sourceRefs, 1).length > 0,
-	};
-}
-
-function synthesisFactSlot(slot) {
-	const item = asObject(slot);
-	return {
-		slotId: stringOf(item.slotId),
-		label: truncateText(item.label, 120),
-		status: stringOf(item.status),
-		gapReason: truncateText(item.gapReason, 120),
-		parentImpact: truncateText(item.parentImpact, 120),
-	};
-}
-
-function synthesisGap(gap) {
-	const item = asObject(gap);
-	return {
-		id: stringOf(item.id),
-		kind: stringOf(item.kind),
-		claimId: stringOf(item.claimId),
-		slotId: stringOf(item.slotId),
-		evidenceState: stringOf(item.evidenceState),
-		reason: truncateText(item.reason, 220),
-		nextStep: truncateText(item.nextStep, 180),
-		scopeItem: truncateText(item.scopeItem, 160),
-		whyItMatters: truncateText(item.whyItMatters, 180),
-	};
-}
-
-function synthesisScopeCoverage(row) {
-	const item = asObject(row);
-	return {
-		scopeItem: truncateText(item.scopeItem ?? item.item ?? item.topic, 160),
-		status: stringOf(item.status ?? item.coverageStatus),
-		evidenceState: stringOf(item.evidenceState),
-		summary: truncateText(item.summary ?? item.reason, 220),
-		whyItMatters: truncateText(item.whyItMatters, 180),
-	};
-}
-
-function buildSynthesisInput({
-	plan,
-	factSlotCoverage,
-	claimDigests,
-	preservedClaims,
-	coverageGaps,
-	remainingGaps,
-	sourceRefJoinFailures,
-	researchScopeCoverage,
-	integritySummary,
-	audit,
-}) {
-	return {
-		researchMetadata: {
-			depth: stringOf(plan.depth),
-			taskType: stringOf(plan.taskType),
-			expectedFinalShape: stringOf(plan.expectedFinalShape),
-			researchQuestions: asArray(plan.researchQuestions).length,
-			plannedFactSlots: asArray(plan.factSlots).length,
-		},
-		verdictCounts: asObject(audit.verdictCounts),
-		factSlotStatusCounts: countByStatus(factSlotCoverage),
-		integritySummary,
-		researchScopeCoverage: asArray(researchScopeCoverage)
-			.slice(0, 24)
-			.map(synthesisScopeCoverage),
-		factSlots: factSlotCoverage.map(synthesisFactSlot),
-		claims: claimDigests.map(synthesisClaimDigest),
-		preservedClaims: preservedClaims.slice(0, 12).map((claim) => ({
-			id: idOf(claim),
-			claim: truncateText(claim.claim, 240),
-			factSlotIds: compactStrings(claim.factSlotIds, 8),
-			whyItMatters: truncateText(claim.whyItMatters ?? claim.reason, 180),
-		})),
-		gaps: [
-			...remainingGaps.map((gap) =>
-				synthesisGap({ ...gap, kind: "remaining" }),
-			),
-			...coverageGaps.map((gap) => synthesisGap({ ...gap, kind: "coverage" })),
-			...sourceRefJoinFailures.map((gap) =>
-				synthesisGap({ ...gap, kind: "sourceRefJoinFailure" }),
-			),
-		],
-	};
-}
-
 export default async function finalAuditPacket({ sources }) {
 	const plan = asObject(findSource(sources, "plan"));
 	const normalizeClaims = asObject(findSource(sources, "normalize-claims"));
@@ -365,23 +369,53 @@ export default async function finalAuditPacket({ sources }) {
 			: normalizeClaims;
 	const sanitizerDiagnostics = asObject(normalized.sanitizerDiagnostics);
 	const auditSource = findSource(sources, "audit-claims");
-	if (!auditSource || typeof auditSource !== "object" || Array.isArray(auditSource)) {
+	if (
+		!auditSource ||
+		typeof auditSource !== "object" ||
+		Array.isArray(auditSource)
+	) {
 		throw new Error(
 			"deep-research final-audit-packet: missing audit-claims control source; refusing to emit an empty packet",
 		);
 	}
 	const audit = auditSource;
+	const inputPacket = asObject(findSource(sources, "normalize-input-packet"));
+	const questionCoverageInput = inputPacket.packet?.researchQuestionCoverage;
+	const researchQuestionCoverage =
+		questionCoverageInput &&
+		typeof questionCoverageInput === "object" &&
+		!Array.isArray(questionCoverageInput) &&
+		typeof questionCoverageInput.passed === "boolean"
+			? questionCoverageInput
+			: null;
 	// These fields establish that the audit stage actually ran and produced an
 	// auditable ledger. Do not turn an absent/incomplete audit into a valid empty packet.
 	const incompleteAuditFields = [
 		["claimDigests", Array.isArray(audit.claimDigests)],
-		["gateSummary", audit.gateSummary && typeof audit.gateSummary === "object" && !Array.isArray(audit.gateSummary)],
-	].filter(([, present]) => !present).map(([field]) => field);
+		[
+			"gateSummary",
+			audit.gateSummary &&
+				typeof audit.gateSummary === "object" &&
+				!Array.isArray(audit.gateSummary),
+		],
+	]
+		.filter(([, present]) => !present)
+		.map(([field]) => field);
 	const hasAuditLedger =
 		Object.keys(audit.gateSummary ?? {}).length > 0 ||
-		(audit.verdictCounts && typeof audit.verdictCounts === "object" && !Array.isArray(audit.verdictCounts) && Object.keys(audit.verdictCounts).length > 0) ||
-		(audit.statusPartitions && typeof audit.statusPartitions === "object" && !Array.isArray(audit.statusPartitions) && Object.keys(audit.statusPartitions).length > 0);
-	if (incompleteAuditFields.length === 0 && audit.claimDigests.length === 0 && !hasAuditLedger)
+		(audit.verdictCounts &&
+			typeof audit.verdictCounts === "object" &&
+			!Array.isArray(audit.verdictCounts) &&
+			Object.keys(audit.verdictCounts).length > 0) ||
+		(audit.statusPartitions &&
+			typeof audit.statusPartitions === "object" &&
+			!Array.isArray(audit.statusPartitions) &&
+			Object.keys(audit.statusPartitions).length > 0);
+	if (
+		incompleteAuditFields.length === 0 &&
+		audit.claimDigests.length === 0 &&
+		!hasAuditLedger
+	)
 		incompleteAuditFields.push("audit ledgers");
 	if (incompleteAuditFields.length > 0) {
 		throw new Error(
@@ -391,14 +425,30 @@ export default async function finalAuditPacket({ sources }) {
 	const claimInventory = asObject(normalized.claimInventory);
 	const verificationCandidates = asArray(claimInventory.verificationCandidates);
 	const preservedClaims = asArray(claimInventory.preservedClaims);
-	const claimDigests = asArray(audit.claimDigests).map(compactClaimDigest);
+	const auditedClaimsById = new Map(
+		asArray(audit.auditedClaims)
+			.map((claim) => [idOf(claim), claim])
+			.filter(([id]) => id),
+	);
+	const claimDigests = asArray(audit.claimDigests).map((digest) => {
+		const audited = auditedClaimsById.get(idOf(digest));
+		return compactClaimDigest({
+			...digest,
+			...(audited?.evidence ? { evidence: audited.evidence } : {}),
+			...(Array.isArray(audited?.localQuoteGate)
+				? { localQuoteGate: audited.localQuoteGate }
+				: {}),
+		});
+	});
 	const auditedIds = new Set(claimDigests.map(idOf).filter(Boolean));
 	const candidateIds = verificationCandidates.map(idOf).filter(Boolean);
 	const omittedCandidateIds = candidateIds.filter((id) => !auditedIds.has(id));
-	const factSlotCoverage = reconcileFactSlotCoverageWithAudit(
+	const factSlotReconciliation = reconcileFactSlotCoverageWithAudit(
 		asArray(normalized.factSlotCoverage).map(compactSlot),
 		claimDigests,
+		candidateIds,
 	);
+	const factSlotCoverage = factSlotReconciliation.factSlots;
 	const coverageGaps = withGeneratedIds(
 		asArray(normalized.coverageGaps).map(compactGap),
 		"gap-coverage",
@@ -420,8 +470,12 @@ export default async function finalAuditPacket({ sources }) {
 	const invalidNormalizedCandidateRows = asArray(
 		audit.invalidNormalizedCandidates,
 	).map(compactInvalidNormalizedCandidate);
-	const verifierOwnerLedger = asArray(audit.verifierOwnerLedger).map(compactOwner);
-	const verifierOwnerIssues = asArray(audit.verifierOwnerIssues).map(compactVerifierIssue);
+	const verifierOwnerLedger = asArray(audit.verifierOwnerLedger).map(
+		compactOwner,
+	);
+	const verifierOwnerIssues = asArray(audit.verifierOwnerIssues).map(
+		compactVerifierIssue,
+	);
 	const gateSummary = asObject(audit.gateSummary);
 	const batchAdoptionReadiness = compactBatchAdoptionReadiness(
 		audit.batchAdoptionReadiness,
@@ -444,38 +498,11 @@ export default async function finalAuditPacket({ sources }) {
 		).length,
 		sourceRefJoinFailures: sourceRefJoinFailures.length,
 	};
-	const integritySummary = {
-		omittedVerificationCandidateCount: omittedCandidateIds.length,
-		sourceRefJoinFailures: sourceRefJoinFailures.length,
-		invalidVerifierRows: invalidVerifierRows.length,
-		duplicateVerifierRows: duplicateVerifierRows.length,
-		verifierOwnerIssues: verifierOwnerIssues.length,
-		invalidNormalizedCandidateCount: invalidNormalizedCandidateRows.length,
-		invalidNormalizedCandidateRows,
-		missingVerifierResults: Number(gateSummary.missingVerifierResults ?? 0),
-		zeroCandidateFloorBlockers,
-		batchAdoptionStatus: stringOf(batchAdoptionReadiness.status),
-		batchAdoptionBlockers: asArray(batchAdoptionReadiness.blockers),
-		sourceRefCoverage,
-	};
-	const synthesisInput = buildSynthesisInput({
-		plan,
-		factSlotCoverage,
-		claimDigests,
-		preservedClaims,
-		coverageGaps,
-		remainingGaps,
-		sourceRefJoinFailures,
-		researchScopeCoverage: normalized.researchScopeCoverage,
-		integritySummary,
-		audit,
-	});
 
-	return {
+	const result = {
 		schema: SCHEMA,
 		digest: `Prepared final-audit packet with ${claimDigests.length} audited claim(s), ${factSlotCoverage.length} fact slot(s), and ${remainingGaps.length + coverageGaps.length + sourceRefJoinFailures.length} gap row(s).`,
 		packet: {
-			synthesisInput,
 			researchMetadataSeed: {
 				depth: stringOf(plan.depth),
 				taskType: stringOf(plan.taskType),
@@ -483,9 +510,8 @@ export default async function finalAuditPacket({ sources }) {
 				researchQuestions: asArray(plan.researchQuestions).length,
 				sourcePolicy: asObject(plan.sourcePolicy),
 				plannedFactSlots: asArray(plan.factSlots).length,
-				filledFactSlots: factSlotCoverage.filter(
-					(slot) => slot.status === "filled",
-				).length,
+				filledFactSlots: factSlotCoverage.filter((slot) => slot.status === "filled")
+					.length,
 				partialFactSlots: factSlotCoverage.filter(
 					(slot) => slot.status === "partial",
 				).length,
@@ -512,6 +538,7 @@ export default async function finalAuditPacket({ sources }) {
 			claimVerdictLedger: claimDigests,
 			verifierIntegrity: {
 				gateSummary,
+				researchQuestionIntegrity: researchQuestionCoverage,
 				invalidVerifierRows,
 				duplicateVerifierRows,
 				invalidNormalizedCandidateCount: invalidNormalizedCandidateRows.length,
@@ -530,28 +557,31 @@ export default async function finalAuditPacket({ sources }) {
 				id: idOf(claim),
 				claim: stringOf(claim.claim),
 				factSlotIds: compactStrings(claim.factSlotIds, 8),
-				sourceRefs: compactStrings(claim.sourceRefs, 6),
-				sourceUrls: compactStrings(claim.sourceUrls, 6),
+				sourceRefs: compactStrings(claim.sourceRefs, Infinity),
+				sourceUrls: compactStrings(claim.sourceUrls, Infinity),
 				whyItMatters: stringOf(claim.whyItMatters ?? claim.reason),
 			})),
 			researchScopeCoverage: asArray(normalized.researchScopeCoverage),
+			researchQuestionCoverage: asArray(researchQuestionCoverage?.rows),
+			factSlotReconciliation: factSlotReconciliation.reconciliation,
 			invariantChecks: {
 				candidateCount: verificationCandidates.length,
+				factSlotReconciliation: factSlotReconciliation.reconciliation,
 				auditedClaimCount: claimDigests.length,
 				candidateIds,
 				auditedClaimIds: claimDigests.map(idOf),
 				statusPartitionIds: asObject(audit.statusPartitions),
 				omittedCandidateIds,
 				droppedSlotIds: asArray(audit.slotCoverageCheck?.droppedSlotIds),
+				researchQuestionIntegrity: researchQuestionCoverage,
 				sourceRefCoverage,
 				verifierIntegrity: {
 					invalidVerifierRows: invalidVerifierRows.length,
+					researchQuestionIntegrity: researchQuestionCoverage,
 					duplicateVerifierRows: duplicateVerifierRows.length,
 					invalidNormalizedCandidateCount: invalidNormalizedCandidateRows.length,
 					verifierOwnerIssues: verifierOwnerIssues.length,
-					missingVerifierResults: Number(
-						gateSummary.missingVerifierResults ?? 0,
-					),
+					missingVerifierResults: Number(gateSummary.missingVerifierResults ?? 0),
 					zeroCandidateFloorBlockers,
 					batchAdoptionStatus: stringOf(batchAdoptionReadiness.status),
 				},
@@ -568,4 +598,6 @@ export default async function finalAuditPacket({ sources }) {
 			},
 		},
 	};
+	result.packet.synthesisInput = buildSynthesisPages(result.packet);
+	return result;
 }

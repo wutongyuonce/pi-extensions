@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { AgentToolResult } from "@earendil-works/pi-agent-core";
-import { safeTerminalText } from "../../shared/display-text.ts";
+import { safeTerminalText, truncateDisplayText } from "../../shared/display-text.ts";
 import { formatDuration, formatModelThinking, formatTokens, shortenPath } from "../../shared/formatters.ts";
 import { formatActivityLabel } from "../../shared/status-format.ts";
 import {
@@ -23,6 +23,10 @@ import { isTrustedRecordedSessionFile } from "../../shared/session-file-trust.ts
 const DEFAULT_TRANSCRIPT_LINES = 80;
 const MAX_TRANSCRIPT_LINES = 500;
 const TRANSCRIPT_TAIL_BYTES = 256 * 1024;
+const MAX_TRANSCRIPT_LINE_CHARS = 2000;
+const MAX_TRANSCRIPT_BODY_BYTES = 32 * 1024;
+const TRANSCRIPT_LINE_OMISSION = "… [content omitted]";
+const TRANSCRIPT_BODY_OMISSION = "  … [earlier lines omitted]";
 
 type ForegroundControl = SubagentState["foregroundControls"] extends Map<string, infer T> ? T : never;
 type ForegroundRun = NonNullable<SubagentState["foregroundRuns"]> extends Map<string, infer T> ? T : never;
@@ -335,7 +339,16 @@ function formatDetachedForegroundFleetLines(runs: ForegroundRun[]): string[] {
 	return lines;
 }
 
-function formatAsyncFleetLines(runs: AsyncRunSummary[]): string[] {
+function externalCliStepFacts(step: AsyncRunSummary["steps"][number], now: number): string | undefined {
+	if (step.runner?.type !== "external-cli") return undefined;
+	const process = step.externalProcess;
+	const elapsed = process
+		? process.durationMs ?? Math.max(0, (process.endedAt ?? now) - process.startedAt)
+		: undefined;
+	return `external-cli${elapsed !== undefined ? ` · ${formatDuration(elapsed)}` : ""}`;
+}
+
+function formatAsyncFleetLines(runs: AsyncRunSummary[], now = Date.now()): string[] {
 	if (runs.length === 0) return [];
 	const lines = ["Async runs:"];
 	for (const run of runs) {
@@ -353,7 +366,7 @@ function formatAsyncFleetLines(runs: AsyncRunSummary[]): string[] {
 			const phase = step.phase ? `[${step.phase}] ` : "";
 			const stepActivity = formatActivityFacts(step);
 			const modelThinking = formatModelThinking(step.model, step.thinking);
-			const parts = [`${step.index}. ${phase}${display}${stepContext ? ` ${stepContext}` : ""}`, step.status, stepActivity, modelThinking].filter(Boolean);
+			const parts = [`${step.index}. ${phase}${display}${stepContext ? ` ${stepContext}` : ""}`, step.status, externalCliStepFacts(step, now), stepActivity, modelThinking].filter(Boolean);
 			lines.push(`  ${parts.join(" | ")}`);
 			const output = path.join(run.asyncDir, `output-${step.index}.log`);
 			if (fs.existsSync(output)) lines.push(`    output: ${shortenPath(output)}`);
@@ -416,7 +429,7 @@ export function inspectSubagentFleet(_params: FleetViewParams, deps: FleetViewDe
 	if (foregroundLines.length) lines.push(...foregroundLines, "");
 	const detachedForegroundLines = formatDetachedForegroundFleetLines(detachedForegroundRuns);
 	if (detachedForegroundLines.length) lines.push(...detachedForegroundLines, "");
-	const asyncLines = formatAsyncFleetLines(asyncRuns);
+	const asyncLines = formatAsyncFleetLines(asyncRuns, deps.now?.() ?? Date.now());
 	if (asyncLines.length) lines.push(...asyncLines, "");
 	lines.push("Commands:");
 	lines.push("  Refresh fleet: subagent({ action: \"status\", view: \"fleet\" })");
@@ -494,17 +507,66 @@ function appendTranscriptBody(lines: string[], sourceLabel: string, sourceLines:
 		lines.push("  (no transcript lines available yet)");
 		return;
 	}
-	for (const line of sourceLines) lines.push(`  ${line}`);
+	// Bound the rendered body, not the raw input: terminal escaping can expand it.
+	// Keep line prefixes (roles/tool names), then prefer whole recent lines. The
+	// byte budget includes indentation, separators and omission markers, but not
+	// the source label, run metadata, warnings or artifact paths above the body.
+	const body: string[] = [];
+	let bytes = 0;
+	for (let index = sourceLines.length - 1; index >= 0; index--) {
+		// Preserve assembled-line binary detection (including indentation). A
+		// binary placeholder replaces the whole line and must not be reindented.
+		const safe = safeTerminalText(`  ${sourceLines[index]!}`);
+		const lineLimit = MAX_TRANSCRIPT_LINE_CHARS + 2;
+		const line = safe.length <= lineLimit
+			? safe
+			: truncateDisplayText(safe, lineLimit - TRANSCRIPT_LINE_OMISSION.length) + TRANSCRIPT_LINE_OMISSION;
+		const size = Buffer.byteLength(line) + 1;
+		if (bytes + size > MAX_TRANSCRIPT_BODY_BYTES) {
+			const markerBytes = Buffer.byteLength(TRANSCRIPT_BODY_OMISSION) + 1;
+			while (bytes + markerBytes > MAX_TRANSCRIPT_BODY_BYTES) bytes -= Buffer.byteLength(body.pop()!) + 1;
+			body.push(TRANSCRIPT_BODY_OMISSION);
+			break;
+		}
+		body.push(line);
+		bytes += size;
+	}
+	lines.push(...body.reverse());
+}
+
+function resolveWorkflowTranscriptChild(status: AsyncStatus, asyncDir: string, options: TranscriptOptions): { status: AsyncStatus; asyncDir: string } | undefined {
+	if (status.mode !== "workflow" || options.index === undefined) return undefined;
+	const step = status.steps?.[options.index];
+	if (step?.async !== true || typeof step.runId !== "string" || !/^[A-Za-z0-9_-]+$/.test(step.runId) || step.runId === status.runId) return undefined;
+	try {
+		const asyncRoot = fs.realpathSync(path.dirname(asyncDir));
+		const childDir = path.join(asyncRoot, step.runId);
+		if (fs.realpathSync(childDir) !== childDir || fs.lstatSync(path.join(childDir, "status.json")).isSymbolicLink()) return undefined;
+		const childStatus = readStatus(childDir);
+		return childStatus?.runId === step.runId
+			&& childStatus.parentWorkflowRunId === status.runId
+			&& typeof step.workflowKey === "string" && step.workflowKey.length > 0
+			&& childStatus.workflowKey === step.workflowKey
+			&& typeof status.sessionId === "string" && status.sessionId.length > 0
+			&& childStatus.sessionId === status.sessionId
+			? { status: childStatus, asyncDir: childDir }
+			: undefined;
+	} catch (error) {
+		if (isNotFoundError(error)) return undefined;
+		throw error;
+	}
 }
 
 export function formatAsyncRunTranscript(status: AsyncStatus, asyncDir: string, options: TranscriptOptions = {}): string {
+	const workflowChild = resolveWorkflowTranscriptChild(status, asyncDir, options);
+	if (workflowChild) return formatAsyncRunTranscript(workflowChild.status, workflowChild.asyncDir, { ...options, index: undefined });
 	const lineLimit = transcriptLineLimit(options.lines);
 	const selected = selectTranscriptStep(status, options);
 	const stepOutputPath = selected.index !== undefined ? path.join(asyncDir, `output-${selected.index}.log`) : undefined;
 	const runOutputPath = resolveMaybeRelative(asyncDir, status.outputFile);
 	const logPath = path.join(asyncDir, `subagent-log-${status.runId}.md`);
 	const outputPaths = selected.index !== undefined
-		? uniqueStrings([stepOutputPath, runOutputPath && stepOutputPath && path.resolve(runOutputPath) === path.resolve(stepOutputPath) ? runOutputPath : undefined])
+		? uniqueStrings([selected.step?.externalProcess?.finalOutputPath, stepOutputPath, runOutputPath && stepOutputPath && path.resolve(runOutputPath) === path.resolve(stepOutputPath) ? runOutputPath : undefined])
 		: uniqueStrings([runOutputPath]);
 	const sessionFile = selected.index !== undefined ? selected.step?.sessionFile : status.sessionFile;
 	const eventsPath = path.join(asyncDir, "events.jsonl");
@@ -525,12 +587,22 @@ export function formatAsyncRunTranscript(status: AsyncStatus, asyncDir: string, 
 	let transcriptLines: string[] = [];
 	let transcriptSource = "Transcript tail";
 	let truncated = false;
-	for (const outputPath of outputPaths) {
+	const externalProcess = selected.step?.runner?.type === "external-cli" ? selected.step.externalProcess : undefined;
+	const externalLogPaths = externalProcess ? [
+		{ path: externalProcess.stderrPath, label: "External stderr tail" },
+		{ path: externalProcess.stdoutPath, label: "External stdout tail" },
+	] : [];
+	const runningExternal = selected.step?.status === "running" && externalProcess;
+	const sources = runningExternal
+		? [...externalLogPaths, ...outputPaths.map((outputPath) => ({ path: outputPath, label: "Transcript tail" }))]
+		: [...outputPaths.map((outputPath) => ({ path: outputPath, label: "Transcript tail" })), ...externalLogPaths];
+	for (const source of sources) {
+		const outputPath = source.path;
 		const tail = readContainedTextTail(outputPath, lineLimit, [asyncDir], "output");
 		if (tail.error) warnings.push(`Output read failed for ${tail.path}: ${tail.error}`);
-		if (tail.lines.length === 0) continue;
+		if (!tail.lines.some((line) => line.trim().length > 0)) continue;
 		transcriptLines = tail.lines;
-		transcriptSource = `Transcript tail from ${tail.path}`;
+		transcriptSource = `${source.label} from ${tail.path}`;
 		truncated = tail.truncated;
 		break;
 	}

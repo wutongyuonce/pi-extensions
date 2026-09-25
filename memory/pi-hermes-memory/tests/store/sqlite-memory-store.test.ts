@@ -20,6 +20,41 @@ import {
   reconcileMarkdownFailureScopes,
 } from '../../src/store/sqlite-memory-store.js';
 import { MemoryStore } from '../../src/store/memory-store.js';
+import { MDSYNC_METADATA_KEY_PREFIX } from '../../src/constants.js';
+
+function mdsyncKey(target: string, project: string | null): string {
+  return MDSYNC_METADATA_KEY_PREFIX + JSON.stringify([target, project]);
+}
+
+function readMdsyncValue(dbManager: DatabaseManager, target: string, project: string | null): string | undefined {
+  const row = dbManager.getDb().prepare(
+    'SELECT value FROM extension_metadata WHERE key = ?',
+  ).get(mdsyncKey(target, project)) as { value: string } | undefined;
+  return row?.value;
+}
+
+function withBlockedMemoryWrites<T>(
+  dbManager: DatabaseManager,
+  fn: () => T,
+  mode: 'insert' | 'insert-or-update' = 'insert-or-update',
+): T {
+  const db = dbManager.getDb() as { prepare: (sql: string) => unknown };
+  const originalPrepare = db.prepare.bind(db);
+  db.prepare = (sql: string) => {
+    const normalized = sql.replace(/\s+/g, ' ').trim();
+    const isInsert = /^INSERT(?: OR REPLACE)? INTO memories\b/i.test(normalized);
+    const isUpdate = /^UPDATE memories\b/i.test(normalized);
+    if (isInsert || (mode === 'insert-or-update' && isUpdate)) {
+      throw new Error(`unexpected memories write: ${normalized}`);
+    }
+    return originalPrepare(sql);
+  };
+  try {
+    return fn();
+  } finally {
+    db.prepare = originalPrepare;
+  }
+}
 
 describe('sqlite-memory-store', () => {
   let tmpDir: string;
@@ -179,6 +214,89 @@ describe('sqlite-memory-store', () => {
       assert.deepStrictEqual(getMemories(dbManager, { project: 'spoofed-project' }), []);
     });
 
+    it('reports a degraded result (not a swallowed success) on FTS5 index errors', () => {
+      // A genuine FTS5 search-index error must not look like a successful
+      // zero-row sync: the result carries degraded + reason so the caller can
+      // surface /memory-sync-markdown repair guidance.
+      const failingDb = {
+        prepare: (sql: string) => ({
+          get: () => undefined,
+          all: () => [],
+          run: () => {
+            throw new Error('fts5: table memory_fts is corrupted');
+          },
+        }),
+      } as never;
+      const stubDbManager = {
+        getDb: () => failingDb,
+        withCorruptionRecovery: <T>(operation: () => T): T => operation(),
+      } as unknown as DatabaseManager;
+
+      const result = reconcileMarkdownMemoryScope(
+        stubDbManager,
+        ['degraded reconcile test entry'],
+        'memory',
+        null,
+      );
+      assert.equal(result.degraded, true);
+      assert.match(result.degradedReason ?? '', /fts5/);
+      assert.equal(result.inserted, 0);
+    });
+
+    it('propagates degraded from failure scopes (first reason wins)', () => {
+      // When multiple failure scopes are degraded, the aggregate result must
+      // be degraded with the first reason (not the last) so the user sees the
+      // original failure, not a later duplicate.
+      let callCount = 0;
+      const failingDb = {
+        prepare: (sql: string) => ({
+          get: () => undefined,
+          all: () => [],
+          run: () => {
+            callCount++;
+            throw new Error(`fts5: error #${callCount}`);
+          },
+        }),
+      } as never;
+      const stubDbManager = {
+        getDb: () => failingDb,
+        withCorruptionRecovery: <T>(operation: () => T): T => operation(),
+      } as unknown as DatabaseManager;
+
+      const result = reconcileMarkdownFailureScopes(
+        stubDbManager,
+        [
+          'failure entry one — Project: project-a <!-- created=2026-01-01 -->',
+          'failure entry two — Project: project-b <!-- created=2026-01-01 -->',
+        ],
+      );
+      assert.equal(result.degraded, true);
+      assert.match(result.degradedReason ?? '', /fts5: error #1/);
+    });
+
+    it('still propagates corruption errors instead of degrading (recovery must run)', () => {
+      // Corruption signals are NOT FTS5 errors: they must escape so
+      // DatabaseManager quarantines + rebuilds, never a degraded zero-result.
+      const failingDb = {
+        prepare: () => ({
+          get: () => undefined,
+          all: () => [],
+          run: () => {
+            throw new Error('database disk image is malformed');
+          },
+        }),
+      } as never;
+      const stubDbManager = {
+        getDb: () => failingDb,
+        withCorruptionRecovery: <T>(operation: () => T): T => operation(),
+      } as unknown as DatabaseManager;
+
+      assert.throws(
+        () => reconcileMarkdownMemoryScope(stubDbManager, ['corruption test entry'], 'memory', null),
+        /malformed/,
+      );
+    });
+
     it('prunes only absent rows in the exact target and project scope', () => {
       addMemory(dbManager, 'kept global memory', 'memory', null);
       addMemory(dbManager, 'orphaned global memory', 'memory', null);
@@ -251,6 +369,239 @@ describe('sqlite-memory-store', () => {
         created: '2026-06-01',
         last_referenced: '2026-07-05',
       }]);
+    });
+
+    it('skips an unchanged scope without touching memories', () => {
+      const entries = ['scope one', 'scope two', 'scope three'];
+      const first = reconcileMarkdownMemoryScope(dbManager, entries, 'memory', null);
+      assert.strictEqual(first.inserted, 3);
+      const ids = getMemories(dbManager, { target: 'memory', project: null }).map((entry) => entry.id);
+      const state = readMdsyncValue(dbManager, 'memory', null);
+      assert.ok(state);
+      const parsed = JSON.parse(state) as { sha256: string; entryCount: number };
+      assert.strictEqual(parsed.entryCount, 3);
+      assert.match(parsed.sha256, /^[0-9a-f]{64}$/i);
+
+      const second = withBlockedMemoryWrites(dbManager, () =>
+        reconcileMarkdownMemoryScope(dbManager, entries, 'memory', null),
+      );
+      assert.deepStrictEqual(second, { inserted: 0, existing: 3, removed: 0 });
+      assert.deepStrictEqual(
+        getMemories(dbManager, { target: 'memory', project: null }).map((entry) => entry.id),
+        ids,
+      );
+      assert.strictEqual(readMdsyncValue(dbManager, 'memory', null), state);
+    });
+
+    it('isolates a single-scope change from an untouched sibling scope', () => {
+      const kept = ['kept project memory'];
+      const edited = ['edited project original'];
+      reconcileMarkdownMemoryScope(dbManager, kept, 'memory', 'kept-project');
+      reconcileMarkdownMemoryScope(dbManager, edited, 'memory', 'edited-project');
+      const keptIds = getMemories(dbManager, { target: 'memory', project: 'kept-project' }).map((entry) => entry.id);
+      const keptState = readMdsyncValue(dbManager, 'memory', 'kept-project');
+
+      const editedResult = reconcileMarkdownMemoryScope(
+        dbManager,
+        ['edited project replacement'],
+        'memory',
+        'edited-project',
+      );
+      const keptResult = withBlockedMemoryWrites(dbManager, () =>
+        reconcileMarkdownMemoryScope(dbManager, kept, 'memory', 'kept-project'),
+      );
+
+      assert.strictEqual(editedResult.inserted, 1);
+      assert.strictEqual(editedResult.removed, 1);
+      assert.deepStrictEqual(keptResult, { inserted: 0, existing: 1, removed: 0 });
+      assert.deepStrictEqual(
+        getMemories(dbManager, { target: 'memory', project: 'kept-project' }).map((entry) => entry.id),
+        keptIds,
+      );
+      assert.strictEqual(readMdsyncValue(dbManager, 'memory', 'kept-project'), keptState);
+      assert.deepStrictEqual(
+        getMemories(dbManager, { target: 'memory', project: 'edited-project' }).map((entry) => entry.content),
+        ['edited project replacement'],
+      );
+    });
+
+    it('reimports when memories are emptied but the fingerprint survives', () => {
+      const entries = ['mirror one', 'mirror two', 'mirror three'];
+      reconcileMarkdownMemoryScope(dbManager, entries, 'memory', null);
+      assert.ok(readMdsyncValue(dbManager, 'memory', null));
+      dbManager.getDb().prepare('DELETE FROM memories').run();
+      assert.strictEqual(getMemories(dbManager).length, 0);
+
+      const result = reconcileMarkdownMemoryScope(dbManager, entries, 'memory', null);
+      assert.strictEqual(result.inserted, 3);
+      assert.strictEqual(getMemories(dbManager, { target: 'memory', project: null }).length, 3);
+    });
+
+    it('repopulates a missing fingerprint without inserting existing rows', () => {
+      const entries = ['fingerprint missing one', 'fingerprint missing two'];
+      reconcileMarkdownMemoryScope(dbManager, entries, 'memory', null);
+      const ids = getMemories(dbManager, { target: 'memory', project: null }).map((entry) => entry.id);
+      dbManager.getDb().prepare('DELETE FROM extension_metadata WHERE key = ?').run(mdsyncKey('memory', null));
+      assert.equal(readMdsyncValue(dbManager, 'memory', null), undefined);
+
+      const result = withBlockedMemoryWrites(
+        dbManager,
+        () => reconcileMarkdownMemoryScope(dbManager, entries, 'memory', null),
+        'insert',
+      );
+      assert.strictEqual(result.inserted, 0);
+      assert.ok(readMdsyncValue(dbManager, 'memory', null));
+      assert.deepStrictEqual(
+        getMemories(dbManager, { target: 'memory', project: null }).map((entry) => entry.id),
+        ids,
+      );
+    });
+
+    it('force-repairs COUNT-preserving sqlite-only drift', () => {
+      const entries = ['canonical markdown content'];
+      reconcileMarkdownMemoryScope(dbManager, entries, 'memory', null);
+      dbManager.getDb().prepare(`
+        UPDATE memories SET content = 'drifted sqlite content' WHERE target = 'memory' AND project IS NULL
+      `).run();
+
+      const skipped = withBlockedMemoryWrites(dbManager, () =>
+        reconcileMarkdownMemoryScope(dbManager, entries, 'memory', null),
+      );
+      assert.deepStrictEqual(skipped, { inserted: 0, existing: 1, removed: 0 });
+      assert.strictEqual(getMemories(dbManager, { target: 'memory', project: null })[0].content, 'drifted sqlite content');
+
+      const forced = reconcileMarkdownMemoryScope(dbManager, entries, 'memory', null, { force: true });
+      assert.strictEqual(forced.inserted, 1);
+      assert.strictEqual(forced.removed, 1);
+      assert.deepStrictEqual(
+        getMemories(dbManager, { target: 'memory', project: null }).map((entry) => entry.content),
+        ['canonical markdown content'],
+      );
+      const rewritten = JSON.parse(readMdsyncValue(dbManager, 'memory', null)!) as { entryCount: number };
+      assert.strictEqual(rewritten.entryCount, 1);
+    });
+
+    it('drops the fingerprint when the force path empties a scope', () => {
+      reconcileMarkdownMemoryScope(dbManager, ['force-emptied entry'], 'memory', 'force-emptied');
+      assert.ok(readMdsyncValue(dbManager, 'memory', 'force-emptied'));
+
+      const forced = reconcileMarkdownMemoryScope(dbManager, [], 'memory', 'force-emptied', { force: true });
+
+      assert.strictEqual(forced.removed, 1);
+      assert.equal(
+        readMdsyncValue(dbManager, 'memory', 'force-emptied'),
+        undefined,
+        'the emptied scope must not leave a fingerprint behind',
+      );
+    });
+
+    it('restores search through the force path when the index lost a row', () => {
+      const entries = ['indexed needle entry', 'indexed companion entry'];
+      reconcileMarkdownMemoryScope(dbManager, entries, 'memory', null);
+      assert.strictEqual(searchMemories(dbManager, 'needle').length, 1);
+
+      const lost = dbManager.getDb().prepare(
+        'SELECT id, content FROM memories WHERE content = ?',
+      ).get('indexed needle entry') as { id: number; content: string };
+      dbManager.getDb().prepare(
+        "INSERT INTO memory_fts(memory_fts, rowid, content) VALUES ('delete', ?, ?)",
+      ).run(lost.id, lost.content);
+      assert.strictEqual(searchMemories(dbManager, 'needle').length, 0, 'the index gap must hide the entry');
+
+      // The fingerprint binds markdown bytes, so an unchanged scope keeps
+      // skipping even though search can no longer see the row. That is the
+      // documented boundary; the forced repair is what has to close it.
+      const skipped = reconcileMarkdownMemoryScope(dbManager, entries, 'memory', null);
+      assert.strictEqual(skipped.inserted, 0);
+      assert.strictEqual(searchMemories(dbManager, 'needle').length, 0);
+
+      reconcileMarkdownMemoryScope(dbManager, entries, 'memory', null, { force: true });
+
+      assert.strictEqual(searchMemories(dbManager, 'needle').length, 1, 'force must re-index the scope');
+    });
+
+    it('drops rows and the fingerprint for an emptied project scope', () => {
+      reconcileMarkdownMemoryScope(dbManager, ['doomed project memory'], 'memory', 'doomed-project');
+      assert.ok(readMdsyncValue(dbManager, 'memory', 'doomed-project'));
+
+      const firstEmpty = reconcileMarkdownMemoryScope(dbManager, [], 'memory', 'doomed-project');
+      assert.strictEqual(firstEmpty.removed, 1);
+      assert.deepStrictEqual(getMemories(dbManager, { target: 'memory', project: 'doomed-project' }), []);
+      assert.equal(readMdsyncValue(dbManager, 'memory', 'doomed-project'), undefined);
+
+      const secondEmpty = withBlockedMemoryWrites(dbManager, () =>
+        reconcileMarkdownMemoryScope(dbManager, [], 'memory', 'doomed-project'),
+      );
+      assert.deepStrictEqual(secondEmpty, { inserted: 0, existing: 0, removed: 0 });
+      assert.equal(readMdsyncValue(dbManager, 'memory', 'doomed-project'), undefined);
+    });
+
+    it('does not write a fingerprint when FTS5 degrades the reconcile', () => {
+      const db = dbManager.getDb() as { prepare: (sql: string) => any };
+      const originalPrepare = db.prepare.bind(db);
+      db.prepare = (sql: string) => {
+        const stmt = originalPrepare(sql);
+        const normalized = sql.replace(/\s+/g, ' ').trim();
+        if (/^INSERT(?: OR REPLACE)? INTO memories\b/i.test(normalized) || /^UPDATE memories\b/i.test(normalized)) {
+          return {
+            get: (...args: unknown[]) => stmt.get(...args),
+            all: (...args: unknown[]) => stmt.all(...args),
+            run: () => {
+              throw new Error('fts5: table memory_fts is corrupted');
+            },
+          };
+        }
+        return stmt;
+      };
+      try {
+        const result = reconcileMarkdownMemoryScope(dbManager, ['degraded fingerprint probe'], 'memory', null);
+        assert.equal(result.degraded, true);
+        assert.equal(readMdsyncValue(dbManager, 'memory', null), undefined);
+      } finally {
+        db.prepare = originalPrepare;
+      }
+    });
+
+    it('treats corrupt fingerprint JSON as a miss and rewrites valid state', () => {
+      const entries = ['corrupt-state entry'];
+      reconcileMarkdownMemoryScope(dbManager, entries, 'memory', null);
+      dbManager.getDb().prepare(
+        'UPDATE extension_metadata SET value = ? WHERE key = ?',
+      ).run('{not-json', mdsyncKey('memory', null));
+
+      const result = withBlockedMemoryWrites(
+        dbManager,
+        () => reconcileMarkdownMemoryScope(dbManager, entries, 'memory', null),
+        'insert',
+      );
+      assert.strictEqual(result.inserted, 0);
+      const rewritten = JSON.parse(readMdsyncValue(dbManager, 'memory', null)!) as {
+        sha256: string;
+        entryCount: number;
+      };
+      assert.match(rewritten.sha256, /^[0-9a-f]{64}$/i);
+      assert.strictEqual(rewritten.entryCount, 1);
+      assert.deepStrictEqual(Object.keys(rewritten).sort(), ['entryCount', 'sha256']);
+    });
+
+    it('treats extra fingerprint fields as a miss', () => {
+      const entries = ['strict-state entry'];
+      reconcileMarkdownMemoryScope(dbManager, entries, 'memory', null);
+      const current = JSON.parse(readMdsyncValue(dbManager, 'memory', null)!) as {
+        sha256: string;
+        entryCount: number;
+      };
+      dbManager.getDb().prepare(
+        'UPDATE extension_metadata SET value = ? WHERE key = ?',
+      ).run(JSON.stringify({ ...current, extra: true }), mdsyncKey('memory', null));
+
+      withBlockedMemoryWrites(
+        dbManager,
+        () => reconcileMarkdownMemoryScope(dbManager, entries, 'memory', null),
+        'insert',
+      );
+      const rewritten = JSON.parse(readMdsyncValue(dbManager, 'memory', null)!) as Record<string, unknown>;
+      assert.deepStrictEqual(Object.keys(rewritten).sort(), ['entryCount', 'sha256']);
     });
   });
 
@@ -331,6 +682,18 @@ describe('sqlite-memory-store', () => {
       addMemory(dbManager, 'exact phrase memory search example');
       addMemory(dbManager, 'name: Chandrateja', 'user');
       addMemory(dbManager, 'timezone: AEST', 'user');
+    });
+
+    it('degrades an all-stop-word query to the LIKE fallback instead of []', () => {
+      // "the" is a stop word and "and"/"or" connectors, so FTS5 normalization
+      // leaves nothing to match. The query must fall through to the scoped
+      // literal fallback (which still searches the raw terms) rather than
+      // hard-return an empty result set.
+      addMemory(dbManager, 'the build passes after restart');
+
+      const results = searchMemories(dbManager, 'the and or');
+      assert.ok(results.length > 0, 'all-stop-word query must reach the LIKE fallback, not []');
+      assert.ok(results.some(r => r.content.includes('the')));
     });
 
     it('should find memories by keyword', () => {
@@ -496,6 +859,45 @@ describe('sqlite-memory-store', () => {
     it('should return empty for malformed operator queries', () => {
       const results = searchMemories(dbManager, 'AND OR NOT');
       assert.strictEqual(results.length, 0);
+    });
+
+    it('ranks a dense old match above a fresher, more diluted one (BM25 before recency)', () => {
+      addMemory(dbManager, 'deploy target is the staging cluster');
+      addMemory(
+        dbManager,
+        'unrelated retrospective notes that mention deploy once among a great many other words about hiring, budgets, roadmaps, vendor calls, office moves and quarterly planning for the staging of a conference'
+      );
+      const db = dbManager.getDb();
+      db.prepare("UPDATE memories SET last_referenced = '2025-01-01' WHERE content LIKE 'deploy target%'").run();
+      db.prepare("UPDATE memories SET last_referenced = '2026-08-30' WHERE content LIKE 'unrelated retrospective%'").run();
+
+      const results = searchMemories(dbManager, 'deploy staging');
+
+      // Both rows match; recency ordering would put the long fresh note first.
+      assert.strictEqual(results.length, 2);
+      assert.ok(results[0].content.startsWith('deploy target is the staging cluster'));
+    });
+
+    it('still broadens a two-term natural-language query through the OR fallback', () => {
+      // Neither "dark" nor "chocolate" co-occur, so the implicit-AND query
+      // misses and only the OR fallback can recover this row. The existing
+      // fallback test uses three terms; this pins the two-term case.
+      addMemory(dbManager, 'user prefers dark mode UI theme', 'user');
+
+      const results = searchMemories(dbManager, 'dark chocolate', { target: 'user' });
+
+      assert.ok(results.some((r) => r.content.includes('dark mode')));
+    });
+
+    it('recovers a natural-language query whose raw FTS5 form fails to parse', () => {
+      // "DO NOT USE FIND /" passes through as raw FTS5 syntax and throws;
+      // runSearch must catch that and let the natural-language retry run.
+      addMemory(dbManager, 'Never search whole filesystem from root. Do not run find /.', 'user');
+
+      assert.doesNotThrow(() => searchMemories(dbManager, 'DO NOT USE FIND /', { target: 'user' }));
+      const results = searchMemories(dbManager, 'DO NOT USE FIND /', { target: 'user' });
+
+      assert.ok(results.some((r) => r.content.includes('find /')));
     });
   });
 

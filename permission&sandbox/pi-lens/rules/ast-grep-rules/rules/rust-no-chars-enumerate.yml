@@ -1,0 +1,19 @@
+id: rust-no-chars-enumerate
+language: Rust
+severity: warning
+message: "chars().enumerate() may confuse character indices with byte offsets"
+note: |
+  `chars().enumerate()` produces character positions, while many Rust APIs
+  require byte offsets. This rule is detection-only because the intended index
+  semantics cannot be proved from syntax. Use `char_indices()` only when the
+  consumer requires byte offsets.
+rule:
+  pattern: $TEXT.chars().enumerate()
+has_fix: false
+tags:
+  - rust
+  - correctness
+  - unicode
+examples:
+  bad: "for (index, character) in text.chars().enumerate() {}"
+  good: "for (index, character) in text.char_indices() {}"

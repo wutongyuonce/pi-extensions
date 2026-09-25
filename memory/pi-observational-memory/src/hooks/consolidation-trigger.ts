@@ -124,6 +124,22 @@ function makeModelResolver(runtime: Runtime, ctx: ConsolidationCtx): (stage: "ob
 		});
 		if (cached.ok) {
 			runtime.resolveFailureNotified = false;
+			// Console Go (opencode.ai) rejects requests without x-opencode-session
+			// (400 MissingSessionID). Mirror pi's own session headers on worker calls.
+			const model = (cached.model ?? {}) as { provider?: string; baseUrl?: string };
+			if (model.provider === "opencode" || model.provider === "opencode-go" || (typeof model.baseUrl === "string" && model.baseUrl.includes("opencode.ai"))) {
+				const sessionId = ctx.sessionManager.getSessionId?.();
+				if (sessionId) {
+					return {
+						...cached,
+						headers: {
+							...(cached.headers ?? {}),
+							"x-opencode-session": sessionId,
+							"x-opencode-client": "pi",
+						},
+					};
+				}
+			}
 			return cached;
 		}
 		debugLog(`${stage}.model_unavailable`, { reason: cached.reason });
@@ -318,6 +334,7 @@ async function runObserverStage(
 			allowedSourceEntryIds: sourceEntryIds,
 			maxTurns: runtime.config.agentMaxTurns,
 			thinkingLevel: runtime.config.model?.thinking ?? "low",
+			modelRegistry: ctx.modelRegistry,
 		});
 	} catch (error) {
 		if (error instanceof ObserverStreamError) {
@@ -389,6 +406,7 @@ async function runReflectorStage(
 		observations: folded.activeObservations,
 		maxTurns: runtime.config.agentMaxTurns,
 		thinkingLevel: runtime.config.model?.thinking ?? "low",
+		modelRegistry: ctx.modelRegistry,
 	});
 	if (!reflections) return { outcome: "continue", sameRunReflections: [] };
 
@@ -463,6 +481,7 @@ async function runDropperStage(
 		targetTokens: runtime.config.observationsPoolTargetTokens,
 		maxTurns: runtime.config.agentMaxTurns,
 		thinkingLevel: runtime.config.model?.thinking ?? "low",
+		modelRegistry: ctx.modelRegistry,
 	});
 	const coversUpToId = earlierCoverageMarkerId(entries, observationCoverageId, sameRunReflectionCoverageId);
 	const data = coversUpToId && droppedIds ? buildObservationsDroppedData(droppedIds, coversUpToId) : undefined;

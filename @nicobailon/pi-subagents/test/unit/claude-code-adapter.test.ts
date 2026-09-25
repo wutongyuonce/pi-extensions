@@ -113,7 +113,9 @@ describe("Claude Code adapter", () => {
 		const launch = resolveClaudeCodeLaunch({ adapter: CLAUDE_CODE_ADAPTER_ID, command: "claude" });
 		const help = "Claude Code - starts an interactive session --print --input-format stream-json --verbose --permission-mode plan --tools --strict-mcp-config --mcp-config --setting-sources --no-session-persistence --disable-slash-commands --no-chrome";
 		const evidence = { binaryPath: "/tmp/claude", binaryMtimeMs: 1, version: "2.1.150 (Claude Code)", help, cacheHit: false };
+		assert.doesNotThrow(() => launch.preflight.validate?.({ ...evidence, version: "2026.4.24 macos-arm64 (2026-04-27)" }));
 		assert.throws(() => launch.preflight.validate?.({ ...evidence, version: "Claude unknown" }), /Unsupported Claude Code version response/);
+		assert.throws(() => launch.preflight.validate?.({ ...evidence, version: "2026.4.24 macos-arm64 (not-a-date)" }), /Unsupported Claude Code version response/);
 		assert.throws(() => launch.preflight.validate?.({ ...evidence, help: "Claude Code - starts an interactive session --print" }), /does not document required option/);
 	});
 

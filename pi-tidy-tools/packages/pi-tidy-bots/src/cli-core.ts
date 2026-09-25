@@ -54,6 +54,7 @@ import {
   ensureStoredToken,
   isLoopbackHost,
   rotateStoredToken,
+  readStoredToken,
 } from "./pairing.ts";
 
 export interface StartTokenResolution {
@@ -74,6 +75,8 @@ export function resolveStartToken(opts: {
   explicitToken?: string;
   wantsQr: boolean;
   wantsRotate: boolean;
+  /** Neutral gateway mode always requires authentication, including loopback. */
+  requireAuth?: boolean;
 }): StartTokenResolution {
   if (opts.wantsRotate)
     return { token: rotateStoredToken(opts.fleetDir), rotated: true };
@@ -81,7 +84,12 @@ export function resolveStartToken(opts: {
     return {
       token: ensureStoredToken(opts.fleetDir, opts.explicitToken).token,
     };
-  if (!isLoopbackHost(opts.host))
+  // Issue 51: a stored token is sticky — restarts must preserve it (console
+  // URLs survive `pi-tidy-bots restart`) instead of silently dropping auth
+  // on loopback boots.
+  const stored = readStoredToken(opts.fleetDir);
+  if (stored) return { token: stored };
+  if (opts.requireAuth || !isLoopbackHost(opts.host))
     return { token: ensureStoredToken(opts.fleetDir).token };
   if (opts.wantsQr)
     return { token: ensureStoredToken(opts.fleetDir, undefined, true).token };
@@ -154,6 +162,91 @@ export function pickStopPid(
   const lockPid = readLockHolderPid(fleetDir);
   if (lockPid) return { pid: lockPid, from: "lock.json" };
   return undefined;
+}
+
+/**
+ * Issue 135: does this command line look like a pi-tidy-bots daemon?
+ * Matches the bin shim (`node .../pi-tidy-bots.mjs start …`) and the
+ * source entry (`node --import tsx .../cli.ts start …`) — foreground or
+ * daemonized.
+ */
+export function daemonCommandMatches(command: string): boolean {
+  return (
+    /pi-tidy-bots(\.mjs)?|cli\.ts/.test(command) && /\bstart\b/.test(command)
+  );
+}
+
+export type DaemonIdentityCheck =
+  | { kind: "match"; fleetDir: string }
+  | { kind: "foreign-fleet"; fleetDir: string }
+  | { kind: "unreachable" };
+
+/**
+ * Issue 154: identity fingerprint before ANY signal — the daemon serving
+ * the fleet's configured port must report THIS fleet dir via /api/version.
+ * A different fleet's daemon on the port (concurrent fleets, stale
+ * registry) is a loud refusal, never a signal.
+ */
+export async function probeDaemonIdentity(
+  port: number,
+  expectedDir: string,
+  fetchImpl: (url: string, init?: RequestInit) => Promise<Response> = (
+    url,
+    init
+  ) => fetch(url, init),
+  /** Issue 178: token-protected fleets 401 the bare probe — the stored
+   * token must ride the identity check exactly like the readiness loop. */
+  token?: string
+): Promise<DaemonIdentityCheck> {
+  try {
+    const res = await fetchImpl(`http://127.0.0.1:${port}/api/version`, {
+      headers: token ? { authorization: `Bearer ${token}` } : {},
+    });
+    if (!res.ok) return { kind: "unreachable" };
+    const payload = (await res.json()) as { fleetDir?: string };
+    const reported = payload.fleetDir
+      ? resolveLike(expectedDir, payload.fleetDir)
+      : undefined;
+    if (reported === expectedDir)
+      return { kind: "match", fleetDir: payload.fleetDir ?? "" };
+    return { kind: "foreign-fleet", fleetDir: payload.fleetDir ?? "" };
+  } catch {
+    return { kind: "unreachable" };
+  }
+}
+
+function resolveLike(
+  expectedDir: string,
+  reported: string
+): string | undefined {
+  // Compare resolved paths without importing node:path resolve twice.
+  return reported.replace(/\/$/, "") === expectedDir.replace(/\/$/, "")
+    ? expectedDir
+    : undefined;
+}
+
+export type DaemonPidCheck =
+  | { kind: "alive-daemon"; pid: number; command: string }
+  | { kind: "foreign"; pid: number; command: string }
+  | { kind: "dead"; pid: number };
+
+/** Issue 135: verify a pid is alive AND ours before signalling it. */
+export function verifyDaemonPid(
+  pid: number,
+  run: (file: string, args: string[]) => string = (file, args) =>
+    execFileSync(file, args, { encoding: "utf8", timeout: 5_000 })
+): DaemonPidCheck {
+  const command = (() => {
+    try {
+      return run("ps", ["-p", String(pid), "-o", "command="]).trim();
+    } catch {
+      return "";
+    }
+  })();
+  if (command.length === 0) return { kind: "dead", pid };
+  if (daemonCommandMatches(command))
+    return { kind: "alive-daemon", pid, command };
+  return { kind: "foreign", pid, command };
 }
 
 /** True while the pid is alive (signal 0 probe). */
@@ -258,7 +351,7 @@ export async function healthCheck(url: string): Promise<boolean> {
   }
 }
 
-/** Issue 51: name the process holding a TCP port (best-effort, POSIX tools). */
+/** Issue 51: name the process(es) holding a TCP port (best-effort, POSIX tools). */
 export function describePortHolder(
   port: number,
   run: (file: string, args: string[]) => string = (file, args) =>
@@ -266,15 +359,27 @@ export function describePortHolder(
 ): string {
   try {
     // Listener state only: client connections to the port (e.g. the console
-    // tab's sockets) must not be misattributed as the holder.
-    const pids = run("lsof", ["-ti", "-sTCP:LISTEN", "-i", `:${port}`])
+    // tab's sockets) must not be misattributed as the holder. A port can have
+    // SEPARATE holders per address family (e.g. our daemon on 127.0.0.1 and a
+    // foreign listener on [::]) — name them all, not an arbitrary first.
+    const seen = new Set<string>();
+    // NB: the `-i :<port>` space form silently ignores the port filter on
+    // macOS lsof (returns every listener) — the glued `-iTCP:<port>` form
+    // is required. `-nP` keeps it numeric and fast.
+    const pids = run("lsof", ["-nP", "-t", "-sTCP:LISTEN", `-iTCP:${port}`])
       .split("\n")
       .map((line) => line.trim())
-      .filter((line) => /^\d+$/.test(line));
-    const pid = pids[0];
-    if (!pid) return "";
-    const command = run("ps", ["-p", pid, "-o", "command="]).trim();
-    return `held by pid ${pid}: ${command}`;
+      .filter((line) => /^\d+$/.test(line))
+      .slice(0, 3);
+    for (const pid of pids) {
+      try {
+        const command = run("ps", ["-p", pid, "-o", "command="]).trim();
+        seen.add(`pid ${pid}: ${command.slice(0, 120)}`);
+      } catch {
+        seen.add(`pid ${pid}`);
+      }
+    }
+    return seen.size > 0 ? `held by ${[...seen].join("; ")}` : "";
   } catch {
     return "";
   }

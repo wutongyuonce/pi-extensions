@@ -21,11 +21,11 @@ export interface ResolveSubagentRunIdDeps {
 
 function exactAsyncLocation(id: string, asyncDirRoot: string, resultsDir: string): AsyncRunLocation | undefined {
 	const asyncDir = path.join(asyncDirRoot, id);
-	const asyncDirExists = fs.existsSync(asyncDir);
+	const hasStatus = fs.existsSync(path.join(asyncDir, "status.json"));
 	const resultPath = resultPathFor(resultsDir, id);
-	if (!asyncDirExists && !resultPath) return undefined;
+	if (!hasStatus && !resultPath) return undefined;
 	return {
-		asyncDir: asyncDirExists ? asyncDir : null,
+		asyncDir: hasStatus ? asyncDir : null,
 		resultPath,
 		resolvedId: id,
 	};
@@ -131,11 +131,16 @@ function nestedScopeFromState(state: SubagentState | undefined): NestedRunResolu
 	};
 	for (const control of state.foregroundControls.values()) add(control.nestedRoute as NestedRoute | undefined);
 	for (const job of state.asyncJobs.values()) add(job.nestedRoute as NestedRoute | undefined);
+	if (state.retainedNestedLookupRoutes?.sessionId === state.currentSessionId) {
+		for (const route of state.retainedNestedLookupRoutes.routes.values()) add(route);
+	}
 	return { routes };
 }
 
 function asyncPrefixMatches(prefix: string, asyncDirRoot: string, resultsDir: string): Array<{ id: string; location: AsyncRunLocation }> {
-	return findAsyncRunPrefixMatches(prefix, asyncDirRoot, resultsDir);
+	return findAsyncRunPrefixMatches(prefix, asyncDirRoot, resultsDir).filter((match) =>
+		match.location.resultPath || (match.location.asyncDir && fs.existsSync(path.join(match.location.asyncDir, "status.json")))
+	);
 }
 
 export function resolveSubagentRunId(id: string, deps: ResolveSubagentRunIdDeps = {}): ResolvedSubagentRunId | undefined {
@@ -143,7 +148,6 @@ export function resolveSubagentRunId(id: string, deps: ResolveSubagentRunIdDeps 
 	const asyncDirRoot = deps.asyncDirRoot ?? DIRS.async;
 	const resultsDir = deps.resultsDir ?? DIRS.results;
 
-	const nestedScope = deps.nested ?? nestedScopeFromState(deps.state);
 	if (hasExactForegroundId(deps.state, id)) return { kind: "foreground", id };
 	const exactAsync = exactAsyncLocation(id, asyncDirRoot, resultsDir);
 	if (exactAsync) return { kind: "async", id, location: exactAsync };
@@ -152,6 +156,7 @@ export function resolveSubagentRunId(id: string, deps: ResolveSubagentRunIdDeps 
 	const exactToolCallIdMatches = indexedToolCallIdAsyncLocations(id, asyncDirRoot, resultsDir);
 	if (exactToolCallIdMatches.length > 1) throw new Error(`Subagent tool-call id '${id}' is ambiguous across async runs. Use the returned asyncId instead.`);
 	if (exactToolCallIdMatches[0]) return { kind: "async", id: exactToolCallIdMatches[0].id, location: exactToolCallIdMatches[0].location };
+	const nestedScope = deps.nested ?? nestedScopeFromState(deps.state);
 	const exactNested = findNestedRunMatchesById(id, nestedScope ? { scope: nestedScope } : {});
 	if (exactNested.length > 1) throw new Error(`Nested run id '${id}' is ambiguous across authorized registries. Provide the full id after stale registries are cleaned up.`);
 	if (exactNested[0]) return { kind: "nested", id, match: exactNested[0] };

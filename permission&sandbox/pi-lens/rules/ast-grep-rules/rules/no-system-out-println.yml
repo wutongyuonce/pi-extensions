@@ -1,0 +1,16 @@
+id: no-system-out-println
+language: java
+severity: warning
+message: Avoid System.out.println; use a logging framework instead.
+note: Ported from VTCode (https://github.com/vinhnx/VTCode), refs #2195. Logger policy and intentional console output vary by project, so this rule is detection-only.
+rule:
+  any:
+    - pattern: System.out.println($$$)
+    - pattern: System.out.print($$$)
+    - pattern: System.err.println($$$)
+    - pattern: System.err.print($$$)
+files:
+  - "**/*.java"
+ignores:
+  - "**/test/**"
+  - "**/*Test.java"

@@ -1,0 +1,21 @@
+{
+	"provenance": {
+		"runner": "phpstan",
+		"tool": "phpstan",
+		"version": "2.2.8",
+		"command": "phpstan analyse --error-format=json --no-progress",
+		"argv": [
+			"analyse",
+			"--error-format=json",
+			"--no-progress"
+		],
+		"workspace": "tests/fixtures/tool-smoke/phpstan-internal",
+		"platform": "win32-x64",
+		"capturedAt": "2026-08-21",
+		"note": "an unmatched ignore pattern: a finding phpstan reports outside files{}"
+	},
+	"file": "clean.php",
+	"exitCode": 1,
+	"stdout": "{\"totals\":{\"errors\":1,\"file_errors\":0},\"files\":{},\"errors\":[\"Ignored error pattern #Never emitted by this fixture# was not matched in reported errors.\"]}",
+	"stderr": "Note: Using configuration file __WORKSPACE__\\phpstan.neon.\r\n"
+}

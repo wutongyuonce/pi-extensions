@@ -1,13 +1,18 @@
+import { createHash } from 'node:crypto';
 import { DatabaseManager } from './db.js';
 import {
   buildFallbackFts5Query,
   buildNaturalLanguageFallbackQuery,
+  collectLikeTerms,
   isFts5QueryError,
   normalizeFts5Query,
   normalizeNaturalLanguageFts5Query,
 } from './fts-query.js';
 import { normalizeMemoryLookupText } from './memory-lookup.js';
+import { MDSYNC_METADATA_KEY_PREFIX } from '../constants.js';
 import type { MemoryCategory } from '../types.js';
+
+export { isFts5QueryError };
 
 const MEMORY_SELECT_COLUMNS = `
   id,
@@ -21,6 +26,13 @@ const MEMORY_SELECT_COLUMNS = `
   created,
   last_referenced
 `;
+
+// The BM25-ranked search joins memory_fts, which also has a `content` column,
+// so that one query needs the same list qualified with the `memories` alias.
+const MEMORY_SELECT_COLUMNS_M = MEMORY_SELECT_COLUMNS
+  .split(',')
+  .map((column) => `m.${column.trim()}`)
+  .join(',\n        ');
 
 const FAILURE_CATEGORY_SET = new Set<MemoryCategory>([
   'failure',
@@ -84,6 +96,46 @@ export interface MarkdownMemoryReconcileResult {
   inserted: number;
   existing: number;
   removed: number;
+  /**
+   * True when the scope was left un-reconciled because of a genuine FTS5
+   * search-index error. Markdown remains the source of truth and the write
+   * did not fail; search may be stale until /memory-sync-markdown rebuilds
+   * the index. Callers should surface that repair guidance to the user.
+   */
+  degraded?: boolean;
+  /** Human-readable reason for the degraded state, when degraded is true. */
+  degradedReason?: string;
+}
+
+export interface MarkdownReconcileOptions {
+  /** Repair path. Ignore stored fingerprint and rewrite the scope. */
+  force?: boolean;
+}
+
+interface MarkdownScopeSyncState {
+  sha256: string;
+  entryCount: number;
+}
+
+function markdownScopeSyncKey(target: string, project: string | null): string {
+  return MDSYNC_METADATA_KEY_PREFIX + JSON.stringify([target, project]);
+}
+
+function parseMarkdownScopeSyncState(value: unknown): MarkdownScopeSyncState | null {
+  if (typeof value !== 'string') return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value);
+  } catch {
+    return null;
+  }
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) return null;
+  const rec = parsed as Record<string, unknown>;
+  if (Object.keys(rec).length !== 2) return null;
+  const { sha256, entryCount } = rec;
+  if (typeof sha256 !== 'string' || !/^[0-9a-f]{64}$/i.test(sha256)) return null;
+  if (typeof entryCount !== 'number' || !Number.isInteger(entryCount) || entryCount < 0) return null;
+  return { sha256, entryCount };
 }
 
 export interface ParsedMarkdownMemoryEntry extends SqliteMemorySyncInput {}
@@ -452,13 +504,48 @@ export function reconcileMarkdownMemoryScope(
   rawEntries: string[],
   target: 'memory' | 'user' | 'failure',
   project: string | null = null,
+  options?: MarkdownReconcileOptions,
 ): MarkdownMemoryReconcileResult {
-  const db = dbManager.getDb();
   const normalizedProject = normalizeNullable(project);
+  const syncKey = markdownScopeSyncKey(target, normalizedProject);
+  const hash = createHash('sha256').update(JSON.stringify(rawEntries)).digest('hex');
+  const force = options?.force === true;
 
+  // The full reconcile runs against the CURRENT database handle. It must fetch
+  // it via dbManager.getDb() rather than a pre-fetched handle: after corruption
+  // recovery quarantines the old file and rebuilds a fresh one, the retry has
+  // to run on the new handle.
   const reconcile = (): MarkdownMemoryReconcileResult => {
+    const db = dbManager.getDb();
+
+    // Read the fingerprint row on the force path too: an emptying scope needs it
+    // to know whether a stale row is worth deleting, and force is the repair
+    // command, where one indexed read costs nothing.
+    const stateRow = db.prepare(
+      'SELECT value FROM extension_metadata WHERE key = ?',
+    ).get(syncKey) as { value: string } | undefined;
+    const state = parseMarkdownScopeSyncState(stateRow?.value);
+    if (!force && state && state.sha256 === hash) {
+      // Liveness here is a row COUNT over this scope's slice: the fingerprint
+      // binds markdown bytes, not the mirror's content, so a mirror that drifted
+      // without changing its row count keeps skipping. That is the deliberate
+      // trade for the per-startup sweep this gate removes; the forced
+      // /memory-sync-markdown reconcile is the repair for every such drift,
+      // including a search index that lost rows.
+      const countParams: unknown[] = [];
+      const countConditions = buildScopeConditions(countParams, target, normalizedProject);
+      const countRow = db.prepare(
+        `SELECT COUNT(*) as count FROM memories WHERE ${countConditions.join(' AND ')}`,
+      ).get(...countParams) as { count: number } | undefined;
+      const count = Number(countRow?.count ?? 0);
+      if (count === state.entryCount) {
+        return { inserted: 0, existing: state.entryCount, removed: 0 };
+      }
+    }
+
     let inserted = 0;
     let existing = 0;
+    let removed = 0;
     const desiredIdentities = new Set<string>();
 
     for (const rawEntry of rawEntries) {
@@ -491,17 +578,53 @@ export function reconcileMarkdownMemoryScope(
       }
     }
 
-    let removed = 0;
     if (orphanIds.length > 0) {
       const placeholders = orphanIds.map(() => '?').join(', ');
       removed = db.prepare(`DELETE FROM memories WHERE id IN (${placeholders})`).run(...orphanIds).changes;
     }
 
+    const unique = desiredIdentities.size;
+    if (unique === 0) {
+      // Only a scope that previously had a fingerprint needs the delete; an
+      // always-empty scope costs two reads, never a write transaction.
+      if (state) {
+        db.prepare('DELETE FROM extension_metadata WHERE key = ?').run(syncKey);
+      }
+    } else {
+      db.prepare(
+        'INSERT OR REPLACE INTO extension_metadata (key, value) VALUES (?, ?)',
+      ).run(syncKey, JSON.stringify({ sha256: hash, entryCount: unique }));
+    }
+
     return { inserted, existing, removed };
   };
 
-  const transactional = db.transaction?.(reconcile);
-  return transactional ? transactional() : reconcile();
+  const run = (): MarkdownMemoryReconcileResult => {
+    const db = dbManager.getDb();
+    const transactional = db.transaction?.(reconcile);
+    return transactional ? transactional() : reconcile();
+  };
+
+  try {
+    // Corruption errors (e.g. "database disk image is malformed") are NOT
+    // search-index problems: they must stay on the recovery path so
+    // DatabaseManager quarantines the corrupt file, rebuilds a fresh one, and
+    // retries this sync (#186). Swallowing them would hide corruption and
+    // leave a corrupt database in place.
+    return dbManager.withCorruptionRecovery(run);
+  } catch (err) {
+    if (isFts5QueryError(err)) {
+      // A genuine FTS5 query/index error means the search index is stale or
+      // broken, not that the database is corrupt. Markdown is the source of
+      // truth, so the write must not fail: warn in the log and report a
+      // DEGRADED result so the caller can surface the /memory-sync-markdown
+      // repair guidance to the user.
+      const detail = err instanceof Error ? err.message : String(err);
+      console.warn(`[pi-hermes-memory] FTS5 search index error during markdown sync (search may be stale; run /memory-sync-markdown): ${detail}`);
+      return { inserted: 0, existing: 0, removed: 0, degraded: true, degradedReason: detail };
+    }
+    throw err;
+  }
 }
 
 function failureProject(rawEntry: string): string | null {
@@ -511,6 +634,7 @@ function failureProject(rawEntry: string): string | null {
 export function reconcileMarkdownFailureScopes(
   dbManager: DatabaseManager,
   rawEntries: string[],
+  options?: MarkdownReconcileOptions,
 ): MarkdownMemoryReconcileResult {
   const entriesByProject = new Map<string | null, string[]>();
   for (const rawEntry of rawEntries) {
@@ -538,10 +662,17 @@ export function reconcileMarkdownFailureScopes(
       entriesByProject.get(project) ?? [],
       'failure',
       project,
+      options,
     );
     total.inserted += result.inserted;
     total.existing += result.existing;
     total.removed += result.removed;
+    if (result.degraded && !total.degraded) {
+      // Surface the first degraded scope: repair guidance applies to the whole
+      // sync run, and the first reason is the one to act on.
+      total.degraded = true;
+      total.degradedReason = result.degradedReason;
+    }
   }
 
   return total;
@@ -718,11 +849,8 @@ export function searchMemories(
   const conditions: string[] = [];
   const params: unknown[] = [];
 
-  // FTS5 match via subquery with escaped query
+  // FTS5 match via JOIN with BM25 ranking
   const normalizedQuery = normalizeFts5Query(query);
-  if (normalizedQuery.length === 0) {
-    return [];
-  }
 
   let ftsParseError = false;
 
@@ -730,7 +858,7 @@ export function searchMemories(
     const conditions: string[] = [];
     const params: unknown[] = [];
 
-    conditions.push('m.id IN (SELECT rowid FROM memory_fts WHERE memory_fts MATCH ?)');
+    conditions.push('memory_fts MATCH ?');
     params.push(matchQuery);
 
     if (project !== undefined) {
@@ -752,10 +880,13 @@ export function searchMemories(
     const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(' AND ')}` : '';
 
     const sql = `
-      SELECT ${MEMORY_SELECT_COLUMNS}
+      SELECT
+        ${MEMORY_SELECT_COLUMNS_M},
+        bm25(memory_fts) AS rank_score
       FROM memories m
+      JOIN memory_fts ON memory_fts.rowid = m.id
       ${whereClause}
-      ORDER BY m.last_referenced DESC
+      ORDER BY rank_score ASC, m.last_referenced DESC
       LIMIT ?
     `;
 
@@ -771,6 +902,7 @@ export function searchMemories(
         corrected_to: string | null;
         created: string;
         last_referenced: string;
+        rank_score: number;
       }>;
 
       return rows.map(mapRow);
@@ -825,6 +957,61 @@ export function searchMemories(
     }>;
     return rows.map(mapRow);
   };
+
+  // Every term a stop word or connector leaves FTS5 nothing to match.
+  // Degrade to a scoped literal substring search (OR over the raw terms) —
+  // the same fallback session search uses for this case — instead of a hard
+  // [].
+  const runLiteralLikeFallback = (): SqliteMemoryEntry[] => {
+    const terms = collectLikeTerms(query);
+    if (terms.length === 0) return [];
+
+    const conditions: string[] = [
+      `(${terms.map(() => "m.content LIKE ? ESCAPE '\\'").join(' OR ')})`,
+    ];
+    const params: unknown[] = terms.map((term) => `%${escapeLikePattern(term.trim())}%`);
+
+    if (project !== undefined) {
+      if (project === null) {
+        conditions.push('m.project IS NULL');
+      } else {
+        conditions.push('m.project = ?');
+        params.push(project);
+      }
+    }
+    if (target) {
+      conditions.push('m.target = ?');
+      params.push(target);
+    }
+    if (category) {
+      conditions.push('m.category = ?');
+      params.push(category);
+    }
+
+    const rows = db.prepare(`
+      SELECT ${MEMORY_SELECT_COLUMNS}
+      FROM memories m
+      WHERE ${conditions.join(' AND ')}
+      ORDER BY m.last_referenced DESC
+      LIMIT ?
+    `).all(...params, limit) as Array<{
+      id: number;
+      project: string | null;
+      target: string;
+      category: string | null;
+      content: string;
+      failure_reason: string | null;
+      tool_state: string | null;
+      corrected_to: string | null;
+      created: string;
+      last_referenced: string;
+    }>;
+    return rows.map(mapRow);
+  };
+
+  if (normalizedQuery.length === 0) {
+    return runLiteralLikeFallback();
+  }
 
   const exactResults = runSearch(normalizedQuery);
   if (exactResults.length > 0) {

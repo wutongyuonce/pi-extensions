@@ -1,0 +1,18 @@
+{
+	"global": null,
+	"lsp": {},
+	"project": {
+		"configPath": "<HOME>/proj/pi-lens.json",
+		"ignore": [
+			"vendor/**"
+		],
+		"maxProjectFiles": 1234,
+		"raw": {
+			"ignore": [
+				"vendor/**"
+			],
+			"maxProjectFiles": 1234
+		},
+		"rules": {}
+	}
+}

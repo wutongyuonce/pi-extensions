@@ -1,0 +1,16 @@
+id: no-win32-isabsolute-for-qualification
+valid:
+  # DOCUMENTED LIMITATION (#1349 review): the aliased parser -- the shape
+  # the actual pre-#1330 defect used -- is beyond ast-grep's reach and is
+  # deliberately a negative; flipping it to invalid requires an engine
+  # capability decision. Review-enforced meanwhile (AGENTS.md shape 2).
+  - |
+    const w = path.win32;
+    if (w.isAbsolute(filePath)) {
+      return true;
+    }
+  - "isFullyQualified(filePath)"
+  - "path.posix.isAbsolute(filePath)"
+invalid:
+  - "path.win32.isAbsolute(filePath)"
+  - "win32.isAbsolute(filePath)"

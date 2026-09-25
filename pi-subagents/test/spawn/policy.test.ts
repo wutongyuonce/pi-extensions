@@ -28,6 +28,7 @@ function preparedEnv(agentDefs: AgentDefaults | null): Record<string, string> {
 			runtimePaths: {},
 			sessionFile: "parent.jsonl",
 			subagentSessionFile: "child.jsonl",
+			skillLaunchPlan: { visibilitySpec: "" },
 		} as PreparedSubagentLaunch,
 		{ agent: "target", name: "child", task: "task", title: "Child task" },
 		() => "lineage-only",

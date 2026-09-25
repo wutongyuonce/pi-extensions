@@ -1,0 +1,92 @@
+name: Publish npm package
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Publish @earendil-works/pi-voice
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          registry-url: "https://registry.npmjs.org"
+          package-manager-cache: false
+
+      - name: Check tag and package versions
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          node --input-type=module <<'NODE'
+          import { readFileSync } from "node:fs";
+
+          const tag = process.env.RELEASE_TAG;
+          if (!/^v\d+\.\d+\.\d+$/.test(tag)) {
+            throw new Error(`Invalid release tag: ${tag}`);
+          }
+
+          const expectedVersion = tag.slice(1);
+          for (const path of ["package.json", "package-lock.json"]) {
+            const pkg = JSON.parse(readFileSync(path, "utf8"));
+            if (pkg.version !== expectedVersion) {
+              throw new Error(`${path} has version ${pkg.version}; expected ${expectedVersion}`);
+            }
+          }
+          NODE
+
+      - name: Upgrade npm for trusted publishing
+        run: npm install --global npm@11.16.0 --ignore-scripts
+
+      - name: Install dependencies
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: Validate
+        run: npm test
+
+      - name: Check whether version is already published
+        id: package
+        run: |
+          node --input-type=module <<'NODE'
+          import { appendFileSync, readFileSync } from "node:fs";
+          import { spawnSync } from "node:child_process";
+
+          const { name, version } = JSON.parse(readFileSync("package.json", "utf8"));
+          const spec = `${name}@${version}`;
+          const result = spawnSync("npm", ["view", spec, "version", "--json"], {
+            encoding: "utf8",
+          });
+          if (result.error) throw result.error;
+
+          if (result.status === 0) {
+            appendFileSync(process.env.GITHUB_OUTPUT, "publish=false\n");
+            console.log(`${spec} is already published; skipping.`);
+          } else if (result.status !== null && JSON.parse(result.stdout).error?.code === "E404") {
+            appendFileSync(process.env.GITHUB_OUTPUT, "publish=true\n");
+            console.log(`${spec} is not published yet.`);
+          } else {
+            throw new Error(`Could not check ${spec}: ${result.stderr}`);
+          }
+          NODE
+
+      - name: Publish
+        if: steps.package.outputs.publish == 'true'
+        run: npm publish

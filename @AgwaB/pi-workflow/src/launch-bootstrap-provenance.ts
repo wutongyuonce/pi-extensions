@@ -12,6 +12,10 @@ import {
 import { fromProjectPath, workflowRunDir } from "./store.js";
 import { workflowStateRootIdentity } from "./workflow-state-root.js";
 import {
+	assertWorkflowResourcePolicyMatchesTask,
+	isWorkflowResourcePolicy,
+} from "./resource-inheritance.js";
+import {
 	isWorkflowTaskSessionIdentity,
 	workflowTaskAttemptIdentity,
 	workflowTaskSessionId,
@@ -20,12 +24,15 @@ import type {
 	CompiledTask,
 	LaunchBootstrapProvenanceHistory,
 	LaunchBootstrapProvenanceRecord,
+	LaunchBootstrapProvenanceRecordBase,
 	WorkflowRunRecord,
 	WorkflowTaskRunRecord,
 } from "./types.js";
 
 export const LAUNCH_BOOTSTRAP_PROVENANCE_SCHEMA =
 	"pi-workflow-launch-bootstrap-provenance-v1" as const;
+export const LAUNCH_BOOTSTRAP_RESOURCE_POLICY_PROVENANCE_SCHEMA =
+	"pi-workflow-launch-bootstrap-provenance-v2" as const;
 export const EXTERNAL_LAUNCH_GRANT_SHA256_ENV =
 	"PI_WORKFLOW_EXTERNAL_LAUNCH_GRANT_SHA256" as const;
 export const REQUIRE_EXTERNAL_LAUNCH_GRANT_ENV =
@@ -56,12 +63,18 @@ export async function createLaunchBootstrapProvenance(
 		captureToolCalls: false,
 	},
 ): Promise<LaunchBootstrapProvenanceRecord> {
+	const resourcePolicy = assertWorkflowResourcePolicyMatchesTask(
+		preparedTask,
+		preparedLaunch.resourcePolicy,
+	);
 	const sessionId = workflowTaskSessionId(run, task);
 	const artifactIdentities = await artifactIdentity(cwd, run, task);
 	const stateRootIdentity = await workflowStateRootIdentity(cwd);
 	const externalGrantSha256 = externalLaunchGrantSha256();
-	const record: Omit<LaunchBootstrapProvenanceRecord, "identitySha256"> = {
-		schema: LAUNCH_BOOTSTRAP_PROVENANCE_SCHEMA,
+	const recordBase: Omit<
+		LaunchBootstrapProvenanceRecordBase,
+		"identitySha256"
+	> = {
 		workflow: {
 			type: run.type,
 			specPathSha256: sha256Text(run.specPath),
@@ -77,6 +90,9 @@ export async function createLaunchBootstrapProvenance(
 			launchRetry: task.launchRetry?.attempts ?? 0,
 			outputRetry: task.outputRetry?.attempts ?? 0,
 			resume: task.resumeEvents?.length ?? 0,
+			...(task.foreachBatch?.physicalAttempt === undefined
+				? {}
+				: { physicalAttempt: task.foreachBatch.physicalAttempt }),
 		},
 		...(sessionId === undefined ? {} : { sessionId }),
 		backend: { id: backendId, type: run.backend.type, mode: run.backend.mode },
@@ -142,7 +158,18 @@ export async function createLaunchBootstrapProvenance(
 				: { artifactAccess: preparedTask.artifactGraph.artifactAccess }),
 		},
 	};
-	return { ...record, identitySha256: sha256Canonical(record) };
+	const record =
+		resourcePolicy === undefined
+			? { schema: LAUNCH_BOOTSTRAP_PROVENANCE_SCHEMA, ...recordBase }
+			: {
+					schema: LAUNCH_BOOTSTRAP_RESOURCE_POLICY_PROVENANCE_SCHEMA,
+					...recordBase,
+					resourcePolicy,
+				};
+	return {
+		...record,
+		identitySha256: sha256Canonical(record),
+	} as LaunchBootstrapProvenanceRecord;
 }
 
 /** Persist only an exact deterministic replay of a known attempt. */
@@ -161,6 +188,7 @@ export function recordLaunchBootstrapProvenance(
 		if (
 			!isValidLaunchBootstrapRecord(candidate) ||
 			!hasSameHistoryOwner(candidate, record) ||
+			candidate.schema !== record.schema ||
 			attempts.has(candidate.attempt.key)
 		)
 			throw new Error("launch-bootstrap provenance is malformed");
@@ -194,7 +222,9 @@ export function assertRecordedLaunchBootstrapProvenance(
 	for (const candidate of history.records) {
 		if (
 			!isValidLaunchBootstrapRecord(candidate) ||
-			(owner !== undefined && !hasSameHistoryOwner(candidate, owner)) ||
+			(owner !== undefined &&
+				(!hasSameHistoryOwner(candidate, owner) ||
+					candidate.schema !== owner.schema)) ||
 			attempts.has(candidate.attempt.key)
 		)
 			throw new Error("launch-bootstrap provenance is malformed");
@@ -343,8 +373,21 @@ function isValidLaunchBootstrapRecord(
 		!hasRequiredKeys(value, requiredRecordKeys)
 	)
 		return false;
+	const hasResourcePolicySchema =
+		value.schema === LAUNCH_BOOTSTRAP_RESOURCE_POLICY_PROVENANCE_SCHEMA;
 	if (
-		value.schema !== LAUNCH_BOOTSTRAP_PROVENANCE_SCHEMA ||
+		value.schema !== LAUNCH_BOOTSTRAP_PROVENANCE_SCHEMA &&
+		!hasResourcePolicySchema
+	)
+		return false;
+	if (
+		(hasResourcePolicySchema &&
+			(!hasRequiredKeys(value, ["resourcePolicy"]) ||
+				!isWorkflowResourcePolicy(value.resourcePolicy))) ||
+		(!hasResourcePolicySchema && Object.hasOwn(value, "resourcePolicy"))
+	)
+		return false;
+	if (
 		!isSha256(value.identitySha256) ||
 		!isWorkflow(value.workflow) ||
 		!nonEmptyString(value.runId) ||
@@ -364,15 +407,19 @@ function isValidLaunchBootstrapRecord(
 		launchRetry: number;
 		outputRetry: number;
 		resume: number;
+		physicalAttempt?: number;
 	};
+	const expectedAttemptKey = [
+		`launch-retry:${attempt.launchRetry}`,
+		`output-retry:${attempt.outputRetry}`,
+		`resume:${attempt.resume}`,
+		...(attempt.physicalAttempt === undefined
+			? []
+			: [`physical:${attempt.physicalAttempt}`]),
+		`session:${value.sessionId ?? "none"}`,
+	].join(";");
 	if (
-		attempt.key !==
-		[
-			`launch-retry:${attempt.launchRetry}`,
-			`output-retry:${attempt.outputRetry}`,
-			`resume:${attempt.resume}`,
-			`session:${value.sessionId ?? "none"}`,
-		].join(";") ||
+		attempt.key !== expectedAttemptKey ||
 		(value.sessionId !== undefined &&
 			!isWorkflowTaskSessionIdentity({
 				runId: value.runId as string,
@@ -415,6 +462,7 @@ const recordKeys = [
 	"effectiveLaunch",
 	"effectivePolicy",
 	"sourceDependencies",
+	"resourcePolicy",
 ] as const;
 const requiredRecordKeys = [
 	"schema",
@@ -452,11 +500,16 @@ function isTask(value: unknown): boolean {
 function isAttempt(value: unknown): boolean {
 	return (
 		isRecord(value) &&
-		hasExactKeys(value, ["key", "launchRetry", "outputRetry", "resume"]) &&
+		hasAllowedKeys(value, ["key", "launchRetry", "outputRetry", "resume", "physicalAttempt"]) &&
+		hasRequiredKeys(value, ["key", "launchRetry", "outputRetry", "resume"]) &&
 		nonEmptyString(value.key) &&
 		nonNegativeInteger(value.launchRetry) &&
 		nonNegativeInteger(value.outputRetry) &&
-		nonNegativeInteger(value.resume)
+		nonNegativeInteger(value.resume) &&
+		(value.physicalAttempt === undefined ||
+			(typeof value.physicalAttempt === "number" &&
+				Number.isSafeInteger(value.physicalAttempt) &&
+				value.physicalAttempt >= 1))
 	);
 }
 

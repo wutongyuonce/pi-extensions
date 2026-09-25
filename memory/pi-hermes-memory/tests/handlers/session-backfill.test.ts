@@ -6,6 +6,7 @@ import os from 'node:os';
 import { DatabaseManager } from '../../src/store/db.js';
 import {
   scheduleSessionBackfill,
+  joinSessionBackfill,
   waitForSessionBackfill,
   type SessionBackfillState,
 } from '../../src/handlers/session-backfill.js';
@@ -188,5 +189,59 @@ describe('session backfill handler', () => {
     const completed = await waitForSessionBackfill(5, state);
 
     assert.equal(completed, false);
+  });
+
+  it('first-use join does not inherit the five-second shutdown deadline', async (t) => {
+    t.mock.timers.enable({ apis: ['setTimeout'] });
+    const backfill = Promise.withResolvers<void>();
+    const state: SessionBackfillState = { inProgress: true, promise: backfill.promise };
+    let joined = false;
+    const firstUse = joinSessionBackfill(state).then(() => { joined = true; });
+    const shutdown = waitForSessionBackfill(5000, state);
+    t.mock.timers.tick(6000);
+    assert.equal(await shutdown, false);
+    assert.equal(joined, false);
+    backfill.resolve();
+    await firstUse;
+    assert.equal(joined, true);
+  });
+
+  it('propagates the retention cutoff to the backfill file set', async () => {
+    // Only an expired file exists (mtime older than the 30-day cutoff). Even
+    // with recent backfill timestamps, the backfill must not be scheduled
+    // because the file is outside the retained window.
+    writeJsonlSession(sessionsDir, 'project-a', 'old');
+    const oldFile = path.join(sessionsDir, 'project-a', 'old.jsonl');
+    const cutoffMs = Date.now() - 30 * 24 * 60 * 60 * 1000;
+    const oldMtime = cutoffMs - 1000;
+    fs.utimesSync(oldFile, new Date(oldMtime), new Date(oldMtime));
+
+    touchBackfillTimestamp(dbManager);
+
+    let receivedCutoff: number | undefined;
+    let indexOptions: { retentionCutoffMs?: number } | undefined;
+    const state: SessionBackfillState = { inProgress: false, promise: null };
+
+    const scheduled = scheduleSessionBackfill(dbManager, sessionsDir, {
+      state,
+      retentionCutoffMs: cutoffMs,
+      setTimeoutFn: () => 0,
+      // Capture the cutoff that would be forwarded to the store so we prove
+      // the wiring reaches both the eligibility check and the indexer.
+      needsBackfillFn: (_db, _dir, _now, cutoff) => {
+        receivedCutoff = cutoff;
+        return false;
+      },
+      indexSessionsFn: (_db, _dir, options) => {
+        indexOptions = options;
+        return { sessionsProcessed: 0, sessionsIndexed: 0, sessionsSkipped: 0, messagesIndexed: 0, reachedLimit: undefined, errors: [] };
+      },
+    });
+
+    // needsBackfill ran and received the cutoff; because it returned false for
+    // an expired file set, no backfill pass was scheduled.
+    assert.equal(scheduled, false);
+    assert.equal(receivedCutoff, cutoffMs);
+    assert.equal(indexOptions, undefined);
   });
 });

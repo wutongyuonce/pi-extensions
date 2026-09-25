@@ -1,0 +1,33 @@
+# Kotlin No nullable Boolean
+# Detects a `Boolean?` type on a property, parameter, or return type.
+# Ported from vinhnx/VTCode rules/kotlin/no-nullable-boolean.yml (#2198, refs #2195).
+id: kotlin-no-nullable-boolean
+language: kotlin
+severity: warning
+message: "Avoid a nullable Boolean; a two-value enum or a non-null default is usually clearer"
+note: |
+  A nullable Boolean gives a value three states (true/false/unknown) but the
+  type only documents two, so callers routinely forget to handle null and
+  either crash on an unboxing NPE or silently treat it as false.
+  Detection-only: null is a legitimate third state for some APIs (an
+  unanswered tri-state form field, a "not yet loaded" flag), and this rule
+  cannot tell that case from an accidental nullable Boolean.
+rule:
+  kind: nullable_type
+  has:
+    kind: user_type
+    has:
+      kind: type_identifier
+      regex: "^Boolean$"
+files:
+  - "**/*.kt"
+tags:
+  - kotlin
+  - idiom
+  - null-safety
+examples:
+  bad: |
+    fun isEligible(): Boolean? = null
+  good: |
+    enum class Eligibility { ELIGIBLE, INELIGIBLE, UNKNOWN }
+    fun eligibility(): Eligibility = Eligibility.UNKNOWN

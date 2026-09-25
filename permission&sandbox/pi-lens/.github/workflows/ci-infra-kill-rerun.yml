@@ -1,0 +1,222 @@
+name: CI infra-kill rerun
+
+# Moves #2042's judged rerun from session-side polling into a bounded
+# workflow. The classifier remains the single source for log interpretation.
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+  pull_request:
+    types: [synchronize]
+
+permissions: {}
+
+jobs:
+  clear-stale-verdict-labels:
+    name: Clear stale CI verdict labels
+    # Fork pull_request runs receive a read-only GITHUB_TOKEN. Stale labels on
+    # those PRs are acceptable because this bookkeeping check is advisory and
+    # no label state affects the correctness gate (#2993).
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.action == 'synchronize' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    # refs #3123: bounds a hang against GitHub's 360-min default. This job
+    # requires a pull_request synchronize event so --branch master matched
+    # none; measured max over the last 9 successful runs regardless of branch:
+    # 8s; timeout = floor of 10 min.
+    timeout-minutes: 10
+    permissions:
+      pull-requests: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_REPO: ${{ github.repository }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+    steps:
+      - name: Clear labels from the previous head
+        shell: bash
+        run: gh pr edit "$PR_NUMBER" --remove-label 'ci:infra' --remove-label 'ci:real'
+
+  classify:
+    name: Classify failed Unit tests
+    # pull_request runs, PLUS master runs (#2668): CI (ci.yml) reaches
+    # master through TWO non-PR events, not one -- `push` for an ordinary
+    # merge, and `repository_dispatch` (type merge-train-post-merge) for a
+    # bot merge, because the merge lane's own GITHUB_TOKEN merge suppresses
+    # the ordinary `push` event (AGENTS.md, "the lane uses this event
+    # because its GITHUB_TOKEN merge suppresses the ordinary push event").
+    # Excluding repository_dispatch left most real bot-merged master kills
+    # unrerun -- of the 11 master CI failures reviewed when this gap was
+    # found, 3 were repository_dispatch, not push, and a failing Unit tests
+    # on that lane also flips `record-post-merge-validation` to
+    # state=failed, which the merge warden reads as fatal (ci.yml's
+    # `record-post-merge-validation` job).
+    #
+    # Both non-PR events carry an empty `pull_requests` array (there is no
+    # PR to look one up from), so the classifier is given --allow-missing-pr
+    # and skips every PR-comment step on both -- classification and the
+    # one-shot rerun still run in full. See "Reading a master infra-kill"
+    # below for how to tell that apart from a real red on master.
+    #
+    # A repository_dispatch run's own `head_sha` is master's tip AT DISPATCH
+    # TIME, not necessarily the exact merge commit named in the dispatch
+    # payload (`client_payload.sha`) -- a second merge landing between
+    # dispatch and this job's own read can make them differ. That sha is
+    # only ever used for the classify log line and an (absent, on this
+    # path) comment marker; the rerun itself targets RUN_ID, which always
+    # names the correct CI run regardless of which sha is reported
+    # alongside it.
+    #
+    # Same-repo runs only: a fork PR's workflow_run also carries an empty
+    # pull_requests array, so the classifier would otherwise throw the same
+    # no-associated-PR error the push/dispatch paths now handle
+    # deliberately. Fork-lane rerun coverage stays tracked on #2042's
+    # remainder.
+    #
+    # Attempt bound (#2042, 2026-09-15): this job fires for attempts 1 AND 2
+    # of a FAILED "CI" run, and never beyond. One head can be 137-killed by
+    # the runner more than once -- #3048 was killed on attempts 1 and 2, and
+    # #3040 likewise on 1e9844d -- and because this gate read
+    # `run_attempt == 1`, the SECOND kill was never classified, so attempt 3
+    # had to be triggered BY HAND both times.
+    #
+    # `<= 2` is a BOUND, not merely a larger number: a rerun can only ever be
+    # issued FROM attempt 1 or 2, so at most TWO automatic reruns exist per
+    # head and attempt 3 is terminal. A head still red on attempt 3 is a
+    # human's call by construction. An unbounded gate would let a
+    # persistently starved runner loop this lane forever, burning exactly the
+    # quota the real fix for the kills (#3058/#3062) needs.
+    #
+    # The gate is necessary but not sufficient: the classifier ALSO carries a
+    # once-per-head rerun guard keyed on its own sticky PR comment marker,
+    # which refused the second rerun on the PR lane even when this job did
+    # fire. That guard is now keyed on sha AND run attempt and capped at the
+    # same two attempts (scripts/lib/ci-failure-classifier.mjs,
+    # MAX_AUTO_RERUN_ATTEMPT). The master lane never reaches it -- there is
+    # no PR to hold a marker -- so this gate was its only blocker.
+    #
+    # Reading a master infra-kill vs a real red:
+    #   - This job fires for a first or second attempt (run_attempt <= 2) of
+    #     a FAILED "CI" run, so it runs on every master red, infra or not.
+    #   - Open this job's own log (Actions -> "CI infra-kill rerun" ->
+    #     the run for that push/dispatch). Its one console line names the
+    #     classification: "no PR (push/dispatch) sha=<sha> job=Unit tests ->
+    #     infra-kill (rerun triggered)" means it judged the kill infra and
+    #     already reran the CI workflow once -- check the CI run's Actions
+    #     history for a second attempt (run_attempt == 2) landing green.
+    #   - A line ending in "-> real" (or classification "infra-kill" with no
+    #     "(rerun triggered)", e.g. a same-SHA repeat) means this job did NOT
+    #     paper over it: master is genuinely red and needs a human fix, the
+    #     same as any PR-side "ci-classifier: real" comment would.
+    #   - A PR run's outcome is a sticky issue comment instead of this job's
+    #     log, because a PR has a thread to post it to.
+    if: >-
+      github.event.workflow_run.head_repository.full_name == github.repository &&
+      (
+        github.event.workflow_run.event == 'pull_request' ||
+        (github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'master') ||
+        (github.event.workflow_run.event == 'repository_dispatch' && github.event.workflow_run.head_branch == 'master')
+      ) &&
+      github.event.workflow_run.conclusion == 'failure' &&
+      github.event.workflow_run.run_attempt <= 2
+    runs-on: ubuntu-latest
+    # refs #3123: bounds a hang against GitHub's 360-min default.
+    # Measured max over last 10 successful master runs: 15s; timeout = floor of
+    # 10 min.
+    timeout-minutes: 10
+    permissions:
+      actions: write
+      contents: read
+      pull-requests: write
+    env:
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GITHUB_REPOSITORY: ${{ github.repository }}
+      RUN_ID: ${{ github.event.workflow_run.id }}
+      HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+      PR_NUMBER: ${{ github.event.workflow_run.pull_requests[0].number }}
+      RUN_EVENT: ${{ github.event.workflow_run.event }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Classify Unit-tests failure and rerun infra-kill once
+        shell: bash
+        run: |
+          set -o pipefail
+          args=(--run "$RUN_ID" --sha "$HEAD_SHA" --skip-missing-job)
+          if [[ -n "$PR_NUMBER" ]]; then
+            args+=(--pr "$PR_NUMBER")
+          elif [[ "$RUN_EVENT" == "push" || "$RUN_EVENT" == "repository_dispatch" ]]; then
+            args+=(--allow-missing-pr)
+          fi
+          output="$(node scripts/classify-ci-failure.mjs "${args[@]}")"
+          printf '%s\n' "$output"
+          if [[ -n "$PR_NUMBER" ]]; then
+            if grep -q -- '-> infra-' <<<"$output"; then
+              gh pr edit "$PR_NUMBER" --add-label 'ci:infra' --remove-label 'ci:real'
+            else
+              gh pr edit "$PR_NUMBER" --add-label 'ci:real' --remove-label 'ci:infra'
+            fi
+          fi
+
+  finalize-rerun:
+    name: Finalize CI rerun classification
+    # Keyed on the TERMINAL attempt, not on a fixed number (#2042,
+    # 2026-09-15). While `classify` fired only on attempt 1 there was exactly
+    # one automatic rerun, so "attempt 2" and "terminal" were the same thing.
+    # With `classify` bounded at `run_attempt <= 2` they are not: attempt 2
+    # FAILING is now an intermediate state -- classify reruns it -- and
+    # swapping the terminal labels there would announce a verdict the lane is
+    # still working on. Terminal is therefore:
+    #   * attempt 2 that SUCCEEDED (green; no third attempt will exist), or
+    #   * attempt 3, whatever its conclusion (the bound above forbids a
+    #     fourth automatic attempt, so this is the last word either way).
+    # An attempt-2 FAILURE that classify judges `real` is not covered here
+    # and does not need to be: classify's own step already writes the
+    # `ci:real` label on that path, exactly as it does for an attempt-1 real
+    # failure.
+    if: >-
+      github.event.workflow_run.head_repository.full_name == github.repository &&
+      (
+        github.event.workflow_run.event == 'pull_request' ||
+        (github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'master') ||
+        (github.event.workflow_run.event == 'repository_dispatch' && github.event.workflow_run.head_branch == 'master')
+      ) &&
+      (
+        github.event.workflow_run.run_attempt == 3 ||
+        (github.event.workflow_run.run_attempt == 2 && github.event.workflow_run.conclusion == 'success')
+      ) &&
+      (github.event.workflow_run.conclusion == 'failure' || github.event.workflow_run.conclusion == 'success')
+    runs-on: ubuntu-latest
+    # refs #3123: bounds a hang against GitHub's 360-min default. This job only
+    # runs on a CI-infra-kill rerun (run_attempt 2 or 3); no successful run
+    # found across the last 300 runs of this workflow -- defaulted to the floor
+    # of 10 min, matching sibling jobs classify/clear-stale-verdict-labels
+    # (5-15s) in the same workflow.
+    timeout-minutes: 10
+    permissions:
+      pull-requests: write
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      PR_NUMBER: ${{ github.event.workflow_run.pull_requests[0].number }}
+      RUN_EVENT: ${{ github.event.workflow_run.event }}
+      HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+    steps:
+      - name: Swap terminal rerun labels
+        shell: bash
+        run: |
+          if [[ -z "$PR_NUMBER" ]]; then
+            {
+              echo "## Terminal rerun classification"
+              echo "No associated PR for event=$RUN_EVENT sha=$HEAD_SHA; terminal conclusion=${{ github.event.workflow_run.conclusion }}."
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          if [[ "${{ github.event.workflow_run.conclusion }}" == "success" ]]; then
+            gh pr edit "$PR_NUMBER" --remove-label 'ci:infra'
+          else
+            gh pr edit "$PR_NUMBER" --add-label 'ci:real' --remove-label 'ci:infra'
+          fi

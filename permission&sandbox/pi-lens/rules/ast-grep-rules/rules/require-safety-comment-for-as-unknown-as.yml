@@ -1,0 +1,184 @@
+id: require-safety-comment-for-as-unknown-as
+language: TypeScript
+severity: error
+metadata:
+  category: pi-lens-self-scan
+message: "'x as unknown as T' with no nearby SAFETY: comment — state the invariant TypeScript can't check"
+note: |
+  Narrowed port of dmmulroy/anti-slop's
+  `require-safety-comment-for-type-assertion`
+  (src/rules/require-safety-comment-for-type-assertion.ts, MIT).
+  Upstream requires a `SAFETY:` comment before EVERY non-const type
+  assertion (`as`/angle-bracket), walking up through statement-owner
+  node kinds looking for a preceding comment. This port narrows the
+  target to `x as unknown as T` specifically — the two-hop cast through
+  `unknown`. The 2026-08-19 audit found 2,180 non-const assertions
+  repo-wide and ZERO `SAFETY:` comments; requiring one on every
+  assertion would mean authoring ~1,750 comments in one PR. `as unknown
+  as` is the form that actually launders evidence (routes through the
+  top type rather than a single verifiable hop), and it is the exact
+  shape AGENTS.md's defect shape 13 already asks for in prose: "when a
+  call site hands the policy an outcome it did NOT derive... justify it
+  in a comment at the call site." This rule makes that convention
+  checkable for its most evidence-destroying form.
+
+  2026-08-20 (refs #1727, #1777): promoted `hint` -> `error`. `error` is
+  the only tier that maps to semantic `blocking`
+  (`clients/dispatch/runners/ast-grep-napi.ts`), so AGENTS.md's severity
+  policy requires a documented zero-false-positive audit here. Two
+  changes make that audit come out clean.
+
+  1. STRUCTURAL SCOPING: test paths are excluded (`ignores:` below). In a
+     test, `x as unknown as T` is almost always a partial test double —
+     reaching into a private field or stubbing the two methods of a
+     surface the subject actually calls. The "invariant TypeScript can't
+     check" there is "this stub covers what the code under test touches",
+     which is the test's own subject matter, not a hidden runtime claim.
+     Four-corpus census (2026-08-20) confirms the shape concentrates in
+     test paths rather than assuming it:
+
+     | corpus | total | test-path | non-test | suppressed |
+     |---|---:|---:|---:|---:|
+     | pi-lens (`clients/`+`tests/`) | 305 | 289 | 16 | 95% |
+     | pi core (`packages/`) | 182 | 155 | 27 | 85% |
+     | opencode (`packages/`) | 194 | 154 | 40 | 79% |
+     | oh-my-pi (`packages/`) | 1803 | 1644 | 159 | 91% |
+
+     This is a FALSE-NEGATIVE bias, deliberately, and it is not small:
+     289 uncommented `as unknown as` sites in pi-lens's own `tests/`
+     now raise NO diagnostic at all, where each previously raised an
+     `error` through `no-chained-type-assertions.yml`'s `unknown` arm.
+     The same trade costs 1,644 sites on oh-my-pi. It is a path glob,
+     not a semantic check — ast-grep cannot verify a cast is really a
+     test double, only that it lives under a test path.
+
+  2. REPO-SIDE REMEDIATION: the 16 remaining `clients/` sites were read
+     individually and each was given a truthful `SAFETY:` comment
+     naming the specific invariant (an optional Node API absent from
+     `@types/node`, a two-phase-init field filled before first read, a
+     `Object.fromEntries` key-type loss, a process-global stash). None
+     was a comment written to silence the rule; where the cast had no
+     justification it was replaced instead
+     (`clients/runtime-context.ts`).
+
+  Post-narrowing census on pi-lens: 0 findings over `clients/` +
+  `tests/`. The rule is tagged `metadata.category: pi-lens-self-scan`,
+  so CI's `npm run astgrep:self-scan` lane keeps it at zero.
+
+  Placement contract: a `SAFETY:` comment may directly precede the cast,
+  its enclosing statement, or an object-literal member (`pair`) containing
+  the cast. Array elements and call arguments are also supported through the
+  direct-cast arm when the comment is immediately above the cast expression.
+  JSX attributes, class static blocks, and switch cases are not comment
+  anchors for this valve; place those comments on the enclosing statement.
+  Inline comments remain valid, for example `/* SAFETY: ... */ x as unknown
+  as T`. Upstream walks an arbitrary number of statement-owner levels looking
+  for ANY preceding comment in the file; this port only checks one level up
+  from the assertion and one level up from its immediate containing
+  statement or supported object member. There is NO dominance verification:
+  the rule proves a comment is adjacent, never that the comment is true or
+  that it describes this cast.
+
+  2026-08-20 (#1847, found in #1843's review): the "one level up from
+  its immediate containing statement" kind list omitted
+  `export_statement` and `public_field_definition`, so a `SAFETY:`
+  comment placed directly above an exported cast (`export const b =
+  (x as unknown as T).y;`) or a class-field cast (`bar: unknown = (x as
+  unknown as T).y;`) could not satisfy the valve — the rule is
+  `error`-tier and semantically `blocking`, so this left no escape for
+  those two shapes. Added both kinds. Verified the containing-statement
+  walk already covers casts nested deeper without a new kind: a cast
+  inside a `static {}` init block or an arrow-function body still
+  resolves to an ancestor `lexical_declaration`/`variable_declaration`
+  already in the list (probed with ast-grep's own `--rule` scan, not
+  reasoning about the grammar from memory), and a `SAFETY:` comment on
+  an `export const` nested inside a `namespace` block clears the valve
+  through the same `export_statement` kind — `stopBy: end` already
+  walks past the namespace wrapper to find it. `readonly`/`abstract`/
+  `static`/private-`#name` class fields all parse to the same
+  `public_field_definition` kind, so one entry covers all of them.
+
+  2026-08-20 (#1852 review, F1): the same defect shape one more time —
+  an enum member's initializer cast (`enum Foo { A = (x as unknown as
+  T).y }`) has no recognized ancestor either. The member's own kind is
+  `enum_assignment` (probed the same way: `ast-grep scan --rule` against
+  a real `enum`/`const enum`/`export enum` snippet rather than guessing
+  from the export/field precedent). One `enum_assignment` kind entry
+  covers plain, `const`, and `export` enums alike, the same way
+  `public_field_definition` covered every class-field modifier —
+  `enum_assignment` is the member-list node itself, unaffected by
+  keywords on the enclosing `enum_declaration`. `declare enum` members
+  have no initializer expression to cast, so there is nothing to probe
+  there.
+
+  Matched pair with `no-chained-type-assertions.yml`. As of 2026-08-20
+  the two PARTITION the assertion space instead of overlapping: this
+  rule owns `x as unknown as T` (with the `SAFETY:` escape valve); that
+  rule owns the concrete `x as A as B` chain, which has no escape valve
+  because it has no legitimate reading. Before the split both rules
+  matched the identical `as unknown as` site list (verified: 16/16
+  pi-lens, 182/182 pi, 194/194 opencode), so every uncommented site
+  raised two diagnostics for one defect.
+
+  2026-08-20 (#1834): both `follows` checks used `stopBy: end`, which
+  scans EVERY preceding sibling all the way to the top of the enclosing
+  block, not just the comment directly above the cast. A `SAFETY:`
+  comment attached to one cast silently exempted every LATER cast in the
+  same block, including casts on a different subject with no
+  justification of their own. Probe: `// SAFETY: ...` above `const a =
+  (y as unknown as string).length` followed by an undocumented `const b
+  = (x as unknown as string).length` scored 0 hits; `b`'s cast should
+  have been flagged. Fixed the same way as `redundant-unsafe-function`'s
+  identical valve (PR #1821, refs #1806): bound the backward scan with
+  `stopBy: {not: {kind: comment}}`, so it stops at the first non-comment
+  sibling and only ever searches the CONTIGUOUS comment run directly
+  above the cast (or its containing statement), never an earlier
+  statement's comment. The "Scope and known gap" note above already
+  described this contiguous-comment intent; the shipped pattern didn't
+  implement it.
+
+  2026-08-20 (#1870): the pair arm is bounded by the nearest `pair`. An
+  outer object member's SAFETY comment must not suppress a cast in a nested
+  member, and a nested member's comment must not suppress a parent cast.
+  The direct-cast arm remains the precise escape valve for comments adjacent
+  to casts in array elements and call arguments.
+ignores:
+  - "**/*.test.ts"
+  - "**/*.test.tsx"
+  - "**/*.test.mts"
+  - "**/*.test.cts"
+  - "**/*.spec.ts"
+  - "**/*.spec.tsx"
+  - "**/tests/**"
+  - "**/test/**"
+  - "**/__tests__/**"
+rule:
+  pattern: $X as unknown as $Y
+  not:
+    any:
+      - follows:
+          kind: comment
+          regex: 'SAFETY\s*:'
+          stopBy: { not: { kind: comment } }
+      - inside:
+          stopBy: { kind: pair }
+          any:
+            - kind: pair
+          follows:
+            kind: comment
+            regex: 'SAFETY\s*:'
+            stopBy: { not: { kind: comment } }
+      - inside:
+          stopBy: end
+          any:
+            - kind: expression_statement
+            - kind: lexical_declaration
+            - kind: variable_declaration
+            - kind: return_statement
+            - kind: export_statement
+            - kind: public_field_definition
+            - kind: enum_assignment
+          follows:
+            kind: comment
+            regex: 'SAFETY\s*:'
+            stopBy: { not: { kind: comment } }

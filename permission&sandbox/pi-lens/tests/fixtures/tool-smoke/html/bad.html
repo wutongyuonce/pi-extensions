@@ -1,0 +1,14 @@
+<!DOCTYPE html>
+<!-- Tool-smoke fixture for #209 — htmlhint flags the unclosed <div> (tag-pair). -->
+<html lang="en">
+  <head>
+    <title>tool-smoke</title>
+    <!-- LSP gate seed (#3217): vscode-html-language-server validates embedded
+         CSS, so the unknown property below is its own primary finding. The
+         unclosed <div> is an htmlhint finding, not an LSP one. -->
+    <style>b { colr: red; }</style>
+  </head>
+  <body>
+    <div>
+  </body>
+</html>

@@ -1,0 +1,33 @@
+id: no-raw-types
+language: java
+severity: warning
+message: Use parameterized types instead of raw types.
+note: Ported from VTCode (https://github.com/vinhnx/VTCode), refs #2195. Raw collection types need a project/API-aware generic choice, so this rule is detection-only. Contexts with no valid parameterized form are excluded.
+rule:
+  kind: type_identifier
+  regex: "^(List|Map|Set|Collection|Iterator|Iterable|Queue|Deque|Optional)$"
+  not:
+    any:
+      # Already parameterized. These carry no `stopBy`, so they test only the
+      # immediate parent. `stopBy: end` walked every ancestor instead, which
+      # silenced a raw type nested in a type argument: in `Map<String, List>`
+      # the inner `List` has a generic_type ancestor and went unreported.
+      - inside:
+          kind: generic_type
+      # The qualifier chain of a parameterized qualified type, so
+      # `java.util.List<String>` and `Map.Entry<K, V>` stay silent.
+      - inside:
+          kind: scoped_type_identifier
+          inside:
+            kind: generic_type
+      # `o instanceof List` and `List.class` have no valid parameterized form.
+      # `o instanceof List<String>` and `List<String>.class` are both compile
+      # errors, so a finding here is unactionable.
+      - inside:
+          kind: instanceof_expression
+      - inside:
+          kind: class_literal
+files:
+  - "**/*.java"
+ignores:
+  - "**/test/**"

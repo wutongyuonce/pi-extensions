@@ -10,6 +10,7 @@ import { getPiInvocation, getSubagentChildProcessEnv } from "../launch/child-com
 import { resolveDenyEnvPatterns } from "../launch/child-env.ts";
 import { CHILD_CONTEXT_BOUNDARY_SYSTEM_PROMPT } from "../launch/context-boundary.ts";
 import { parseEnvString } from "../launch/env.ts";
+import { getSkillVisibilitySpec, PI_SUBAGENT_SKILL_VISIBILITY } from "../launch/skill-visibility.ts";
 import { resolveSubagentTimeoutState } from "../launch/policy.ts";
 import {
 	getExtensionLaunchArgs,
@@ -399,6 +400,7 @@ async function resumeSubagentSessionWithoutWidth(
 	} else if (process.env.PI_SUBAGENT_EXTENSIONS) {
 		resumeEnvVars.PI_SUBAGENT_EXTENSIONS = process.env.PI_SUBAGENT_EXTENSIONS;
 	}
+	resumeEnvVars[PI_SUBAGENT_SKILL_VISIBILITY] = getSkillVisibilitySpec(invocationMetadata?.skills);
 	if (process.env.PI_SUBAGENT_ENABLE_SET_TAB_TITLE === "1") {
 		resumeEnvVars.PI_SUBAGENT_ENABLE_SET_TAB_TITLE = "1";
 	}

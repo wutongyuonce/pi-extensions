@@ -3,10 +3,14 @@
 .pi-subagents/
 .DS_Store
 node_modules/
+dist-pkg/
+*.tgz
 .fallow/
 tmp/
 
 # Fallback ignores for local ad-hoc agent and lane reports.
+/memory.md
+/todo.md
 /reports/
 /*-report*.json
 /issue-*-council-*.json

@@ -6,6 +6,7 @@ import { AtomicLockCoordinator } from './atomic-lock-coordinator.js';
 import { canonicalStoragePathSync } from './canonical-storage-path.js';
 import { isBunRuntime, loadBetterSqlite3 } from './sqlite-native.js';
 import { measureLifecycleSync } from '../lifecycle-timing.js';
+import { MDSYNC_METADATA_KEY_PREFIX } from '../constants.js';
 
 type StatementLike = {
   run: (...args: any[]) => any;
@@ -164,6 +165,7 @@ export class DatabaseManager {
   private lastRecovery: DatabaseRecoveryResult | null = null;
   private openGuard: (() => void) | null = null;
   private pendingOpenIntegrityScan: Promise<void> | null = null;
+  private quickCheckOnOpen = true;
   private activeRecoveryLease: { coordinator: AtomicLockCoordinator; key: string; token: string } | null = null;
 
   constructor(memoryDir: string, recoveryOptions: DatabaseRecoveryOptions = {}) {
@@ -180,6 +182,10 @@ export class DatabaseManager {
 
   setOpenGuard(guard: (() => void) | null): void {
     this.openGuard = guard;
+  }
+
+  setQuickCheckOnOpen(enabled: boolean): void {
+    this.quickCheckOnOpen = enabled;
   }
 
   /**
@@ -304,6 +310,7 @@ export class DatabaseManager {
    * at operation time.
    */
   private scheduleOpenIntegrityScan(db: DatabaseLike): void {
+    if (!this.quickCheckOnOpen) return;
     if (this.pendingOpenIntegrityScan) return;
     const scan = new Promise<void>((resolve) => {
       setTimeout(() => {
@@ -645,13 +652,21 @@ export class DatabaseManager {
   }
 
   private copyRecoverableRows(source: DatabaseLike, target: DatabaseLike): Record<string, number> {
-    return {
+    const counts = {
       extension_metadata: this.copyExtensionMetadata(source, target),
       sessions: this.copySessions(source, target),
       messages: this.copyMessages(source, target),
       session_files: this.copySessionFiles(source, target),
       memories: this.copyMemories(source, target),
     };
+    // Markdown-scope fingerprints describe the rows in their source db; the
+    // copies above coerce invalid values instead of dropping rows, so a copied
+    // fingerprint can agree with coerced rows while content drifted. A rebuilt
+    // database re-mirrors markdown exactly once, at zero cost when healthy.
+    // The pattern follows the shared prefix constant, so bumping its version
+    // keeps this strip in step instead of silently missing the new keys.
+    target.prepare("DELETE FROM extension_metadata WHERE key LIKE ?").run(`${MDSYNC_METADATA_KEY_PREFIX}%`);
+    return counts;
   }
 
   private copyExtensionMetadata(source: DatabaseLike, target: DatabaseLike): number {

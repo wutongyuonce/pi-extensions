@@ -1,0 +1,12 @@
+id: ts-defensive-null-guard
+language: typescript
+severity: warning
+message: if (x === null || x === undefined) return null - overly defensive early guard
+metadata:
+  weight: 2
+  category: slop
+rule:
+  kind: if_statement
+  any:
+  - pattern: "if ($X === null || $X === undefined) { return null; }"
+  - pattern: "if ($X == null) { return null; }"

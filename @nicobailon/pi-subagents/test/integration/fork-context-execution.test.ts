@@ -3,10 +3,9 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { MockPi } from "../support/helpers.ts";
-import { createEventBus, createMockPi, createTempDir, events, removeTempDir, tryImport } from "../support/helpers.ts";
+import { createEventBus, createMockPi, createTempDir, events, removeTempDir, resolveMockPiCallArgs, tryImport } from "../support/helpers.ts";
 import { discoverAgents } from "../../src/agents/agents.ts";
 import { ACTIVE_ASYNC_CAPACITY_DIR, acquireActiveAsyncCapacity, activeAsyncCapacitySessionKey } from "../../src/runs/background/active-async-capacity.ts";
-import { clearExclusions } from "../../src/runs/shared/model-exclusions.ts";
 import { DEFAULT_FORK_PREAMBLE, INTERCOM_DETACH_REQUEST_EVENT, SUBAGENT_ASYNC_STARTED_EVENT } from "../../src/shared/types.ts";
 
 interface ExecutorModule {
@@ -107,11 +106,9 @@ describe("fork context execution wiring", { skip: !available ? "subagent executo
 		tempDir = createTempDir("pi-subagent-fork-test-");
 		mockPi.reset();
 		mockPi.onCall({ output: "ok" });
-		clearExclusions();
 	});
 
 	afterEach(() => {
-		clearExclusions();
 		if (originalHome === undefined) delete process.env.HOME;
 		else process.env.HOME = originalHome;
 		if (originalUserProfile === undefined) delete process.env.USERPROFILE;
@@ -161,23 +158,23 @@ describe("fork context execution wiring", { skip: !available ? "subagent executo
 			.sort()
 			.at(-1);
 		assert.ok(callFile, "expected a recorded mock pi call");
-		return readRecordedArgs(callFile);
+		return readRecordedArgs(callFile, true);
 	}
 
 	function readAllCallArgs(): string[][] {
 		return fs.readdirSync(mockPi.dir)
 			.filter((name) => name.startsWith("call-") && name.endsWith(".json"))
 			.sort()
-			.map(readRecordedArgs);
+			.map((name) => readRecordedArgs(name));
 	}
 
-	function readRecordedArgs(callFile: string): string[] {
-		const payload = JSON.parse(fs.readFileSync(path.join(mockPi.dir, callFile), "utf-8"));
+	function readRecordedArgs(callFile: string, effective = false): string[] {
+		const payload = JSON.parse(fs.readFileSync(path.join(mockPi.dir, callFile), "utf-8")) as { args?: string[]; effectiveArgs?: string[] };
 		assert.equal(typeof payload, "object", "expected recorded args payload");
 		assert.notEqual(payload, null, "expected recorded args payload");
 		assert.ok("args" in payload, "expected recorded args payload");
 		assert.ok(Array.isArray(payload.args), "expected recorded args");
-		return payload.args;
+		return effective ? resolveMockPiCallArgs(payload) : payload.args;
 	}
 
 	function readSessionArgsFromCalls(): string[] {
@@ -190,20 +187,6 @@ describe("fork context execution wiring", { skip: !available ? "subagent executo
 				return sessionFile;
 			})
 			.filter((sessionFile): sessionFile is string => Boolean(sessionFile));
-	}
-
-	function readCallArgsForTask(taskText: string): string[] {
-		const args = readAllCallArgs().find((callArgs) => {
-			const prompt = callArgs.at(-1) ?? "";
-			return prompt.startsWith(`Task: ${taskText}\n`)
-				|| prompt.includes(`\n\nTask:\n${taskText}\n`);
-		});
-		assert.ok(args, `expected a recorded mock pi call for task '${taskText}'`);
-		return args;
-	}
-
-	function isTaskFileArg(arg: string): boolean {
-		return arg.startsWith("@") && arg.endsWith("task.md");
 	}
 
 	function readSessionArg(args: string[]): string {
@@ -317,16 +300,15 @@ describe("fork context execution wiring", { skip: !available ? "subagent executo
 		);
 
 		assert.equal(result.isError, undefined);
-		const args = readCallArgs();
+		const args = readAllCallArgs()[0] ?? [];
 		const taskArg = args.at(-1) ?? "";
-		if (process.platform === "darwin") {
-			assert.ok(isTaskFileArg(taskArg));
-		} else {
-			assert.ok(taskArg.startsWith("Task: \n\n## Acceptance Contract"));
-		}
+		assert.equal(taskArg, "Task: ");
+		const systemIndex = args.findIndex((arg) => arg === "--system-prompt" || arg === "--append-system-prompt");
+		assert.notEqual(systemIndex, -1);
+		assert.match(args[systemIndex + 1] ?? "", /## Acceptance Contract/);
 	});
 
-	it("fails pruned fork model auth before child spawn", async () => {
+	it("does not manually preflight pruned fork model auth before child spawn", async () => {
 		const parentSessionFile = path.join(tempDir, "parent.jsonl");
 		const { manager } = makeForkingSessionManagerRecorder({ sessionFile: parentSessionFile, leafId: "leaf-current" });
 		const executor = makeExecutorWithConfig({ forkContext: { mode: "pruned", model: "test/pruner" } });
@@ -336,14 +318,13 @@ describe("fork context execution wiring", { skip: !available ? "subagent executo
 			modelRegistry: {
 				getAvailable: () => [model],
 				find: () => model,
-				getApiKeyAndHeaders: async () => ({ ok: false as const, error: "credentials unavailable" }),
+				getApiKeyAndHeaders: async () => { throw new Error("manual auth extraction must not run"); },
 			},
 		};
 
 		const result = await executor.execute("id", { agent: "echo", task: "test", context: "fork" }, new AbortController().signal, undefined, ctx);
-		assert.equal(result.isError, true);
-		assert.match(result.content.map((block) => block.text).join("\n"), /Pruned fork model auth failed.*credentials unavailable/);
-		assert.equal(fs.readdirSync(mockPi.dir).some((name) => name.startsWith("call-") && name.endsWith(".json")), false);
+		assert.equal(result.isError, undefined);
+		assert.equal(fs.readdirSync(mockPi.dir).some((name) => name.startsWith("call-") && name.endsWith(".json")), true);
 	});
 
 
@@ -493,7 +474,7 @@ describe("fork context execution wiring", { skip: !available ? "subagent executo
 		assert.match(result.content[0]?.text ?? "", /context: "profile" requires agent 'worker' to declare defaultContext/);
 	});
 
-	it("sanitizes inherited signed thinking and forces child thinking off", async () => {
+	it("sanitizes inherited signed thinking and keeps child thinking", async () => {
 		const parentSessionFile = path.join(tempDir, "parent.jsonl");
 		const childSessionFile = path.join(tempDir, "fork-with-thinking.jsonl");
 		fs.writeFileSync(parentSessionFile, '{"type":"session","version":1,"id":"parent","timestamp":"2026-04-16T00:00:00.000Z","cwd":"/tmp"}\n', "utf-8");
@@ -529,14 +510,14 @@ describe("fork context execution wiring", { skip: !available ? "subagent executo
 
 		assert.equal(result.isError, undefined);
 		const args = readCallArgs();
-		assert.equal(args[args.indexOf("--model") + 1], "anthropic/claude-sonnet-4-5:off");
+		assert.equal(args[args.indexOf("--model") + 1], "anthropic/claude-sonnet-4-5:high");
 		const entries = fs.readFileSync(childSessionFile, "utf-8").trim().split("\n").map((line) => JSON.parse(line));
 		assert.deepEqual(entries[2].message.content, [{ type: "text", text: "answer" }]);
-		assert.equal(entries[3].type, "thinking_level_change");
-		assert.equal(entries[3].thinkingLevel, "off");
+		assert.equal(entries.length, 3);
+		assert.ok(!entries.some((entry) => entry.type === "thinking_level_change"));
 	});
 
-	it("uses an explicit Anthropic model for fork thinking preparation", async () => {
+	it("keeps thinking for an explicit Anthropic model on a forked child", async () => {
 		const parentSessionFile = path.join(tempDir, "parent.jsonl");
 		const childSessionFile = path.join(tempDir, "fork-explicit-anthropic.jsonl");
 		fs.writeFileSync(parentSessionFile, '{"type":"session","version":1,"id":"parent","timestamp":"2026-04-16T00:00:00.000Z","cwd":"/tmp"}\n', "utf-8");
@@ -580,76 +561,13 @@ describe("fork context execution wiring", { skip: !available ? "subagent executo
 
 		assert.equal(result.isError, undefined);
 		const args = readCallArgs();
-		assert.equal(args[args.indexOf("--model") + 1], "anthropic/claude-sonnet-4-5:off");
+		assert.equal(args[args.indexOf("--model") + 1], "anthropic/claude-sonnet-4-5:high");
 		const entries = fs.readFileSync(childSessionFile, "utf-8").trim().split("\n").map((line) => JSON.parse(line));
 		assert.deepEqual(entries[1].message.content, [{ type: "text", text: "answer" }]);
-		assert.equal(entries[2].type, "thinking_level_change");
-		assert.equal(entries[2].thinkingLevel, "off");
+		assert.equal(entries.length, 2);
+		assert.ok(!entries.some((entry) => entry.type === "thinking_level_change"));
 	});
-
-	it("forces every foreground fallback attempt off after sanitizing inherited signed thinking", async () => {
-		mockPi.reset();
-		mockPi.onCall({
-			jsonl: [{
-				type: "message_end",
-				message: {
-					role: "assistant",
-					content: [{ type: "text", text: "temporary provider failure" }],
-					model: "openai/gpt-5-mini",
-					errorMessage: "rate limit exceeded",
-					usage: { input: 10, output: 5, cacheRead: 0, cacheWrite: 0, cost: { total: 0.01 } },
-				},
-			}],
-			exitCode: 1,
-		});
-		mockPi.onCall({ output: "Recovered on fallback" });
-		const parentSessionFile = path.join(tempDir, "parent.jsonl");
-		const childSessionFile = path.join(tempDir, "fork-with-thinking.jsonl");
-		fs.writeFileSync(parentSessionFile, '{"type":"session","version":1,"id":"parent","timestamp":"2026-04-16T00:00:00.000Z","cwd":"/tmp"}\n', "utf-8");
-		const manager = {
-			getSessionId: () => "session-123",
-			getSessionFile: () => parentSessionFile,
-			getLeafId: () => "assistant-1",
-			openSession: () => ({
-				createBranchedSession: () => {
-					fs.writeFileSync(childSessionFile, [
-						{ type: "session", version: 1, id: "child", timestamp: "2026-04-16T00:00:00.000Z", cwd: "/tmp", parentSession: parentSessionFile },
-						{ type: "message", id: "assistant-1", parentId: null, timestamp: "2026-04-16T00:00:02.000Z", message: { role: "assistant", provider: "anthropic", api: "anthropic-messages", model: "anthropic/claude-sonnet-4-5", content: [{ type: "thinking", thinking: "private chain", thinkingSignature: "signed" }, { type: "text", text: "answer" }] } },
-					].map((entry) => JSON.stringify(entry)).join("\n") + "\n", "utf-8");
-					return childSessionFile;
-				},
-			}),
-		};
-		const executor = makeExecutorWithDiscoverAgents(() => ({
-			agents: [
-				{ name: "worker", description: "Worker", defaultContext: "fork", model: "openai/gpt-5-mini:high", fallbackModels: ["anthropic/claude-sonnet-4:low"], thinking: "high" },
-			],
-			projectAgentsDir: null,
-		}));
-
-		const ctx = {
-			...makeCtx(manager),
-			modelRegistry: {
-				getAvailable: () => [
-					{ provider: "openai", id: "gpt-5-mini", api: "openai-responses", reasoning: true },
-					{ provider: "anthropic", id: "claude-sonnet-4", api: "anthropic-messages", reasoning: true },
-				],
-			},
-		};
-		const result = await executor.execute(
-			"id",
-			{ agent: "worker", task: "test" },
-			new AbortController().signal,
-			undefined,
-			ctx,
-		);
-
-		assert.equal(result.isError, undefined);
-		const modelArgs = readAllCallArgs().map((args) => args[args.indexOf("--model") + 1]);
-		assert.deepEqual(modelArgs, ["openai/gpt-5-mini:off", "anthropic/claude-sonnet-4:off"]);
-	});
-
-	it("keeps requested thinking for non-Anthropic forked children without Anthropic fallbacks", async () => {
+	it("keeps requested thinking for non-Anthropic forked children", async () => {
 		mockPi.reset();
 		mockPi.onCall({ output: "done" });
 		const parentSessionFile = path.join(tempDir, "parent.jsonl");
@@ -779,7 +697,7 @@ describe("fork context execution wiring", { skip: !available ? "subagent executo
 		}
 	});
 
-	it("notes the forced thinking downgrade in the result for Anthropic forked children", async () => {
+	it("reports no thinking downgrade for Anthropic forked children", async () => {
 		mockPi.reset();
 		mockPi.onCall({ output: "done" });
 		const parentSessionFile = path.join(tempDir, "parent.jsonl");
@@ -822,10 +740,12 @@ describe("fork context execution wiring", { skip: !available ? "subagent executo
 
 		assert.equal(result.isError, undefined);
 		const text = result.content.filter((block) => block.type === "text").map((block) => block.text).join("\n");
-		assert.equal(text.includes("fork context forced thinking off for worker (child 0)"), true);
+		assert.equal(text.includes("forced thinking off"), false);
+		const noteArgs = readCallArgs();
+		assert.equal(noteArgs[noteArgs.indexOf("--model") + 1], "anthropic/claude-sonnet-4-5:high");
 	});
 
-	it("resolves inherit before classifying a forked child", async () => {
+	it("resolves inherit for a forked child without downgrading thinking", async () => {
 		const childSessionFile = path.join(tempDir, "fork-inherit-thinking.jsonl");
 		const manager = makeSignedThinkingSessionManager(childSessionFile);
 		const executor = makeExecutorWithDiscoverAgents(() => ({
@@ -852,7 +772,7 @@ describe("fork context execution wiring", { skip: !available ? "subagent executo
 
 		assert.equal(result.isError, undefined);
 		const args = readCallArgs();
-		assert.equal(args[args.indexOf("--model") + 1], "anthropic/claude-sonnet-4-5:off");
+		assert.equal(args[args.indexOf("--model") + 1], "anthropic/claude-sonnet-4-5:high");
 	});
 
 	it("keeps inherited parent models outside the registry during foreground fork preparation", async () => {
@@ -898,7 +818,7 @@ describe("fork context execution wiring", { skip: !available ? "subagent executo
 
 
 
-	it("includes the fork-thinking downgrade note on failed results", async () => {
+	it("adds no fork-thinking downgrade note to failed results", async () => {
 		mockPi.reset();
 		mockPi.onCall({ stderr: "task failed", exitCode: 1 });
 		const childSessionFile = path.join(tempDir, "fork-failed-thinking.jsonl");
@@ -926,7 +846,7 @@ describe("fork context execution wiring", { skip: !available ? "subagent executo
 
 		assert.equal(result.isError, true);
 		const text = result.content.filter((block) => block.text).map((block) => block.text).join("\n");
-		assert.equal(text.includes("fork context forced thinking off for worker (child 0)"), true);
+		assert.equal(text.includes("forced thinking off"), false);
 	});
 
 	it("keeps default-fork context on run-path errors", async () => {
@@ -1323,13 +1243,12 @@ describe("fork context execution wiring", { skip: !available ? "subagent executo
 		);
 
 		assert.equal(result.isError, undefined);
-		const args = readCallArgs();
+		const args = readAllCallArgs()[0] ?? [];
 		const taskArg = args.at(-1) ?? "";
-		if (process.platform === "darwin") {
-			assert.ok(isTaskFileArg(taskArg));
-		} else {
-			assert.ok(taskArg.startsWith(`Task: ${task}\n\n## Acceptance Contract`));
-		}
+		assert.equal(taskArg, `Task: ${task}`);
+		const systemIndex = args.findIndex((arg) => arg === "--system-prompt" || arg === "--append-system-prompt");
+		assert.notEqual(systemIndex, -1);
+		assert.match(args[systemIndex + 1] ?? "", /## Acceptance Contract/);
 		const modelIndex = args.indexOf("--model");
 		assert.notEqual(modelIndex, -1);
 		assert.equal(args[modelIndex + 1], "anthropic/claude-haiku-4-5");

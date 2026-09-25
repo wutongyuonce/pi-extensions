@@ -1,0 +1,67 @@
+id: no-unknown-parameters
+language: TypeScript
+severity: hint
+message: "Parameter typed 'unknown' — decode it at the I/O boundary instead of leaving it unparsed"
+note: |
+  Adapted from dmmulroy/anti-slop's `no-unknown-parameters`
+  (src/rules/no-unknown-parameters.ts, MIT). Upstream exempts a
+  parameter literally named `cause` (the standard `Error` cause-chain
+  field, which is `unknown` by the language's own `ErrorOptions` type)
+  — kept here for the same reason.
+
+  Shipped at `hint`, not `error`: AGENTS.md smell 3 records that this
+  exact arm was dropped from `no-unknown-laundering.yml` after an
+  FP-scan found 166 legitimate `unknown` parameters in pi-lens's own
+  tree (type-guard/validator functions like
+  `errorMessage(err: unknown)`). That finding is about THIS repo's own
+  code, not a reason to withhold the pattern from the shipped catalog —
+  other repositories may have real slop here — so it ships as a
+  discoverable hint instead. Self-scan note: do NOT try to make
+  pi-lens's own tree clean against this rule (#1718's baseline
+  problem); the adopting PR records the 2026-08-19 hit count instead.
+
+  Scope: a direct `unknown` annotation on a required or optional
+  parameter, matched structurally at the `predefined_type` leaf (same
+  shape as `no-bare-object-param.yml`). Rest/default-value parameters
+  (`...rest: unknown[]`, `x = y: unknown`) are out of scope — ast-grep
+  doesn't unwrap those parameter-pattern wrappers the way upstream's
+  AST-walk does. A union member (`unknown | null`) is not flagged for
+  the same "direct annotation only" reason `no-bare-object-param.yml`
+  gives.
+
+  2026-08-20 (refs #1727, #1777): CONSIDERED for promotion to `error`,
+  KEPT at `hint`. Four-corpus census, ast-grep CLI 0.45:
+
+  | corpus | hits |
+  |---|---:|
+  | pi-lens `clients/` | 149 |
+  | pi-lens `tests/` | 146 |
+  | pi core `packages/` | 381 (194 outside test paths) |
+  | opencode `packages/` | 678 (522) |
+  | oh-my-pi `packages/` | 2140 (1697) |
+
+  Verdict: structural narrowing was probed and does not reach zero. The
+  type-guard suppression (a parameter inside a function whose return type
+  is a `value is T` predicate) and a parser-name suppression together
+  clear the large predicate/validator block, but the residual is a second
+  legitimate class they cannot touch: opaque-payload SINKS that never
+  parse their argument at all — `setFileFact(path, id, value: unknown)`,
+  `bus(channel, payload: unknown)`, `emitLensEvent(name, payload:
+  unknown)`, `(err: unknown) => …` rejection handlers. `unknown` is the
+  CORRECT parameter type there, and it is syntactically identical to the
+  unparsed-boundary case the rule targets.
+rule:
+  kind: predefined_type
+  regex: "^unknown$"
+  inside:
+    kind: type_annotation
+    inside:
+      all:
+        - any:
+            - kind: required_parameter
+            - kind: optional_parameter
+        - not:
+            has:
+              stopBy: neighbor
+              kind: identifier
+              regex: "^cause$"

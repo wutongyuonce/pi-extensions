@@ -1,7 +1,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { writePrivateAtomicJson } from "../shared/atomic-json.ts";
-import type { AcceptanceRecoveryMetadata, ExternalCliReceiptMetadata, WorkflowReceipt, WorkflowReceiptEntry, WorkflowReceiptState, WorkflowRecoveryAction, WorkflowResourceProvenanceV1, WorkflowTerminalOutcome, WorkflowTerminalResolution } from "../shared/types.ts";
+import type { AcceptanceRecoveryMetadata, ExternalCliReceiptMetadata, WorkflowReceipt, WorkflowReceiptEntry, WorkflowReceiptState, WorkflowRecoveryAction, WorkflowResourceProvenance, WorkflowTerminalOutcome, WorkflowTerminalResolution } from "../shared/types.ts";
 import type { WorkflowReceiptResumeReference, WorkflowScriptChildResult } from "./scripted-workflow.ts";
 import { parseWorkflowChildSummary } from "./workflow-child-summary.ts";
 import { HOST_STEP_MAX_COUNT, assertUniqueHostStepIds, parseHostStepNode } from "../runs/shared/host-step-status.ts";
@@ -37,13 +37,15 @@ export function buildWorkflowReceipt(input: {
 	workflowRunId: string;
 	state: WorkflowReceiptState;
 	children: WorkflowScriptChildResult[];
+	argsDigest?: string;
 	hostSteps?: WorkflowReceipt["hostSteps"];
 	workflowChildren?: WorkflowReceipt["workflowChildren"];
-	resource?: WorkflowResourceProvenanceV1;
+	resource?: WorkflowResourceProvenance;
 	terminalOutcome?: WorkflowTerminalOutcome;
 	createdAt?: number;
 }): WorkflowReceipt {
 	const workflowRunId = assertSafeRunId(input.workflowRunId, "workflowRunId");
+	if (input.argsDigest !== undefined && !/^[a-f0-9]{64}$/u.test(input.argsDigest)) throw new Error("workflow receipt argsDigest must be a lowercase SHA-256 digest.");
 	if (input.workflowChildren?.workflowRunId !== undefined && input.workflowChildren.workflowRunId !== workflowRunId) throw new Error("workflowChildren workflowRunId does not match its receipt.");
 	const entries: Record<string, WorkflowReceiptEntry> = Object.create(null) as Record<string, WorkflowReceiptEntry>;
 	for (const child of input.children) {
@@ -75,7 +77,7 @@ export function buildWorkflowReceipt(input: {
 	const hostSteps = input.hostSteps?.map((hostStep, index) => parseHostStepNode(hostStep, `workflow receipt hostSteps[${index}]`));
 	if (hostSteps) assertUniqueHostStepIds(hostSteps, "workflow receipt");
 	const resource = parseWorkflowResource(input.resource, "workflow receipt");
-	return { version: WORKFLOW_RECEIPT_VERSION, workflowRunId, state: input.state, createdAt: input.createdAt ?? Date.now(), entries, ...(resource ? { resource } : {}), ...(hostSteps?.length ? { hostSteps } : {}), ...(input.workflowChildren ? { workflowChildren: input.workflowChildren } : {}), ...(input.terminalOutcome ? { terminalOutcome: input.terminalOutcome } : {}) };
+	return { version: WORKFLOW_RECEIPT_VERSION, workflowRunId, state: input.state, createdAt: input.createdAt ?? Date.now(), entries, ...(input.argsDigest ? { argsDigest: input.argsDigest } : {}), ...(resource ? { resource } : {}), ...(hostSteps?.length ? { hostSteps } : {}), ...(input.workflowChildren ? { workflowChildren: input.workflowChildren } : {}), ...(input.terminalOutcome ? { terminalOutcome: input.terminalOutcome } : {}) };
 }
 
 export function writeWorkflowReceipt(asyncDir: string, receipt: WorkflowReceipt): string {
@@ -115,12 +117,26 @@ const EXTERNAL_CLI_CAPABILITIES = {
 	extensionBindings: false,
 } as const;
 
+function parseExternalCliMachine(value: unknown, label: string): void {
+	if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`${label}.machine must be an object.`);
+	const machine = value as Record<string, unknown>;
+	const unknownMachine = Object.keys(machine).filter((field) => !["provider", "id", "label", "target", "session", "cwd", "remoteGit"].includes(field));
+	if (unknownMachine.length > 0) throw new Error(`${label}.machine has unsupported fields: ${unknownMachine.join(", ")}.`);
+	if (machine.provider !== "herdr" || typeof machine.id !== "string" || !machine.id.trim() || typeof machine.target !== "string" || !machine.target.trim() || typeof machine.cwd !== "string" || !machine.cwd.trim()) throw new Error(`${label}.machine is invalid.`);
+	for (const field of ["label", "session"] as const) if (machine[field] !== undefined && (typeof machine[field] !== "string" || !machine[field].trim())) throw new Error(`${label}.machine.${field} is invalid.`);
+	if (machine.remoteGit === undefined) return;
+	if (!machine.remoteGit || typeof machine.remoteGit !== "object" || Array.isArray(machine.remoteGit)) throw new Error(`${label}.machine.remoteGit must be an object.`);
+	const remoteGit = machine.remoteGit as Record<string, unknown>;
+	const unknownRemoteGit = Object.keys(remoteGit).filter((field) => !["head", "branch", "dirty"].includes(field));
+	if (unknownRemoteGit.length > 0 || (remoteGit.head !== undefined && (typeof remoteGit.head !== "string" || !remoteGit.head.trim())) || (remoteGit.branch !== undefined && (typeof remoteGit.branch !== "string" || !remoteGit.branch.trim())) || (remoteGit.dirty !== undefined && typeof remoteGit.dirty !== "boolean")) throw new Error(`${label}.machine.remoteGit is invalid.`);
+}
+
 function parseExternalCliReceiptMetadata(value: unknown, key: string, source: string): ExternalCliReceiptMetadata | undefined {
 	if (value === undefined) return undefined;
 	const label = `Invalid workflow receipt '${source}': entry '${key}' externalAdapter`;
 	if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`${label} must be an object.`);
 	const metadata = value as Record<string, unknown>;
-	const unknownMetadata = Object.keys(metadata).filter((field) => !["adapter", "capabilities", "safety", "outputArtifacts", "handoff", "supervisor", "nonResumableReason"].includes(field));
+	const unknownMetadata = Object.keys(metadata).filter((field) => !["adapter", "capabilities", "machine", "safety", "outputArtifacts", "handoff", "supervisor", "nonResumableReason"].includes(field));
 	if (unknownMetadata.length > 0) throw new Error(`${label} has unsupported fields: ${unknownMetadata.join(", ")}.`);
 	const adapter = metadata.adapter;
 	if (!adapter || typeof adapter !== "object" || Array.isArray(adapter)) throw new Error(`${label}.adapter must be an object.`);
@@ -136,6 +152,7 @@ function parseExternalCliReceiptMetadata(value: unknown, key: string, source: st
 	for (const [capability, expected] of Object.entries(EXTERNAL_CLI_CAPABILITIES)) {
 		if (capabilityRecord[capability] !== expected) throw new Error(`${label}.capabilities.${capability} is invalid.`);
 	}
+	if (metadata.machine !== undefined) parseExternalCliMachine(metadata.machine, label);
 	const safety = metadata.safety;
 	if (adapterRecord.id === "codex-exec") {
 		if (!safety || typeof safety !== "object" || Array.isArray(safety)) throw new Error(`${label}.safety is missing.`);
@@ -262,7 +279,7 @@ function parseWorkflowResolution(value: unknown, source: string): WorkflowTermin
 	return value;
 }
 
-function parseWorkflowResource(value: unknown, source: string): WorkflowResourceProvenanceV1 | undefined {
+function parseWorkflowResource(value: unknown, source: string): WorkflowResourceProvenance | undefined {
 	if (value === undefined) return undefined;
 	if (!value || typeof value !== "object" || Array.isArray(value)) throw new Error(`Invalid workflow receipt '${source}': resource must be an object.`);
 	const resource = value as Record<string, unknown>;
@@ -330,10 +347,11 @@ export function readWorkflowReceipt(asyncDirRoot: string, workflowRunId: string)
 		assertUniqueHostStepIds(hostSteps, receiptPath);
 	}
 	const workflowResolution = parseWorkflowResolution(receipt.workflowResolution, receiptPath);
+	if (receipt.argsDigest !== undefined && (typeof receipt.argsDigest !== "string" || !/^[a-f0-9]{64}$/u.test(receipt.argsDigest))) throw new Error(`Invalid workflow receipt '${receiptPath}': argsDigest is invalid.`);
 	const resource = parseWorkflowResource(receipt.resource, receiptPath);
 	const terminalOutcome = parseTerminalOutcome(receipt.terminalOutcome, `Invalid workflow receipt '${receiptPath}': terminalOutcome`);
 	const recovery = parseRecovery(receipt.recovery, workflowRunId, entries, receiptPath);
-	return { version: 1, workflowRunId, state: receipt.state, createdAt: receipt.createdAt, entries, ...(resource ? { resource } : {}), ...(hostSteps?.length ? { hostSteps } : {}), ...(workflowChildren ? { workflowChildren } : {}), ...(workflowResolution ? { workflowResolution } : {}), ...(terminalOutcome ? { terminalOutcome } : {}), ...(recovery ? { recovery } : {}) };
+	return { version: 1, workflowRunId, state: receipt.state, createdAt: receipt.createdAt, entries, ...(receipt.argsDigest ? { argsDigest: receipt.argsDigest } : {}), ...(resource ? { resource } : {}), ...(hostSteps?.length ? { hostSteps } : {}), ...(workflowChildren ? { workflowChildren } : {}), ...(workflowResolution ? { workflowResolution } : {}), ...(terminalOutcome ? { terminalOutcome } : {}), ...(recovery ? { recovery } : {}) };
 }
 
 export function resolveWorkflowReceiptResumeEntry(input: {

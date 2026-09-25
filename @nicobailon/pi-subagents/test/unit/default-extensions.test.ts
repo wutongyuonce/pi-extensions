@@ -9,6 +9,7 @@ import {
 	discoverAgentsAll,
 } from "../../src/agents/agents.ts";
 import { handleUpdate } from "../../src/agents/agent-management.ts";
+import { resolvePiLaunchToolPlan } from "../../src/api/child-tool-plan.ts";
 
 let tempHome = "";
 let tempProject = "";
@@ -21,17 +22,17 @@ function writeJson(filePath: string, value: unknown): void {
 	fs.writeFileSync(filePath, JSON.stringify(value, null, 2), "utf-8");
 }
 
-function writeProjectAgent(name: string, extensions?: string): void {
+function writeProjectAgent(name: string, extensionFrontmatter = ""): void {
 	const filePath = path.join(tempProject, ".pi", "agents", `${name}.md`);
 	fs.mkdirSync(path.dirname(filePath), { recursive: true });
 	fs.writeFileSync(
 		filePath,
-		`---\nname: ${name}\ndescription: Test agent${extensions === undefined ? "" : `\nextensions:${extensions ? ` ${extensions}` : ""}`}\n---\n\nTest agent.\n`,
+		`---\nname: ${name}\ndescription: Test agent${extensionFrontmatter ? `\n${extensionFrontmatter}` : ""}\n---\n\nTest agent.\n`,
 		"utf-8",
 	);
 }
 
-describe("subagents.defaultExtensions", () => {
+describe("subagent extension defaults", () => {
 	beforeEach(() => {
 		tempHome = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-home-"));
 		tempProject = fs.mkdtempSync(
@@ -59,6 +60,7 @@ describe("subagents.defaultExtensions", () => {
 			(agent) => agent.name === "scout",
 		);
 		assert.equal(scout?.extensions, undefined);
+		assert.equal(scout?.subagentOnlyExtensions, undefined);
 
 		writeJson(path.join(tempHome, ".pi", "agent", "settings.json"), {
 			subagents: { defaultExtensions: [] },
@@ -69,13 +71,72 @@ describe("subagents.defaultExtensions", () => {
 		assert.deepEqual(scout?.extensions, []);
 	});
 
+	it("preserves ambient loading unless extensions defaults are also configured", () => {
+		writeJson(path.join(tempHome, ".pi", "agent", "settings.json"), {
+			subagents: { defaultSubagentOnlyExtensions: ["  ./child.ts  "] },
+		});
+		const scout = discoverAgentsAll(tempProject).builtin.find((agent) => agent.name === "scout");
+		assert.ok(scout);
+		assert.equal(scout.extensions, undefined);
+		assert.deepEqual(scout.subagentOnlyExtensions, ["./child.ts"]);
+
+		const plan = resolvePiLaunchToolPlan(scout);
+		assert.equal(plan.disableAmbientExtensions, false);
+		assert.ok(plan.extensionArgs.includes("./child.ts"));
+
+		writeJson(path.join(tempHome, ".pi", "agent", "settings.json"), {
+			subagents: {
+				defaultExtensions: ["./allowlisted.ts"],
+				defaultSubagentOnlyExtensions: ["./child.ts"],
+			},
+		});
+		const allowlisted = discoverAgentsAll(tempProject).builtin.find((agent) => agent.name === "scout");
+		assert.ok(allowlisted);
+		const allowlistedPlan = resolvePiLaunchToolPlan(allowlisted);
+		assert.equal(allowlistedPlan.disableAmbientExtensions, true);
+		assert.ok(allowlistedPlan.extensionArgs.includes("./allowlisted.ts"));
+		assert.ok(allowlistedPlan.extensionArgs.includes("./child.ts"));
+	});
+
+	it("preserves an explicit child-only field and applies overrides after defaults", () => {
+		writeJson(path.join(tempHome, ".pi", "agent", "settings.json"), {
+			subagents: {
+				defaultSubagentOnlyExtensions: ["./default.ts"],
+				agentOverrides: {
+					replaced: { subagentOnlyExtensions: ["./user-replacement.ts"] },
+					cleared: { subagentOnlyExtensions: ["./user-cleared.ts"] },
+					scout: { subagentOnlyExtensions: [] },
+				},
+			},
+		});
+		writeJson(path.join(tempProject, ".pi", "settings.json"), {
+			subagents: {
+				agentOverrides: {
+					replaced: { subagentOnlyExtensions: ["./replacement.ts"] },
+					cleared: { subagentOnlyExtensions: false },
+				},
+			},
+		});
+		writeProjectAgent("empty", "subagentOnlyExtensions:");
+		writeProjectAgent("explicit", "subagentOnlyExtensions: ./explicit.ts");
+		writeProjectAgent("replaced");
+		writeProjectAgent("cleared");
+
+		const agents = discoverAgents(tempProject, "both").agents;
+		assert.deepEqual(agents.find((agent) => agent.name === "empty")?.subagentOnlyExtensions, []);
+		assert.deepEqual(agents.find((agent) => agent.name === "explicit")?.subagentOnlyExtensions, [path.join(tempProject, ".pi", "agents", "explicit.ts")]);
+		assert.deepEqual(agents.find((agent) => agent.name === "replaced")?.subagentOnlyExtensions, ["./replacement.ts"]);
+		assert.equal(agents.find((agent) => agent.name === "cleared")?.subagentOnlyExtensions, undefined);
+		assert.deepEqual(agents.find((agent) => agent.name === "scout")?.subagentOnlyExtensions, []);
+	});
+
 	it("applies the allowlist only when an agent has no extensions field", () => {
 		writeJson(path.join(tempHome, ".pi", "agent", "settings.json"), {
 			subagents: { defaultExtensions: ["./shared.ts"] },
 		});
 		writeProjectAgent("inherited");
-		writeProjectAgent("explicit", "./explicit.ts");
-		writeProjectAgent("disabled", "");
+		writeProjectAgent("explicit", "extensions: ./explicit.ts");
+		writeProjectAgent("disabled", "extensions:");
 
 		const agents = discoverAgents(tempProject, "both").agents;
 		assert.deepEqual(
@@ -104,7 +165,7 @@ describe("subagents.defaultExtensions", () => {
 			},
 		});
 		writeProjectAgent("inherited");
-		writeProjectAgent("explicit", "./frontmatter.ts");
+		writeProjectAgent("explicit", "extensions: ./frontmatter.ts");
 
 		const agents = discoverAgents(tempProject, "both").agents;
 		assert.deepEqual(
@@ -125,6 +186,7 @@ describe("subagents.defaultExtensions", () => {
 		writeJson(path.join(tempProject, ".pi", "settings.json"), {
 			subagents: {
 				defaultExtensions: ["./default.ts"],
+				defaultSubagentOnlyExtensions: ["./child-default.ts"],
 				agentOverrides: {
 					overridden: { extensions: ["./override.ts"] },
 				},
@@ -132,12 +194,16 @@ describe("subagents.defaultExtensions", () => {
 		});
 		writeProjectAgent("defaulted");
 		writeProjectAgent("overridden");
+		writeProjectAgent("declared", "subagentOnlyExtensions: ./declared.ts");
+		const discovered = new Map(discoverAgents(tempProject, "both").agents.map((agent) => [agent.name, agent]));
+		for (const name of ["defaulted", "overridden"]) assert.deepEqual(discovered.get(name)?.subagentOnlyExtensions, ["./child-default.ts"]);
+		assert.deepEqual(discovered.get("declared")?.subagentOnlyExtensions, [path.join(tempProject, ".pi", "agents", "declared.ts")]);
 
 		const ctx = {
 			cwd: tempProject,
 			modelRegistry: { getAvailable: () => [] },
 		} as unknown as Parameters<typeof handleUpdate>[1];
-		for (const agent of ["defaulted", "overridden"]) {
+		for (const agent of ["defaulted", "overridden", "declared"]) {
 			const updated = handleUpdate(
 				{ agent, config: { description: `Updated ${agent}` } },
 				ctx,
@@ -151,6 +217,8 @@ describe("subagents.defaultExtensions", () => {
 				"utf-8",
 			);
 			assert.doesNotMatch(content, /^extensions:/m);
+			if (agent === "declared") assert.match(content, /^subagentOnlyExtensions: \.\/declared\.ts$/m);
+			else assert.doesNotMatch(content, /^subagentOnlyExtensions:/m);
 		}
 	});
 
@@ -177,43 +245,47 @@ describe("subagents.defaultExtensions", () => {
 
 	it("uses project settings over user settings while respecting discovery scope", () => {
 		writeJson(path.join(tempHome, ".pi", "agent", "settings.json"), {
-			subagents: { defaultExtensions: ["./user.ts"] },
+			subagents: {
+				defaultExtensions: ["./user.ts"],
+				defaultSubagentOnlyExtensions: ["./user-child.ts"],
+			},
 		});
 		writeJson(path.join(tempProject, ".pi", "settings.json"), {
 			subagents: { defaultExtensions: [] },
 		});
 
+		const both = discoverAgents(tempProject, "both").agents.find((agent) => agent.name === "scout");
+		const user = discoverAgents(tempProject, "user").agents.find((agent) => agent.name === "scout");
+		const project = discoverAgents(tempProject, "project").agents.find((agent) => agent.name === "scout");
+		assert.deepEqual(both?.extensions, []);
+		assert.deepEqual(both?.subagentOnlyExtensions, ["./user-child.ts"]);
+		assert.deepEqual(user?.extensions, ["./user.ts"]);
+		assert.deepEqual(user?.subagentOnlyExtensions, ["./user-child.ts"]);
+		assert.deepEqual(project?.extensions, []);
+		assert.equal(project?.subagentOnlyExtensions, undefined);
+
+		writeJson(path.join(tempProject, ".pi", "settings.json"), {
+			subagents: { defaultExtensions: [], defaultSubagentOnlyExtensions: [] },
+		});
 		assert.deepEqual(
-			discoverAgents(tempProject, "both").agents.find(
-				(agent) => agent.name === "scout",
-			)?.extensions,
-			[],
-		);
-		assert.deepEqual(
-			discoverAgents(tempProject, "user").agents.find(
-				(agent) => agent.name === "scout",
-			)?.extensions,
-			["./user.ts"],
-		);
-		assert.deepEqual(
-			discoverAgents(tempProject, "project").agents.find(
-				(agent) => agent.name === "scout",
-			)?.extensions,
+			discoverAgents(tempProject, "both").agents.find((agent) => agent.name === "scout")?.subagentOnlyExtensions,
 			[],
 		);
 	});
 
 	it("rejects malformed values", () => {
 		const settingsPath = path.join(tempHome, ".pi", "agent", "settings.json");
-		for (const defaultExtensions of ["nope", 42, [""], [42], ["valid", 42]]) {
-			writeJson(settingsPath, { subagents: { defaultExtensions } });
-			assert.throws(
-				() => discoverAgents(tempProject, "both"),
-				(error: unknown) =>
-					error instanceof Error &&
-					error.message.includes(settingsPath) &&
-					error.message.includes("defaultExtensions"),
-			);
+		for (const settingName of ["defaultExtensions", "defaultSubagentOnlyExtensions"]) {
+			for (const value of ["nope", ["   "], [42], ["valid", 42]]) {
+				writeJson(settingsPath, { subagents: { [settingName]: value } });
+				assert.throws(
+					() => discoverAgents(tempProject, "both"),
+					(error: unknown) =>
+						error instanceof Error &&
+						error.message.includes(settingsPath) &&
+						error.message.includes(settingName),
+				);
+			}
 		}
 	});
 });

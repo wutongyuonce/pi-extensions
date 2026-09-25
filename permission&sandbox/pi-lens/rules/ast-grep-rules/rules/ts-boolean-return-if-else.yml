@@ -1,0 +1,12 @@
+id: ts-boolean-return-if-else
+language: typescript
+severity: warning
+message: if/else returning true/false - simplify to return the condition directly
+metadata:
+  weight: 3
+  category: slop
+rule:
+  kind: if_statement
+  any:
+  - pattern: "if ($COND) { return true; } else { return false; }"
+  - pattern: "if ($COND) { return false; } else { return true; }"

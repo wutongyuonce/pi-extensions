@@ -89,15 +89,13 @@
 - [`pi-fff`](./pi-fff) - <https://github.com/dmtrKovalenko/fff/tree/main/packages/pi-fff>
 - [`pi-kanban0`](./pi-kanban0) - <https://github.com/AHGGG/pi-kanban0>
 - [`pi-lens`](./pi-lens) - <https://github.com/apmantza/pi-lens>
-- [`pi-review-loop`](./pi-review-loop) - <https://github.com/earendil-works/pi-review-loop>
 - [`pi-subagents`](./pi-subagents) - <https://github.com/edxeth/pi-subagents>
 - [`pi-tidy-tools`](./pi-tidy-tools) - <https://github.com/mikeyobrien/pi-tidy-tools>
 - [`pi-transcribe`](./pi-transcribe) - <https://github.com/earendil-works/pi-transcribe>
-- [`pi-web`](./pi-web) - <https://github.com/agegr/pi-web>
 - [`pi-workspace-history`](./pi-workspace-history) - <https://github.com/wcldyx/pi-workspace-history>
 - [`pi-feishu-link`](./pi-feishu-link)
 - [`pi-compact-thinking`](./pi-compact-thinking)
 
-## Docs：各个 Extension 的解析文档
+## Docs：部分 Extension 的解析文档
 
 `docs/` 目录主要放的是各个 extension 的源码解析、阅读笔记和专题说明，不是独立 extension。

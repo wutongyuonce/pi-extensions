@@ -22,9 +22,32 @@ describe("subagent guide", () => {
 		assert.ok(SUBAGENT_ACTIONS.includes("guide"));
 	});
 
+	it("serves the council protocol and its references without loaded skills", () => {
+		const guide = readSubagentGuide("council");
+
+		assert.match(guide, /# Council Mode/);
+		assert.match(guide, /skills\/council-mode\/references\/pass-contracts\.md -->/);
+		assert.match(guide, /skills\/pi-subagents\/references\/execution-controls\.md -->/);
+		assert.match(guide, /Completed external-job runs can use `action: "resume"` for provider follow-up when the registered provider exposes `followUp\(input\)`/);
+		assert.doesNotMatch(guide, /External job profiles do not support[^.\n]*steer\/resume/);
+	});
+
 	it("documents external CLI runner limits in packaged guide topics", () => {
 		assert.match(readSubagentGuide("tool-reference"), /External CLI agent profiles[\s\S]*native Pi child options[\s\S]*model override[\s\S]*native Pi tools/);
 		assert.match(readSubagentGuide("agents"), /External CLI agents use their own runner contract[\s\S]*native Pi child options/);
+	});
+
+	it("documents failed-lane recovery boundaries in packaged guide topics", () => {
+		const workflows = readSubagentGuide("workflows");
+		const toolReference = readSubagentGuide("tool-reference");
+		assert.match(workflows, /subagent workflow[\s\S]*child launch[\s\S]*prompt runtime[\s\S]*extension loading[\s\S]*child tooling setup[\s\S]*lane infrastructure blocker/);
+		assert.match(workflows, /exact failure[\s\S]*run\/status[\s\S]*(?:repo|repository)\/cwd\/worktree\/branch\/ref/);
+		assert.match(workflows, /clean[\s\S]*partial diff/);
+		assert.match(workflows, /same-protocol retry/);
+		assert.match(workflows, /asking the owner/);
+		assert.match(workflows, /external\/foreground\/CLI fallback requires explicit owner approval/);
+		assert.match(workflows, /Pi core[\s\S]*pi -ne[\s\S]*out-of-repo hint[\s\S]*not protocol-approved fallback/);
+		assert.match(toolReference, /lane infrastructure blocker[\s\S]*external\/foreground\/CLI fallback requires explicit owner approval[\s\S]*interactive_shell[\s\S]*pi -ne/);
 	});
 
 	it("keeps advanced workflow details in the packaged guide", () => {

@@ -5,6 +5,10 @@ import { loadAgentByName } from "./agents.js";
 import { DYNAMIC_OUTPUT_PROFILES } from "./dynamic-profiles.js";
 import { stringifyPromptJson } from "./prompt-json.js";
 import { compileRole } from "./roles.js";
+import {
+	resourceInheritanceWarnings,
+	WORKFLOW_RESOURCE_POLICY_VERSION,
+} from "./resource-inheritance.js";
 import { EXECUTION_PROFILE_FOREACH_BATCH } from "./execution-profile.js";
 import {
 	classifyToolCapability,
@@ -22,6 +26,7 @@ import {
 	type ArtifactGraphRequiredRead,
 	type ArtifactGraphStageSpec,
 	type ArtifactGraphWorkflowSpec,
+	type CompiledDynamicWorkflowTask,
 	type CompiledTask,
 	type CompiledTaskSafety,
 	type CompiledToolProvider,
@@ -72,12 +77,24 @@ interface CompileOptions {
 	cwd: string;
 	specPath?: string;
 	availableModels?: WorkflowModelInfo[];
+	/** Bounded routing preflight injects frontmatter-only agent metadata. */
+	agentLoader?: (name: string, cwd: string) => Promise<AgentDefinition | undefined>;
+	/** Avoid optional schema/warning file reads while deriving local routing facts. */
+	metadataOnly?: boolean;
 }
 
 interface ArtifactGraphCompilePlanBuildResult {
 	plan: any;
 	stageMetadata: Map<string, NonNullable<CompiledTask["artifactGraph"]>>;
 }
+
+type LoweredArtifactGraphFrom =
+	| ArtifactGraphStageSpec["from"]
+	| {
+			stage: string;
+			path: string;
+			streaming?: { enabled: true; minChunk?: number };
+	  };
 
 function compileWorkflowFailurePolicy(
 	policy: WorkflowFailurePolicy | undefined,
@@ -193,7 +210,9 @@ function lowerArtifactGraphStage(
 	return lowered;
 }
 
-function lowerArtifactGraphFrom(from: ArtifactGraphStageSpec["from"]): unknown {
+function lowerArtifactGraphFrom(
+	from: ArtifactGraphStageSpec["from"],
+): LoweredArtifactGraphFrom {
 	if (
 		from &&
 		typeof from === "object" &&
@@ -203,9 +222,7 @@ function lowerArtifactGraphFrom(from: ArtifactGraphStageSpec["from"]): unknown {
 		return {
 			stage: from.source,
 			path: from.path,
-			...((from as { streaming?: unknown }).streaming !== undefined
-				? { streaming: (from as { streaming?: unknown }).streaming }
-				: {}),
+			...(from.streaming !== undefined ? { streaming: from.streaming } : {}),
 		};
 	}
 	return from;
@@ -223,13 +240,17 @@ function appendWorkflowOutputInstructions(
 	stage: ArtifactGraphStageSpec,
 ): string {
 	const controlSchema = stage.output?.controlSchema;
+	const analysisRequired = stage.output?.analysis?.required ?? true;
+	const refsRequired = (stage.output?.refs?.required ?? true) || (stage.output?.refs?.minItems ?? 0) > 0;
 	return [
 		prompt,
 		"# Workflow Output Protocol",
-		"Return your final answer exactly as these three sections, in this order, with no prose outside the tags:",
+		analysisRequired && refsRequired
+			? "Return your final answer exactly as these three sections, in this order, with no prose outside the tags:"
+			: "Return your final answer using these sections in this order, at most once each, with no prose outside the tags. Optional sections may be omitted:",
 		"<control>{...}</control>",
-		"<analysis>...</analysis>",
-		"<refs>[]</refs>",
+		analysisRequired ? "<analysis>...</analysis>" : "<analysis>...</analysis> (optional)",
+		refsRequired ? "<refs>[]</refs>" : "<refs>[]</refs> (optional)",
 		"The <control> section must be valid JSON object data for the workflow control plane.",
 		"The control object must include a non-empty string `schema` and a concise non-empty string `digest`.",
 		...controlSchemaOutputInstructions(controlSchema, "stage-control-v1"),
@@ -267,7 +288,8 @@ function partialOutputInstructions(
 		'<partial-control>{"schema":"workflow-partial-output-v1","path":"$.items","items":[{"id":"stable-id","...":"..."}]}</partial-control>',
 		"Use the actual declared path, not the example path, and include only items that are final/stable enough to appear unchanged in your final <control> at that path.",
 		"Every partial item must be the exact JSON object that will appear in the final array and must include a stable non-empty string `id`; never revise or withdraw a published partial item.",
-		"If an item might change, do not publish it partially; wait for the final workflow output. The final answer must still include the normal <control>, <analysis>, and <refs> sections exactly once.",
+		"Emit each partial-control publication as a standalone block before any final output sections, not inside prose or code fences.",
+		"If an item might change, do not publish it partially; wait for the final workflow output. The final answer must still follow the required/optional section rules above, with no duplicate sections.",
 	];
 }
 
@@ -714,20 +736,22 @@ export async function compileWorkflow(
 	const foreachSpecDir = options.specPath
 		? dirname(resolve(options.cwd, options.specPath))
 		: options.cwd;
-	compiled.warnings.push(
-		...(await collectForeachPathWarnings(
-			spec.artifactGraph?.stages ?? [],
-			foreachSpecDir,
-		)),
-		...(await collectSourceProjectionWarnings(
-			spec.artifactGraph?.stages ?? [],
-			foreachSpecDir,
-		)),
-		...(await collectWorkflowQualityWarnings(
-			spec.artifactGraph?.stages ?? [],
-			foreachSpecDir,
-		)),
-	);
+	if (!options.metadataOnly) {
+		compiled.warnings.push(
+			...(await collectForeachPathWarnings(
+				spec.artifactGraph?.stages ?? [],
+				foreachSpecDir,
+			)),
+			...(await collectSourceProjectionWarnings(
+				spec.artifactGraph?.stages ?? [],
+				foreachSpecDir,
+			)),
+			...(await collectWorkflowQualityWarnings(
+				spec.artifactGraph?.stages ?? [],
+				foreachSpecDir,
+			)),
+		);
+	}
 	const failurePolicy = compileWorkflowFailurePolicy(spec.artifactGraph);
 	if (failurePolicy) compiled.failurePolicy = failurePolicy;
 	return compiled;
@@ -1055,12 +1079,24 @@ async function collectWorkflowQualityWarnings(
 
 		for (const field of complexControlShapeFields(schema, prompt)) {
 			if (!promptShowsJsonKeyShape(prompt, field.key, field.expectedShape)) {
-				const example = field.expectedShape === "object" ? "{}" : "[]";
+				// The check only needs the literal opener after the key; when the
+				// schema forbids an empty container, say so instead of suggesting a
+				// skeleton that the schema itself would reject.
+				const example = field.nonEmpty
+					? field.expectedShape === "object"
+						? "{ ... }"
+						: "[ ... ]"
+					: field.expectedShape === "object"
+						? "{}"
+						: "[]";
+				const nonEmptyNote = field.nonEmpty
+					? ` (the schema requires a non-empty ${field.expectedShape}, so show at least one example item)`
+					: "";
 				const source = field.required
 					? `requires ${field.path}`
 					: `defines ${field.path}`;
 				warnings.push(
-					`stage "${stage.id}" ${source} as a JSON ${field.expectedShape}, but the prompt does not show an exact "${field.key}": ${example} control shape. Add a small schema-valid <control> JSON skeleton so model output does not drift to the wrong type or alias nested fields.`,
+					`stage "${stage.id}" ${source} as a JSON ${field.expectedShape}, but the prompt does not show an exact "${field.key}": ${example} control shape${nonEmptyNote}. Add a small schema-valid <control> JSON skeleton so model output does not drift to the wrong type or alias nested fields.`,
 				);
 			}
 		}
@@ -1148,6 +1184,8 @@ type ComplexControlShapeField = {
 	key: string;
 	expectedShape: "array" | "object";
 	required: boolean;
+	/** True when the schema forbids an empty container (minItems/minProperties > 0). */
+	nonEmpty: boolean;
 };
 
 function complexControlShapeFields(
@@ -1179,6 +1217,10 @@ function complexControlShapeFields(
 				key,
 				expectedShape,
 				required: isRequired,
+				nonEmpty:
+					expectedShape === "array"
+						? Number(child?.minItems) > 0
+						: Number(child?.minProperties) > 0,
 			});
 		}
 		if (isRequired) {
@@ -1395,6 +1437,7 @@ async function compileArtifactGraphPlan(
 			options.cwd,
 			agentCache,
 			"$.defaults.agent",
+			options.agentLoader,
 		);
 		return defaultAgent;
 	};
@@ -1407,6 +1450,7 @@ async function compileArtifactGraphPlan(
 						options.cwd,
 						agentCache,
 						`$.roles.${name}.fromAgent`,
+						options.agentLoader,
 					)
 				: undefined;
 			return compileRole(name, role, sourceAgent);
@@ -1517,6 +1561,7 @@ async function compileArtifactGraphPlan(
 				},
 				overrides,
 			);
+			dynamicTask.resourcePolicyVersion = WORKFLOW_RESOURCE_POLICY_VERSION;
 			dynamicTask.runtime = {
 				...dynamicTask.runtime,
 				...resolvedDynamicRuntime,
@@ -1547,6 +1592,7 @@ async function compileArtifactGraphPlan(
 						options.cwd,
 						agentCache,
 						`$.artifactGraph.stages.${jsonKey(stage.id)}.${each?.agent !== undefined ? "each.agent" : "agent"}`,
+						options.agentLoader,
 					);
 		if (!validatedAgentPaths.has(stageAgent.sourcePath)) {
 			validateAgentRuntime(
@@ -1554,6 +1600,7 @@ async function compileArtifactGraphPlan(
 				issues,
 				`$.artifactGraph.stages.${jsonKey(stage.id)}.${each?.agent !== undefined ? "each.agent" : "agent"}`,
 			);
+			warnings.push(...resourceInheritanceWarnings(stageAgent));
 			validatedAgentPaths.add(stageAgent.sourcePath);
 		}
 		const selectedRoles = selectRoles(
@@ -1721,6 +1768,7 @@ async function compileArtifactGraphPlan(
 			systemPromptMode: stageAgent.systemPromptMode,
 			inheritProjectContext: stageAgent.inheritProjectContext,
 			inheritSkills: stageAgent.inheritSkills,
+			resourcePolicyVersion: WORKFLOW_RESOURCE_POLICY_VERSION,
 			roleNames: selectedRoles.names,
 			task: normalizedPrompt,
 			cwd: taskCwd,
@@ -1774,6 +1822,7 @@ async function compileArtifactGraphPlan(
 		containerContextDependsOn: string[] | undefined,
 	): Promise<string[]> => {
 		const scopedStageTaskKeys = new Map<string, string[]>();
+		// Foreach refs are already namespaced when this output-source map is read.
 		const scopedSourceStageIds = new Map<string, string>();
 
 		for (const childStage of containerStage.stages ?? []) {
@@ -1820,7 +1869,7 @@ async function compileArtifactGraphPlan(
 				scopedStageTaskKeys.set(childStage.id, currentChildTaskKeys);
 				const outputStageId = resolveDagOutputStageId(namespacedChildStage);
 				if (outputStageId)
-					scopedSourceStageIds.set(childStage.id, outputStageId);
+					scopedSourceStageIds.set(namespacedChildStage.id, outputStageId);
 				continue;
 			}
 
@@ -1858,7 +1907,7 @@ async function compileArtifactGraphPlan(
 			}
 
 			scopedStageTaskKeys.set(childStage.id, currentChildTaskKeys);
-			scopedSourceStageIds.set(childStage.id, namespacedChildStage.id);
+			scopedSourceStageIds.set(namespacedChildStage.id, namespacedChildStage.id);
 		}
 
 		const outputChildId = resolveDagOutputChildId(containerStage);
@@ -2195,7 +2244,7 @@ function buildDynamicTask(
 	]
 		.filter(Boolean)
 		.join("\n\n");
-	const helpers: Record<string, any> = {};
+	const helpers: CompiledDynamicWorkflowTask["helpers"] = {};
 	for (const [helperId, helper] of Object.entries(
 		isPlainRecord(dynamic.helpers) ? dynamic.helpers : {},
 	)) {
@@ -2218,7 +2267,7 @@ function buildDynamicTask(
 				: {}),
 		};
 	}
-	const workflows: Record<string, any> = {};
+	const workflows: CompiledDynamicWorkflowTask["workflows"] = {};
 	for (const [workflowId, workflow] of Object.entries(
 		isPlainRecord(dynamic.workflows) ? dynamic.workflows : {},
 	)) {
@@ -2459,10 +2508,13 @@ async function loadWorkflowAgent(
 	cwd: string,
 	cache: Map<string, AgentDefinition>,
 	path: string,
+	agentLoader?: (name: string, cwd: string) => Promise<AgentDefinition | undefined>,
 ): Promise<AgentDefinition> {
 	const cached = cache.get(name);
 	if (cached) return cached;
-	const agent = await loadAgentByName(name, cwd).catch(() => undefined);
+	const agent = await (agentLoader ?? loadAgentByName)(name, cwd).catch(
+		() => undefined,
+	);
 	if (!agent)
 		throw new WorkflowValidationError([
 			{ path, message: `unknown agent "${name}"` },

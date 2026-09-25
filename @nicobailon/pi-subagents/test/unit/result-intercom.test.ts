@@ -12,6 +12,16 @@ import {
 } from "../../src/intercom/result-intercom.ts";
 
 describe("result intercom formatter", () => {
+	it("does not promote running children to grouped completion", () => {
+		assert.equal(resolveSubagentResultStatus({ state: "running" }), "running");
+		assert.equal(resolveSubagentResultStatus({ state: "running", success: true }), "running");
+		const payload = buildSubagentResultIntercomPayload({ to: "parent", runId: "workflow", mode: "workflow", source: "async", children: [
+			{ agent: "finished", status: "completed", summary: "done", outputState: "present" },
+			{ agent: "launched", status: "running", summary: "", outputState: "absent" },
+		] });
+		assert.equal(payload.status, "running");
+		assert.equal(payload.summary, "1 running, 1 completed");
+	});
 	it("builds one grouped intercom payload with status counts and child sections", () => {
 		const payload = buildSubagentResultIntercomPayload({
 			to: "subagent-chat-main",

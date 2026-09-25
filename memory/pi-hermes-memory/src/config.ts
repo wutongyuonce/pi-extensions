@@ -12,9 +12,11 @@ import {
   DEFAULT_REVIEW_RECENT_MESSAGES,
   DEFAULT_FLUSH_RECENT_MESSAGES,
   DEFAULT_CONSOLIDATION_TIMEOUT_MS,
+  DEFAULT_FLUSH_COMPACT_TIMEOUT_MS,
   DEFAULT_OVERFLOW_GRACE_MS,
   DEFAULT_FAILURE_INJECTION_MAX_AGE_DAYS,
   DEFAULT_FAILURE_INJECTION_MAX_ENTRIES,
+  DEFAULT_SESSION_RETENTION_DAYS,
 } from "./constants.js";
 import { AGENT_ROOT, normalizeConfiguredMemoryDir, normalizeProjectsMemoryDir } from "./paths.js";
 
@@ -40,6 +42,7 @@ function isThinkingLevel(value: unknown): value is ThinkingLevel {
 }
 
 const DEFAULT_CONFIG: MemoryConfig = {
+  lazyInitialization: false,
   memoryMode: "policy-only",
   memoryPolicyStyle: "full",
   memoryCharLimit: DEFAULT_MEMORY_CHAR_LIMIT,
@@ -53,6 +56,7 @@ const DEFAULT_CONFIG: MemoryConfig = {
   flushOnShutdown: true,
   flushMinTurns: DEFAULT_FLUSH_MIN_TURNS,
   flushRecentMessages: DEFAULT_FLUSH_RECENT_MESSAGES,
+  flushCompactTimeoutMs: DEFAULT_FLUSH_COMPACT_TIMEOUT_MS,
   memoryOverflowStrategy: "auto-consolidate",
   overflowGraceMs: DEFAULT_OVERFLOW_GRACE_MS,
   autoConsolidate: true,
@@ -66,6 +70,8 @@ const DEFAULT_CONFIG: MemoryConfig = {
   standingInstructionsEnabled: true,
   projectsMemoryDir: DEFAULT_PROJECTS_MEMORY_DIR,
   sessionSearch: { variant: "legacy" },
+  quickCheckOnOpen: true,
+  sessionRetentionDays: DEFAULT_SESSION_RETENTION_DAYS,
 };
 
 export const DEFAULT_CONFIG_PATH = path.join(
@@ -88,6 +94,7 @@ export function loadConfig(configPath = DEFAULT_CONFIG_PATH): MemoryConfig {
       );
       let hasLegacyAutoConsolidate = false;
       let hasMemoryOverflowStrategy = false;
+      if (typeof parsed.lazyInitialization === "boolean") config.lazyInitialization = parsed.lazyInitialization;
       if (parsed.memoryMode === "policy-only" || parsed.memoryMode === "legacy-inject") config.memoryMode = parsed.memoryMode;
       if (
         parsed.memoryPolicyStyle === "full" ||
@@ -106,6 +113,16 @@ export function loadConfig(configPath = DEFAULT_CONFIG_PATH): MemoryConfig {
       if (typeof parsed.flushOnShutdown === "boolean") config.flushOnShutdown = parsed.flushOnShutdown;
       if (typeof parsed.flushMinTurns === "number") config.flushMinTurns = parsed.flushMinTurns;
       if (isNonNegativeNumber(parsed.flushRecentMessages)) config.flushRecentMessages = parsed.flushRecentMessages;
+      if (typeof parsed.flushCompactTimeoutMs === "number" && Number.isFinite(parsed.flushCompactTimeoutMs)) {
+        config.flushCompactTimeoutMs = parsed.flushCompactTimeoutMs;
+        // Zero and below is the documented disable, not a too-low timeout.
+        if (parsed.flushCompactTimeoutMs > 0 && parsed.flushCompactTimeoutMs < DEFAULT_FLUSH_COMPACT_TIMEOUT_MS) {
+          console.warn(
+            `⚠️ flushCompactTimeoutMs is set to ${parsed.flushCompactTimeoutMs}ms, below the ${DEFAULT_FLUSH_COMPACT_TIMEOUT_MS}ms default.`
+            + " Compact flush is one LLM turn over the conversation; local models are routinely cut off below this.",
+          );
+        }
+      }
       if (typeof parsed.autoConsolidate === "boolean") {
         config.autoConsolidate = parsed.autoConsolidate;
         hasLegacyAutoConsolidate = true;
@@ -136,6 +153,12 @@ export function loadConfig(configPath = DEFAULT_CONFIG_PATH): MemoryConfig {
       if (typeof parsed.failureInjectionMaxAgeDays === "number") config.failureInjectionMaxAgeDays = parsed.failureInjectionMaxAgeDays;
       if (typeof parsed.failureInjectionMaxEntries === "number") config.failureInjectionMaxEntries = parsed.failureInjectionMaxEntries;
       if (typeof parsed.nudgeToolCalls === "number") config.nudgeToolCalls = parsed.nudgeToolCalls;
+      // Accept any finite number >= 0 so a user can both opt in (positive value)
+      // and explicitly disable retention with 0. Invalid/negative values are
+      // ignored, keeping the current (default) semantics.
+      if (typeof parsed.sessionRetentionDays === "number" && Number.isFinite(parsed.sessionRetentionDays) && parsed.sessionRetentionDays >= 0) {
+        config.sessionRetentionDays = parsed.sessionRetentionDays;
+      }
       if (typeof parsed.standingInstructionsEnabled === "boolean") config.standingInstructionsEnabled = parsed.standingInstructionsEnabled;
       if (typeof parsed.projectCharLimit === "number") config.projectCharLimit = parsed.projectCharLimit;
       if (typeof parsed.memoryDir === "string") {
@@ -153,9 +176,32 @@ export function loadConfig(configPath = DEFAULT_CONFIG_PATH): MemoryConfig {
       ) {
         config.sessionSearch = { variant: parsed.sessionSearch.variant };
       }
+      if (typeof parsed.quickCheckOnOpen === "boolean") config.quickCheckOnOpen = parsed.quickCheckOnOpen;
       if (typeof parsed.llmModelOverride === "string") {
         const trimmed = parsed.llmModelOverride.trim();
         if (trimmed.length > 0) config.llmModelOverride = trimmed;
+      }
+      // Support array form for primary override too (e.g. llmModelOverride: ["a/b","c/d"]) — first entry is primary, rest are fallbacks
+      if (Array.isArray(parsed.llmModelOverride) && parsed.llmModelOverride.every((v: unknown) => typeof v === "string")) {
+        const cleaned = (parsed.llmModelOverride as string[]).map((s) => s.trim()).filter(Boolean);
+        if (cleaned.length > 0) {
+          config.llmModelOverride = cleaned[0];
+          const fallbacks = cleaned.slice(1);
+          if (fallbacks.length > 0) config.llmFallbackModels = fallbacks;
+        }
+      }
+      if (isStringArray(parsed.llmFallbackModels)) {
+        const cleaned = (parsed.llmFallbackModels as string[]).map((s) => s.trim()).filter(Boolean);
+        if (cleaned.length > 0) config.llmFallbackModels = [...new Set([...(config.llmFallbackModels ?? []), ...cleaned])];
+      }
+      // Backward-compat alias: llmModelFallbacks / fallbackModels
+      if (isStringArray((parsed as Record<string, unknown>).llmModelFallbacks)) {
+        const cleaned = ((parsed as Record<string, unknown>).llmModelFallbacks as string[]).map((s: string) => s.trim()).filter(Boolean);
+        if (cleaned.length > 0) config.llmFallbackModels = [...new Set([...(config.llmFallbackModels ?? []), ...cleaned])];
+      }
+      if (isStringArray((parsed as Record<string, unknown>).fallbackModels)) {
+        const cleaned = ((parsed as Record<string, unknown>).fallbackModels as string[]).map((s: string) => s.trim()).filter(Boolean);
+        if (cleaned.length > 0) config.llmFallbackModels = [...new Set([...(config.llmFallbackModels ?? []), ...cleaned])];
       }
       if (isThinkingLevel(parsed.llmThinkingOverride)) config.llmThinkingOverride = parsed.llmThinkingOverride;
       if (isStringArray(parsed.childExtensionPaths)) {

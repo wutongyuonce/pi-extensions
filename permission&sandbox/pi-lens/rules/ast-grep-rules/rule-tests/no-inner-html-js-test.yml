@@ -1,0 +1,14 @@
+id: no-inner-html-js
+valid:
+  - 'el.textContent = "x"'
+  - 'el.insertAdjacentText("beforeend", "x")'
+  - "el.innerHTML = ''"
+  - 'el.innerHTML = "x"'
+  - 'el.outerHTML = "x"'
+  - 'el.innerHTML = `static markup`'
+invalid:
+  - 'el.insertAdjacentHTML("beforeend", "x")'
+  - "el.innerHTML = html"
+  - "el.innerHTML = getHtml(entry, label)"
+  - 'el.innerHTML = `hi ${name}`'
+  - "el.outerHTML = html"

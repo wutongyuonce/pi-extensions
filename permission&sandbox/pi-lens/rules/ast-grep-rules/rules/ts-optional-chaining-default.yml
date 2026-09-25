@@ -1,0 +1,21 @@
+id: ts-optional-chaining-default
+language: typescript
+severity: warning
+message: "obj && obj.prop ? obj.prop : default - use obj?.prop ?? default"
+metadata:
+  weight: 3
+  category: slop
+rule:
+  # Three equivalent null-guard forms: the explicit `&&` chain,
+  # the loose `obj != null ? ... : ...` (loose-equality catches
+  # both null and undefined), and the strict `obj !== null &&
+  # obj !== undefined` form. All collapse to the idiomatic
+  # `obj?.prop ?? default`.
+  any:
+    - kind: ternary_expression
+      pattern: "$OBJ && $OBJ.$PROP ? $OBJ.$PROP : $DEFAULT"
+    - kind: ternary_expression
+      pattern: "$OBJ != null ? $OBJ.$PROP : $DEFAULT"
+    - kind: ternary_expression
+      pattern: >-
+        $OBJ !== null && $OBJ !== undefined ? $OBJ.$PROP : $DEFAULT

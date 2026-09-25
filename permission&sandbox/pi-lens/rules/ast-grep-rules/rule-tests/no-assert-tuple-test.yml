@@ -1,0 +1,26 @@
+id: no-assert-tuple
+valid:
+  - 'assert True'
+  - 'assert x == 1'
+  - 'assert x, "message"'
+  - 'assert (x == 1), "message"'  # explicit grouping, not a tuple
+  - 'assert actual == (1, 2)'
+  - 'assert (actual == (1, 2))'
+  - 'assert (f((1, 2)))'
+  - 'assert (left, right) == expected'
+  - 'assert value in {(1, 2), (3, 4)}'
+  - 'assert {item for item in values if item != (1, 2)}'
+  - 'assert all(item in {(1, 2)} for item in values)'
+  - 'assert True, ("tuple", "message")'
+  - 'assert actual == (1, 2), ("tuple", "message")'
+invalid:
+  - 'assert ()'
+  - 'assert (1, 2)'
+  - 'assert (x, y)'
+  - 'assert ((x, y))'
+  - 'assert (((x, y)))'
+  - 'assert (x, y), ("tuple", "message")'
+  - 'assert (1, 2, 3), "message"'
+  - |
+    def f():
+        assert (a, b)

@@ -1,5 +1,5 @@
 import { spawnSync } from "node:child_process";
-import type { ProcessTreeTerminalV1 } from "../../shared/types.ts";
+import type { ProcessTreeTerminal } from "../../shared/types.ts";
 
 const DEFAULT_TERM_GRACE_MS = 3000;
 const DEFAULT_KILL_VERIFY_MS = 1000;
@@ -35,6 +35,23 @@ function activeProcessGroupMembers(processGroupId: number): number[] | { diagnos
 	return members;
 }
 
+function knownDetachedDescendants(processGroupId: number): number[] {
+	const result = spawnSync("ps", ["-axo", "pid=,ppid=,pgid=,stat="], { encoding: "utf-8" });
+	if (result.error || result.status !== 0) return [];
+	const owned = new Set<number>();
+	const outside: { pid: number; ppid: number }[] = [];
+	for (const line of result.stdout.split("\n")) {
+		const match = /^\s*(\d+)\s+(\d+)\s+(\d+)\s+(\S+)/.exec(line);
+		if (!match || match[4]!.startsWith("Z")) continue;
+		const pid = Number(match[1]);
+		const ppid = Number(match[2]);
+		const pgid = Number(match[3]);
+		if (pgid === processGroupId) owned.add(pid);
+		else outside.push({ pid, ppid });
+	}
+	return outside.filter((row) => owned.has(row.ppid)).map((row) => row.pid);
+}
+
 async function waitUntilGroupTerminal(
 	processGroupId: number,
 	timeoutMs: number,
@@ -52,37 +69,47 @@ async function waitUntilGroupTerminal(
 	}
 }
 
-function observed(processGroupId: number): ProcessTreeTerminalV1 {
+function observed(processGroupId: number): ProcessTreeTerminal {
 	return { state: "observed", mechanism: "posix-process-group", processGroupId, verifiedAt: Date.now() };
+}
+
+function observedUnlessLiveDetached(processGroupId: number, detached: readonly number[]): ProcessTreeTerminal {
+	const live = detached.filter((pid) => {
+		const result = spawnSync("ps", ["-o", "stat=", "-p", String(pid)], { encoding: "utf-8" });
+		return result.status === 0 && Boolean(result.stdout.trim()) && !result.stdout.trim().startsWith("Z");
+	});
+	if (live.length === 0) return observed(processGroupId);
+	return { state: "unknown", reason: "verification-failed", diagnostic: `Owned detached descendant(s) still active: ${live.join(", ")}.` };
 }
 
 /** Owns one writer process group and arbitrates its cleanup exactly once. */
 export interface OwnedProcessTreeController {
-	terminate(): Promise<ProcessTreeTerminalV1>;
-	finishAfterWriterClose(): Promise<ProcessTreeTerminalV1>;
+	terminate(): Promise<ProcessTreeTerminal>;
+	finishAfterWriterClose(): Promise<ProcessTreeTerminal>;
 }
 
 export function createOwnedProcessTreeController(
 	pid: number,
 	options: { termGraceMs?: number; killVerifyMs?: number } = {},
 ): OwnedProcessTreeController {
-	let termination: Promise<ProcessTreeTerminalV1> | undefined;
+	let termination: Promise<ProcessTreeTerminal> | undefined;
 	const posixGroupOwned = process.platform !== "win32";
 	const target = posixGroupOwned ? -pid : pid;
 
-	const terminate = (): Promise<ProcessTreeTerminalV1> => {
+	const terminate = (): Promise<ProcessTreeTerminal> => {
 		if (termination) return termination;
 		termination = (async () => {
 			if (!posixGroupOwned) {
 				signalProcess(target, "SIGTERM");
 				return { state: "unknown", reason: "unsupported-platform" };
 			}
+			const detached = knownDetachedDescendants(pid);
 			const term = signalProcess(target, "SIGTERM");
 			if (term !== "sent" && term !== "absent") {
 				return { state: "unknown", reason: "signal-failed", diagnostic: term.diagnostic };
 			}
 			const termExit = await waitUntilGroupTerminal(pid, options.termGraceMs ?? DEFAULT_TERM_GRACE_MS);
-			if (termExit === false) return observed(pid);
+			if (termExit === false) return observedUnlessLiveDetached(pid, detached);
 
 			const kill = signalProcess(target, "SIGKILL");
 			if (kill !== "sent" && kill !== "absent") {
@@ -95,7 +122,7 @@ export function createOwnedProcessTreeController(
 			if (killExit !== false) {
 				return { state: "unknown", reason: "verification-failed", diagnostic: killExit.diagnostic };
 			}
-			return observed(pid);
+			return observedUnlessLiveDetached(pid, detached);
 		})();
 		return termination;
 	};

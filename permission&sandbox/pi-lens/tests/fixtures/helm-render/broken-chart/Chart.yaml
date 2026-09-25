@@ -1,0 +1,4 @@
+apiVersion: v2
+name: pi-lens-render-broken
+description: Chart whose template dereferences a values key that does not exist.
+version: 0.1.0

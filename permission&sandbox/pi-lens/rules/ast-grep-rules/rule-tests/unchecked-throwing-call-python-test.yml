@@ -1,0 +1,24 @@
+id: unchecked-throwing-call-python
+valid:
+  - |
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+  - |
+    try:
+        with open(path) as f:
+            data = f.read()
+    except OSError:
+        return None
+  - 'CONSTANT = 42'
+  - |
+    # #3211: int()/float() moved to unchecked-numeric-parse-python — this
+    # rule no longer fires on the numeric-parse shape.
+    x = int(s)
+invalid:
+  - 'data = json.loads(raw)'
+  - 'f = open(path)'
+  - 'os.remove(path)'
+  - 'os.stat(path)'
+  - 'shutil.rmtree(path)'

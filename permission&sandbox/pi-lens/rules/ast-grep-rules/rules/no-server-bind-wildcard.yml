@@ -1,0 +1,44 @@
+id: no-server-bind-wildcard
+language: Python
+message: "Web servers should not bind to all network interfaces"
+severity: error
+note: |
+  Port of SonarCloud python:S8392 (BLOCKER VULNERABILITY).
+
+  Binding a web server to `0.0.0.0` (or `::`) exposes it on every
+  network interface, including public ones. Production servers
+  should bind to a specific interface or use a reverse proxy.
+
+  Matches any `call` node whose text contains `host=` followed by
+  `0.0.0.0` (within a few characters). Note: `0.0.0.0` in `app.run()`
+  (Flask dev server) is also flagged — for development, prefer
+  `127.0.0.1`.
+
+  2026-08-20 (review round, refs #1806): a prior fix anchored this to
+  `.run(...)` / `.listen(...)` / `.serve(...)` call targets specifically,
+  to exclude a pydantic `Settings.model_construct(...)` test fixture
+  that happened to have a `host`-named field set to `"0.0.0.0"`. That
+  traded one false positive for a false-negative CLASS: a bare
+  `run(host='0.0.0.0')` (no receiver), `uvicorn.Config(app,
+  host='0.0.0.0')` (a different call name — the config object, not the
+  `.run()` invocation), and `app.run_server(...)` (a different method
+  name) all went invisible. For a BLOCKER-severity security rule, a
+  rare false positive is the acceptable trade, not a missed detection
+  class — reverted to the broad `kind: call` + regex match, and
+  excluded the SPECIFIC false-positive shape instead: a call to
+  `.model_construct(...)` / `.construct(...)` (pydantic's
+  validation-skipping constructors — the "this builds a config object,
+  it doesn't bind a socket" case the FP actually was).
+
+  The regex uses `.{0,5}` between `host` and `0.0.0.0` to
+  accept either `host='0.0.0.0'` (single quote) or
+  `host="0.0.0.0"` (double quote) with whitespace.
+metadata:
+  sonar: S8392
+rule:
+  kind: call
+  regex: 'host.{0,5}0\.0\.0\.0'
+  not:
+    any:
+      - pattern: $X.model_construct($$$ARGS)
+      - pattern: $X.construct($$$ARGS)

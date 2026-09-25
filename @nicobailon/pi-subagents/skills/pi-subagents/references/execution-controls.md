@@ -24,7 +24,7 @@ Project settings resolve from the nearest parent directory containing `.pi` or `
 
 An agent may set `runner.type: external-cli` with a non-empty `command`, optional string `args`, and `promptDelivery: stdin` (the default). The command runs with `shell: false`, inherits the resolved cwd and environment, and receives the combined agent instructions and task through stdin. It must already be installed; pi-subagents adds no CLI dependency.
 
-External CLI profiles are async-only and one-shot. They support lifecycle artifacts, stdout/stderr logs, timeout, and stop. Full stdout and stderr are retained in their log files, while the final stdout response and stderr error kept in memory are each limited to their last 64 KiB. They do not support native Pi child options such as model override, structured output, acceptance/agent contract, tool budgets, fast mode, fork context, skills, or native Pi tools unless the runner explicitly implements them. Foreground/clarify, steer/resume/interrupt-as-pause, nested subagents, fallbacks, and sessions are also unsupported.
+A command-runner agent with a plain `command` (no adapter) is also how a classifier or scoring script becomes a typed workflow step: the prompt arrives on stdin, stdout is the child's `output`, and the script parses it. Keep `inheritProjectContext`, `inheritGlobalContext`, and `inheritSkills` off unless the command wants that text. External CLI profiles are async-only and one-shot. They support lifecycle artifacts, stdout/stderr logs, timeout, and stop. Full stdout and stderr are retained in their log files, while the final stdout response and stderr error kept in memory are each limited to their last 64 KiB. They do not support native Pi child options such as model override, structured output, acceptance/agent contract, tool budgets, fast mode, fork context, skills, or native Pi tools unless the runner explicitly implements them. Foreground/clarify, steer/resume/interrupt-as-pause, nested subagents, and sessions are also unsupported.
 
 ### External job profiles
 
@@ -32,7 +32,7 @@ An agent may set `runner.type: external-job` with a non-empty `provider` and opt
 
 External job profiles are async-only. The provider owns the remote job and Pi owns the async run record. Status persists provider name, provider job id, prompt digest, provider options, handle/conversation URLs when supplied, result artifact path, last known state, and provider failure code/message. Recovery uses existing provider job metadata to call `reattach` and `result`; it refuses to redispatch a prompt when the persisted provider job does not match the prompt digest.
 
-External job profiles do not support foreground/clarify, steer/resume, Pi models/tools/extensions/skills, tool budgets, structured output, native child permissions, fallbacks, or Pi child sessions. Capacity conflicts fail closed and include the blocking provider job id when the provider supplies it.
+External job profiles do not support foreground/clarify, live steer or native session resume, Pi models/tools/extensions/skills, tool budgets, structured output, native child permissions, or Pi child sessions. Completed external-job runs can use `action: "resume"` for provider follow-up when the registered provider exposes `followUp(input)`; running jobs must finish first, and providers without follow-up support fail closed with an update/reload message. Capacity conflicts fail closed and include the blocking provider job id when the provider supplies it.
 
 ### Single agent
 
@@ -83,10 +83,10 @@ lanes, or a fanout that the parent will consume together.
 ```js
 subagent({
   workflowScript: `
-    const scan = await runs.run("scan", { agent: "scout", task: "Map the target" });
+    const scan = await runs.run("scan", { label: "Map target behavior", agent: "scout", task: "Map the target" });
     const reviews = await runs.all([
-      { key: "correctness", agent: "reviewer", task: "Review correctness: " + scan.output },
-      { key: "tests", agent: "reviewer", task: "Review tests: " + scan.output }
+      { key: "correctness", label: "Review target correctness", agent: "reviewer", task: "Review correctness: " + scan.output },
+      { key: "tests", label: "Review target test coverage", agent: "reviewer", task: "Review tests: " + scan.output }
     ]);
     return reviews.map(result => result.output);
   `
@@ -99,9 +99,11 @@ If `runs.all` is missing in a running session, reload or update `pi-subagents` b
 
 For one host-run verification command, pass `gate: "npm test"` on a `runs.run`/`runs.all` item (or at the top level as a workflow default). It is shorthand for verified acceptance with that single command: the runtime executes it on the host, records the result as evidence, and memoizes it per tracked workspace state and effective environment. `gate` cannot be combined with `acceptance`; use explicit `acceptance.verify` for multiple commands or custom criteria.
 
+For a typed post-run check, pass the object form `gate: { command, output: "json", schema?, timeoutMs? }`. A passing command must print one JSON document (under 12,000 characters); the parsed value, validated against `schema` when given, becomes the child's `structuredOutput`, so a script can branch on `result.structuredOutput` and `runs.lanes` blocks on `verdict === "blocked"` without the parent reading the child's output. Pair it with `output` + `outputMode: "file-only"` so the command reads the saved file. Empty, non-JSON, or schema-invalid stdout fails the gate and rejects the run. Typed gates are never memoized. A typed gate cannot be combined with an `outputSchema` from the launch or the agent; the launch is rejected before any child starts. See the `tool-reference` guide, "Typed gates".
+
 If omitted, acceptance is inferred from role, mode, and risk. Use `level: "checked"` for ordinary writer evidence and `level: "verified"` when the runtime should run explicit validation commands. Independent review is orthogonal: use `review: { required: true, agent: "reviewer" }`; reviewer/read-only calls omit `acceptance`. `review-required` means evidence passed but review is pending; `reviewed` means an independent review found no blockers. Never request `level: "reviewed"`; it is recognized only so preflight can return an actionable correction. Disable gates with `{ level: "none", reason: "..." }`; bare `"none"` is rejected and `false` is only a deprecated shorthand. Child-reported command success is evidence, not runtime verification.
 
-Completed workflow children from this parent session stay addressable as retained children. `subagent({ action: "children.list" })` lists up to the last 10 with run ids and reports each row as `resumable` or `not resumable` with a reason. Resume only rows reported `resumable`. For a retained-child challenge, use `resume` instead of `steer` when the child is complete. If no retained child is resumable, launch a same-role fallback challenge and label it as fallback. A later workflow continues a resumable child with `runs.run(key, { resume: "<run-id>", task: "follow-up" })`. Inside `workflowScript`, awaiting that call waits for the revived child to finish and returns its completed output and new `runId`; top-level `{ action: "resume" }` remains detached. Pass explicit follow-up task text. Assign each returned child result back to the loop variable because every resume can return a new retained `runId`; always resume the latest returned id. `resume` and `agent` are mutually exclusive, the revived child keeps its stored agent/model/tool contract, and `gate` is rejected on retained resume items.
+Completed workflow children from this parent session stay addressable as retained children. `subagent({ action: "children.list" })` lists up to the last 10 with run ids and reports each row as `resumable` or `not resumable` with a reason. This workflow-only roster is not an exhaustive list of direct native children. Resume only rows reported `resumable`. When the exact run id of an intended direct child is known, inspect it with `subagent({ action: "status", id: "<run-id>" })`; if status identifies the candidate, attempt `subagent({ action: "resume", id: "<run-id>", message: "..." })`. Resume performs the authoritative eligibility check and may reject the attempt. For a retained-child challenge, use `resume` instead of `steer` when the child is complete. Launch a same-role fallback challenge, labeled as fallback, only when no known candidate exists or resume rejects eligibility. A later workflow continues a resumable child with `runs.run(key, { resume: "<run-id>", task: "follow-up" })`. Inside `workflowScript`, awaiting that call waits for the revived child to finish and returns its completed output and new `runId`; top-level `{ action: "resume" }` remains detached. Pass explicit follow-up task text. Assign each returned child result back to the loop variable because every resume can return a new retained `runId`; always resume the latest returned id. `resume` and `agent` are mutually exclusive, the revived child keeps its stored agent/model/tool contract, and `gate` is rejected on retained resume items.
 
 Each workflow key identifies one result lane: use a new stable workflow key for every distinct retained resume pass; same-key calls are reused only when launch parameters are identical, and incompatible parameters are rejected.
 
@@ -109,6 +111,7 @@ Terminal async workflows also persist `workflow-receipt.json` beside `status.jso
 
 ```js
 return runs.run("cross-oracle", {
+  label: "Challenge proposed direction",
   resume: { workflowRunId: "<pass-1-workflow-id>", key: "advisor-oracle", latest: true },
   task: "Review the focused challenge packet."
 });
@@ -120,7 +123,8 @@ Keyed resume reads that one exact receipt and revalidates the retained run at la
 
 For a broad plan with a known set of narrow, visible stages per lane, use
 `runs.lanes(...)` inside a `workflowScript`; it is a nested helper, not a
-top-level `subagent` mode. Give each lane and stage a stable key. The first
+top-level `subagent` mode. Give each lane and stage a stable key; give stage
+items a short verb + behavior `label`, preserving explicit user labels. The first
 stage from every lane is launched together, then later stages sequence per lane.
 `resume: "previous"` requires the retained predecessor, and a failed or blocked
 stage blocks only that lane. The returned board exposes lane/stage results for
@@ -236,8 +240,8 @@ Resume behavior:
 - Multi-child async runs require `index` unless only one running child is selectable.
 - Completed foreground single, parallel, and chain runs can also be revived by `index` while their run metadata remains in extension state.
 - Nested runs can be resumed by nested id when a live route or persisted nested session metadata is available.
-- Revive starts a new child process from the old session context; it does not restart the same OS process.
-- Direct revival holds an exclusive cross-process lease on the canonical child session file until the new child finishes. Concurrent attempts fail before Pi starts and identify the owning revived run; stale ownership is reclaimed only when the recorded process is demonstrably gone or reused.
+- Revive starts a new child session from the old session context; it does not resume the original child session.
+- Direct revival holds an exclusive cross-process lease on the canonical child session file until the new child finishes. Concurrent attempts fail before the child session starts and identify the owning revived run; stale ownership is reclaimed only when the recorded process is demonstrably gone or reused.
 - If the chosen child has no persisted `.jsonl` session file, resume fails and reports that directly.
 
 Use diagnostics when setup or child startup looks wrong:
@@ -246,15 +250,19 @@ Use diagnostics when setup or child startup looks wrong:
 subagent({ action: "doctor" })
 ```
 
+### Failed lane recovery and execution-mode changes
+
+A failure in the subagent workflow, child launch, prompt runtime, extension loading, or child tooling setup is a lane infrastructure blocker, not permission to silently change execution mode. Stop and report the exact failure, run/status, and repo/cwd/worktree/branch/ref state. Retry or fix the `subagent` path only through a clear same-protocol retry; before retrying or asking the owner, verify the worktree is clean or capture the partial diff. For backlog lanes and other subagent-governed workflows, switching to `interactive_shell`, `pi -ne`, Codex/Claude/Cursor CLI, a foreground agent, or another external mode requires explicit owner approval. Pi core may print a generic `pi -ne` extension-load hint; that hint is outside this package and is not protocol-approved. A verified compaction abort may continue the retained child session once on the same resolved model; provider failures never select another model automatically.
+
 ### External terminal work
 
-Use native `subagent` runs for unattended implementation, review, and gate work that needs managed isolation, durable artifacts, and process controls. Use `interactive_shell` for visible terminal work, alternate CLIs, trust prompts, and recovery.
+Use native `subagent` runs for unattended implementation, review, and gate work that needs managed isolation, durable artifacts, and process controls. Use `interactive_shell` for visible terminal work, alternate CLIs, trust prompts, or recovery only when the user explicitly requests that mode or the task is outside the governed subagent protocol; it is not an implicit replacement for a failed `subagent` lane.
 
 A cooperating terminal runtime can register read-only external records through `pi-subagents/external-runs`. Records include the source, session, state, optional report path, and completion reason. They are observations only: pi-subagents does not start, stop, steer, or otherwise own the foreign process. Run unattended raw terminal agents in an explicit isolated cwd or worktree; do not use a live project checkout as disposable review space.
 
 ### Scheduled subagent runs
 
-Schedules are durable project records under `.pi/subagents/schedules/`. They are enabled by default; set `{ "scheduledRuns": { "enabled": false } }` in `~/.pi/agent/extensions/subagent/config.json` to disable them. Only schedule explicit work the user asked for.
+Schedules are durable project records under `.pi/subagents/schedules/`. They are enabled by default; set `{ "scheduledRuns": { "enabled": false } }` in `~/.pi/agent/extensions/subagent/config.json` to disable them. Only schedule explicit work the user asked for. To keep schedules outside the project repository, set `{ "scheduledRuns": { "storeRoot": "~/.pi/subagent-schedules" } }` in the same config: `storeRoot` accepts an absolute path or a `~/`-prefixed path, and records land under `<storeRoot>/<sha256(path.resolve(cwd)) first 20 hex>/<scheduleId>/`.
 
 ```typescript
 // One-shot reviewer
@@ -323,6 +331,19 @@ subagent({ action: "steer", id: "abc123", message: "Focus on the failing test." 
 
 The action waits up to three seconds for the child Pi session to accept the correlated user input and returns a request id with `delivered`, `scheduled`, `pending`, `partial`, `recovered`, or `failed` plus per-child states. Indexed pending children return `scheduled` immediately. Only a top-level single-child run may automatically interrupt after a missed acknowledgment and recover after confirmed pause within a further 15 seconds. Recovery preserves the original child contract and only its remaining deadline, turn, and tool budgets. If the session is missing, a budget is exhausted, the pause cannot be confirmed, or replacement launch fails, the source remains paused when pausing succeeded and the action returns the exact failure. Chain, parallel, and nested runs never auto-interrupt; inspect their per-child outcomes and handle failures explicitly. A late acknowledgment is recorded and cannot cancel committed recovery.
 
+Steering supports three delivery modes via the `mode` parameter (`steer` is the default):
+
+- `mode: "steer"` — interrupt the child at the next safe point of its current turn and deliver the message.
+- `mode: "follow_up"` — do not interrupt; queue input through Pi's native follow-up path for the next turn boundary. Eligible completed retained workflow children (single-step runs in state `complete` with a stored session file) receive the message as a revival brief (`queueRevivalBrief`) when they are revived; paused children reject follow-up steering outright. The 20-message queue limit applies to retained revival briefs, not live follow-up input.
+- `mode: "auto"` — same next-safe-point delivery path as `steer`, but without the automatic pause-and-revive recovery after a missed acknowledgment.
+
+```typescript
+subagent({ action: "steer", id: "abc123", mode: "follow_up", message: "After this step, also validate the config file." })
+subagent({ action: "steer", id: "abc123", mode: "auto", message: "Switch to the failing test now." })
+```
+
+For async runs, `delivered` records that the child consumed the correlated user input; foreground `delivered` records in-process transport acceptance. Neither is proof of model compliance. A live foreground follow-up acknowledgment reports `queued`, meaning Pi accepted it into its follow-up queue, not that it was delivered. The foreground transport does not provide a later correlated queued-to-delivered receipt.
+
 ## Watchdog
 
 The subagent watchdog is an **opt-in** adversarial change reviewer. It is not the
@@ -337,9 +358,10 @@ child changes land. Enabled watchdogs also run changed-file TypeScript/JavaScrip
 LSP diagnostics before the model pass when `typescript-language-server` is available.
 They keep bounded current-scope context from real user prompts (`watchdog.scope.enabled`)
 and can optionally run non-blocking Scopey-style cadence reviews every N tool results
-(`watchdog.cadence.everyNTools`). Cadence corrections and blocker auto-follow prompts
-are always transcript-visible; choose the watchdog model that matches the desired
-cheap-monitor vs strong-reviewer policy.
+(`watchdog.cadence.everyNTools`). Cadence corrections and boundary warnings are always
+transcript-visible; a boundary warning continues the run so the agent can act on it, and
+repeated identical warnings stop after `watchdog.stalemateRepeats`. Choose the watchdog
+model that matches the desired cheap-monitor vs strong-reviewer policy.
 
 Prefer a strong complementary model (for example Opus 4.8 high paired against a
 GPT 5.5 main session, or the reverse). Recommendation and configuration:
@@ -471,7 +493,7 @@ subagent({
   workflowScript: `return runs.run("oracle-check", { agent: "oracle", task: "Review my current direction, challenge assumptions, and propose the best next move." })`
 })
 
-// Implementation only after explicit approval. Worker defaults to forked context.
+// Implementation only after explicit approval. Worker defaults to fresh context.
 subagent({
   workflowScript: `return runs.run("implementation", { agent: "worker", task: "Implement the approved approach: ..." })`
 })

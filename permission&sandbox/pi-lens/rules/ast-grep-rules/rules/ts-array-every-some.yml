@@ -1,0 +1,22 @@
+# DISABLED: Debatable value - arr.length === 0 is often clearer than !arr.length
+# id: ts-empty-array-check
+# language: typescript
+# severity: warning
+# message: arr.length === 0 - use !arr.length or arr.length (truthiness)
+# metadata:
+#   weight: 2
+#   category: slop
+# rule:
+#   kind: binary_expression
+#   pattern: "$ARR.length === 0"
+# ---
+id: ts-array-every-some
+language: typescript
+severity: warning
+message: arr.map(x => x.prop).every(Boolean) - use arr.every(x => !!x.prop)
+metadata:
+  weight: 3
+  category: slop
+rule:
+  kind: call_expression
+  pattern: "$ARR.map($FN).every(Boolean)"

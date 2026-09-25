@@ -8,33 +8,33 @@ describe("watchdog warning formatting and rendering", () => {
 	it("puts all LLM-needed warning fields in custom message content", () => {
 		const content = formatWatchdogWarningContent({
 			severity: "blocker",
+			importance: "high",
 			category: "correctness",
 			source: "main",
 			summary: "Fix <bug>",
 			evidence: "The failing assertion says A & B differ.",
 			recommendedAction: "Update the parser before finalizing.",
-			confidence: "high",
 			agent: "main",
 			runId: "run-1",
 			stale: true,
-			autoFollowAttempt: 2,
 		});
 
-		assert.match(content, /^<subagent_watchdog severity="blocker" category="correctness" source="main" guidance="weigh, don't blindly obey">/);
+		assert.match(content, /^<subagent_watchdog severity="blocker" importance="high" category="correctness" source="main" guidance="weigh, don't blindly obey">/);
 		assert.match(content, /<summary>Fix &lt;bug&gt;<\/summary>/);
 		assert.match(content, /<evidence>The failing assertion says A &amp; B differ\.<\/evidence>/);
 		assert.match(content, /<recommended_action>Update the parser before finalizing\.<\/recommended_action>/);
-		assert.match(content, /<confidence>high<\/confidence>/);
+		assert.doesNotMatch(content, /confidence/);
 		assert.match(content, /<agent>main<\/agent>/);
 		assert.match(content, /<run_id>run-1<\/run_id>/);
 		assert.match(content, /<stale>true<\/stale>/);
-		assert.match(content, /<auto_follow_attempt>2<\/auto_follow_attempt>/);
+		assert.doesNotMatch(content, /auto_follow/);
 		assert.match(content, /<blocker_guidance>/);
 	});
 
 	it("keeps structured details alongside the LLM-visible content", () => {
 		const message = createWatchdogWarningMessage({
 			severity: "concern",
+			importance: "medium",
 			summary: "Missing focused test",
 			evidence: "The parser changed without a unit test.",
 			recommendedAction: "Add a parser regression test.",
@@ -51,11 +51,12 @@ describe("watchdog warning formatting and rendering", () => {
 	it("renders concern, blocker, stale, failed, and stalemate states in text", () => {
 		const base: WatchdogWarningDetails = {
 			severity: "blocker",
+			importance: "low",
 			category: "loop-risk",
 			source: "main",
 			summary: "Repeated blocker",
-			evidence: "The same issue survived another auto-follow.",
-			recommendedAction: "Stop auto-follow and ask for user review.",
+			evidence: "The same issue survived another continuation.",
+			recommendedAction: "Ask for user review.",
 			state: "stalemate",
 			stalemateRepeats: 3,
 		};
@@ -65,10 +66,11 @@ describe("watchdog warning formatting and rendering", () => {
 		const failed = formatWatchdogWarningRenderText({ ...base, state: "failed", error: "provider aborted" });
 		const displayed = formatWatchdogWarningRenderText({ ...base, state: "displayed" });
 
-		assert.match(stalemate, /Subagent watchdog Blocker \(stalemate · auto-follow stopped\): Repeated blocker/);
-		assert.match(stalemate, /Auto-follow stopped after 3 repeated blocker warnings\./);
-		assert.match(stale, /Subagent watchdog Concern \(stale · no auto-follow\): Repeated blocker/);
-		assert.match(stale, /must not auto-follow/);
+		assert.match(stalemate, /Subagent watchdog Blocker \(stalemate\): Repeated blocker/);
+		assert.match(stalemate, /Importance: Low/);
+		assert.match(stalemate, /Same warning 3 times in a row; the watchdog stopped continuing the run\./);
+		assert.match(stale, /Subagent watchdog Concern \(stale\): Repeated blocker/);
+		assert.match(stale, /arrived after the watchdog catch-up timeout\./);
 		assert.match(failed, /failed review/);
 		assert.match(failed, /Failure: provider aborted/);
 		assert.match(displayed, /Subagent watchdog Blocker \(displayed\): Repeated blocker/);

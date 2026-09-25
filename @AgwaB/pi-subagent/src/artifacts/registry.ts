@@ -1,8 +1,11 @@
+import { randomBytes } from "node:crypto";
 import {
 	appendFile,
+	lstat,
 	mkdir,
 	readFile,
 	rename,
+	rm,
 	stat,
 	writeFile,
 } from "node:fs/promises";
@@ -23,6 +26,8 @@ import type {
 } from "./result.ts";
 
 const DEFAULT_RUNS_DIR = ".pi/agent/runs";
+/** Hidden directory under a runs dir that holds per-run lock directories. */
+export const RUN_LOCKS_DIR = ".locks";
 const RUN_RECORD_SCHEMA_VERSION = 2 as const;
 const RUN_EVENT_SCHEMA_VERSION = 2 as const;
 const SAFE_ID_PATTERN = /^[A-Za-z0-9._-]+$/;
@@ -441,7 +446,9 @@ export function runPaths(ref: RunRef): RunPaths {
 		runDir,
 		runJsonPath: join(runDir, "run.json"),
 		eventsPath: join(runDir, "events.jsonl"),
-		lockPath: join(runDir, "run.lock"),
+		// The run lock lives beside the run directory, not inside it, so it stays
+		// a stable fence while the directory itself is renamed or removed.
+		lockPath: join(runsDir, RUN_LOCKS_DIR, `${ref.runId}.lock`),
 	};
 }
 
@@ -513,6 +520,49 @@ async function withFileLock<T>(
 	}
 }
 
+/**
+ * Remove a run directory while holding its run lock for the whole operation:
+ * re-validation (`isRemovable`, plus an exact `expectedUpdatedAt` generation
+ * check when given), an `lstat` that refuses symlinks, an atomic rename to a
+ * sibling tombstone, removal of the tombstone, and the caller's `afterRemove`
+ * (for example locator cleanup). Because the lock lives beside the run
+ * directory rather than inside it, every mutation serializes with the
+ * deletion: one that arrives while the lock is held waits and then either
+ * fails or, through `beginRunRecord`, starts a fresh record after the
+ * deletion has fully completed. Nothing is ever partially deleted.
+ */
+export async function removeRunIfStill(
+	ref: RunRef,
+	isRemovable: (record: RunRecord) => boolean,
+	options: {
+		expectedUpdatedAt?: string;
+		afterRemove?: () => Promise<void>;
+	} = {},
+): Promise<"removed" | "changed" | "missing"> {
+	const paths = runPaths(ref);
+	const tombstone = join(
+		paths.runsDir,
+		RUN_LOCKS_DIR,
+		`${ref.runId}.pruning-${process.pid}-${randomBytes(4).toString("hex")}`,
+	);
+	return await withFileLock(paths.lockPath, async () => {
+		const existing = await readRecordPath(paths);
+		if (existing === null) return "missing" as const;
+		if (!isRemovable(existing)) return "changed" as const;
+		if (
+			options.expectedUpdatedAt !== undefined &&
+			existing.updatedAt !== options.expectedUpdatedAt
+		)
+			return "changed" as const;
+		const info = await lstat(paths.runDir);
+		if (!info.isDirectory()) return "changed" as const;
+		await rename(paths.runDir, tombstone);
+		await rm(tombstone, { recursive: true, force: true });
+		await options.afterRemove?.();
+		return "removed" as const;
+	});
+}
+
 async function withRunMutation<T>(
 	ref: RunRef,
 	fn: (
@@ -521,8 +571,8 @@ async function withRunMutation<T>(
 	) => Promise<{ record: RunRecord; value: T }>,
 ): Promise<T> {
 	const paths = runPaths(ref);
-	await mkdir(paths.runDir, { recursive: true });
 	return await withFileLock(paths.lockPath, async () => {
+		await mkdir(paths.runDir, { recursive: true });
 		const existing = await readRecordPath(paths);
 		const { record, value } = await fn(existing, paths);
 		await writeRecordPath(paths.runJsonPath, record);
@@ -913,7 +963,8 @@ export async function commitAttemptResultIfActive(
 	result: ResultEnvelope,
 ): Promise<{ committed: boolean; record: RunRecord | null }> {
 	const paths = runPaths(baseRef);
-	await mkdir(paths.runDir, { recursive: true });
+	// Operates on an existing record only: never create a run directory here,
+	// so a late commit cannot resurrect a run that prune removed.
 	return await withFileLock(paths.lockPath, async () => {
 		const existing = await readRecordPath(paths);
 		if (existing === null) return { committed: false, record: null };
@@ -951,7 +1002,6 @@ export async function refreshTerminalAttemptResultIfCurrent(
 	result: ResultEnvelope,
 ): Promise<{ refreshed: boolean; record: RunRecord | null }> {
 	const paths = runPaths(baseRef);
-	await mkdir(paths.runDir, { recursive: true });
 	return await withFileLock(paths.lockPath, async () => {
 		const existing = await readRecordPath(paths);
 		if (existing === null) return { refreshed: false, record: null };
@@ -1070,8 +1120,11 @@ export async function recordInterruptRequest(
 	});
 }
 
+// Events are appended only to runs that `beginRunRecord` already created;
+// the directory is deliberately not created here, so an event written after
+// prune removed the run fails with ENOENT instead of leaving an event-only
+// ghost directory behind.
 async function appendJsonLine(path: string, event: RunEvent): Promise<void> {
-	await mkdir(dirname(path), { recursive: true });
 	await appendFile(path, `${JSON.stringify(event)}\n`);
 }
 
@@ -1082,7 +1135,6 @@ export async function appendRunEvent(
 	},
 ): Promise<RunEvent> {
 	const paths = runPaths(ref);
-	await mkdir(paths.runDir, { recursive: true });
 	const timestamp =
 		event.timestamp === undefined
 			? new Date().toISOString()
@@ -1207,7 +1259,6 @@ export async function appendTerminalEventsIfCurrent(
 	if (!isTerminalStatus(options.status))
 		throw new Error("terminal event publication requires terminal status");
 	const paths = runPaths(ref);
-	await mkdir(paths.runDir, { recursive: true });
 	return await withFileLock(paths.lockPath, async () => {
 		const record = await readRecordPath(paths);
 		if (

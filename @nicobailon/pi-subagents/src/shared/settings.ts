@@ -32,8 +32,9 @@ export interface SequentialStep {
 	phase?: string;
 	label?: string;
 	as?: string;
-	outputSchema?: JsonSchemaObject;
+	outputSchema?: JsonSchemaObject | false;
 	cwd?: string;
+	machine?: string;
 	output?: OutputOverrideInput;
 	outputMode?: OutputMode;
 	reads?: string[] | false;
@@ -56,8 +57,9 @@ export interface ParallelTaskItem {
 	phase?: string;
 	label?: string;
 	as?: string;
-	outputSchema?: JsonSchemaObject;
+	outputSchema?: JsonSchemaObject | false;
 	cwd?: string;
+	machine?: string;
 	count?: number;
 	output?: OutputOverrideInput;
 	outputMode?: OutputMode;
@@ -110,6 +112,7 @@ export interface ParallelStep {
 	failFast?: boolean;
 	worktree?: boolean;
 	cwd?: string;
+	machine?: string;
 	agentContract?: AgentContract;
 	gateOn?: ChainGateLayer;
 }

@@ -140,6 +140,18 @@ describe("mcp-auth-flow", () => {
   })
 
   describe("getValidToken", () => {
+    it("returns null for an expired access token without a refresh token", async () => {
+      const serverName = "expired-no-refresh-test"
+      const serverUrl = "https://expired-no-refresh.example.com/mcp"
+      await updateTokens(serverName, {
+        accessToken: "expired-access",
+        expiresAt: Date.now() / 1000 - 3600,
+      }, serverUrl)
+
+      assert.strictEqual(await getValidToken(serverName, serverUrl), null)
+      clearAllCredentials(serverName)
+    })
+
     it("should not attempt refresh or wipe credentials when stored client info is a config-pre-registered stub", async () => {
       const serverName = "stub-refresh-test"
       const serverUrl = "https://stub-refresh.example.com/mcp"
@@ -309,93 +321,29 @@ describe("mcp-auth-flow", () => {
       )
     })
 
-    it("should reject malformed OAuth redirectUri values", async () => {
-      await assert.rejects(
-        async () => await startAuth("bad-redirect", "https://api.example.com/mcp", {
-          url: "https://api.example.com/mcp",
-          auth: "oauth",
-          oauth: { redirectUri: "not a url" },
-        }),
-        /Invalid OAuth redirectUri/
-      )
-    })
-
-    it("should reject insecure non-local OAuth redirectUri values", async () => {
-      await assert.rejects(
-        async () => await startAuth("remote-redirect", "https://api.example.com/mcp", {
-          url: "https://api.example.com/mcp",
-          auth: "oauth",
-          oauth: { redirectUri: "http://example.com:3118/callback" },
-        }),
-        /https:\/\/ URI or an http:\/\/ localhost or loopback URI/
-      )
-    })
-
-    it("should reject non-local OAuth redirectUri values with invalid ports", async () => {
-      await assert.rejects(
-        async () => await startAuth("bad-remote-port", "https://api.example.com/mcp", {
-          url: "https://api.example.com/mcp",
-          auth: "oauth",
-          oauth: { redirectUri: "https://example.com:0/callback" },
-        }),
-        /positive numeric port/
-      )
-    })
-
-    it("should reject OAuth redirectUri values without an explicit port", async () => {
-      await assert.rejects(
-        async () => await startAuth("no-port-redirect", "https://api.example.com/mcp", {
-          url: "https://api.example.com/mcp",
-          auth: "oauth",
-          oauth: { redirectUri: "http://localhost/callback" },
-        }),
-        /explicit numeric port/
-      )
-    })
-
-    it("should reject blank OAuth redirectUri values", async () => {
-      await assert.rejects(
-        async () => await startAuth("blank-redirect", "https://api.example.com/mcp", {
-          url: "https://api.example.com/mcp",
-          auth: "oauth",
-          oauth: { redirectUri: "  " },
-        }),
-        /redirectUri must not be empty/
-      )
-    })
-
-    it("should reject non-string OAuth redirectUri values", async () => {
-      await assert.rejects(
-        async () => await startAuth("typed-redirect", "https://api.example.com/mcp", {
-          url: "https://api.example.com/mcp",
-          auth: "oauth",
-          oauth: { redirectUri: 3118 as unknown as string },
-        }),
-        /redirectUri must be a string/
-      )
-    })
-
-    it("should reject OAuth redirectUri values with fragments", async () => {
-      await assert.rejects(
-        async () => await startAuth("fragment-redirect", "https://api.example.com/mcp", {
-          url: "https://api.example.com/mcp",
-          auth: "oauth",
-          oauth: { redirectUri: "http://localhost:3118/callback#fragment" },
-        }),
-        /redirectUri must not include a fragment/
-      )
-    })
-
-    it("should reject OAuth redirectUri values with username or password", async () => {
-      await assert.rejects(
-        async () => await startAuth("credential-redirect", "https://api.example.com/mcp", {
-          url: "https://api.example.com/mcp",
-          auth: "oauth",
-          oauth: { redirectUri: "http://user:pass@localhost:3118/callback" },
-        }),
-        /redirectUri must not include username or password/
-      )
-    })
+    const redirectUriCases: Array<[string, string, unknown, RegExp]> = [
+      ["should reject malformed OAuth redirectUri values", "bad-redirect", "not a url", /Invalid OAuth redirectUri/],
+      ["should reject insecure non-local OAuth redirectUri values", "remote-redirect", "http://example.com:3118/callback", /https:\/\/ URI or an http:\/\/ localhost or loopback URI/],
+      ["should reject non-local OAuth redirectUri values with invalid ports", "bad-remote-port", "https://example.com:0/callback", /positive numeric port/],
+      ["should reject OAuth redirectUri values without an explicit port", "no-port-redirect", "http://localhost/callback", /explicit numeric port/],
+      ["should reject a dynamic port placeholder outside the loopback URI port", "bad-dynamic-redirect", "http://127.0.0.1/callback/{port}", /\{port\} placeholder must be the loopback URI port/],
+      ["should reject blank OAuth redirectUri values", "blank-redirect", "  ", /redirectUri must not be empty/],
+      ["should reject non-string OAuth redirectUri values", "typed-redirect", 3118, /redirectUri must be a string/],
+      ["should reject OAuth redirectUri values with fragments", "fragment-redirect", "http://localhost:3118/callback#fragment", /redirectUri must not include a fragment/],
+      ["should reject OAuth redirectUri values with username or password", "credential-redirect", "http://user:pass@localhost:3118/callback", /redirectUri must not include username or password/],
+    ]
+    for (const [name, serverName, redirectUri, expectedError] of redirectUriCases) {
+      it(name, async () => {
+        await assert.rejects(
+          () => startAuth(serverName, "https://api.example.com/mcp", {
+            url: "https://api.example.com/mcp",
+            auth: "oauth",
+            oauth: { redirectUri: redirectUri as string },
+          }),
+          expectedError
+        )
+      })
+    }
 
     it("should reject non-string OAuth clientName and clientUri values", () => {
       assert.throws(
@@ -467,6 +415,68 @@ describe("mcp-auth-flow", () => {
       )
     })
 
+    it("should accept, interpolate, and trim an HTTPS OAuth clientMetadataUrl", () => {
+      process.env.PI_MCP_TEST_CIMD_HOST = "client.example.com"
+      try {
+        const config = extractOAuthConfig({
+          url: "https://api.example.com/mcp",
+          auth: "oauth",
+          oauth: { clientMetadataUrl: "  https://${PI_MCP_TEST_CIMD_HOST}/oauth/client.json  " },
+        })
+        assert.strictEqual(config.clientMetadataUrl, "https://client.example.com/oauth/client.json")
+      } finally {
+        delete process.env.PI_MCP_TEST_CIMD_HOST
+      }
+    })
+
+    it("should reject clientMetadataUrl with clientSecret unless clientId is explicit", () => {
+      for (const grantType of ["authorization_code", "client_credentials"] as const) {
+        assert.throws(
+          () => extractOAuthConfig({
+            url: "https://api.example.com/mcp",
+            auth: "oauth",
+            oauth: {
+              grantType,
+              clientMetadataUrl: "https://client.example.com/oauth/client.json",
+              clientSecret: "secret",
+            },
+          }),
+          /clientSecret requires an explicit clientId when clientMetadataUrl is configured/,
+        )
+      }
+
+      assert.doesNotThrow(() => extractOAuthConfig({
+        url: "https://api.example.com/mcp",
+        auth: "oauth",
+        oauth: {
+          clientId: "registered-client",
+          clientMetadataUrl: "https://client.example.com/oauth/client.json",
+          clientSecret: "secret",
+        },
+      }))
+    })
+
+    it("should reject malformed OAuth clientMetadataUrl values", () => {
+      for (const clientMetadataUrl of ["", "  ", "http://client.example.com/client.json", "https://client.example.com/", "not a url"]) {
+        assert.throws(
+          () => extractOAuthConfig({
+            url: "https://api.example.com/mcp",
+            auth: "oauth",
+            oauth: { clientMetadataUrl },
+          }),
+          /clientMetadataUrl must (not be empty|be a valid HTTPS URL with a non-root pathname)/,
+        )
+      }
+      assert.throws(
+        () => extractOAuthConfig({
+          url: "https://api.example.com/mcp",
+          auth: "oauth",
+          oauth: { clientMetadataUrl: 123 as unknown as string },
+        }),
+        /clientMetadataUrl must be a string/,
+      )
+    })
+
     it("should accept and trim an absolute https OAuth authServerMetadataUrl", () => {
       const config = extractOAuthConfig({
         url: "https://api.example.com/mcp",
@@ -511,6 +521,61 @@ describe("mcp-auth-flow", () => {
       assert.strictEqual(config.redirectUri, "http://localhost:3118/callback")
       assert.strictEqual(config.clientName, "Custom MCP")
       assert.strictEqual(config.clientUri, "https://example.com/custom")
+    })
+
+    it("should preserve tokens on a stale redirect URI when a refresh token exists", async () => {
+      const serverName = "redirect-mismatch-refresh-test"
+      const serverUrl = "https://redirect-mismatch-refresh.example.com/mcp"
+      // A client registered against an older ephemeral loopback port.
+      await updateClientInfo(serverName, {
+        clientId: "registered-client",
+        redirectUris: ["http://localhost:1/callback"],
+      }, serverUrl)
+      await updateTokens(serverName, {
+        accessToken: "expired-access",
+        refreshToken: "stored-refresh",
+        expiresAt: Date.now() / 1000 - 3600,
+      }, serverUrl)
+
+      // startAuth binds a fresh ephemeral port, so the stored redirect URI does
+      // not match. The flow then proceeds to discovery, which fails for this
+      // fake server — but the mismatch decision has already been made.
+      await assert.rejects(() => startAuth(serverName, serverUrl, {
+        url: serverUrl,
+        auth: "oauth",
+      }))
+
+      const entry = await getAuthForUrl(serverName, serverUrl)
+      assert.strictEqual(entry?.tokens?.refreshToken, "stored-refresh")
+      assert.strictEqual(entry?.tokens?.accessToken, "expired-access")
+      assert.strictEqual(entry?.clientInfo?.clientId, "registered-client")
+
+      clearAllCredentials(serverName)
+    })
+
+    it("should re-register the client on a stale redirect URI when no refresh token exists", async () => {
+      const serverName = "redirect-mismatch-interactive-test"
+      const serverUrl = "https://redirect-mismatch-interactive.example.com/mcp"
+      await updateClientInfo(serverName, {
+        clientId: "registered-client",
+        redirectUris: ["http://localhost:1/callback"],
+      }, serverUrl)
+      await updateTokens(serverName, {
+        accessToken: "expired-access",
+        expiresAt: Date.now() / 1000 - 3600,
+      }, serverUrl)
+
+      await assert.rejects(() => startAuth(serverName, serverUrl, {
+        url: serverUrl,
+        auth: "oauth",
+      }))
+
+      // With no refresh token the interactive leg is unavoidable, so the stale
+      // client registration is dropped to force re-registration on the new port.
+      const entry = await getAuthForUrl(serverName, serverUrl)
+      assert.strictEqual(entry?.clientInfo, undefined)
+
+      clearAllCredentials(serverName)
     })
   })
 })

@@ -35,7 +35,7 @@ export interface UiSessionRequest {
   onNeedsAuth?: SessionRecoveryDeps["onNeedsAuth"];
 }
 
-export type UiSessionViewer = "browser" | "glimpse" | "suppressed";
+export type UiSessionViewer = "browser" | "glimpse" | "orca" | "suppressed";
 
 export interface UiSessionRuntime {
   serverName: string;
@@ -143,6 +143,19 @@ async function openInBrowser(state: McpExtensionState, url: string, signal: Abor
   }
 }
 
+async function openInOrcaBrowser(url: string, signal: AbortSignal): Promise<void> {
+  throwIfAborted(signal);
+  await new Promise<void>((resolve, reject) => {
+    execFile("orca", ["goto", "--url", url], { timeout: 10000, signal }, (error) => {
+      if (error) {
+        reject(error instanceof Error ? error : new Error(String(error)));
+      } else {
+        resolve();
+      }
+    });
+  });
+}
+
 function isRemoteSession(): boolean {
   return Boolean(process.env.SSH_CONNECTION || process.env.SSH_TTY);
 }
@@ -173,7 +186,7 @@ function probeMoshiGateway(): Promise<boolean> {
   });
 }
 
-function remoteAccessHint(opts: { url: string; port: number; moshi: boolean; openError: string | null; openedOnHost?: boolean }): string {
+function remoteAccessHint(opts: { url: string; port: number; proxyPort: number; moshi: boolean; openError: string | null; openedOnHost?: boolean }): string {
   const lines = [
     opts.openError !== null
       ? "Couldn't open MCP UI here. Open it from your own device:"
@@ -186,10 +199,12 @@ function remoteAccessHint(opts: { url: string; port: number; moshi: boolean; ope
     lines.push(`Browser launch failed: ${opts.openError}`);
   }
   if (opts.moshi) {
-    lines.push("Moshi: tap the preview button in the terminal title bar and pick this MCP UI server.");
+    lines.push(
+      `Moshi: tap the preview button in the terminal title bar and pick this MCP UI server (it must reach ports ${opts.port} and ${opts.proxyPort}).`,
+    );
   }
   lines.push(
-    `SSH: run \`ssh -L ${opts.port}:127.0.0.1:${opts.port} <this-host>\` on your local machine, then open the URL above.`,
+    `SSH: run \`ssh -L ${opts.port}:127.0.0.1:${opts.port} -L ${opts.proxyPort}:127.0.0.1:${opts.proxyPort} <this-host>\` on your local machine, then open the URL above.`,
     "mosh can't forward ports - run that ssh command in a separate terminal.",
   );
   return lines.join("\n");
@@ -479,46 +494,34 @@ export async function maybeStartUiSession(
     if (uiSuppressed) {
       viewer = "suppressed";
       windowOpen = false;
-      state.ui?.notify(`MCP UI window suppressed (MCP_UI_VIEWER=${viewerPref}). Open manually: ${handle.url}`, "info");
-      log.info("Suppressing MCP UI window (MCP_UI_VIEWER=" + viewerPref + ")", { url: handle.url });
+      state.ui?.notify(
+        `MCP UI window suppressed (MCP_UI_VIEWER=${viewerPref}). Open manually: ${handle.url}\n` +
+        `If this session is remote, run ssh -L ${handle.port}:127.0.0.1:${handle.port} -L ${handle.proxyPort}:127.0.0.1:${handle.proxyPort} <this-host> first.`,
+        "info",
+      );
     } else {
       const remoteLikely = remoteByEnv || await hasActiveRemoteLogin();
       const emitRemoteHint = async (openError: string | null, openedOnHost = false) => {
         state.ui?.notify(remoteAccessHint({
           url: handle.url,
           port: handle.port,
+          proxyPort: handle.proxyPort,
           moshi: await probeMoshiGateway(),
           openError,
           openedOnHost,
         }), openError === null ? "info" : "warning");
       };
-      const glimpseDetected = !remoteByEnv && isGlimpseAvailable();
-      const useGlimpse = !remoteByEnv && (viewerPref === "glimpse" ||
-        (viewerPref !== "browser" && glimpseDetected));
-
-      if (useGlimpse) {
+      // Handle Orca browser viewer
+      if (viewerPref === "orca") {
         try {
-          const glimpseHtml = `<!DOCTYPE html><html><head><meta charset="utf-8"><style>body{margin:0;padding:0;width:100vw;height:100vh;overflow:hidden}iframe{width:100%;height:100%;border:none}</style></head><body><iframe src="${handle.url}"></iframe></body></html>`;
-          const glimpseWindow = await openGlimpseWindow(glimpseHtml, {
-            title: `MCP · ${request.serverName} · ${request.toolName}`,
-            width: 1000,
-            height: 800,
-            onClosed: () => {
-              if (active) handle.close("glimpse-closed");
-            },
-          });
-          if (state.owner?.isActive() === false || runtimeSignal.aborted) {
-            glimpseWindow.close();
-            throwIfAborted(runtimeSignal);
-            throw new Error("MCP Glimpse window became stale before registration");
-          }
-          activeGlimpseWindow = glimpseWindow;
-          viewer = "glimpse";
+          await openInOrcaBrowser(handle.url, runtimeSignal);
           if (remoteLikely) {
             await emitRemoteHint(null, true);
           }
+          viewer = "orca";
         } catch (error) {
-          log.debug("Glimpse unavailable, using browser", {
+          if (isAbortError(error, runtimeSignal)) throw error;
+          log.debug("Orca browser failed, using fallback", {
             error: error instanceof Error ? error.message : String(error),
           });
           const openError = await openInBrowser(state, handle.url, runtimeSignal);
@@ -528,9 +531,46 @@ export async function maybeStartUiSession(
           viewer = "browser";
         }
       } else {
-        const openError = await openInBrowser(state, handle.url, runtimeSignal);
-        if (openError !== null || remoteLikely) {
-          await emitRemoteHint(openError);
+        const glimpseDetected = !remoteByEnv && isGlimpseAvailable();
+        const useGlimpse = !remoteByEnv && (viewerPref === "glimpse" ||
+          (viewerPref !== "browser" && glimpseDetected));
+
+        if (useGlimpse) {
+          try {
+            const glimpseHtml = `<!DOCTYPE html><html><head><meta charset="utf-8"><style>body{margin:0;padding:0;width:100vw;height:100vh;overflow:hidden}iframe{width:100%;height:100%;border:none}</style></head><body><iframe src="${handle.url}"></iframe></body></html>`;
+            const glimpseWindow = await openGlimpseWindow(glimpseHtml, {
+              title: `MCP · ${request.serverName} · ${request.toolName}`,
+              width: 1000,
+              height: 800,
+              onClosed: () => {
+                if (active) handle.close("glimpse-closed");
+              },
+            });
+            if (state.owner?.isActive() === false || runtimeSignal.aborted) {
+              glimpseWindow.close();
+              throwIfAborted(runtimeSignal);
+              throw new Error("MCP Glimpse window became stale before registration");
+            }
+            activeGlimpseWindow = glimpseWindow;
+            viewer = "glimpse";
+            if (remoteLikely) {
+              await emitRemoteHint(null, true);
+            }
+          } catch (error) {
+            log.debug("Glimpse unavailable, using browser", {
+              error: error instanceof Error ? error.message : String(error),
+            });
+            const openError = await openInBrowser(state, handle.url, runtimeSignal);
+            if (openError !== null || remoteLikely) {
+              await emitRemoteHint(openError);
+            }
+            viewer = "browser";
+          }
+        } else {
+          const openError = await openInBrowser(state, handle.url, runtimeSignal);
+          if (openError !== null || remoteLikely) {
+            await emitRemoteHint(openError);
+          }
         }
       }
     }

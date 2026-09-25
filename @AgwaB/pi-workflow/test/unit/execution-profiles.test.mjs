@@ -17,20 +17,31 @@ import {
 	selectWorkflowExecutionProfile,
 } from "../../.tmp/unit/extension.js";
 import { parseArtifactGraphWorkflowSpec } from "../../.tmp/unit/artifact-graph-schema.js";
+import { workflowDefinitionFingerprint } from "../../.tmp/unit/execution-profile.js";
 import { loadWorkflowSpec } from "../../.tmp/unit/schema.js";
 import { compiledWorkflowPath, readRunRecord } from "../../.tmp/unit/store.js";
-import { setSubagentApiForTests } from "../../.tmp/unit/subagent-backend.js";
+import { withMaterializedRawHost } from './raw-host-fixture.mjs';
+const setSubagentApiForTests = withMaterializedRawHost(setRawApi);
+import { setSubagentApiForTests as setRawApi } from "../../.tmp/unit/subagent-backend.js";
 
-const UNIT_TEST_HOME = mkdtempSync(join(tmpdir(), "execution-profiles-home-"));
+const UNIT_TEST_ROOT = mkdtempSync(join(tmpdir(), "pi-workflow-tests-"));
+const UNIT_TEST_HOME = mkdtempSync(join(UNIT_TEST_ROOT, "execution-profiles-home-"));
 process.env.HOME = UNIT_TEST_HOME;
 process.env.USERPROFILE = UNIT_TEST_HOME;
 
-after(() => {
-	rmSync(UNIT_TEST_HOME, { recursive: true, force: true });
-});
+function cleanupUnitTestRoot() {
+	if (process.exitCode !== undefined && process.exitCode !== 0) {
+		console.error(`execution profile test artifacts retained at ${UNIT_TEST_ROOT}`);
+		return;
+	}
+	rmSync(UNIT_TEST_ROOT, { recursive: true, force: true });
+}
+
+after(cleanupUnitTestRoot);
+process.on("exit", cleanupUnitTestRoot);
 
 function makeProject() {
-	return mkdtempSync(join(tmpdir(), "execution-profiles-"));
+	return mkdtempSync(join(UNIT_TEST_ROOT, "execution-profiles-"));
 }
 
 function writeAgent(cwd, name) {
@@ -581,6 +592,85 @@ test("selected profile overlays model and thinking, records complete overrides, 
 	}
 });
 
+test("pre-resolved user profiles are frozen on the run and declared profiles remain highest priority", async () => {
+	const cwd = makeProject();
+	try {
+		writeAgent(cwd, "unit-scout");
+		const authored = profileSpec();
+		writeSpec(cwd, authored);
+		const calls = installFakeSubagentApi(cwd);
+		const captured = {
+			name: "Custom",
+			definitionFingerprint: workflowDefinitionFingerprint(authored),
+			stageOverrides: {
+				one: { model: "saved/model", thinking: "medium" },
+				two: { model: "saved/other", thinking: "high" },
+			},
+		};
+		await assert.rejects(
+			() =>
+				runWorkflow("profile-target", cwd, {
+					task: "Unbound captured profile.",
+					executionProfileOverride: {
+						name: "Custom",
+						stageOverrides: captured.stageOverrides,
+					},
+				}),
+			/invalid definition fingerprint/,
+		);
+		const started = await runWorkflow("profile-target", cwd, {
+			task: "Captured user profile.",
+			executionProfileOverride: captured,
+		});
+		captured.stageOverrides.one.model = "changed/after-start";
+		const completed = await waitForRun(cwd, started.runId, 30_000);
+		assert.equal(completed.status, "completed");
+		assert.deepEqual(completed.executionProfile, {
+			name: "Custom",
+			definitionFingerprint: workflowDefinitionFingerprint(authored),
+			stageOverrides: {
+				one: { model: "saved/model", thinking: "medium" },
+				two: { model: "saved/other", thinking: "high" },
+			},
+		});
+		assert.deepEqual(calls.launches, [
+			{ model: "saved/model", thinking: "medium" },
+			{ model: "saved/other", thinking: "high" },
+		]);
+		assert.match(
+			readFileSync(compiledWorkflowPath(cwd, started.runId), "utf8"),
+			/saved\/model/,
+		);
+
+		calls.launches.length = 0;
+		captured.definitionFingerprint = "0".repeat(64);
+		const explicit = await runWorkflow("profile-target", cwd, {
+			task: "Declared profile wins.",
+			executionProfile: "cost conscious",
+			executionProfileOverride: captured,
+		});
+		await waitForRun(cwd, explicit.runId, 30_000);
+		assert.deepEqual(calls.launches, [
+			{ model: "profile/model", thinking: "low" },
+			{ model: undefined, thinking: "high" },
+		]);
+
+		calls.launches.length = 0;
+		await assert.rejects(
+			() =>
+				runWorkflow("profile-target", cwd, {
+					task: "Stale captured user profile.",
+					executionProfileOverride: captured,
+				}),
+			/definition changed after the saved profile was resolved/,
+		);
+		assert.deepEqual(calls.launches, []);
+	} finally {
+		setSubagentApiForTests(undefined);
+		rmSync(cwd, { recursive: true, force: true });
+	}
+});
+
 test("empty profile is identity and selected foreach batches lower to compiled task metadata", async () => {
 	const cwd = makeProject();
 	try {
@@ -604,7 +694,10 @@ test("empty profile is identity and selected foreach batches lower to compiled t
 		);
 		assert.equal(identityCompiled, baseCompiled);
 
-		writeSpec(cwd, foreachProfileSpec());
+		const foreachSpec = foreachProfileSpec();
+		foreachSpec.executionProfiles.batched.items.thinking = "low";
+		foreachSpec.artifactGraph.stages[1].each.thinking = "xhigh";
+		writeSpec(cwd, foreachSpec);
 		const batched = await runWorkflow("profile-target", cwd, {
 			task: "Batch metadata.",
 			executionProfile: "batched",
@@ -617,6 +710,24 @@ test("empty profile is identity and selected foreach batches lower to compiled t
 			maxItems: 2,
 			groupBy: ["$.repository", "$.kind"],
 		});
+		assert.equal(task.runtime.thinking, "xhigh");
+
+		const userProfile = await runWorkflow("profile-target", cwd, {
+			task: "User foreach runtime.",
+			executionProfileOverride: {
+				name: "Custom",
+				definitionFingerprint: workflowDefinitionFingerprint(foreachSpec),
+				stageOverrides: { items: { thinking: "medium" } },
+			},
+		});
+		const userCompiled = JSON.parse(
+			readFileSync(compiledWorkflowPath(cwd, userProfile.runId), "utf8"),
+		);
+		assert.equal(
+			userCompiled.tasks.find((item) => item.stageId === "items").runtime
+				.thinking,
+			"medium",
+		);
 	} finally {
 		setSubagentApiForTests(undefined);
 		rmSync(cwd, { recursive: true, force: true });

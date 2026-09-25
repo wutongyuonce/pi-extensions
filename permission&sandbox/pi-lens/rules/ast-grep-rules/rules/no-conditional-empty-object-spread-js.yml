@@ -1,0 +1,21 @@
+id: no-conditional-empty-object-spread-js
+language: JavaScript
+severity: hint
+message: "Conditional empty-object spread — use an explicit if/else to omit fields"
+note: |
+  `{...(cond ? {} : {x})}` hides field omission behind a ternary — an
+  explicit `if` reads better. Matched structurally (spread of a ternary
+  whose consequence or alternative is an empty object literal), not by
+  exact source text, so it also catches the un-parenthesized form.
+
+  Kept at `hint` to match no-conditional-empty-object-spread.yml — see
+  that rule's note for the FP-scan finding (147 hits, all a deliberate
+  existing idiom).
+rule:
+  kind: spread_element
+  has:
+    stopBy: end
+    kind: ternary_expression
+    any:
+      - has: { field: consequence, stopBy: neighbor, kind: object, regex: '^\{\s*\}$' }
+      - has: { field: alternative, stopBy: neighbor, kind: object, regex: '^\{\s*\}$' }

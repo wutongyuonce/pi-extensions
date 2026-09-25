@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { UnauthorizedError } from "@modelcontextprotocol/client";
+import { auth as runSdkAuth, UnauthorizedError } from "@modelcontextprotocol/client";
 import { McpOAuthProvider } from "../mcp-oauth-provider.ts";
 import { getAuthForUrl, saveAuthEntry } from "../mcp-auth.ts";
 
@@ -28,6 +28,26 @@ describe("McpOAuthProvider clientMetadata scope", () => {
 
     expect(provider.clientMetadata).not.toHaveProperty("scope");
   });
+
+  it("exposes a valid CIMD URL unless a pre-registered client ID takes precedence", () => {
+    const clientMetadataUrl = "https://client.example.com/oauth/client.json";
+    const provider = new McpOAuthProvider(
+      "cimd-test",
+      "https://api.example.com/mcp",
+      { clientMetadataUrl },
+      { onRedirect: async () => {} },
+    );
+    const preRegistered = new McpOAuthProvider(
+      "cimd-preregistered-test",
+      "https://api.example.com/mcp",
+      { clientId: "registered-client", clientSecret: "secret", clientMetadataUrl },
+      { onRedirect: async () => {} },
+    );
+
+    expect(provider.clientMetadataUrl).toBe(clientMetadataUrl);
+    expect(preRegistered.clientMetadataUrl).toBeUndefined();
+  });
+
 });
 
 describe("McpOAuthProvider addClientAuthentication", () => {
@@ -41,6 +61,7 @@ describe("McpOAuthProvider addClientAuthentication", () => {
   });
 
   afterEach(() => {
+    vi.unstubAllGlobals();
     rmSync(authDir, { recursive: true, force: true });
     if (originalOAuthDir === undefined) {
       delete process.env.MCP_OAUTH_DIR;
@@ -189,6 +210,7 @@ describe("McpOAuthProvider discovery state", () => {
   });
 
   afterEach(() => {
+    vi.unstubAllGlobals();
     rmSync(authDir, { recursive: true, force: true });
     if (originalOAuthDir === undefined) {
       delete process.env.MCP_OAUTH_DIR;
@@ -197,12 +219,139 @@ describe("McpOAuthProvider discovery state", () => {
     }
   });
 
+  it("preserves a stored DCR refresh pair before transitioning to CIMD after invalidation", async () => {
+    const clientMetadataUrl = "https://client.example.com/oauth/client.json";
+    const oldClientId = "old-dynamic-registration";
+    saveAuthEntry("cimd-migration", {
+      clientInfo: {
+        clientId: oldClientId,
+        redirectUris: ["http://localhost:19876/callback"],
+      },
+      tokens: {
+        accessToken: "expired-dcr-access",
+        refreshToken: "dcr-refresh-token",
+        expiresAt: Date.now() / 1000 - 60,
+      },
+      serverUrl,
+    }, serverUrl);
+
+    let authorizationUrl: URL | undefined;
+    const provider = new McpOAuthProvider(
+      "cimd-migration",
+      serverUrl,
+      { clientMetadataUrl },
+      { onRedirect: async url => { authorizationUrl = url; } },
+      {},
+      undefined,
+      "migration-state",
+    );
+    await provider.saveDiscoveryState({
+      authorizationServerUrl: "https://auth.example.com",
+      resourceMetadata: { resource: serverUrl },
+      authorizationServerMetadata: {
+        issuer: "https://auth.example.com",
+        authorization_endpoint: "https://auth.example.com/authorize",
+        token_endpoint: "https://auth.example.com/token",
+        response_types_supported: ["code"],
+        client_id_metadata_document_supported: true,
+      },
+    });
+
+    const tokenBodies: string[] = [];
+    const fetchFn = vi.fn(async (input: string | URL | Request, init?: RequestInit) => {
+      expect(String(input)).toBe("https://auth.example.com/token");
+      expect(getAuthForUrl("cimd-migration", serverUrl)).toMatchObject({
+        clientInfo: { clientId: oldClientId },
+        tokens: { accessToken: "expired-dcr-access", refreshToken: "dcr-refresh-token" },
+      });
+      tokenBodies.push(String(init?.body));
+      return new Response(JSON.stringify({ error: "invalid_grant" }), {
+        status: 400,
+        headers: { "content-type": "application/json" },
+      });
+    });
+
+    await expect(runSdkAuth(provider, { serverUrl, fetchFn })).resolves.toBe("REDIRECT");
+
+    expect(tokenBodies).toHaveLength(1);
+    const refreshParams = new URLSearchParams(tokenBodies[0]);
+    expect(refreshParams.get("grant_type")).toBe("refresh_token");
+    expect(refreshParams.get("refresh_token")).toBe("dcr-refresh-token");
+    expect(refreshParams.get("client_id")).toBe(oldClientId);
+    expect(authorizationUrl?.searchParams.get("client_id")).toBe(clientMetadataUrl);
+    expect(getAuthForUrl("cimd-migration", serverUrl)?.clientInfo).toMatchObject({
+      clientId: clientMetadataUrl,
+    });
+  });
+
+  it("selects CIMD immediately when stored DCR has no refresh pair to preserve", async () => {
+    const clientMetadataUrl = "https://client.example.com/oauth/client.json";
+    saveAuthEntry("cimd-no-refresh", {
+      clientInfo: {
+        clientId: "old-dynamic-registration",
+        redirectUris: ["http://localhost:19876/callback"],
+      },
+      serverUrl,
+    }, serverUrl);
+    const provider = new McpOAuthProvider(
+      "cimd-no-refresh",
+      serverUrl,
+      { clientMetadataUrl },
+      { onRedirect: async () => {} },
+    );
+    await provider.saveDiscoveryState({
+      authorizationServerUrl: "https://auth.example.com",
+      authorizationServerMetadata: {
+        issuer: "https://auth.example.com",
+        authorization_endpoint: "https://auth.example.com/authorize",
+        token_endpoint: "https://auth.example.com/token",
+        response_types_supported: ["code"],
+        client_id_metadata_document_supported: true,
+      },
+    });
+
+    expect(await provider.clientInformation({ issuer: "https://auth.example.com" })).toBeUndefined();
+  });
+
+  it("retains DCR when the authorization server does not advertise CIMD", async () => {
+    const clientMetadataUrl = "https://client.example.com/oauth/client.json";
+    saveAuthEntry("cimd-fallback", {
+      clientInfo: {
+        clientId: "dynamic-registration",
+        redirectUris: ["http://localhost:19876/callback"],
+      },
+      serverUrl,
+    }, serverUrl);
+    const fallbackProvider = new McpOAuthProvider(
+      "cimd-fallback",
+      serverUrl,
+      { clientMetadataUrl },
+      { onRedirect: async () => {} },
+    );
+    await fallbackProvider.saveDiscoveryState({
+      authorizationServerUrl: "https://auth.example.com",
+      authorizationServerMetadata: {
+        issuer: "https://auth.example.com",
+        authorization_endpoint: "https://auth.example.com/authorize",
+        token_endpoint: "https://auth.example.com/token",
+        response_types_supported: ["code"],
+        client_id_metadata_document_supported: false,
+      },
+    });
+
+    expect(await fallbackProvider.clientInformation()).toMatchObject({
+      client_id: "dynamic-registration",
+    });
+  });
+
   it("loads configured authorization-server metadata and binds it to the resource", async () => {
-    const metadataUrl = "https://auth.example.com/oauth2/default/.well-known/openid-configuration";
+    const serverUrl = "https://service.example.test/mcp";
+    const controller = new AbortController();
+    const metadataUrl = "https://auth.example.test/oauth2/default/.well-known/openid-configuration";
     const metadata = {
-      issuer: "https://auth.example.com/oauth2/default",
-      authorization_endpoint: "https://auth.example.com/oauth2/default/authorize",
-      token_endpoint: "https://auth.example.com/oauth2/default/token",
+      issuer: "https://auth.example.test/oauth2/default",
+      authorization_endpoint: "https://auth.example.test/oauth2/default/authorize",
+      token_endpoint: "https://auth.example.test/oauth2/default/token",
       response_types_supported: ["code"],
     };
     const response = () => new Response(JSON.stringify(metadata), {
@@ -217,6 +366,8 @@ describe("McpOAuthProvider discovery state", () => {
         serverUrl,
         { authServerMetadataUrl: metadataUrl },
         { onRedirect: async () => {} },
+        {},
+        controller.signal,
       );
 
       await expect(provider.discoveryState()).resolves.toMatchObject({
@@ -224,13 +375,47 @@ describe("McpOAuthProvider discovery state", () => {
         authorizationServerMetadata: metadata,
         resourceMetadata: { resource: serverUrl },
       });
-      expect(fetchMock).toHaveBeenCalledWith(
-        metadataUrl,
-        expect.objectContaining({ headers: { accept: "application/json" } }),
-      );
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      const [input, init] = fetchMock.mock.calls[0]!;
+      expect(input).toBe(metadataUrl);
+      expect(Object.fromEntries(new Headers(init.headers))).toEqual({ accept: "application/json" });
+      expect(init.signal).toBeInstanceOf(AbortSignal);
+      expect(init.signal.aborted).toBe(false);
+      controller.abort();
+      expect(init.signal.aborted).toBe(true);
     } finally {
       vi.unstubAllGlobals();
     }
+  });
+
+  it("rejects configured discovery that resumes after logout", async () => {
+    let release!: (response: Response) => void;
+    let markStarted!: () => void;
+    const response = new Promise<Response>(resolve => { release = resolve; });
+    const started = new Promise<void>(resolve => { markStarted = resolve; });
+    vi.stubGlobal("fetch", vi.fn(async () => {
+      markStarted();
+      return response;
+    }));
+    const metadataUrl = "https://auth.example.test/.well-known/openid-configuration";
+    const provider = new McpOAuthProvider(
+      "configured-discovery-logout",
+      serverUrl,
+      { authServerMetadataUrl: metadataUrl },
+      { onRedirect: async () => {} },
+    );
+    const pending = provider.discoveryState();
+    await started;
+    const { removeAuth } = await import("../mcp-auth-flow.ts");
+    await removeAuth("configured-discovery-logout");
+    release(new Response(JSON.stringify({
+      issuer: "https://auth.example.test",
+      authorization_endpoint: "https://auth.example.test/authorize",
+      token_endpoint: "https://auth.example.test/token",
+      response_types_supported: ["code"],
+    }), { headers: { "content-type": "application/json" } }));
+
+    await expect(pending).rejects.toThrow("OAuth flow is no longer active");
   });
 
   it("keeps configured issuer validation enabled unless explicitly skipped", async () => {

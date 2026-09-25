@@ -1,0 +1,7 @@
+id: kotlin-no-unsafe-cast
+valid:
+  - |
+    val name = value as? String ?: return
+invalid:
+  - |
+    val name = value as String

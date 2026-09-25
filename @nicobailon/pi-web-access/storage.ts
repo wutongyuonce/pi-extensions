@@ -36,6 +36,7 @@ export interface QueryResultData {
 	results: SearchResult[];
 	error: string | null;
 	provider?: string;
+	providers?: string[];
 }
 
 interface FetchCacheRef {
@@ -426,8 +427,17 @@ function readCachedFetchData(data: StoredSearchData, now = Date.now()): StoredSe
 	}
 }
 
+function pruneExpiredFetchedResults(now: number): void {
+	for (const [id, data] of storedResults) {
+		if (data.type === "fetch" && now - data.timestamp >= CACHE_TTL_MS) {
+			storedResults.set(id, unavailableFetchData(data, "Cached fetched content is missing or expired"));
+		}
+	}
+}
+
 export function pruneExpiredFetchCache(now = Date.now(), requestedLimits?: Partial<FetchCacheLimits>): void {
 	const limits = cacheLimits(requestedLimits);
+	pruneExpiredFetchedResults(now);
 	try { pruneFetchCache(now, limits); } catch {}
 }
 
@@ -436,6 +446,7 @@ export function storeResult(id: string, data: StoredSearchData): void {
 }
 
 export function storeFetchedContentResult(id: string, data: StoredSearchData & { type: "fetch"; urls: ExtractedContent[] }): StoredSearchData {
+	pruneExpiredFetchedResults(Date.now());
 	let ref: FetchCacheRef | null = null;
 	let cacheError: string | undefined;
 	try {

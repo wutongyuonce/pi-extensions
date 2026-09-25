@@ -10,6 +10,12 @@ import { isServerInActiveFailureBackoff } from "./failure-backoff.ts";
  */
 const MIN_STEM_LENGTH = 4;
 
+// Keep ASCII tokens unchanged; bound adjacent bigrams for non-ASCII Unicode word runs.
+// Whole-run fallbacks preserve single characters and prevent truncated queries from matching only a prefix.
+const MAX_UNICODE_BIGRAMS_PER_RUN = 64;
+const SEARCH_RUN = /[a-z0-9]+|(?:(?![a-z0-9])[\p{L}\p{N}\p{M}])+/gu;
+const ASCII_RUN = /^[a-z0-9]+$/;
+
 const FIELD_WEIGHTS = {
   name: 12,
   originalName: 10,
@@ -82,7 +88,32 @@ export function normalizeSearchText(value: string): string {
 }
 
 export function tokenize(value: string): string[] {
-  return normalizeSearchText(value).split(/[^a-z0-9]+/).filter(Boolean);
+  const tokens: string[] = [];
+  for (const run of normalizeSearchText(value).match(SEARCH_RUN) ?? []) {
+    if (ASCII_RUN.test(run)) {
+      tokens.push(run);
+      continue;
+    }
+    const characters = [...run];
+    if (characters.length === 1 || characters.length > MAX_UNICODE_BIGRAMS_PER_RUN + 1) {
+      tokens.push(run);
+      continue;
+    }
+    let previous = "";
+    for (const character of characters) {
+      if (previous) {
+        tokens.push(previous + character);
+      }
+      previous = character;
+    }
+  }
+  return tokens;
+}
+
+function matchesAsciiStem(fieldToken: string, queryToken: string): boolean {
+  return ASCII_RUN.test(fieldToken)
+    && ASCII_RUN.test(queryToken)
+    && (fieldToken.startsWith(queryToken) || (fieldToken.length >= MIN_STEM_LENGTH && queryToken.startsWith(fieldToken)));
 }
 
 function prepareToolSearch(tool: ToolMetadata, server: string, keywords?: string[]): PreparedToolSearch {
@@ -132,7 +163,7 @@ function scorePreparedToolMatch(
       if (fieldTokens.includes(token)) {
         score += weight * 4;
         matchedTokens.add(token);
-      } else if (fieldTokens.some(fieldToken => fieldToken.startsWith(token) || (fieldToken.length >= MIN_STEM_LENGTH && token.startsWith(fieldToken)))) {
+      } else if (fieldTokens.some(fieldToken => matchesAsciiStem(fieldToken, token))) {
         score += weight * 2;
         matchedTokens.add(token);
       } else if (value.includes(token)) {
@@ -167,7 +198,7 @@ function scorePreparedToolMatch(
       if (prepared.keywordTokens.includes(token)) {
         score += weight * 4;
         matchedTokens.add(token);
-      } else if (prepared.keywordTokens.some(keywordToken => keywordToken.startsWith(token) || (keywordToken.length >= MIN_STEM_LENGTH && token.startsWith(keywordToken)))) {
+      } else if (prepared.keywordTokens.some(keywordToken => matchesAsciiStem(keywordToken, token))) {
         score += weight * 2;
         matchedTokens.add(token);
       } else if (prepared.keywordPhrases.some(phrase => phrase.includes(token))) {
@@ -266,13 +297,13 @@ export function paginate<T>(items: T[], offset: number, limit: number): { items:
   };
 }
 
-export function rankSuggestions(state: McpExtensionState, name: string, limit: number): string[] {
+export function rankSuggestions(state: McpExtensionState, name: string, limit: number, server?: string): string[] {
   const stripped = Object.keys(state.config.mcpServers)
-    .flatMap(server => (["server", "short", "mcp"] as const)
-      .map(prefix => getServerPrefix(server, prefix)))
+    .flatMap(serverName => (["server", "short", "mcp"] as const)
+      .map(prefix => getServerPrefix(serverName, prefix)))
     .filter((candidate): candidate is string => Boolean(candidate) && name.startsWith(`${candidate}_`))
     .sort((a, b) => b.length - a.length)
     .map(candidate => name.slice(candidate.length + 1));
   const query = stripped[0] ?? name;
-  return rankToolMatches(state, query, undefined, false).slice(0, limit).map(match => match.tool.name);
+  return rankToolMatches(state, query, server, false).slice(0, limit).map(match => match.tool.name);
 }

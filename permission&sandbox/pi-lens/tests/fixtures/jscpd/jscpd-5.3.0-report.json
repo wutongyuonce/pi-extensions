@@ -1,0 +1,71 @@
+{
+	"duplicates": [
+		{
+			"firstFile": {
+				"end": 81,
+				"endLoc": {
+					"column": 49,
+					"line": 81,
+					"position": 3991
+				},
+				"name": "index.ts",
+				"start": 2,
+				"startLoc": {
+					"column": 0,
+					"line": 2,
+					"position": 12
+				}
+			},
+			"format": "typescript",
+			"fragment": "function helperFn0(x) { return x + 0 * 2 - 1; }\nfunction helperFn1(x) { return x + 1 * 2 - 1; }\nfunction helperFn2(x) { return x + 2 * 2 - 1; }\nfunction helperFn3(x) { return x + 3 * 2 - 1; }\nfunction helperFn4(x) { return x + 4 * 2 - 1; }\nfunction helperFn5(x) { return x + 5 * 2 - 1; }\nfunction helperFn6(x) { return x + 6 * 2 - 1; }\nfunction helperFn7(x) { return x + 7 * 2 - 1; }\nfunction helperFn8(x) { return x + 8 * 2 - 1; }\nfunction helperFn9(x) { return x + 9 * 2 - 1; }\nfunction helperFn10(x) { return x + 10 * 2 - 1; }\nfunction helperFn11(x) { return x + 11 * 2 - 1; }\nfunction helperFn12(x) { return x + 12 * 2 - 1; }\nfunction helperFn13(x) { return x + 13 * 2 - 1; }\nfunction helperFn14(x) { return x + 14 * 2 - 1; }\nfunction helperFn15(x) { return x + 15 * 2 - 1; }\nfunction helperFn16(x) { return x + 16 * 2 - 1; }\nfunction helperFn17(x) { return x + 17 * 2 - 1; }\nfunction helperFn18(x) { return x + 18 * 2 - 1; }\nfunction helperFn19(x) { return x + 19 * 2 - 1; }\nfunction helperFn20(x) { return x + 20 * 2 - 1; }\nfunction helperFn21(x) { return x + 21 * 2 - 1; }\nfunction helperFn22(x) { return x + 22 * 2 - 1; }\nfunction helperFn23(x) { return x + 23 * 2 - 1; }\nfunction helperFn24(x) { return x + 24 * 2 - 1; }\nfunction helperFn25(x) { return x + 25 * 2 - 1; }\nfunction helperFn26(x) { return x + 26 * 2 - 1; }\nfunction helperFn27(x) { return x + 27 * 2 - 1; }\nfunction helperFn28(x) { return x + 28 * 2 - 1; }\nfunction helperFn29(x) { return x + 29 * 2 - 1; }\nfunction helperFn30(x) { return x + 30 * 2 - 1; }\nfunction helperFn31(x) { return x + 31 * 2 - 1; }\nfunction helperFn32(x) { return x + 32 * 2 - 1; }\nfunction helperFn33(x) { return x + 33 * 2 - 1; }\nfunction helperFn34(x) { return x + 34 * 2 - 1; }\nfunction helperFn35(x) { return x + 35 * 2 - 1; }\nfunction helperFn36(x) { return x + 36 * 2 - 1; }\nfunction helperFn37(x) { return x + 37 * 2 - 1; }\nfunction helperFn38(x) { return x + 38 * 2 - 1; }\nfunction helperFn39(x) { return x + 39 * 2 - 1; }\nfunction helperFn40(x) { return x + 40 * 2 - 1; }\nfunction helperFn41(x) { return x + 41 * 2 - 1; }\nfunction helperFn42(x) { return x + 42 * 2 - 1; }\nfunction helperFn43(x) { return x + 43 * 2 - 1; }\nfunction helperFn44(x) { return x + 44 * 2 - 1; }\nfunction helperFn45(x) { return x + 45 * 2 - 1; }\nfunction helperFn46(x) { return x + 46 * 2 - 1; }\nfunction helperFn47(x) { return x + 47 * 2 - 1; }\nfunction helperFn48(x) { return x + 48 * 2 - 1; }\nfunction helperFn49(x) { return x + 49 * 2 - 1; }\nfunction helperFn50(x) { return x + 50 * 2 - 1; }\nfunction helperFn51(x) { return x + 51 * 2 - 1; }\nfunction helperFn52(x) { return x + 52 * 2 - 1; }\nfunction helperFn53(x) { return x + 53 * 2 - 1; }\nfunction helperFn54(x) { return x + 54 * 2 - 1; }\nfunction helperFn55(x) { return x + 55 * 2 - 1; }\nfunction helperFn56(x) { return x + 56 * 2 - 1; }\nfunction helperFn57(x) { return x + 57 * 2 - 1; }\nfunction helperFn58(x) { return x + 58 * 2 - 1; }\nfunction helperFn59(x) { return x + 59 * 2 - 1; }\nfunction helperFn60(x) { return x + 60 * 2 - 1; }\nfunction helperFn61(x) { return x + 61 * 2 - 1; }\nfunction helperFn62(x) { return x + 62 * 2 - 1; }\nfunction helperFn63(x) { return x + 63 * 2 - 1; }\nfunction helperFn64(x) { return x + 64 * 2 - 1; }\nfunction helperFn65(x) { return x + 65 * 2 - 1; }\nfunction helperFn66(x) { return x + 66 * 2 - 1; }\nfunction helperFn67(x) { return x + 67 * 2 - 1; }\nfunction helperFn68(x) { return x + 68 * 2 - 1; }\nfunction helperFn69(x) { return x + 69 * 2 - 1; }\nfunction helperFn70(x) { return x + 70 * 2 - 1; }\nfunction helperFn71(x) { return x + 71 * 2 - 1; }\nfunction helperFn72(x) { return x + 72 * 2 - 1; }\nfunction helperFn73(x) { return x + 73 * 2 - 1; }\nfunction helperFn74(x) { return x + 74 * 2 - 1; }\nfunction helperFn75(x) { return x + 75 * 2 - 1; }\nfunction helperFn76(x) { return x + 76 * 2 - 1; }\nfunction helperFn77(x) { return x + 77 * 2 - 1; }\nfunction helperFn78(x) { return x + 78 * 2 - 1; }\nfunction helperFn79(x) { return x + 79 * 2 - 1; }",
+			"isNew": false,
+			"kind": "exact",
+			"lines": 80,
+			"secondFile": {
+				"end": 82,
+				"endLoc": {
+					"column": 49,
+					"line": 82,
+					"position": 4015
+				},
+				"name": "second.ts",
+				"start": 3,
+				"startLoc": {
+					"column": 0,
+					"line": 3,
+					"position": 36
+				}
+			},
+			"tokens": 1280
+		}
+	],
+	"statistics": {
+		"detectionDate": "2026-09-25T08:56:58.066Z",
+		"formats": {
+			"typescript": {
+				"clones": 1,
+				"duplicatedLines": 79,
+				"duplicatedTokens": 1280,
+				"lines": 163,
+				"newClones": 0,
+				"newDuplicatedLines": 0,
+				"percentage": 48.466257668711656,
+				"percentageTokens": 50,
+				"sources": 2,
+				"tokens": 2560
+			}
+		},
+		"total": {
+			"clones": 1,
+			"duplicatedLines": 79,
+			"duplicatedTokens": 1280,
+			"lines": 163,
+			"newClones": 0,
+			"newDuplicatedLines": 0,
+			"percentage": 48.466257668711656,
+			"percentageTokens": 50,
+			"sources": 2,
+			"tokens": 2560
+		}
+	}
+}

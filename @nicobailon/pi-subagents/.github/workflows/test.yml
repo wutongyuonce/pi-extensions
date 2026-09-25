@@ -8,9 +8,19 @@ on:
 
 jobs:
   test:
+    name: test (${{ matrix.label }})
     strategy:
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        include:
+          - os: ubuntu-latest
+            label: ubuntu
+            testArgs: ""
+          - os: windows-latest
+            label: windows-1
+            testArgs: --test-concurrency=2 --test-shard=1/2
+          - os: windows-latest
+            label: windows-2
+            testArgs: --test-concurrency=2 --test-shard=2/2
       fail-fast: false
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
@@ -24,13 +34,40 @@ jobs:
       - name: Typecheck
         run: npm run typecheck
       - name: Unit tests
-        run: npm test
+        run: node --experimental-strip-types --import ./test/support/isolated-temp-root.mjs --test ${{ matrix.testArgs }} test/unit/*.test.ts
       - name: Integration tests
         timeout-minutes: 10
-        run: npm run test:integration
-      - name: E2E tests
-        timeout-minutes: 5
-        run: npm run test:e2e
+        env:
+          NODE_DISABLE_COMPILE_CACHE: '1'
+          PI_SUBAGENTS_TERMINAL_EVIDENCE_DIR: ${{ runner.temp }}/1906-terminal-evidence
+        run: node --experimental-strip-types --import ./test/support/register-loader.mjs --test ${{ matrix.testArgs }} test/integration/*.test.ts
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: shared-cwd-terminal-${{ matrix.label }}
+          path: ${{ runner.temp }}/1906-terminal-evidence/shared-cwd-terminal.json
+          if-no-files-found: ignore
+
+  native-nested-wait:
+    strategy:
+      matrix:
+        os: [macos-latest, windows-latest]
+      fail-fast: false
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+      - run: npm ci --ignore-scripts
+      - name: Install native Pi SDK
+        run: npm install --prefix "${{ runner.temp }}/native-host" --no-package-lock --ignore-scripts @earendil-works/pi-coding-agent@0.86.1
+      - name: Native nested result consumption
+        env:
+          PI_SUBAGENTS_NATIVE_PI_ROOT: ${{ runner.temp }}/native-host/node_modules/@earendil-works/pi-coding-agent
+          NODE_DISABLE_COMPILE_CACHE: '1'
+        run: node --experimental-strip-types --import ./test/support/isolated-temp-root.mjs --import ./test/support/native-peer-loader.mjs --test test/integration/nested-async-wait.test.ts
 
   bun-workflow-script:
     runs-on: ubuntu-latest
@@ -49,3 +86,108 @@ jobs:
         run: >-
           bun test test/unit/scripted-workflow.test.ts
           --test-name-pattern "portable workflow parity|regex literals|template expressions|portable plain helper|nested plain helper|unawaited child launch|unawaited runs.all|directly returned runs.run|docs-style awaited|awaited native Promise|Promise.resolve|Promise.all|then chain|new Promise wrapper"
+
+  runner-loader-capability:
+    strategy:
+      matrix:
+        include:
+          - node: 22.14.0
+            loader: jiti
+          - node: 22.19.0
+            loader: native
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: ${{ matrix.node }}
+      - run: npm ci --ignore-scripts
+      - run: node test/smoke/runner-loader-capability.mjs ${{ matrix.loader }}
+
+  clean-install:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22.19.0
+      - run: npm ci --ignore-scripts
+      - name: Real Pi 0.86.1 background child smoke
+        run: node --experimental-strip-types test/smoke/clean-install.mjs "${{ runner.temp }}/clean-install-smoke" 0.86.1
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: clean-install-smoke-logs
+          path: |
+            ${{ runner.temp }}/clean-install-smoke/*.log
+            ${{ runner.temp }}/clean-install-smoke/aliases.json
+            ${{ runner.temp }}/clean-install-smoke/host/package-lock.json
+            ${{ runner.temp }}/clean-install-smoke/extension/package-lock.json
+
+  official-standalone:
+    # The official Linux x64 release only; 22.04 permits bubblewrap namespaces.
+    runs-on: ubuntu-22.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+      - name: Install controller dependencies and isolation tool
+        run: |
+          node -e 'const a = require("node:assert/strict"); a.equal(process.platform, "linux"); a.equal(process.arch, "x64");'
+          npm ci --ignore-scripts
+          # Bubblewrap needs only Ubuntu indexes, not the runner's third-party repositories.
+          printf '%s\n' 'deb http://archive.ubuntu.com/ubuntu jammy main universe' 'deb http://archive.ubuntu.com/ubuntu jammy-updates main universe' 'deb http://security.ubuntu.com/ubuntu jammy-security main universe' > "$RUNNER_TEMP/ubuntu.sources.list"
+          sudo apt-get -o Dir::Etc::sourcelist="$RUNNER_TEMP/ubuntu.sources.list" -o Dir::Etc::sourceparts=- update
+          sudo apt-get -o Dir::Etc::sourcelist="$RUNNER_TEMP/ubuntu.sources.list" -o Dir::Etc::sourceparts=- install -y bubblewrap
+      - name: Provision the checksum-pinned official binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          url="$(node -p 'require("./test/smoke/standalone-release.json").url')"
+          sha="$(node -p 'require("./test/smoke/standalone-release.json").archiveSha256')"
+          mkdir -p "$RUNNER_TEMP/pi-official"
+          curl --fail --location --retry 3 "$url" --output "$RUNNER_TEMP/pi-official/release.tar.gz"
+          printf '%s  %s\n' "$sha" "$RUNNER_TEMP/pi-official/release.tar.gz" | sha256sum --check -
+          tar -xzf "$RUNNER_TEMP/pi-official/release.tar.gz" -C "$RUNNER_TEMP/pi-official"
+      - name: Complete isolated official binary matrix
+        run: node test/smoke/standalone-matrix.mjs "$RUNNER_TEMP/pi-official/pi/pi" "$RUNNER_TEMP/standalone-matrix"
+      - name: Provision npm host for public launch regression
+        run: node test/smoke/clean-install.mjs "$RUNNER_TEMP/npm-background-sdk" 0.86.1
+      - name: Isolated real npm public launch
+        run: node test/smoke/npm-background.mjs "$RUNNER_TEMP/npm-background-sdk" "$RUNNER_TEMP/npm-background"
+      - name: Require completed Linux smoke receipts
+        run: |
+          node -e 'const a = require("node:assert/strict"); const r = require(process.env.RUNNER_TEMP + "/standalone-matrix/matrix.json"); a.equal(r.complete, true); a.equal(r.cases.length, 18); a.ok(r.cases.every(c => c.exitCode === 0 && !c.error));'
+          node -e 'const a = require("node:assert/strict"); const r = require(process.env.RUNNER_TEMP + "/npm-background/npm-launch.json"); a.equal(r.publicLaunch, true); a.equal(r.runtime, "Node"); a.equal(r.version, "0.86.1"); a.equal(r.network, "unshared");'
+      - name: Collect bounded lifecycle evidence
+        id: evidence
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/standalone-matrix"
+          find . -type d \( -name package -o -name cache -o -name bun-cache -o -name home -o -name agent -o -name assets -o -name theme -o -name export-html \) -prune -o -type f \( -name '*.log' -o -name '*.jsonl' -o -name status.json -o -name process-terminal.json -o -name identity.json -o -name '*result.json' -o -name '*notification*.json' -o -name '*witness.json' -o -name '*competition.json' -o -name launch.json -o -name '*failure.json' -o -name launch-error.json \) -print0 > "$RUNNER_TEMP/standalone-files"
+          tar --null -czf "$RUNNER_TEMP/standalone-evidence.tar.gz" --files-from "$RUNNER_TEMP/standalone-files"
+          test "$(stat -c %s "$RUNNER_TEMP/standalone-evidence.tar.gz")" -le 33554432
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: official-standalone-receipt
+          path: |
+            ${{ runner.temp }}/standalone-matrix/matrix.json
+            ${{ runner.temp }}/standalone-matrix/inputs.json
+            ${{ runner.temp }}/npm-background/parent.log
+            ${{ runner.temp }}/npm-background/npm-launch.json
+          if-no-files-found: warn
+          retention-days: 7
+      - uses: actions/upload-artifact@v4
+        if: always() && steps.evidence.outcome == 'success'
+        with:
+          name: official-standalone-lifecycle
+          path: ${{ runner.temp }}/standalone-evidence.tar.gz
+          if-no-files-found: error
+          retention-days: 7

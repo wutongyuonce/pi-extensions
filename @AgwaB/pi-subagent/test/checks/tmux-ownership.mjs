@@ -31,6 +31,7 @@ import {
 	tmuxOwnershipTokenDigest,
 	TmuxOwnershipError,
 } from "../../src/runners/tmux-control.ts";
+import { userCancelledAbortReason } from "../../src/core/constants.ts";
 import { runTmuxModel } from "../../src/runners/tmux.ts";
 import {
 	captureProcessIdentity,
@@ -41,6 +42,7 @@ import {
 	withSandboxedArgv,
 } from "../../src/sandbox/srt.ts";
 import { beginRunRecord } from "../../src/artifacts/index.ts";
+import { checkTmuxRuntimeProbes } from "../fixtures/tmux-runtime-probes.mjs";
 
 const execFileAsync = promisify(execFile);
 const sleep = (ms) =>
@@ -183,6 +185,7 @@ wait
 
 	const realTmux = await realTmuxPath();
 	if (realTmux !== "") {
+		await checkTmuxRuntimeProbes(realTmux);
 		const paneGateCwd = join(tempRoot, "pane-gate-cwd");
 		const paneGatePi = join(tempRoot, "pane-gate-pi");
 		const paneGateSideEffect = join(paneGateCwd, "side-effect");
@@ -198,10 +201,7 @@ await new Promise((resolveSleep) => setTimeout(resolveSleep, 2_000));
 			{ mode: 0o700 },
 		);
 		const tmuxShellHook = join(tempRoot, "tmux-shell-hook.sh");
-		const tmuxShellHookSideEffect = join(
-			paneGateCwd,
-			"shell-hook-side-effect",
-		);
+		const tmuxShellHookSideEffect = join(paneGateCwd, "shell-hook-side-effect");
 		await writeFile(
 			tmuxShellHook,
 			`echo unsafe > ${JSON.stringify(tmuxShellHookSideEffect)}\n`,
@@ -265,8 +265,7 @@ await new Promise((resolveSleep) => setTimeout(resolveSleep, 2_000));
 			timeoutMs: 30_000,
 			signal: hungOwnershipAbort.signal,
 			onTmuxStart: async (tmux) => {
-				if (tmux.launchState === "gated")
-					await new Promise(() => undefined);
+				if (tmux.launchState === "gated") await new Promise(() => undefined);
 			},
 		});
 		setTimeout(() => hungOwnershipAbort.abort(), 100);
@@ -276,6 +275,51 @@ await new Promise((resolveSleep) => setTimeout(resolveSleep, 2_000));
 			Date.now() - hungOwnershipStartedAt < 2_000,
 			"abort must bound a hung tmux ownership callback",
 		);
+
+		// After the pane is running, a tagged operator abort (what the durable
+		// worker sends on SIGTERM/SIGINT) must be recorded as user_cancelled,
+		// while a plain caller abort stays "abort".
+		const longPanePi = join(tempRoot, "long-pane-pi");
+		await writeFile(
+			longPanePi,
+			`#!/usr/bin/env node
+await new Promise((resolveSleep) => setTimeout(resolveSleep, 20_000));
+`,
+			{ mode: 0o700 },
+		);
+		for (const [label, reason, expectedKind] of [
+			[
+				"tagged",
+				userCancelledAbortReason("durable worker received SIGTERM"),
+				"user_cancelled",
+			],
+			["plain", undefined, "abort"],
+		]) {
+			const runningAbort = new AbortController();
+			const runningResult = await runTmuxModel({
+				cwd: paneGateCwd,
+				runId: `run_tmux_running_abort_${label}`,
+				attemptId: `attempt_tmux_running_abort_${label}`,
+				piCommand: longPanePi,
+				agent: "running-abort-worker",
+				task: `abort while running (${label})`,
+				timeoutMs: 30_000,
+				signal: runningAbort.signal,
+				onTmuxStart: async (tmux) => {
+					if (tmux.launchState === "running") runningAbort.abort(reason);
+				},
+			});
+			assert.equal(
+				runningResult.status,
+				"cancelled",
+				`${label}: ${JSON.stringify(runningResult)}`,
+			);
+			assert.equal(
+				runningResult.failureKind,
+				expectedKind,
+				`${label} abort after launch records ${expectedKind}`,
+			);
+		}
 
 		const executionError = new TmuxOwnershipError(
 			"sandbox execution callback ownership failure",
@@ -301,88 +345,75 @@ await new Promise((resolveSleep) => setTimeout(resolveSleep, 2_000));
 		}
 
 		if (sandboxAvailable) {
-		const sandboxPaneSideEffect = join(
-			paneGateCwd,
-			"sandbox-side-effect",
-		);
-		await writeFile(
-			paneGatePi,
-			`#!/usr/bin/env node
+			const sandboxPaneSideEffect = join(paneGateCwd, "sandbox-side-effect");
+			await writeFile(
+				paneGatePi,
+				`#!/usr/bin/env node
 import { writeFileSync } from "node:fs";
 writeFileSync(${JSON.stringify(sandboxPaneSideEffect)}, "started");
 process.stdout.write(JSON.stringify({ type: "message_end", message: { role: "assistant", content: [{ type: "text", text: "sandbox-pane-gated" }], provider: "fake", model: "fake/model", usage: { inputTokens: 1, outputTokens: 1 }, stopReason: "end" } }) + "\\n");
 await new Promise((resolveSleep) => setTimeout(resolveSleep, 2_000));
 `,
-			{ mode: 0o700 },
-		);
-		let releaseSandboxOwnership;
-		const sandboxOwnershipReleased = new Promise((resolveRelease) => {
-			releaseSandboxOwnership = resolveRelease;
-		});
-		let sandboxOwnershipObserved;
-		const sandboxOwnershipEntered = new Promise((resolveEntered) => {
-			sandboxOwnershipObserved = resolveEntered;
-		});
-		const sandboxPaneRun = runTmuxModel({
-			cwd: paneGateCwd,
-			runId: "run_tmux_sandbox_pane_gate",
-			attemptId: "attempt_tmux_sandbox_pane_gate",
-			piCommand: paneGatePi,
-			agent: "sandbox-pane-gate-worker",
-			task: "wait for final sandbox ownership",
-			timeoutMs: 30_000,
-			sandbox: true,
-			onTmuxStart: async (tmux) => {
-				if (tmux.launchState !== "running") return;
-				sandboxOwnershipObserved();
-				await sandboxOwnershipReleased;
-			},
-		});
-		const sandboxOwnershipReady = await Promise.race([
-			sandboxOwnershipEntered.then(() => true),
-			sandboxPaneRun.then((result) => {
-				if (
-					result.failureKind === "sandbox" &&
-					result.stderr?.includes("sandbox")
-				)
-					return false;
-				throw new Error(
-					"sandbox tmux exited before final ownership persistence",
+				{ mode: 0o700 },
+			);
+			let releaseSandboxOwnership;
+			const sandboxOwnershipReleased = new Promise((resolveRelease) => {
+				releaseSandboxOwnership = resolveRelease;
+			});
+			let sandboxOwnershipObserved;
+			const sandboxOwnershipEntered = new Promise((resolveEntered) => {
+				sandboxOwnershipObserved = resolveEntered;
+			});
+			const sandboxPaneRun = runTmuxModel({
+				cwd: paneGateCwd,
+				runId: "run_tmux_sandbox_pane_gate",
+				attemptId: "attempt_tmux_sandbox_pane_gate",
+				piCommand: paneGatePi,
+				agent: "sandbox-pane-gate-worker",
+				task: "wait for final sandbox ownership",
+				timeoutMs: 30_000,
+				sandbox: true,
+				onTmuxStart: async (tmux) => {
+					if (tmux.launchState !== "running") return;
+					sandboxOwnershipObserved();
+					await sandboxOwnershipReleased;
+				},
+			});
+			const sandboxOwnershipReady = await Promise.race([
+				sandboxOwnershipEntered.then(() => true),
+				sandboxPaneRun.then((result) => {
+					if (result.failureKind === "sandbox" && result.stderr?.includes("sandbox"))
+						return false;
+					throw new Error("sandbox tmux exited before final ownership persistence");
+				}),
+			]);
+			if (sandboxOwnershipReady) {
+				await sleep(100);
+				assert.equal(
+					await pathExists(sandboxPaneSideEffect),
+					false,
+					"sandbox tmux pane must retain the final ownership gate",
 				);
-			}),
-		]);
-		if (sandboxOwnershipReady) {
-			await sleep(100);
-			assert.equal(
-				await pathExists(sandboxPaneSideEffect),
-				false,
-				"sandbox tmux pane must retain the final ownership gate",
-			);
-			releaseSandboxOwnership();
-			const sandboxPaneResult = await sandboxPaneRun;
-			for (
-				let index = 0;
-				index < 100 && !(await pathExists(sandboxPaneSideEffect));
-				index += 1
-			)
-				await sleep(10);
-			assert.equal(
-				await pathExists(sandboxPaneSideEffect),
-				true,
-				`sandbox pane did not execute after its ownership gate opened: ${sandboxPaneResult.stderr ?? "no diagnostic"}`,
-			);
-			assert.ok(
-				["completed", "failed", "cancelled"].includes(
-					sandboxPaneResult.status,
-				),
-			);
-		}
+				releaseSandboxOwnership();
+				const sandboxPaneResult = await sandboxPaneRun;
+				for (
+					let index = 0;
+					index < 100 && !(await pathExists(sandboxPaneSideEffect));
+					index += 1
+				)
+					await sleep(10);
+				assert.equal(
+					await pathExists(sandboxPaneSideEffect),
+					true,
+					`sandbox pane did not execute after its ownership gate opened: ${sandboxPaneResult.stderr ?? "no diagnostic"}`,
+				);
+				assert.ok(
+					["completed", "failed", "cancelled"].includes(sandboxPaneResult.status),
+				);
+			}
 		}
 
-		const rejectedPaneSideEffect = join(
-			paneGateCwd,
-			"rejected-side-effect",
-		);
+		const rejectedPaneSideEffect = join(paneGateCwd, "rejected-side-effect");
 		await writeFile(
 			paneGatePi,
 			`#!/usr/bin/env node
@@ -446,10 +477,7 @@ writeFileSync(${JSON.stringify(rejectedPaneSideEffect)}, "started");
 				...correctProof,
 				...(await readPrivateTmuxRuntimeIdentity(correctProof)),
 			};
-			const independentCleanupCwd = join(
-				tempRoot,
-				"independent-cleanup-cwd",
-			);
+			const independentCleanupCwd = join(tempRoot, "independent-cleanup-cwd");
 			await mkdir(independentCleanupCwd);
 			const incompleteWorker = spawn("/bin/sleep", ["30"], {
 				detached: true,
@@ -468,12 +496,8 @@ writeFileSync(${JSON.stringify(rejectedPaneSideEffect)}, "started");
 						attemptId: "attempt_independent_tmux_cleanup",
 						status: "running",
 						backend: "tmux",
-						startedAt: new Date(
-							Date.now() - 60_000,
-						).toISOString(),
-						heartbeatAt: new Date(
-							Date.now() - 60_000,
-						).toISOString(),
+						startedAt: new Date(Date.now() - 60_000).toISOString(),
+						heartbeatAt: new Date(Date.now() - 60_000).toISOString(),
 						process: { workerPid: incompleteWorker.pid },
 						tmux: runtimeProof,
 					},
@@ -514,10 +538,7 @@ writeFileSync(${JSON.stringify(rejectedPaneSideEffect)}, "started");
 		const controlRaceRoot = await mkdtemp("/tmp/pso-control-race-");
 		socketRoots.push(controlRaceRoot);
 		const controlRaceDirectory = join(controlRaceRoot, `tmux-${uid}`);
-		const controlRaceSocket = join(
-			controlRaceDirectory,
-			"ps-control-race",
-		);
+		const controlRaceSocket = join(controlRaceDirectory, "ps-control-race");
 		const controlRaceBin = join(tempRoot, "control-race-bin");
 		await mkdir(controlRaceDirectory, { recursive: true, mode: 0o700 });
 		await mkdir(controlRaceBin);
@@ -574,10 +595,7 @@ exit 99
 			true,
 			"cleanup may succeed only after the verified pane is dead",
 		);
-		assert.equal(
-			await verifyProcessIdentity(controlRacePaneIdentity),
-			"dead",
-		);
+		assert.equal(await verifyProcessIdentity(controlRacePaneIdentity), "dead");
 		ownedProbePids.delete(controlRacePane.pid);
 		await new Promise((resolveClose) =>
 			controlRaceSocketServer.close(resolveClose),
@@ -659,21 +677,15 @@ exit 99
 			const unsafePaneIdentity = await captureProcessIdentity(unsafePane.pid);
 			const mixedMetadata = {
 				serverName: `ps-mixed-${unsafeKind}`,
-				socketPath: join(
-					incompleteDirectory,
-					`ps-mixed-${unsafeKind}`,
-				),
-				ownershipTokenSha256: tmuxOwnershipTokenDigest(
-					`mixed-${unsafeKind}-token`,
-				),
+				socketPath: join(incompleteDirectory, `ps-mixed-${unsafeKind}`),
+				ownershipTokenSha256: tmuxOwnershipTokenDigest(`mixed-${unsafeKind}-token`),
 				launchState: "running",
 				launchPid: null,
 				launchProcessGroupId: null,
 				launchProcessBirthIdentity: null,
 				serverPid: verifiedServerIdentity.pid,
 				serverProcessGroupId: verifiedServerIdentity.processGroupId,
-				serverProcessBirthIdentity:
-					verifiedServerIdentity.birthIdentity,
+				serverProcessBirthIdentity: verifiedServerIdentity.birthIdentity,
 				panePid: unsafePaneIdentity.pid,
 				paneProcessGroupId: unsafePaneIdentity.processGroupId,
 				paneProcessBirthIdentity:
@@ -728,19 +740,13 @@ exit 99
 		);
 		ownedProbePids.add(deadPaneChildPid);
 		process.kill(deadPaneLeader.pid, "SIGKILL");
-		for (
-			let index = 0;
-			index < 100 && pidAlive(deadPaneLeader.pid);
-			index += 1
-		)
+		for (let index = 0; index < 100 && pidAlive(deadPaneLeader.pid); index += 1)
 			await sleep(10);
 		await assert.rejects(
 			terminatePrivateTmuxServer({
 				serverName: "ps-dead-pane-leader",
 				socketPath: join(incompleteDirectory, "ps-dead-pane-leader"),
-				ownershipTokenSha256: tmuxOwnershipTokenDigest(
-					"dead-pane-token",
-				),
+				ownershipTokenSha256: tmuxOwnershipTokenDigest("dead-pane-token"),
 				launchState: "running",
 				launchPid: null,
 				launchProcessGroupId: null,
@@ -831,7 +837,7 @@ if [ "$1" = "-V" ]; then exec ${JSON.stringify(realTmux)} "$@"; fi
 case " $* " in
   *" new-session "*)
     output="$(${JSON.stringify(realTmux)} "$@")" || exit $?
-    ${JSON.stringify(realTmux)} -S "$2" display-message -p -t run '#{pid}\t#{pane_pid}' > ${JSON.stringify(launchingPidsPath)}
+    ${JSON.stringify(realTmux)} -S "$2" display-message -p -t run '#{pid}|#{pane_pid}' > ${JSON.stringify(launchingPidsPath)}
     rm -f "$2"
     echo started > ${JSON.stringify(launchingMarker)}
     sleep 10
@@ -873,7 +879,7 @@ exec ${JSON.stringify(realTmux)} "$@"
 			await readFile(launchingPidsPath, "utf8")
 		)
 			.trim()
-			.split("\t")
+			.split("|")
 			.map(Number);
 		ownedProbePids.add(launchingServerPid);
 		ownedProbePids.add(launchingPanePid);
@@ -902,20 +908,13 @@ exec ${JSON.stringify(realTmux)} "$@"
 			ownedProbePids.delete(pid);
 		}
 		for (let index = 0; index < 100; index += 1) {
-			if (
-				!pidAlive(launchingPanePid) &&
-				!pidAlive(launchingServerPid)
-			)
-				break;
+			if (!pidAlive(launchingPanePid) && !pidAlive(launchingServerPid)) break;
 			await sleep(10);
 		}
 		assert.equal(pidAlive(launchingPanePid), false);
 		assert.equal(pidAlive(launchingServerPid), false);
 		const launchingLossProcesses = (
-			await execFileAsync("/bin/ps", [
-				"-axo",
-				"pid=,command=",
-			])
+			await execFileAsync("/bin/ps", ["-axo", "pid=,command="])
 		).stdout
 			.split("\n")
 			.map((line) => line.trim())
@@ -970,8 +969,7 @@ await new Promise((resolveSleep) => setTimeout(resolveSleep, 10_000));
 			socketLossAttempt = status?.attempts?.[0];
 			if (
 				socketLossAttempt?.tmux?.launchState === "running" &&
-				typeof socketLossAttempt.tmux.serverProcessBirthIdentity ===
-					"string" &&
+				typeof socketLossAttempt.tmux.serverProcessBirthIdentity === "string" &&
 				typeof socketLossAttempt.tmux.paneProcessBirthIdentity === "string"
 			)
 				break;

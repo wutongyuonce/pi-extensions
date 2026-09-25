@@ -3,6 +3,8 @@ import { activityMonitor } from "./activity.ts";
 import { hasCredentialSource, redactCredential, resolveCredential } from "./credential-source.ts";
 import type { ExtractedContent } from "./extract.ts";
 import type { SearchOptions, SearchResponse } from "./perplexity.ts";
+import { formatSearchResultsAsAnswer } from "./search-answer-formatting.ts";
+import { normalizeSearchResultCount } from "./search-result-count-normalization.ts";
 import { getWebSearchConfigPath } from "./utils.ts";
 
 const JINA_SEARCH_BASE_URL = "https://s.jina.ai/";
@@ -72,11 +74,6 @@ async function requireApiKey(signal?: AbortSignal): Promise<string> {
 		);
 	}
 	return apiKey;
-}
-
-function normalizeCount(value: number | undefined): number {
-	if (typeof value !== "number" || !Number.isFinite(value)) return 5;
-	return Math.max(1, Math.min(Math.floor(value), 20));
 }
 
 function normalizeDomain(value: string): string | null {
@@ -181,14 +178,6 @@ function mapItems(items: JinaSearchItem[], numResults: number, filters: ReturnTy
 	return { results, content };
 }
 
-function buildAnswer(results: SearchResponse["results"]): string {
-	return results
-		.map((result) => result.snippet
-			? `${result.snippet}\nSource: ${result.title} (${result.url})`
-			: `Source: ${result.title} (${result.url})`)
-		.join("\n\n");
-}
-
 function rethrowRequestError(
 	err: unknown,
 	apiKey: string,
@@ -220,7 +209,7 @@ export function isJinaSearchAvailable(): boolean {
 
 export async function searchWithJina(query: string, options: JinaSearchOptions = {}): Promise<SearchResponse> {
 	const apiKey = await requireApiKey(options.signal);
-	const numResults = normalizeCount(options.numResults);
+	const numResults = normalizeSearchResultCount(options.numResults);
 	const { url, filters } = buildSearchRequest(query, options, numResults);
 	const activityId = activityMonitor.logStart({ type: "api", query });
 	const request = requestSignal(options.signal);
@@ -276,7 +265,7 @@ export async function searchWithJina(query: string, options: JinaSearchOptions =
 	}
 	activityMonitor.logComplete(activityId, response.status);
 	const result: SearchResponse = {
-		answer: buildAnswer(mapped.results),
+		answer: formatSearchResultsAsAnswer(mapped.results),
 		results: mapped.results,
 	};
 	if (options.includeContent && mapped.content.length > 0) result.inlineContent = mapped.content;

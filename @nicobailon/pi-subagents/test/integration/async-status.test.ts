@@ -73,7 +73,7 @@ describe("async status helpers", () => {
 				outputFile,
 				steps: [
 					{ agent: "scout", status: "complete", durationMs: 10, description: "Inspect auth only" },
-					{ agent: "worker", status: "running", durationMs: 20, description: "Patch billing only", contextLimit: 128_000, toolBudgetBlocked: true, watchdog: { phase: "stale", seq: 2, lastUpdate: 200, followUpPending: false } },
+					{ agent: "worker", status: "running", durationMs: 20, description: "Patch billing only", contextLimit: 128_000, toolBudgetBlocked: true, watchdog: { phase: "stale", seq: 2, lastUpdate: 200 } },
 				],
 			});
 			const descriptor = createRunFanoutBudget("run-a", 64);
@@ -330,7 +330,7 @@ describe("async status helpers", () => {
 		}
 	});
 
-	it("preserves agent contract projections on step summaries", () => {
+	it("reads legacy mutation-effect fields as inert persisted JSON", () => {
 		const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-async-status-contract-"));
 		try {
 			createAsyncDir(root, "run-contract", {
@@ -357,6 +357,7 @@ describe("async status helpers", () => {
 			assert.equal(step?.acceptance?.status, "rejected");
 			assert.equal(step?.review?.status, "not-requested");
 			assert.equal(step?.effects?.fileMutation?.status, "missing");
+			assert.equal(step?.execution?.success, true);
 		} finally {
 			fs.rmSync(root, { recursive: true, force: true });
 		}

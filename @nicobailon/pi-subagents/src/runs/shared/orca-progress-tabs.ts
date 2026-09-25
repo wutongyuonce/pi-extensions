@@ -29,7 +29,7 @@ const ORCA_CREATE_WATCHDOG_SCRIPT = [
 	"function exists(file){try{return fs.existsSync(file)}catch{return false}}",
 	"function keepQueued(){try{const now=new Date();fs.utimesSync(done,now,now)}catch{}}",
 	"function predecessorReady(){if(previous==='-')return true;if(exists(previous.replace(/\\.pending$/,'.ready')))return true;try{return Date.now()-fs.statSync(previous).mtimeMs>=waitTimeout}catch{return true}}",
-	"function updateManifest(state,stdout=''){if(manifest==='-')return;try{const payload=JSON.parse(fs.readFileSync(manifest,'utf8'));payload.state=state;payload.updatedAt=new Date().toISOString();const raw=stdout.trim().split(/\\r?\\n/).filter(Boolean).at(-1);if(raw){try{payload.orca=JSON.parse(raw)}catch{payload.orcaRaw=raw.slice(0,4096)}}fs.writeFileSync(manifest,JSON.stringify(payload,null,2)+'\\n')}catch{}}",
+	"function updateManifest(state,stdout=''){if(manifest==='-')return;try{const payload=JSON.parse(fs.readFileSync(manifest,'utf8'));payload.state=state;payload.updatedAt=new Date().toISOString();const raw=stdout.trim();if(raw){try{payload.orca=JSON.parse(raw)}catch{payload.orcaRaw=raw.slice(0,4096)}}fs.writeFileSync(manifest,JSON.stringify(payload,null,2)+'\\n')}catch{}}",
 	"function start(){",
 	" try{",
 	"  const child=spawn(command,args,{stdio:['ignore','pipe','ignore'],windowsHide:true});",
@@ -53,10 +53,13 @@ const ORCA_CLEANUP_WATCHDOG_SCRIPT = [
 ].join("");
 
 export interface OrcaProgressTab {
+	/** Resolves when the terminal-create watchdog closes, after its final manifest/queue writes (success or failure). Not viewer completion. */
+	readonly creationSettled: Promise<void>;
 	append(text: string): void;
 	section(input: { agent: string; index: number; count: number }): void;
 	event(event: { type?: string; message?: Message; toolName?: string; args?: unknown }): void;
-	finish(status: "completed" | "failed" | "stopped", sessionFile?: string): void;
+	/** Resolves once the mirrored log and its done marker are on disk, so a host may exit afterwards. */
+	finish(status: "completed" | "failed" | "stopped", sessionFile?: string): Promise<void>;
 }
 
 function executableFile(candidate: string): boolean {
@@ -102,9 +105,10 @@ const VIEWER_SCRIPT = [
 	"if(state==='escape'){if(char==='[')state='csi';else if(char===']')state='osc';else if(char==='P'||char==='X'||char==='^'||char==='_')state='string';else if(code<32||code>47)state='text';continue}",
 	"if(state==='csi'){if(code>=64&&code<=126)state='text';continue}",
 	"if(state==='osc'){if(code===7)state='text';else if(code===27)state='osc-escape';continue}",
-	"if(state==='osc-escape'){state=char==='\\\\'?'text':code===27?'osc-escape':'osc';continue}",
+	"const BACKSLASH=String.fromCharCode(92);",
+	"if(state==='osc-escape'){state=char===BACKSLASH?'text':code===27?'osc-escape':'osc';continue}",
 	"if(state==='string'){if(code===27)state='string-escape';continue}",
-	"if(state==='string-escape')state=char==='\\\\'?'text':code===27?'string-escape':'string';",
+	"if(state==='string-escape')state=char===BACKSLASH?'text':code===27?'string-escape':'string';",
 	"}return output}",
 	"function write(buffer){const output=sanitize(decoder.write(buffer));if(output)process.stdout.write(output)}",
 	"function pump(){",
@@ -401,6 +405,8 @@ export function createOrcaProgressTab(input: {
 		}
 	};
 	let createSettled = false;
+	let resolveCreationSettled!: () => void;
+	const creationSettled = new Promise<void>((resolve) => { resolveCreationSettled = resolve; });
 	let cleanupPaths: string[] | undefined;
 	const scheduleDeferredCleanup = () => {
 		if (!createSettled || cleanupPaths === undefined) return;
@@ -433,6 +439,7 @@ export function createOrcaProgressTab(input: {
 			createSettled = true;
 			if (code !== 0) failObserver();
 			scheduleDeferredCleanup();
+			resolveCreationSettled();
 		});
 		watchdog.once("error", () => {
 			markCreateReady();
@@ -449,6 +456,7 @@ export function createOrcaProgressTab(input: {
 
 	let finished = false;
 	return {
+		creationSettled,
 		append(text) {
 			if (finished) return;
 			writeProgress(text);
@@ -475,7 +483,7 @@ export function createOrcaProgressTab(input: {
 			}
 		},
 		finish(status, sessionFile) {
-			if (!available || finished) return;
+			if (!available || finished) return Promise.resolve();
 			finished = true;
 			const sessionId = status === "completed" ? resolvePiSessionId(sessionFile) : undefined;
 			let verifiedSessionFile: string | undefined;
@@ -488,11 +496,15 @@ export function createOrcaProgressTab(input: {
 			const truncation = truncated ? `\n[progress mirror truncated at ${MAX_MIRROR_BYTES} bytes]\n` : "";
 			let footer = `${truncation}\n${"─".repeat(48)}\n${terminalMessage}\n`;
 			if (scheduledBytes + Buffer.byteLength(footer) > MAX_MIRROR_BYTES) footer = `\n${status}\n`;
-			logStream.end(footer, () => {
-				if (!available) return;
-				try { fs.writeFileSync(donePath, `${status}\n`, { encoding: "utf-8", mode: 0o600 }); } catch { /* best effort */ }
-				cleanupPaths = [logPath, donePath];
-				scheduleDeferredCleanup();
+			return new Promise<void>((resolve) => {
+				logStream.end(footer, () => {
+					if (available) {
+						try { fs.writeFileSync(donePath, `${status}\n`, { encoding: "utf-8", mode: 0o600 }); } catch { /* best effort */ }
+						cleanupPaths = [logPath, donePath];
+						scheduleDeferredCleanup();
+					}
+					resolve();
+				});
 			});
 		},
 	};

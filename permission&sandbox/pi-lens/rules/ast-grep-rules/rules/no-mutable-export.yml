@@ -1,0 +1,13 @@
+id: no-mutable-export
+language: TypeScript
+severity: warning
+message: "Exported 'let'/'var' is mutable — importers observe it change, creating hidden shared state; export 'const'"
+metadata:
+  category: code-smell
+note: |
+  A binding exported with let/var can be reassigned after import, so different
+  modules may see different values over time — a common source of hard-to-trace
+  bugs. Export a const, or expose a getter/function when the value must change.
+rule:
+  kind: export_statement
+  regex: '^export\s+(let|var)\b'

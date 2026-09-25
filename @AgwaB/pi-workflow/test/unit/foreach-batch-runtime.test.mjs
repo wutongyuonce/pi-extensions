@@ -1,22 +1,30 @@
+import { drainWorkflowFixture, withWorkflowFixtureLease } from "./workflow-fixture-lifecycle.mjs";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import {
 	mkdirSync,
 	mkdtempSync,
 	readFileSync,
+	statSync,
 	rmSync,
 	writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join, relative } from "node:path";
+import { join, relative, dirname } from "node:path";
 import { after, test } from "node:test";
 
+import { compileWorkflow } from "../../.tmp/unit/compiler.js";
+import { applyExecutionProfileStageOverrides } from "../../.tmp/unit/execution-profile.js";
+import { loadWorkflowSpec } from "../../.tmp/unit/schema.js";
 import { buildForeachGeneratedTasks } from "../../.tmp/unit/engine-run-graph.js";
 import {
 	assertForeachBatchRecord,
 	buildForeachBatchPrompt,
+	foreachBatchTasks,
+	migrateForeachBatchFallbackTasks,
 	parseForeachBatchEnvelope,
 } from "../../.tmp/unit/foreach-batch-runtime.js";
+import { hasNonSpawnableWorkflowLaunchAuthority } from "../../.tmp/unit/launch-authority.js";
 import {
 	refreshRun,
 	resumeRun,
@@ -27,19 +35,32 @@ import {
 } from "../../.tmp/unit/engine.js";
 import {
 	compiledWorkflowPath,
+	createWorkflowRunRecord,
 	readRunRecord,
 	withRunLease,
 	workflowRunDir,
 	writeRunRecord,
+	writeStaticRunArtifacts,
 } from "../../.tmp/unit/store.js";
 import {
+	launchSubagentTask,
+	recoverForeachBatchRuntimeForTests,
 	setSubagentApiForTests,
 	setSubagentLaunchControlsForTests,
 } from "../../.tmp/unit/subagent-backend.js";
+import {
+	readWorkflowArtifact,
+	handleWorkflowArtifactToolCall,
+	setArtifactReadHookForTests,
+} from "../../.tmp/unit/workflow-artifact-tool.js";
+import { checkRequiredArtifactReads } from "../../.tmp/unit/subagent-backend.js";
+import * as rawContract from "../../.tmp/unit/workflow-raw-contract.js";
+const { establishRawOwner, setRawOwnerEstablishmentHookForTests } = rawContract;
 import { setWorkflowOutputArtifactWriteHookForTests } from "../../.tmp/unit/workflow-output-artifacts.js";
 
+const UNIT_TEST_ROOT = mkdtempSync(join(tmpdir(), "pi-workflow-tests-"));
 const UNIT_TEST_HOME = mkdtempSync(
-	join(tmpdir(), "foreach-batch-runtime-home-"),
+	join(UNIT_TEST_ROOT, "foreach-batch-runtime-home-"),
 );
 process.env.HOME = UNIT_TEST_HOME;
 process.env.USERPROFILE = UNIT_TEST_HOME;
@@ -50,12 +71,19 @@ process.env.USERPROFILE = UNIT_TEST_HOME;
 // the assertion runs under the full concurrent suite.
 setSubagentLaunchControlsForTests({ releaseDelayMs: 0, retryJitterMs: 0 });
 
-after(() => {
-	rmSync(UNIT_TEST_HOME, { recursive: true, force: true });
-});
+function cleanupUnitTestRoot() {
+	if (process.exitCode !== undefined && process.exitCode !== 0) {
+		console.error(`foreach batch test artifacts retained at ${UNIT_TEST_ROOT}`);
+		return;
+	}
+	rmSync(UNIT_TEST_ROOT, { recursive: true, force: true });
+}
+
+after(cleanupUnitTestRoot);
+process.on("exit", cleanupUnitTestRoot);
 
 function makeProject() {
-	return mkdtempSync(join(tmpdir(), "foreach-batch-runtime-"));
+	return mkdtempSync(join(UNIT_TEST_ROOT, "foreach-batch-runtime-"));
 }
 
 function writeAgent(cwd) {
@@ -94,12 +122,7 @@ function batchOutput(items) {
 function writeWorkflow(
 	cwd,
 	name,
-	{
-		itemCount = 3,
-		maxConcurrency = 2,
-		groupBy,
-		stageMaxConcurrency,
-	} = {},
+	{ itemCount = 3, maxConcurrency = 2, groupBy, stageMaxConcurrency } = {},
 ) {
 	const dir = join(cwd, "workflows", name);
 	mkdirSync(dir, { recursive: true });
@@ -156,7 +179,14 @@ function writeWorkflow(
 	}));
 }
 
-function writeSubagentArtifacts(cwd, runsDir, runId, attemptId, output) {
+function writeSubagentArtifacts(
+	cwd,
+	runsDir,
+	runId,
+	attemptId,
+	output,
+	correlationId,
+) {
 	const dir = join(cwd, runsDir, runId, "attempts", attemptId);
 	mkdirSync(dir, { recursive: true });
 	writeFileSync(join(dir, "output.log"), output);
@@ -164,10 +194,23 @@ function writeSubagentArtifacts(cwd, runsDir, runId, attemptId, output) {
 	writeFileSync(
 		join(dir, "result.json"),
 		JSON.stringify({
+			runId,
+			attemptId,
 			status: "completed",
 			startedAt: new Date(Date.now() - 100).toISOString(),
 			completedAt: new Date().toISOString(),
 			exitCode: 0,
+		}),
+	);
+	writeFileSync(
+		join(cwd, runsDir, runId, "run.json"),
+		JSON.stringify({
+			runId,
+			correlationId,
+			latestAttemptId: attemptId,
+			activeAttemptId: null,
+			status: "completed",
+			attempts: [{ attemptId, status: "completed" }],
 		}),
 	);
 	return dir;
@@ -228,8 +271,7 @@ function fakeApi({
 								...(options.authorityBindingSha256 === undefined
 									? {}
 									: {
-											authorityBindingSha256:
-												options.authorityBindingSha256,
+											authorityBindingSha256: options.authorityBindingSha256,
 										}),
 								directoryIdentity: { device: 1, inode: barrierCount },
 								timeoutMs: options.timeoutMs,
@@ -239,9 +281,7 @@ function fakeApi({
 							return barrier;
 						},
 						durableLaunchBarrierDigest(value) {
-							return createHash("sha256")
-								.update(JSON.stringify(value))
-								.digest("hex");
+							return createHash("sha256").update(JSON.stringify(value)).digest("hex");
 						},
 						async waitForDurableLaunchBarrierV2Ready(barrier) {
 							const launch = launches.at(-1);
@@ -255,8 +295,7 @@ function fakeApi({
 								...(barrier.authorityBindingSha256 === undefined
 									? {}
 									: {
-											authorityBindingSha256:
-												barrier.authorityBindingSha256,
+											authorityBindingSha256: barrier.authorityBindingSha256,
 										}),
 								runId: launch.runId,
 								attemptId: launch.attemptId,
@@ -284,8 +323,7 @@ function fakeApi({
 								...(barrier.authorityBindingSha256 === undefined
 									? {}
 									: {
-											authorityBindingSha256:
-												barrier.authorityBindingSha256,
+											authorityBindingSha256: barrier.authorityBindingSha256,
 										}),
 								runId: ready.runId,
 								attemptId: ready.attemptId,
@@ -310,8 +348,7 @@ function fakeApi({
 								...(barrier.authorityBindingSha256 === undefined
 									? {}
 									: {
-											authorityBindingSha256:
-												barrier.authorityBindingSha256,
+											authorityBindingSha256: barrier.authorityBindingSha256,
 										}),
 								cancellationId: options.cancellationId,
 								reasonSha256: options.reasonSha256,
@@ -391,6 +428,7 @@ function fakeApi({
 					runId,
 					attemptId,
 					output,
+					options.correlationId,
 				);
 				launches.push({ runId, attemptId, kind, prompt, artifactDir });
 				runs.set(runId, { runId, attemptId, kind, artifactDir });
@@ -455,9 +493,7 @@ function fakeApi({
 					interruptedAttempts: [],
 					unsupportedAttempts: [],
 					record: {
-						attempts: [
-							{ attemptId: options.attemptId, status: "cancelled" },
-						],
+						attempts: [{ attemptId: options.attemptId, status: "cancelled" }],
 					},
 				};
 			},
@@ -471,10 +507,7 @@ async function persistTerminalBatchBoundary(cwd, runId, fake) {
 	assert.ok(record, "expected one durable batch record");
 	const launch = fake.launches.find((candidate) => candidate.kind === "batch");
 	assert.ok(launch, "expected physical batch launch");
-	const rawOutput = readFileSync(
-		join(launch.artifactDir, "output.log"),
-		"utf8",
-	);
+	const rawOutput = readFileSync(join(launch.artifactDir, "output.log"), "utf8");
 	const directory = join(
 		workflowRunDir(cwd, runId),
 		"foreach-batches",
@@ -504,6 +537,9 @@ async function persistTerminalBatchBoundary(cwd, runId, fake) {
 			batchId: record.batchId,
 			role: member.role,
 			phase: "terminal_received",
+			...(task.foreachBatch?.physicalAttempt === undefined
+				? {}
+				: { physicalAttempt: task.foreachBatch.physicalAttempt }),
 		};
 		task.status = "running";
 		task.statusDetail = "batch_terminal_received";
@@ -593,7 +629,10 @@ test("batch prompt makes nested JSON decoding explicit and preserves decoded pre
 	});
 	assert.match(prompt, /Parse it as JSON before processing either item/);
 	assert.match(prompt, /never from its displayed serialized representation/);
-	assert.match(prompt, /same threshold you would use if that item were the only task/);
+	assert.match(
+		prompt,
+		/same threshold you would use if that item were the only task/,
+	);
 	const encoded = prompt.split("# Untrusted Prepared Item Tasks\n\n")[1];
 	let decoded;
 	try {
@@ -690,9 +729,17 @@ test("groupBy separates adjacent keys and a missing key is singleton-only", asyn
 
 test("profile-only batching uses one physical launch, preserves per-item artifacts, downstream, and logical slots", async () => {
 	const cwd = makeProject();
+	let started;
 	try {
 		writeAgent(cwd);
 		const items = writeWorkflow(cwd, "batch-valid");
+		items.forEach((item, index) => {
+			item.id = ["A", "B", "C"][index];
+		});
+		const specPath = join(cwd, "workflows", "batch-valid", "spec.json");
+		const spec = JSON.parse(readFileSync(specPath, "utf8"));
+		spec.artifactGraph.stages[2].from = "fan";
+		writeFileSync(specPath, JSON.stringify(spec));
 		const fake = fakeApi({
 			cwd,
 			items,
@@ -706,7 +753,7 @@ test("profile-only batching uses one physical launch, preserves per-item artifac
 			}),
 		});
 		setSubagentApiForTests(fake.api);
-		const started = await runWorkflow("batch-valid", cwd, {
+		started = await runWorkflow("batch-valid", cwd, {
 			task: "Run batched items.",
 			executionProfile: "batched",
 		});
@@ -731,7 +778,8 @@ test("profile-only batching uses one physical launch, preserves per-item artifac
 		assert.match(batch.capabilitySubjectSha256, /^[a-f0-9]{64}$/u);
 		assert.equal(batch.dispatch?.state, "reserved");
 		assert.equal(
-			active.tasks.find((task) => task.foreachBatch?.role === "leader")
+			active.tasks
+				.find((task) => task.foreachBatch?.role === "leader")
 				?.durableLaunchBarrier?.records.at(-1)?.phase,
 			"acknowledged",
 		);
@@ -766,6 +814,95 @@ test("profile-only batching uses one physical launch, preserves per-item artifac
 			completedBatch?.physicalExecution?.timing,
 			"physical batch timing must be attributed once at batch level",
 		);
+		// Exercise every logical item (especially the handle-less follower), not
+		// just the physical leader or filesystem bytes. Normal host commits must
+		// have persisted each anchor; tests never synthesize an integrity record.
+		const persisted = await readRunRecord(cwd, started.runId);
+		const runDir = workflowRunDir(cwd, started.runId);
+		const downstream = persisted.tasks.find(
+			(task) => task.stageId === "downstream",
+		);
+		const consumer = dirname(join(cwd, downstream.files.result));
+		const manifestPath = join(consumer, "source-manifest.json");
+		const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+		assert.deepEqual(
+			manifest.sources.map((source) => source.source),
+			["fan", "fan.b", "fan.c"],
+		);
+		for (const source of manifest.sources) {
+			const task = persisted.tasks.find((task) => task.taskId === source.taskId);
+			const path = join(dirname(join(cwd, task.files.result)), "raw.md");
+			const raw = readFileSync(path, "utf8");
+			assert.ok(task.rawArtifactIntegrity, `host anchor for ${task.taskId}`);
+			assert.equal(statSync(path).nlink, task.foreachBatch ? 2 : 3);
+			assert.equal(source.artifacts.raw.path, path);
+			const full = await readWorkflowArtifact(manifest, source.source, "raw", {
+				runDir,
+				maxBytes: 65536,
+			});
+			assert.equal(full.content, raw);
+			assert.equal(full.returnedBytes, Buffer.byteLength(raw));
+			assert.equal(full.truncated, false);
+			assert.equal(full.rawAssurance.kind, "host_digest_verified");
+			const config = {
+				runId: started.runId,
+				taskId: downstream.taskId,
+				runDir,
+				manifestPath,
+				ledgerPath: join(consumer, `${task.taskId}-ledger.jsonl`),
+			};
+			// requiredReads reads read-ledger.jsonl, reset it per logical source.
+			config.ledgerPath = join(consumer, "read-ledger.jsonl");
+			writeFileSync(config.ledgerPath, "");
+			const prefix = await readWorkflowArtifact(manifest, source.source, "raw", {
+				runDir,
+				maxBytes: 19,
+			});
+			assert.equal(prefix.content, raw.slice(0, 19));
+			assert.equal(prefix.returnedBytes, 19);
+			assert.equal(prefix.rawAssurance.kind, "host_digest_verified");
+			await handleWorkflowArtifactToolCall(
+				{ action: "read", source: source.source, artifact: "raw" },
+				{ ...config, maxBytes: 19 },
+			);
+			assert.deepEqual(
+				(await checkRequiredArtifactReads(consumer, [`${source.source}.raw`]))
+					.missing,
+				[`${source.source}.raw`],
+			);
+			const tool = await handleWorkflowArtifactToolCall(
+				{ action: "read", source: source.source, artifact: "raw" },
+				config,
+			);
+			assert.equal(tool.details.rawAssurance.kind, "host_digest_verified");
+			assert.deepEqual(
+				(await checkRequiredArtifactReads(consumer, [`${source.source}.raw`]))
+					.missing,
+				[],
+			);
+		}
+		for (const field of [
+			"taskId",
+			"specId",
+			"stageId",
+			"generation",
+			"sourceGeneration",
+			"source",
+		]) {
+			const forged = structuredClone(manifest),
+				source = forged.sources[0];
+			source[field] =
+				field.includes("Generation") || field === "generation" ? 999 : "foreign";
+			await assert.rejects(() =>
+				readWorkflowArtifact(forged, source.source, "raw", { runDir }),
+			);
+		}
+		const ambiguous = structuredClone(manifest);
+		delete ambiguous.sources[0].taskId;
+		delete ambiguous.sources[0].specId;
+		await assert.rejects(() =>
+			readWorkflowArtifact(ambiguous, "fan", "raw", { runDir }),
+		);
 		const fanTasks = completed.tasks.filter((task) => task.stageId === "fan");
 		assert.equal(fanTasks.length, 3);
 		for (const task of fanTasks) {
@@ -775,9 +912,7 @@ test("profile-only batching uses one physical launch, preserves per-item artifac
 			);
 			assert.equal(control.status, "completed");
 			assert.ok(
-				readFileSync(join(cwd, task.files.output), "utf8").includes(
-					"<control>",
-				),
+				readFileSync(join(cwd, task.files.output), "utf8").includes("<control>"),
 			);
 		}
 		assert.equal(
@@ -785,10 +920,377 @@ test("profile-only batching uses one physical launch, preserves per-item artifac
 			"completed",
 		);
 	} finally {
+		let drained = false;
+		try {
+			if (started) await drainWorkflowFixture(cwd, started.runId);
+			drained = true;
+		} finally {
+			setSubagentApiForTests(undefined);
+			// A failed drain must retain the fixture rather than delete under a writer.
+			if (drained) rmSync(cwd, { recursive: true, force: true });
+		}
+	}
+});
+
+test("scheduler persisted dynamic export manifest reads exact full/truncated raw and rejects forged tuples/aliases", async () => {
+	const cwd = makeProject();
+	try {
+		writeAgent(cwd);
+		const dir = join(cwd, "workflows", "raw-dynamic-export");
+		mkdirSync(dir, { recursive: true });
+		writeFileSync(
+			join(dir, "controller.mjs"),
+			`export default async function(ctx) {
+		 const output = await ctx.agent({id:'synthesis',agent:'unit-scout',tools:['read'],prompt:'Synthesize local output.'});
+		 return {control:{schema:'dynamic-controller-result-v1',digest:'done',outputTasks:[output.specId]},analysis:'Controller evidence é 🎯',refs:[]};
+		}`,
+		);
+		writeFileSync(
+			join(dir, "spec.json"),
+			JSON.stringify({
+				schemaVersion: 1,
+				name: "raw-dynamic-export",
+				defaults: { agent: "unit-scout", readOnly: true, tools: ["read"] },
+				artifactGraph: {
+					stages: [
+						{
+							id: "adaptive",
+							type: "dynamic",
+							dynamic: { uses: "./controller.mjs" },
+						},
+						{
+							id: "consumer",
+							type: "single",
+							from: "adaptive",
+							prompt: "Finish after every fan item.",
+						},
+					],
+				},
+			}),
+		);
+		const fake = fakeApi({ cwd, items: [], durableBarrier: true });
+		setSubagentApiForTests(fake.api);
+		const started = await runWorkflow("raw-dynamic-export", cwd, {
+			task: "Local dynamic export",
+		});
+		const terminal = await waitForRun(cwd, started.runId, 20000);
+		assert.equal(terminal.status, "completed");
+		const run = await readRunRecord(cwd, started.runId),
+			runDir = workflowRunDir(cwd, run.runId);
+		const consumerTask = run.tasks.find((task) => task.stageId === "consumer");
+		const consumer = dirname(join(cwd, consumerTask.files.result)),
+			manifestPath = join(consumer, "source-manifest.json");
+		const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+		assert.deepEqual(
+			manifest.sources.map((source) => source.source),
+			["adaptive", "adaptive.output"],
+		);
+		const config = {
+			runId: run.runId,
+			taskId: consumerTask.taskId,
+			runDir,
+			manifestPath,
+			ledgerPath: join(consumer, "read-ledger.jsonl"),
+		};
+		for (const source of manifest.sources) {
+			const task = run.tasks.find((task) => task.taskId === source.taskId),
+				raw = readFileSync(source.artifacts.raw.path, "utf8");
+			assert.ok(task.rawArtifactIntegrity);
+			assert.deepEqual(
+				JSON.parse(readFileSync(join(cwd, task.files.result), "utf8")).rawIntegrity,
+				task.rawArtifactIntegrity,
+			);
+			for (const maxBytes of [17, 65536]) {
+				const read = await readWorkflowArtifact(manifest, source.source, "raw", {
+					runDir,
+					maxBytes,
+				});
+				assert.equal(read.content, maxBytes === 17 ? raw.slice(0, 17) : raw);
+				assert.equal(read.bytes, Buffer.byteLength(raw));
+				assert.equal(
+					read.returnedBytes,
+					maxBytes === 17 ? 17 : Buffer.byteLength(raw),
+				);
+				assert.equal(read.truncated, maxBytes === 17);
+				assert.equal(read.rawAssurance.kind, "host_digest_verified");
+			}
+			writeFileSync(config.ledgerPath, "");
+			const prefix = await handleWorkflowArtifactToolCall(
+				{ action: "read", source: source.source, artifact: "raw" },
+				{ ...config, maxBytes: 17 },
+			);
+			assert.equal(prefix.details.rawAssurance.kind, "host_digest_verified");
+			assert.deepEqual(
+				(await checkRequiredArtifactReads(consumer, [`${source.source}.raw`]))
+					.missing,
+				[`${source.source}.raw`],
+			);
+			const full = await handleWorkflowArtifactToolCall(
+				{ action: "read", source: source.source, artifact: "raw" },
+				config,
+			);
+			assert.equal(full.details.rawAssurance.kind, "host_digest_verified");
+			assert.deepEqual(
+				(await checkRequiredArtifactReads(consumer, [`${source.source}.raw`]))
+					.missing,
+				[],
+			);
+		}
+		for (const kind of [
+			"taskId",
+			"specId",
+			"stageId",
+			"generation",
+			"sourceGeneration",
+			"missing-task",
+			"missing-spec",
+			"missing-stage",
+			"fabricated-alias",
+			"foreign-export",
+			"duplicate-alias",
+			"foreign-run",
+			"controller-generation",
+		]) {
+			const forged = structuredClone(manifest),
+				source = forged.sources[1];
+			if (["taskId", "specId", "stageId"].includes(kind)) source[kind] = "foreign";
+			if (["generation", "sourceGeneration"].includes(kind)) source[kind] = 999;
+			if (kind.startsWith("missing-"))
+				delete source[
+					{
+						"missing-task": "taskId",
+						"missing-spec": "specId",
+						"missing-stage": "stageId",
+					}[kind]
+				];
+			if (kind === "fabricated-alias") source.source = "arbitrary.output";
+			if (kind === "foreign-export") {
+				const other = forged.sources[0];
+				Object.assign(source, {
+					taskId: other.taskId,
+					specId: other.specId,
+					stageId: other.stageId,
+					generation: other.generation,
+					sourceGeneration: other.sourceGeneration,
+					artifacts: other.artifacts,
+				});
+			}
+			if (kind === "duplicate-alias") forged.sources.push(structuredClone(source));
+			if (kind === "foreign-run") forged.runId = "foreign";
+			if (kind === "controller-generation") forged.sources[0].generation = 999;
+			await assert.rejects(
+				() => readWorkflowArtifact(forged, source.source, "raw", { runDir }),
+				kind,
+			);
+		}
+		const controller = run.tasks.find((task) => task.kind === "dynamic");
+		const controlPath = join(
+			dirname(join(cwd, controller.files.result)),
+			"control.json",
+		);
+		const controlText = readFileSync(controlPath, "utf8");
+		writeFileSync(config.ledgerPath, "");
+		setArtifactReadHookForTests(async () => {
+			setArtifactReadHookForTests(undefined);
+			const control = JSON.parse(controlText);
+			control.outputTasks = [controller.specId];
+			writeFileSync(controlPath, JSON.stringify(control));
+		});
+		await assert.rejects(() =>
+			handleWorkflowArtifactToolCall(
+				{ action: "read", source: "adaptive.output", artifact: "raw" },
+				config,
+			),
+		);
+		assert.equal(
+			readFileSync(config.ledgerPath, "utf8"),
+			"",
+			"changed export resolution cannot publish a ledger row",
+		);
+		assert.deepEqual(
+			(await checkRequiredArtifactReads(consumer, ["adaptive.output.raw"]))
+				.missing,
+			["adaptive.output.raw"],
+		);
+		writeFileSync(controlPath, controlText);
+	} finally {
+		setArtifactReadHookForTests(undefined);
 		setSubagentApiForTests(undefined);
 		rmSync(cwd, { recursive: true, force: true });
 	}
 });
+
+for (const kind of ["backend", "salvage", "batch", "dynamic"])
+	for (const drift of kind === "dynamic"
+		? ["run", "task"]
+		: ["run", "task", "mirror", "attempt"])
+		test(`explicit ${kind} host rejects joined pre-establishment ${drift} drift`, async () => {
+			const cwd = makeProject();
+			let hits = 0;
+			let rejectedTaskDir;
+			try {
+				writeAgent(cwd);
+				let items = [];
+				if (kind === "batch") items = writeWorkflow(cwd, "owner-drift");
+				else {
+					const dir = join(cwd, "workflows", "owner-drift");
+					mkdirSync(dir, { recursive: true });
+					writeFileSync(
+						join(dir, "controller.mjs"),
+						`export default function(){return {control:{schema:'dynamic-controller-result-v1',digest:'done'},analysis:'Fresh dynamic body',refs:[]}}`,
+					);
+					writeFileSync(
+						join(dir, "spec.json"),
+						JSON.stringify({
+							schemaVersion: 1,
+							name: "owner-drift",
+							defaults: { agent: "unit-scout", readOnly: true, tools: ["read"] },
+							artifactGraph: {
+								stages: [
+									kind === "dynamic"
+										? {
+												id: "producer",
+												type: "dynamic",
+												dynamic: { uses: "./controller.mjs" },
+											}
+										: { id: "producer", type: "single", prompt: "Local valid body." },
+								],
+							},
+						}),
+					);
+				}
+				const fake = fakeApi({
+					cwd,
+					items,
+					durableBarrier: true,
+					batchItemFactory: (id) => ({
+						id,
+						control: { schema: "stage-control-v1", digest: id },
+						analysis: "batch evidence",
+						refs: [],
+					}),
+				});
+				if (kind === "salvage") {
+					const get = fake.api.getSubagentStatus;
+					fake.api.getSubagentStatus = async (options) => {
+						const status = await get(options),
+							attemptDir = status.logs[0].artifactCwd,
+							mirrorPath = join(dirname(dirname(attemptDir)), "run.json");
+						const terminalPath = join(attemptDir, "result.json"),
+							terminal = JSON.parse(readFileSync(terminalPath, "utf8")),
+							mirror = JSON.parse(readFileSync(mirrorPath, "utf8"));
+						terminal.status = "failed";
+						mirror.status = "failed";
+						mirror.attempts[0].status = "failed";
+						writeFileSync(terminalPath, JSON.stringify(terminal));
+						writeFileSync(mirrorPath, JSON.stringify(mirror));
+						return {
+							...status,
+							status: "failed",
+							failureKind: "model",
+							metadata: { stopReason: "end", contextLengthExceeded: false },
+						};
+					};
+				}
+				setSubagentApiForTests(fake.api);
+				setRawOwnerEstablishmentHookForTests(async (taskDir) => {
+					const runPath = join(dirname(dirname(taskDir)), "run.json"),
+						run = JSON.parse(readFileSync(runPath, "utf8"));
+					const task = run.tasks.find(
+						(task) => dirname(join(cwd, task.files.result)) === taskDir,
+					);
+					if (kind === "batch" && !task.foreachBatch) return;
+					hits++;
+					rejectedTaskDir = taskDir;
+					// All batch members see the same invalid authority, rather than allowing
+					// a healthy sibling to publish after the failed operation has returned.
+					if (drift === "run") run.runId = "foreign";
+					if (drift === "task")
+						for (const member of run.tasks.filter((candidate) =>
+							kind === "batch" ? candidate.foreachBatch : true,
+						))
+							member.status = "blocked";
+					if (drift === "run" || drift === "task")
+						writeFileSync(runPath, JSON.stringify(run));
+					else {
+						const leader = task.foreachBatch
+							? run.tasks.find(
+									(candidate) => candidate.foreachBatch?.role === "leader",
+								)
+							: task;
+						const state = leader.launchAuthority.records.at(-1).state;
+						const mirrorDir = join(
+							cwd,
+							".pi",
+							"workflow-subagents",
+							run.runId,
+							leader.taskId,
+							state.backendRunId,
+						);
+						const path =
+							drift === "mirror"
+								? join(mirrorDir, "run.json")
+								: join(mirrorDir, "attempts", state.backendAttemptId, "result.json");
+						const record = JSON.parse(readFileSync(path, "utf8"));
+						if (drift === "mirror") record.correlationId = "foreign:task";
+						else record.attemptId = "foreign";
+						writeFileSync(path, JSON.stringify(record));
+					}
+				});
+				let started, error;
+				try {
+					started = await runWorkflow("owner-drift", cwd, {
+						task: "Joined local publication drift",
+						...(kind === "batch" ? { executionProfile: "batched" } : {}),
+					});
+					// Drive only to the rejected publication boundary; do not launch recovery
+					// attempts after this deliberately corrupted host state.
+					for (let i = 0; i < 5 && !hits; i++) {
+						await refreshRun(cwd, started.runId);
+						if (!hits) await scheduleRun(cwd, started.runId);
+					}
+				} catch (caught) {
+					error = caught;
+				}
+				assert.ok(
+					hits > 0,
+					"the actual publisher must reach the establishment fence",
+				);
+				assert.ok(
+					error || kind === "dynamic",
+					"backend publication must propagate the ownership rejection",
+				);
+				const result = JSON.parse(
+					(() => {
+						try {
+							return readFileSync(join(rejectedTaskDir, "result.json"), "utf8");
+						} catch {
+							return "{}";
+						}
+					})(),
+				);
+				assert.notEqual(result.outputValidation?.valid, true);
+				assert.throws(() => statSync(join(rejectedTaskDir, "raw.md")), {
+					code: "ENOENT",
+				});
+				if (started) {
+					const persisted = await readRunRecord(cwd, started.runId).catch(
+						() => undefined,
+					);
+					if (persisted)
+						assert.notEqual(
+							persisted.tasks.find(
+								(task) => dirname(join(cwd, task.files.result)) === rejectedTaskDir,
+							)?.status,
+							"completed",
+						);
+				}
+			} finally {
+				setRawOwnerEstablishmentHookForTests(undefined);
+				setSubagentApiForTests(undefined);
+				rmSync(cwd, { recursive: true, force: true });
+			}
+		});
 
 test("stop and resume clear an active group as a unit and resume as singletons", async () => {
 	const cwd = makeProject();
@@ -921,9 +1423,7 @@ test("restart recovers a prepared exact pair without inferring adjacency", async
 			"recovery may be observed before or immediately after replacement launch",
 		);
 		assert.deepEqual(
-			recoveredPrepared.foreachBatches?.[0]?.members.map(
-				(entry) => entry.taskId,
-			),
+			recoveredPrepared.foreachBatches?.[0]?.members.map((entry) => entry.taskId),
 			[leaderMember.taskId, memberMember.taskId],
 		);
 		await scheduleRun(cwd, started.runId);
@@ -967,8 +1467,12 @@ test("prepared batch execution-surface drift falls back before a physical batch 
 		const prepared = await readRunRecord(cwd, started.runId);
 		const record = prepared.foreachBatches?.[0];
 		assert.ok(record);
-		const leader = prepared.tasks.find((task) => task.foreachBatch?.role === "leader");
-		const member = prepared.tasks.find((task) => task.foreachBatch?.role === "member");
+		const leader = prepared.tasks.find(
+			(task) => task.foreachBatch?.role === "leader",
+		);
+		const member = prepared.tasks.find(
+			(task) => task.foreachBatch?.role === "member",
+		);
 		assert.ok(leader && member);
 		record.phase = "prepared";
 		for (const task of [leader, member]) {
@@ -978,17 +1482,34 @@ test("prepared batch execution-surface drift falls back before a physical batch 
 			task.backendFiles = undefined;
 			task.launchBootstrap = undefined;
 			task.launchAuthority = undefined;
-			task.foreachBatch = { batchId: record.batchId, role: task.foreachBatch.role, phase: "prepared" };
+			task.foreachBatch = {
+				batchId: record.batchId,
+				role: task.foreachBatch.role,
+				phase: "prepared",
+			};
 		}
-		await withRunLease(cwd, started.runId, async () => writeRunRecord(cwd, prepared));
+		await withRunLease(cwd, started.runId, async () =>
+			writeRunRecord(cwd, prepared),
+		);
 		const compiledPath = compiledWorkflowPath(cwd, started.runId);
 		const compiled = JSON.parse(readFileSync(compiledPath, "utf8"));
-		const leaderIndex = compiled.tasks.findIndex((task) => task.id === leader.specId);
-		compiled.tasks[leaderIndex].runtime = { ...compiled.tasks[leaderIndex].runtime, thinkingLevel: "high" };
+		const leaderIndex = compiled.tasks.findIndex(
+			(task) => task.id === leader.specId,
+		);
+		compiled.tasks[leaderIndex].runtime = {
+			...compiled.tasks[leaderIndex].runtime,
+			thinkingLevel: "high",
+		};
 		writeFileSync(compiledPath, JSON.stringify(compiled));
 		await scheduleRun(cwd, started.runId);
-		assert.equal(fake.launches.filter((launch) => launch.kind === "batch").length, 1);
-		assert.equal(fake.launches.filter((launch) => launch.kind === "singleton").length, 2);
+		assert.equal(
+			fake.launches.filter((launch) => launch.kind === "batch").length,
+			1,
+		);
+		assert.equal(
+			fake.launches.filter((launch) => launch.kind === "singleton").length,
+			2,
+		);
 	} finally {
 		setSubagentApiForTests(undefined);
 		rmSync(cwd, { recursive: true, force: true });
@@ -1049,9 +1570,7 @@ test("restart recovers terminal and partial-demux boundaries from durable batch 
 			0,
 			"terminal recovery must not repoll a member or leader",
 		);
-		for (const task of recovered.tasks.filter(
-			(task) => task.stageId === "fan",
-		)) {
+		for (const task of recovered.tasks.filter((task) => task.stageId === "fan")) {
 			assert.equal(task.status, "completed");
 			assert.ok(
 				readFileSync(join(cwd, task.files.result), "utf8").includes(
@@ -1086,10 +1605,23 @@ test("an expired leader falls back the exact pair after backend refresh errors",
 			}),
 		});
 		setSubagentApiForTests(fake.api);
-		const started = await runWorkflow("batch-refresh-error", cwd, {
-			task: "Recover from refresh failure.",
-			executionProfile: "batched",
+		// Own refresh explicitly: runWorkflow attaches a watcher that can consume
+		// the polling error and apply fallback before our rejection assertion.
+		const loaded = await loadWorkflowSpec("batch-refresh-error", cwd);
+		const stageOverrides = structuredClone(loaded.spec.executionProfiles.batched);
+		const spec = applyExecutionProfileStageOverrides(loaded.spec, stageOverrides, {
+			foreachRuntimeTarget: "stage",
 		});
+		const compiled = await compileWorkflow(spec, {
+			cwd,
+			specPath: loaded.specPath,
+			task: "Recover from refresh failure.",
+		});
+		const { run: started } = await createWorkflowRunRecord(cwd, compiled, loaded.specPath);
+		started.executionProfile = { name: "batched", stageOverrides };
+		await writeStaticRunArtifacts(cwd, started, compiled, spec);
+		await writeRunRecord(cwd, started);
+		await scheduleRun(cwd, started.runId, compiled);
 		await refreshRun(cwd, started.runId);
 		await scheduleRun(cwd, started.runId);
 		const active = await readRunRecord(cwd, started.runId);
@@ -1137,6 +1669,7 @@ test("one invalid batched member falls back both items to singleton without outp
 		const fake = fakeApi({
 			cwd,
 			items,
+			durableBarrier: true,
 			batchItemFactory: (id, index) => ({
 				id,
 				control: { schema: "stage-control-v1", digest: `batch-${id}` },
@@ -1168,15 +1701,466 @@ test("one invalid batched member falls back both items to singleton without outp
 			assert.equal(task.status, "completed");
 			assert.equal(task.outputRetry, undefined);
 			assert.equal(task.foreachBatch?.batchingDisabled, true);
+			assert.equal(task.foreachBatch?.physicalAttempt, 2);
 			assert.match(
 				readFileSync(join(cwd, task.files.output), "utf8"),
 				/singleton/,
 			);
+			assert.ok(
+				task.durableLaunchBarrier?.records.length >= 1,
+				"each fallback singleton must have its own durable barrier",
+			);
 		}
+		const leader = fanTasks.find((task) => task.foreachBatch?.role === "leader");
+		assert.ok(leader);
+		assert.equal(
+			leader.launchAuthority?.records.length,
+			2,
+			"batch authority and fallback authority are both retained",
+		);
+		assert.equal(
+			leader.launchBootstrap?.records.length,
+			2,
+			"batch provenance and fallback provenance are both retained",
+		);
+		assert.equal(
+			leader.durableLaunchBarrier?.records.length,
+			2,
+			"batch barrier and fallback barrier are both retained",
+		);
+		assert.notEqual(
+			leader.launchAuthority?.records[0]?.grant.attemptKey,
+			leader.launchAuthority?.records[1]?.grant.attemptKey,
+		);
+		assert.equal(
+			leader.durableLaunchBarrier?.records[0]?.phase,
+			"acknowledged",
+			"the consumed batch barrier remains terminal history",
+		);
+		assert.equal(
+			leader.durableLaunchBarrier?.records[1]?.phase,
+			"acknowledged",
+			"the fallback singleton barrier is independently acknowledged",
+		);
 	} finally {
 		setSubagentApiForTests(undefined);
 		rmSync(cwd, { recursive: true, force: true });
 	}
+});
+
+test("legacy completed member keeps its authority while pending leader migrates to a fresh singleton key", async () => {
+	const cwd = makeProject();
+	let started;
+	try {
+		writeAgent(cwd);
+		const items = writeWorkflow(cwd, "legacy-fallback-authority", {
+			itemCount: 2,
+		});
+		const fake = fakeApi({
+			cwd,
+			items,
+			failBatchLaunchOnce: true,
+			durableBarrier: true,
+			batchItemFactory: (id) => ({
+				id,
+				control: { schema: "stage-control-v1", digest: `batch-${id}` },
+				analysis: `analysis for ${id}`,
+				refs: [],
+			}),
+		});
+		setSubagentApiForTests(fake.api);
+		started = await runWorkflow("legacy-fallback-authority", cwd, {
+			task: "Create a legacy fallback authority fixture.",
+			executionProfile: "batched",
+		});
+		const initial = await waitForRun(cwd, started.runId, 20_000);
+		assert.equal(initial.status, "completed");
+		let fixture = await readRunRecord(cwd, started.runId);
+		const record = fixture.foreachBatches?.[0];
+		assert.equal(record?.phase, "fallback_applied");
+		const fanTasks = fixture.tasks.filter((task) => task.stageId === "fan");
+		const leader = fanTasks.find((task) => task.foreachBatch?.role === "leader");
+		const member = fanTasks.find((task) => task.foreachBatch?.role === "member");
+		assert.ok(leader && member);
+		// Model an old persisted fallback before the physical marker existed. The
+		// first singleton is then launched by the real scheduler with the legacy
+		// key, producing genuine consumed authority/barrier/mirror evidence.
+		for (const task of fanTasks) {
+			delete task.foreachBatch.physicalAttempt;
+			task.foreachBatch.batchingDisabled = true;
+			task.launchBootstrap = undefined;
+			task.launchAuthority = undefined;
+			task.durableLaunchBarrier = undefined;
+			task.backendHandle = undefined;
+			task.backendFiles = undefined;
+		}
+		leader.status = "completed";
+		leader.statusDetail = "completed";
+		leader.completedAt = new Date().toISOString();
+		member.status = "pending";
+		member.statusDetail = "pending";
+		await withWorkflowFixtureLease(cwd, started.runId, async () => {
+			await writeRunRecord(cwd, fixture);
+			const compiled = JSON.parse(
+				readFileSync(compiledWorkflowPath(cwd, started.runId), "utf8"),
+			);
+			await launchSubagentTask(
+				cwd,
+				fixture,
+				member,
+				compiled.tasks[fixture.tasks.indexOf(member)],
+			);
+		});
+		fixture = await waitForRun(cwd, started.runId, 20_000);
+		const completedMember = fixture.tasks.find(
+			(task) => task.taskId === member.taskId,
+		);
+		assert.ok(completedMember);
+		assert.equal(completedMember.status, "completed");
+		assert.equal(completedMember.foreachBatch?.physicalAttempt, undefined);
+		const memberTaskDir = dirname(join(cwd, completedMember.files.result));
+		const memberRawBefore = readFileSync(join(memberTaskDir, "raw.md"));
+		const memberOutputBefore = readFileSync(join(memberTaskDir, "output.log"));
+		const memberResultBefore = readFileSync(join(memberTaskDir, "result.json"));
+		const memberHistoryBefore = JSON.stringify({
+			launchBootstrap: completedMember.launchBootstrap,
+			launchAuthority: completedMember.launchAuthority,
+			durableLaunchBarrier: completedMember.durableLaunchBarrier,
+		});
+		assert.ok(
+			completedMember.launchAuthority?.records.some(
+				(entry) => !entry.grant.attemptKey.includes("physical:"),
+			),
+			"completed member must have a genuine legacy-key authority record",
+		);
+		assert.equal(
+			hasNonSpawnableWorkflowLaunchAuthority(
+				fixture,
+				completedMember,
+				"pi-subagent/headless",
+			),
+			true,
+		);
+		assert.ok(await establishRawOwner(memberTaskDir));
+		const downstream = fixture.tasks.find((task) => task.stageId === "downstream");
+		assert.ok(downstream);
+		const publicRawDir = join(
+			workflowRunDir(cwd, started.runId),
+			"public",
+		);
+		mkdirSync(publicRawDir, { recursive: true });
+		const publicRawPath = join(publicRawDir, "legacy-member-raw.md");
+		writeFileSync(publicRawPath, memberRawBefore);
+		const manifest = {
+			schema: "workflow-source-manifest-v1",
+			runId: started.runId,
+			taskId: downstream.taskId,
+			policy: { accessMode: "human-debug" },
+			sources: [
+				{
+					source: "fan.b",
+					taskId: member.taskId,
+					specId: member.specId,
+					stageId: member.stageId,
+					generation: member.generation,
+					sourceGeneration: member.sourceGeneration,
+					artifacts: { raw: { path: publicRawPath } },
+				},
+			],
+		};
+		const memberSource = manifest.sources[0];
+		assert.equal(
+			(
+				await readWorkflowArtifact(manifest, memberSource.source, "raw", {
+					runDir: workflowRunDir(cwd, started.runId),
+				})
+			).content,
+			memberRawBefore.toString(),
+		);
+		const memberLaunchesBeforeRecovery = await withWorkflowFixtureLease(cwd, started.runId, async () => {
+			for (const historicalStatus of [
+				"failed",
+				"interrupted",
+				"blocked",
+				"skipped",
+			]) {
+				const historicalMember = fixture.tasks.find(
+					(task) => task.taskId === member.taskId,
+				);
+				const pendingPeer = fixture.tasks.find(
+					(task) => task.taskId === leader.taskId,
+				);
+				assert.ok(historicalMember && pendingPeer);
+				historicalMember.status = historicalStatus;
+				historicalMember.statusDetail = historicalStatus;
+				historicalMember.completedAt = undefined;
+				pendingPeer.status = "pending";
+				pendingPeer.statusDetail = "pending";
+				await writeRunRecord(cwd, fixture);
+				const changed = await recoverForeachBatchRuntimeForTests(cwd, fixture);
+				const retained = await readRunRecord(cwd, started.runId);
+				assert.equal(retained.tasks.find((task) => task.taskId === member.taskId)?.foreachBatch
+					?.physicalAttempt, undefined);
+				assert.equal(
+					retained.tasks.find((task) => task.taskId === leader.taskId)?.foreachBatch
+						?.physicalAttempt,
+					2,
+				);
+				assert.ok(
+					retained.tasks.find((task) => task.taskId === member.taskId)?.launchAuthority
+						?.records.some((entry) => !entry.grant.attemptKey.includes("physical:")),
+				);
+				assert.ok(
+					retained.tasks.find((task) => task.taskId === member.taskId)
+						?.durableLaunchBarrier?.records.some(
+							(entry) => !entry.attemptKey.includes("physical:"),
+						),
+				);
+				assert.equal(changed, historicalStatus === "failed");
+
+				assert.equal(await recoverForeachBatchRuntimeForTests(cwd, retained), false);
+				fixture = retained;
+			}
+			const memberBarrier = completedMember.durableLaunchBarrier?.records.find(
+				(entry) => !entry.attemptKey.includes("physical:"),
+			);
+			assert.equal(memberBarrier?.phase, "acknowledged");
+			const memberLaunchesBeforeRecovery = fake.launches.filter(
+				(launch) =>
+					launch.kind === "singleton" && launch.prompt.includes("item=item-2"),
+			).length;
+			const legacyMemberKeys = completedMember.launchAuthority.records.map(
+				(entry) => entry.grant.attemptKey,
+			);
+
+			const resumed = fixture.tasks.find((task) => task.taskId === leader.taskId);
+			assert.ok(resumed);
+			resumed.status = "pending";
+			resumed.statusDetail = "pending";
+			resumed.startedAt = undefined;
+			resumed.completedAt = undefined;
+			resumed.backendHandle = undefined;
+			resumed.backendFiles = undefined;
+			delete resumed.foreachBatch.physicalAttempt;
+			await writeRunRecord(cwd, fixture);
+			assert.equal(await recoverForeachBatchRuntimeForTests(cwd, fixture), true);
+			assert.equal(await recoverForeachBatchRuntimeForTests(cwd, fixture), false);
+			const recovered = await readRunRecord(cwd, started.runId);
+			const recoveredLeader = recovered.tasks.find(
+				(task) => task.taskId === leader.taskId,
+			);
+			const recoveredMember = recovered.tasks.find(
+				(task) => task.taskId === member.taskId,
+			);
+			assert.equal(recoveredLeader?.foreachBatch?.physicalAttempt, 2);
+			assert.equal(recoveredMember?.foreachBatch?.physicalAttempt, undefined);
+			assert.deepEqual(
+				foreachBatchTasks(recovered, recovered.foreachBatches[0]).map(
+					(task) => task.taskId,
+				),
+				[leader.taskId, member.taskId],
+			);
+			assert.equal(
+				hasNonSpawnableWorkflowLaunchAuthority(
+					recovered,
+					recoveredMember,
+					"pi-subagent/headless",
+				),
+				true,
+			);
+			assert.deepEqual(
+				readFileSync(join(memberTaskDir, "raw.md")),
+				memberRawBefore,
+			);
+			assert.deepEqual(
+				readFileSync(join(memberTaskDir, "output.log")),
+				memberOutputBefore,
+			);
+			assert.deepEqual(
+				readFileSync(join(memberTaskDir, "result.json")),
+				memberResultBefore,
+			);
+			assert.equal(
+				JSON.stringify({
+					launchBootstrap: recoveredMember.launchBootstrap,
+					launchAuthority: recoveredMember.launchAuthority,
+					durableLaunchBarrier: recoveredMember.durableLaunchBarrier,
+				}),
+				memberHistoryBefore,
+			);
+
+			// An explicit retry is the only way to rekey historical work. It gets a
+			// fresh physical identity while retaining, but never reusing, its legacy grant.
+			recoveredMember.status = "pending";
+			recoveredMember.statusDetail = "pending";
+			recoveredMember.startedAt = undefined;
+			recoveredMember.completedAt = undefined;
+			await writeRunRecord(cwd, recovered);
+			assert.equal(await recoverForeachBatchRuntimeForTests(cwd, recovered), true);
+			assert.equal(await recoverForeachBatchRuntimeForTests(cwd, recovered), false);
+			const retried = await readRunRecord(cwd, started.runId);
+			const retriedMember = retried.tasks.find(
+				(task) => task.taskId === member.taskId,
+			);
+			assert.equal(retriedMember?.foreachBatch?.physicalAttempt, 2);
+			assert.ok(
+				legacyMemberKeys.every(
+					(key) =>
+						retriedMember.launchAuthority.records.some(
+							(entry) => entry.grant.attemptKey === key,
+						),
+				),
+			);
+			assert.equal(
+				retriedMember.launchAuthority.records.some(
+					(entry) => entry.grant.attemptKey.includes("physical:2"),
+				),
+				false,
+			);
+			return memberLaunchesBeforeRecovery;
+		});
+		const completed = await waitForRun(cwd, started.runId, 20_000);
+		const finalLeader = completed.tasks.find(
+			(task) => task.taskId === leader.taskId,
+		);
+		assert.equal(finalLeader?.status, "completed");
+		const leaderKeys = finalLeader.launchAuthority.records.map(
+			(entry) => entry.grant.attemptKey,
+		);
+		assert.ok(leaderKeys.some((key) => key.includes("physical:2")));
+		assert.ok(leaderKeys.some((key) => !key.includes("physical:")) === false);
+		assert.equal(
+			fake.launches.filter(
+				(launch) => launch.kind === "batch" || launch.kind === "batch-failed",
+			).length,
+			1,
+			"the batch physical attempt is used exactly once",
+		);
+		const finalMember = completed.tasks.find(
+			(task) => task.taskId === member.taskId,
+		);
+		assert.ok(finalMember?.launchAuthority.records.some(
+			(entry) => entry.grant.attemptKey.includes("physical:2"),
+		));
+		assert.equal(
+			fake.launches.filter(
+				(launch) =>
+					launch.kind === "singleton" && launch.prompt.includes("item=item-2"),
+			).length,
+			memberLaunchesBeforeRecovery + 1,
+			"the explicit retry launches the member once under a new physical key",
+		);
+	} finally {
+		let drained = false;
+		try {
+			if (started) await drainWorkflowFixture(cwd, started.runId);
+			drained = true;
+		} finally {
+			setSubagentApiForTests(undefined);
+			if (drained) rmSync(cwd, { recursive: true, force: true });
+		}
+	}
+});
+
+test("fallback physical ownership rejects zero, null, conflicting, and active mixed markers", () => {
+	const record = {
+		version: 1,
+		batchId: "batch",
+		placeholderSpecId: "placeholder",
+		members: [
+			{
+				taskId: "leader",
+				specId: "leader",
+				role: "leader",
+				preparedPrompt: "leader",
+				preparedPromptSha256: "a".repeat(64),
+			},
+			{
+				taskId: "member",
+				specId: "member",
+				role: "member",
+				preparedPrompt: "member",
+				preparedPromptSha256: "b".repeat(64),
+			},
+		],
+		grouping: { enabled: true, groupBy: false },
+		executionSurfaceSha256: "c".repeat(64),
+		attempt: 1,
+		preparedAt: new Date().toISOString(),
+		batchPrompt: "prompt",
+		batchPromptSha256: "d".repeat(64),
+		phase: "fallback_applied",
+		fallback: {
+			preparedAt: new Date().toISOString(),
+			reason: "test",
+			appliedAt: new Date().toISOString(),
+		},
+	};
+	const base = {
+		runId: "run",
+		tasks: [
+			{
+				taskId: "leader",
+				specId: "leader",
+				status: "pending",
+				foreachBatch: {
+					batchId: "batch",
+					role: "leader",
+					phase: "fallback_applied",
+					physicalAttempt: 2,
+				},
+			},
+			{
+				taskId: "member",
+				specId: "member",
+				status: "completed",
+				completedAt: new Date().toISOString(),
+				foreachBatch: {
+					batchId: "batch",
+					role: "member",
+					phase: "fallback_applied",
+				},
+			},
+		],
+	};
+	assert.deepEqual(
+		foreachBatchTasks(base, record).map((task) => task.taskId),
+		["leader", "member"],
+	);
+	for (const marker of [0, null, 3]) {
+		const forged = structuredClone(base);
+		forged.tasks[0].foreachBatch.physicalAttempt = marker;
+		if (marker === null) forged.tasks[1].status = "pending";
+		assert.throws(
+			() => foreachBatchTasks(forged, record),
+			/physical attempt|exact ownership/,
+		);
+	}
+	const active = structuredClone(base);
+	active.tasks[1].foreachBatch.phase = "launching";
+	assert.throws(() => foreachBatchTasks(active, record), /exact ownership/);
+
+	// Validate legacy completion metadata before any pending peer is migrated,
+	// including the all-legacy case (not just a mixed 0/2 marker set).
+	for (const peerMarker of [undefined, 2]) {
+		for (const peerStatus of ["pending", "completed"]) {
+			const malformed = structuredClone(base);
+			malformed.tasks[0].foreachBatch.physicalAttempt = peerMarker;
+			malformed.tasks[0].status = peerStatus;
+			if (peerStatus === "completed") malformed.tasks[0].completedAt = new Date().toISOString();
+			delete malformed.tasks[1].completedAt;
+			const before = structuredClone(malformed);
+			assert.throws(() => migrateForeachBatchFallbackTasks(malformed, record), /legacy completion metadata/);
+			assert.throws(() => foreachBatchTasks(malformed, record), /legacy completion metadata/);
+			assert.deepEqual(malformed, before);
+		}
+	}
+	const validLegacy = structuredClone(base);
+	delete validLegacy.tasks[0].foreachBatch.physicalAttempt;
+	validLegacy.tasks[0].status = "completed";
+	validLegacy.tasks[0].completedAt = new Date().toISOString();
+	assert.equal(migrateForeachBatchFallbackTasks(validLegacy, record), false);
+	assert.equal(foreachBatchTasks(validLegacy, record).length, 2);
 });
 
 test("zero and one foreach items remain valid without creating batch ownership", async () => {
@@ -1314,7 +2298,7 @@ test("multiple groups accept reversed batch rows and preserve exact per-item own
 			batchItemFactory: (id) => ({
 				id,
 				control: { schema: "stage-control-v1", digest: `batch-${id}` },
-				analysis: `역순 Unicode analysis for ${id} — \"quoted\"`,
+				analysis: `역순 Unicode analysis for ${id} — "quoted"`,
 				refs: [],
 			}),
 		});

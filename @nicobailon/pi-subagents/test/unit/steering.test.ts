@@ -3,7 +3,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { describe, it } from "node:test";
-import { actionResultFromSteeringStatus, claimSteeringRecovery, createSteeringStatus, recordSteeringRequest, remainingSteeringRecoveryLimits, steeringMessagePreview, steeringReceipt, terminalSteeringNoticeState, updateSteeringTarget } from "../../src/runs/background/steering.ts";
+import { actionResultFromSteeringStatus, claimSteeringRecovery, createSteeringStatus, recordSteeringRequest, remainingSteeringRecoveryLimits, steeringMessagePreview, steeringReceipt, takeMatchingAcceptedSteer, terminalSteeringNoticeState, unconsumedSteerReason, updateSteeringTarget } from "../../src/runs/background/steering.ts";
 import { applySteeringRecoveryAgentConfig } from "../../src/runs/background/async-resume.ts";
 import type { AgentConfig } from "../../src/agents/agents.ts";
 
@@ -36,6 +36,37 @@ describe("steering lifecycle ledger", () => {
 		assert.equal(status.pending, 21);
 		assert.equal(status.recent.length, 20);
 		assert.equal(status.recent[0]?.id, "request-1");
+	});
+
+	it("matches equal-text accepted steers in FIFO order exactly once", () => {
+		const accepted = [
+			{ id: "first", text: "same guidance" },
+			{ id: "second", text: "same guidance" },
+			{ id: "other", text: "different" },
+		];
+		assert.equal(takeMatchingAcceptedSteer(accepted, "same guidance")?.id, "first");
+		assert.deepEqual(accepted.map((entry) => entry.id), ["second", "other"]);
+		assert.equal(takeMatchingAcceptedSteer(accepted, "same guidance")?.id, "second");
+		assert.equal(takeMatchingAcceptedSteer(accepted, "same guidance"), undefined);
+		assert.deepEqual(accepted.map((entry) => entry.id), ["other"]);
+	});
+
+	it("describes unconsumed requests by delivery mode, not aggregate queue state", () => {
+		assert.equal(unconsumedSteerReason(), "child completed before consuming steering");
+		assert.equal(unconsumedSteerReason("steer"), "child completed before consuming steering");
+		assert.equal(unconsumedSteerReason("auto"), "child completed before consuming steering");
+		assert.equal(unconsumedSteerReason("follow_up"), "child completed before consuming follow-up");
+	});
+
+	it("does not double-count pending when a routed target becomes queued then delivered", () => {
+		const status = createSteeringStatus();
+		recordSteeringRequest(status, { id: "one", requestedAt: 1, message: "guidance", targets: [{ index: 0, state: "routed" }] });
+		assert.equal(status.pending, 1);
+		updateSteeringTarget(status, "one", 0, "queued", 2);
+		assert.equal(status.pending, 1);
+		updateSteeringTarget(status, "one", 0, "delivered", 3);
+		assert.equal(status.pending, 0);
+		assert.equal(status.delivered, 1);
 	});
 
 	it("classifies mixed target outcomes as partial", () => {
@@ -130,7 +161,6 @@ describe("steering lifecycle ledger", () => {
 			name: "worker",
 			description: "current",
 			model: "current/model",
-			fallbackModels: ["current/fallback"],
 			thinking: "high",
 			tools: ["write"],
 			allowNestedSubagents: true,
@@ -144,7 +174,6 @@ describe("steering lifecycle ledger", () => {
 			skills: ["current-skill"],
 			skillPath: ["current-skill-path"],
 			filePath: "/current/agent.md",
-			completionGuard: true,
 			memory: { scope: "user", path: "/current/memory.md" },
 			output: "/current/output.md",
 			toolBudget: { hard: 99, block: "*" },
@@ -174,7 +203,7 @@ describe("steering lifecycle ledger", () => {
 		assert.equal(recovered.inheritProjectContext, false);
 		assert.deepEqual(recovered.toolBudget, { hard: 7, block: ["read"] });
 		assert.equal(recovered.maxSubagentDepth, 2);
-		for (const field of ["fallbackModels", "extensions", "subagentOnlyExtensions", "mcpDirectTools", "skills", "skillPath", "filePath", "completionGuard", "memory", "output"] as const) {
+		for (const field of ["extensions", "subagentOnlyExtensions", "mcpDirectTools", "skills", "skillPath", "filePath", "memory", "output"] as const) {
 			assert.equal(recovered[field], undefined, `${field} leaked from current config`);
 		}
 	});

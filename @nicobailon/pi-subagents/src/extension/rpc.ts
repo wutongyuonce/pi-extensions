@@ -23,15 +23,16 @@ import { sanitizeDisplayText, truncateDisplayText } from "../shared/display-text
 import { readStatus } from "../shared/utils.ts";
 import { SubagentParams } from "./schemas.ts";
 import { normalizePublicSubagentExecution } from "./public-execution.ts";
+import { collectSubagentCost, SUBAGENT_COST_REPORT_VERSION } from "../slash/subagent-cost.ts";
 import { ASYNC_STATUS_SNAPSHOT_KIND, ASYNC_STATUS_SNAPSHOT_VERSION, buildAsyncStatusSnapshotForState } from "../runs/background/async-status-snapshot.ts";
-import { isStoppableAsyncStatusStep, resolveAsyncStatusChild, type ResolvedAsyncStatusChild } from "../runs/shared/child-identity.ts";
+import { isStoppableAsyncStatusStep, resolveAsyncStatusChild, stopStoppableAsyncStatusChildren, type ResolvedAsyncStatusChild } from "../runs/shared/child-identity.ts";
 
 export const SUBAGENT_RPC_PROTOCOL_VERSION = 1;
 export const SUBAGENT_RPC_REQUEST_EVENT = "subagents:rpc:v1:request";
 export const SUBAGENT_RPC_READY_EVENT = "subagents:rpc:v1:ready";
 export const SUBAGENT_RPC_REPLY_EVENT_PREFIX = "subagents:rpc:v1:reply:";
 
-export const SUBAGENT_RPC_METHODS = ["ping", "status", "manage", "spawn", "steer", "interrupt", "stop", "resume"] as const;
+export const SUBAGENT_RPC_METHODS = ["ping", "status", "manage", "spawn", "steer", "interrupt", "stop", "resume", "cost"] as const;
 export type SubagentRpcMethod = typeof SUBAGENT_RPC_METHODS[number];
 
 export interface SubagentRpcRequestEnvelope {
@@ -456,6 +457,7 @@ function pingData(ctx: ExtensionContext | null) {
 			launchResolvedExtensions: { version: 1, source: "launch-resolved" },
 			runtimeAcknowledgedExtensions: { version: 1, source: "child-runtime", event: "subagent:acknowledge-extension" },
 			processTerminalProof: { version: 1, lifecycleArtifactVersion: SUBAGENT_LIFECYCLE_ARTIFACT_VERSION },
+			cost: { version: SUBAGENT_COST_REPORT_VERSION },
 		},
 		events: {
 			ready: SUBAGENT_RPC_READY_EVENT,
@@ -499,9 +501,13 @@ function manageParams(params: unknown): SubagentParamsLike {
 	if (requiresId && typeof input.id !== "string") {
 		throw new SubagentRpcError("invalid_params", `RPC manage ${action} requires id.`);
 	}
+	if (action === "schedule.run" && input.quiet !== undefined && typeof input.quiet !== "boolean") {
+		throw new SubagentRpcError("invalid_params", "RPC manage quiet must be a boolean.");
+	}
 	const output: SubagentParamsLike = {
 		action,
 		...(typeof input.id === "string" ? { id: input.id.trim() } : {}),
+		...(action === "schedule.run" && input.quiet === true ? { quiet: true } : {}),
 	};
 	assertSubagentParams(output, "RPC manage params");
 	return output;
@@ -616,8 +622,8 @@ function stopAsyncRun(
 		}
 	}
 	if (initialStatus.mode === "workflow" && initialStatus.state === "running") {
+		const stopChild = options.state?.workflowChildStops?.get(initialRunId);
 		if (child) {
-			const stopChild = options.state?.workflowChildStops?.get(initialRunId);
 			if (stopChild) {
 				if (!stopChild(child.id, `Workflow child '${child.id}' stopped by RPC.`)) throw new SubagentRpcError("invalid_state", `Child '${childId}' in workflow ${initialRunId} is not available to stop.`);
 				emitChildStopping(initialRunId, location.asyncDir, child);
@@ -633,6 +639,7 @@ function stopAsyncRun(
 		}
 		const workflowController = options.state?.workflowControllers?.get(initialRunId);
 		if (workflowController && !child) {
+			stopStoppableAsyncStatusChildren(initialStatus, stopChild, "Workflow stopped by RPC.");
 			workflowController.abort(new Error("Workflow stopped by RPC."));
 			return {
 				runId: initialRunId,
@@ -642,27 +649,10 @@ function stopAsyncRun(
 				message: `Stop requested for async run ${initialRunId}.`,
 			};
 		}
-		try {
-			deliverStopRequest({
-				asyncDir: location.asyncDir,
-				pid: initialStatus.pid,
-				kill: options.kill,
-				now: options.now,
-				source: "rpc-stop",
-				...(child ? { targetIndex: child.index, childId: child.id } : {}),
-			});
-		} catch (error) {
-			throw new SubagentRpcError("execution_failed", error instanceof Error ? error.message : String(error));
-		}
-		if (child) emitChildStopping(initialRunId, location.asyncDir, child);
-		return {
-			runId: initialRunId,
-			asyncDir: location.asyncDir,
-			previousState: initialStatus.state,
-			state: "stopping",
-			...(child ? { childId: child.id } : {}),
-			message: child ? `Stop requested for child ${child.id} in async run ${initialRunId}.` : `Stop requested for async run ${initialRunId}.`,
-		};
+		// Workflow controls live in-process; a persisted run directory cannot restore them.
+		throw new SubagentRpcError("invalid_state", child
+			? `Child '${child.id}' in workflow ${initialRunId} has no live stop callback available.`
+			: `Workflow ${initialRunId} has no live run controller available to stop.`);
 	}
 
 	let status;
@@ -776,6 +766,13 @@ async function handleRequest(
 	}
 	if (request.method === "resume") {
 		return executeChecked(options, ctx, request.requestId, request.method, resumeParams(request.params));
+	}
+	if (request.method === "cost") {
+		// The same parent-plus-child accounting `/subagent-cost` renders, as data.
+		// Read-only: it walks the current session branch and existing artifacts,
+		// so callers should request it on their own turn boundaries, not on a timer.
+		if (request.params !== undefined && !isRecord(request.params)) throw new SubagentRpcError("invalid_params", "RPC cost params must be an object when provided.");
+		return collectSubagentCost(ctx, options.state ?? { baseCwd: ctx.cwd });
 	}
 	throw new SubagentRpcError("unsupported_method", `Unsupported subagent RPC method: ${String(request.method)}`);
 }

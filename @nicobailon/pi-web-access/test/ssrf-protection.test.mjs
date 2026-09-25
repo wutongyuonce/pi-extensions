@@ -126,6 +126,48 @@ test("domain policy never relaxes SSRF protection", async () => {
 	);
 });
 
+test("allowLoopback exempts only the configured origin, not redirect targets", async () => {
+	const requested = [];
+	const redirectingFetch = (location) => async (url) => {
+		requested.push(url.toString());
+		if (requested.length === 1) return new Response("", { status: 302, headers: { location } });
+		return new Response("ok", { status: 200 });
+	};
+
+	// A same-origin hop stays inside the exemption.
+	const sameOrigin = await fetchRemoteUrl("http://127.0.0.1:11235/md", {}, {
+		lookup: publicLookup,
+		fetch: redirectingFetch("http://127.0.0.1:11235/api/md"),
+		allowLoopback: true,
+	});
+	assert.equal(sameOrigin.status, 200);
+	assert.deepEqual(requested, ["http://127.0.0.1:11235/md", "http://127.0.0.1:11235/api/md"]);
+
+	// A different loopback origin does not inherit it.
+	requested.length = 0;
+	await assert.rejects(
+		fetchRemoteUrl("http://127.0.0.1:11235/md", {}, {
+			lookup: publicLookup,
+			fetch: redirectingFetch("http://127.0.0.2:9999/private"),
+			allowLoopback: true,
+		}),
+		/Blocked internal address/,
+	);
+	assert.deepEqual(requested, ["http://127.0.0.1:11235/md"]);
+
+	// Nor does localhost.
+	requested.length = 0;
+	await assert.rejects(
+		fetchRemoteUrl("http://127.0.0.1:11235/md", {}, {
+			lookup: publicLookup,
+			fetch: redirectingFetch("http://localhost:11235/md"),
+			allowLoopback: true,
+		}),
+		/Blocked internal hostname/,
+	);
+	assert.deepEqual(requested, ["http://127.0.0.1:11235/md"]);
+});
+
 test("fetchRemoteUrl validates redirect targets before following", async () => {
 	const requested = [];
 	const fetchImpl = async (url) => {

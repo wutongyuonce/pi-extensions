@@ -52,7 +52,9 @@ parentPort.on("message", (message) => {
   const resolve = pending.get(message.id);
   if (!resolve) return;
   pending.delete(message.id);
-  resolve(message.envelope);
+  resolve("dataJson" in message
+    ? { ok: true, data: JSON.parse(message.dataJson) }
+    : message.envelope);
 });
 
 function request(type, payload) {
@@ -94,6 +96,10 @@ const tools = new Proxy(Object.create(null), {
   },
 });
 
+const jev = Object.freeze({
+  evaluate: (input) => request("evaluate", { input }),
+});
+
 const emit = (value) => {
   parentPort.postMessage({ type: "emit", block: toContentBlock(value) });
 };
@@ -110,6 +116,7 @@ void (async () => {
   try {
     const context = vm.createContext(Object.assign(Object.create(null), {
       tools,
+      jev,
       emit,
       console: capturedConsole,
     }), {

@@ -1,5 +1,9 @@
+import { buildSynthesisPages, reconstructSynthesisPages } from "../../workflows/deep-research/helpers/synthesis-pages.mjs";
 import test from "node:test";
 import assert from "node:assert/strict";
+import { mkdtemp, writeFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 const load = (relative) => import(new URL(`../${relative}`, import.meta.url));
 const specReview = (await import(new URL("../../workflows/spec-review/helpers/spec-review-pipeline.mjs", import.meta.url))).default;
 const impactRender = (await import(new URL("../../workflows/impact-review/helpers/render-impact-report.mjs", import.meta.url))).default;
@@ -8,15 +12,18 @@ const deepRender = (await import(new URL("../../workflows/deep-review/helpers/re
 const finalAuditPacket = (await import(new URL("../../workflows/deep-research/helpers/final-audit-packet.mjs", import.meta.url))).default;
 const researchRender = (await import(new URL("../../workflows/deep-research/helpers/render-executive.mjs", import.meta.url))).default;
 const claimGate = (await import(new URL("../../workflows/deep-research/helpers/claim-evidence-gate.mjs", import.meta.url))).default;
+const { blankImpactSources, impactSourceStatuses } = await import(new URL("./impact-review-fixtures.mjs", import.meta.url));
 
 const reviewFinding = (id) => ({
   findingId: id,
-  rootCauseId: `root-${id}`,
+  // Both rows are independent observations of one explicitly declared root;
+  // the pipeline may merge them only after the exact claim payload agrees.
+  rootCauseId: "root-runtime-defect",
   title: "Same runtime defect",
   severity: "high",
   file: "src/runtime.ts",
   locations: [{ file: "src/runtime.ts", line: 8 }],
-  evidence: `Observed ${id}`,
+  evidence: "Observed the runtime behavior.",
   evidenceQuotes: ["exact runtime quote"],
   rationale: "The behavior is unsafe.",
   recommendedAction: "Fix the runtime behavior.",
@@ -29,7 +36,10 @@ const statuses = [
   { source: "devil-advocate.F-001", specId: "devil-advocate.F-001", taskId: "verifier-task", stageId: "devil-advocate", itemIdentity: "F-001", placeholderSpecId: "devil-advocate.item", status: "completed" }
 ];
 
-test("spec-review batch fallback IDs preserve end-to-end candidate coverage", async () => {
+test("spec-review batch fallback IDs preserve end-to-end candidate coverage", async (t) => {
+  const cwd = await mkdtemp(join(tmpdir(), "spec-batch-bytes-"));
+  t.after(() => rm(cwd, { recursive: true, force: true }));
+  await writeFile(join(cwd, "source.ts"), "The gap is present.\n");
   const plan = await specReview({
     sources: { "candidate-findings": { candidateFindings: [{ title: "Fallback candidate", severity: "high" }] } },
     options: { mode: "batch-candidates", maxBatchSize: 2 }
@@ -43,10 +53,10 @@ test("spec-review batch fallback IDs preserve end-to-end candidate coverage", as
       "verification-batches": plan,
       "verify-findings": {
         schema: "spec-review-verify-findings-batch-v1",
-        results: [{ id: "candidate-001", title: "Fallback candidate", verdict: "KEEP", severity: "high", evidence: [], counterEvidence: [], finalClaim: "The gap is present.", recommendedAction: "Fix it." }]
+        results: [{ id: "candidate-001", title: "Fallback candidate", verdict: "KEEP", severity: "high", evidence: [{ file: "source.ts", lineStart: 1, lineEnd: 1, quote: "The gap is present." }], counterEvidence: [], finalClaim: "The gap is present.", recommendedAction: "Fix it." }]
       }
     },
-    context: { sourceStatuses: [{ source: "verify-findings", specId: "verify-findings.vbatch-001", taskId: "batch-task-001", stageId: "verify-findings", itemIdentity: "vbatch-001", placeholderSpecId: "verify-findings.item", status: "completed" }] },
+    context: { cwd, sourceStatuses: [{ source: "verify-findings", specId: "verify-findings.vbatch-001", taskId: "batch-task-001", stageId: "verify-findings", itemIdentity: "vbatch-001", placeholderSpecId: "verify-findings.item", status: "completed" }] },
     options: { mode: "partition" }
   });
   assert.equal(result.verifierCoverage.candidateCount, 1);
@@ -97,9 +107,9 @@ test("deep-research packet exposes invalid normalized candidate rows in synthesi
       invalidNormalizedCandidates: [{ index: 2, reason: "duplicate_normalized_candidate_id", nextStep: "repair" }],
     },
   }});
-  const integrity = packet.packet.synthesisInput.integritySummary;
+  const integrity = reconstructSynthesisPages(packet.packet.synthesisInput).verifierIntegrity;
   assert.equal(integrity.invalidNormalizedCandidateCount, 1);
-  assert.deepEqual(integrity.invalidNormalizedCandidateRows[0], packet.packet.verifierIntegrity.invalidNormalizedCandidateRows[0]);
+  assert.deepEqual(integrity.invalidNormalizedCandidateRows[0], JSON.parse(JSON.stringify(packet.packet.verifierIntegrity.invalidNormalizedCandidateRows[0])));
   assert.equal(packet.packet.overflowLedger.invalidNormalizedCandidateCount, 1);
 });
 
@@ -129,26 +139,25 @@ test("deep-review rejects multiple canonical triage sources before ledger foldin
 });
 
 test("impact renderer rejects contradictory source/spec identity and duplicate task identity", async () => {
-  const sources = { "impact-analysis.impact-synthesis.main": {
-    schema: "stage-control-v1", digest: "s", summary: "Ready", verdict: "READY", riskLevel: "low",
-    blockingIssues: [], nonBlockingIssues: [], confirmedSafeAreas: [], recommendedNextActions: [], validationToRun: [], needsHuman: [],
-  }, "impact-analysis.contract-consistency.main": { schema: "stage-control-v1", digest: "c", status: "pass", issues: [], confirmedConsistencies: [] },
-  "impact-analysis.regression-risk.main": { schema: "stage-control-v1", digest: "r", riskLevel: "low", risks: [], riskReducers: [] },
-  "impact-analysis.ship-readiness.main": { schema: "stage-control-v1", digest: "h", status: "ready", requiredBeforeShip: [], niceToHave: [], assumptions: [] } };
-  const statusRows = ["impact-synthesis", "contract-consistency", "regression-risk", "ship-readiness"].map((stage) => ({
-    source: `impact-analysis.${stage}`, specId: `impact-analysis.${stage}.main`, stageId: `impact-analysis.${stage}`, taskId: `task-${stage}`, status: "completed",
-  }));
-  const contradictory = await impactRender({ sources, context: { sourceStatuses: statusRows.map((row) => row.stageId.endsWith("impact-synthesis") ? { ...row, specId: "impact-analysis.other.main" } : row) } });
+  const sources = blankImpactSources({
+    "impact-synthesis": { summary: "Ready", verdict: "READY", riskLevel: "low" },
+    "contract-consistency": { status: "pass" },
+    "regression-risk": { riskLevel: "low" },
+    "ship-readiness": { status: "ready" },
+  });
+  const statusRows = impactSourceStatuses();
+  const contradictory = await impactRender({ sources, context: { sourceStatuses: statusRows.map((row) => row.stageId === "impact-synthesis" ? { ...row, specId: "impact-analysis.other.main" } : row) } });
   assert.equal(contradictory.gates.sourceCoverageComplete, false);
-  assert.equal(contradictory.sourceCoverage.missing.length, 1);
-  assert.equal(contradictory.sourceCoverage.orphan.length, 1);
+  assert.equal(contradictory.sourceCoverage.missing.length, 0);
+  assert.equal(contradictory.sourceCoverage.orphan.length, 0);
+  assert.equal(contradictory.sourceCoverage.wrongStage.length, 1);
   const duplicate = await impactRender({ sources, context: { sourceStatuses: [...statusRows, { ...statusRows[0] }] } });
   assert.equal(duplicate.gates.sourceCoverageComplete, false);
-  assert.deepEqual(duplicate.sourceCoverage.duplicateTaskIds, ["task-impact-synthesis"]);
+  assert.deepEqual(duplicate.sourceCoverage.duplicateTaskIds, ["task-1"]);
 });
 
 test("spec-review partition publishes owner rows and deterministic reconciliation", async () => {
-  const owner = { source: "verify-findings.F-001", specId: "verify-findings.F-001", taskId: "task-1", stageId: "verify-findings", itemIdentity: "F-001", placeholderSpecId: "verify-findings.item", status: "completed" };
+  const owner = { source: "verify-findings.F-001", specId: "verify-findings.f-001", taskId: "task-1", stageId: "verify-findings", itemIdentity: "F-001", placeholderSpecId: "verify-findings.item", status: "completed" };
   const result = await specReview({
     sources: {
       "candidate-findings": { candidateFindings: [{ id: "F-001", title: "Gap", severity: "high" }] },
@@ -217,7 +226,7 @@ test("canonical stage source helpers fail closed on ambiguous aliases", async ()
     },
   });
   assert.equal(impactAmbiguous.status, "blocked");
-  assert.match(impactAmbiguous.blockers[0], /ambiguous impact-synthesis/u);
+  assert.match(impactAmbiguous.blockers.join("\n"), /missing or malformed canonical source/iu);
 });
 
 test("spec-review singleton verifier rejects wrong-stage and swapped materialized owners", async () => {
@@ -282,17 +291,6 @@ test("deep-research packet reconciliation blocks swapped and inconsistent final 
     schema: "deep-research-final-audit-packet-v1",
     digest: "packet",
     packet: {
-      synthesisInput: {
-        researchMetadata: {},
-        verdictCounts: { verified: 1, partiallySupported: 0, unsupported: 0, conflicting: 0, verificationBlocked: 0 },
-        factSlotStatusCounts: { filled: 1 },
-        integritySummary: { invalidNormalizedCandidateCount: 0, invalidNormalizedCandidateRows: [], verifierOwnerIssues: 0 },
-        researchScopeCoverage: [],
-        factSlots: [{ slotId: "slot-001", status: "filled" }],
-        claims: [{ id: "claim-001", status: "verified", verifierOwner: { source: "verify-claims.claim-001", stageId: "verify-claims", specId: "verify-claims.claim-001", taskId: "task-claim-001", itemIdentity: "claim-001", placeholderSpecId: "verify-claims.item", status: "completed" } }],
-        preservedClaims: [],
-        gaps: [],
-      },
       researchMetadataSeed: {},
       verdictCounts: { verified: 1, partiallySupported: 0, unsupported: 0, conflicting: 0, verificationBlocked: 0 },
       statusPartitions: { verified: ["claim-001"], partiallySupported: [], unsupported: [], conflicting: [], verificationBlocked: [] },
@@ -311,6 +309,7 @@ test("deep-research packet reconciliation blocks swapped and inconsistent final 
     },
   };
   const final = { schema: "deep-research-final-synthesis-v1", digest: "final", synthesis: { bottomLine: "Answer", keyFindingIds: ["claim-001"], recommendations: [], actionPlan: [], caveatNotes: [], parentDecisionNotes: [] } };
+  packet.packet.synthesisInput = buildSynthesisPages(packet.packet);
   const good = await researchRender({ sources: { "final-audit-packet": packet, "final-audit": final } });
   assert.equal(good.status, "passed");
   for (const mutate of [
@@ -328,23 +327,19 @@ test("deep-research packet reconciliation blocks swapped and inconsistent final 
 });
 
 test("impact renderer requires a one-to-one canonical source-status stage coverage", async () => {
-  const sourceFor = (stage, value) => ({
-    [`impact-analysis.${stage}.main`]: value,
+  const fullSources = blankImpactSources({
+    "impact-synthesis": { summary: "Ready", verdict: "READY", riskLevel: "low" },
+    "contract-consistency": { status: "pass" },
+    "regression-risk": { riskLevel: "low" },
+    "ship-readiness": { status: "ready" },
   });
-  const fullSources = {
-    "impact-analysis.impact-synthesis.main": { schema: "stage-control-v1", digest: "s", summary: "Ready", verdict: "READY", riskLevel: "low", blockingIssues: [], nonBlockingIssues: [], confirmedSafeAreas: [], recommendedNextActions: [], validationToRun: [], needsHuman: [] },
-    "impact-analysis.contract-consistency.main": { schema: "stage-control-v1", digest: "c", status: "pass", issues: [], confirmedConsistencies: [] },
-    "impact-analysis.regression-risk.main": { schema: "stage-control-v1", digest: "r", riskLevel: "low", risks: [], riskReducers: [] },
-    "impact-analysis.ship-readiness.main": { schema: "stage-control-v1", digest: "h", status: "ready", requiredBeforeShip: [], niceToHave: [], assumptions: [] },
-  };
-  const statusesFor = (stage) => ({ source: `impact-analysis.${stage}`, specId: `impact-analysis.${stage}.main`, stageId: `impact-analysis.${stage}`, taskId: `task-${stage}`, status: "completed" });
-  const statusRows = ["impact-synthesis", "contract-consistency", "regression-risk", "ship-readiness"].map(statusesFor);
+  const statusRows = impactSourceStatuses();
   const good = await impactRender({ sources: fullSources, context: { sourceStatuses: statusRows } });
   assert.equal(good.status, "passed");
   const duplicate = await impactRender({ sources: fullSources, context: { sourceStatuses: [...statusRows, { ...statusRows[0], taskId: "task-b" }] } });
   assert.equal(duplicate.status, "blocked");
   assert.equal(duplicate.gates.sourceCoverageComplete, false);
-  const wrongStage = await impactRender({ sources: fullSources, context: { sourceStatuses: statusRows.map((status) => status.stageId === "impact-analysis.impact-synthesis" ? { ...status, stageId: "impact-analysis.contract-consistency" } : status) } });
+  const wrongStage = await impactRender({ sources: fullSources, context: { sourceStatuses: statusRows.map((status) => status.stageId === "impact-synthesis" ? { ...status, stageId: "contract-consistency" } : status) } });
   assert.equal(wrongStage.status, "blocked");
 });
 

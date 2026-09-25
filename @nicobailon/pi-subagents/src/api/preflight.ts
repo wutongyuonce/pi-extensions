@@ -3,30 +3,37 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { discoverAgentSnapshot, findBlockingAgentDiagnostic, formatUnknownAgentError, resolveAgentName, unknownAgentDiagnosticContext, type AgentConfig, type AgentDiscoveryAllResult, type AgentScope, type AgentSource } from "../agents/agents.ts";
 import { resolveExecutionAgentScope } from "../agents/agent-scope.ts";
-import { buildSkillInjection, normalizeSkillInput, resolveSkillsWithFallback } from "../agents/skills.ts";
-import { buildAgentMemoryInjection } from "../agents/agent-memory.ts";
-import { buildModelCandidates, inheritsParentModel, resolveEffectiveSubagentModel, resolveModelOrigin, type AvailableModelInfo, type ParentModel } from "../runs/shared/model-fallback.ts";
+import { normalizeSkillInput, resolveSkillsWithFallback } from "../agents/skills.ts";
+import { inheritsParentModel, resolveEffectiveSubagentModel, resolveModelOrigin, resolveModelSelection, type AvailableModelInfo, type ParentModel } from "../runs/shared/model-resolution.ts";
 import { resolveModelScopesForAgent } from "../runs/shared/model-scope.ts";
-import { applyThinkingSuffix, resolvePiLaunchToolPlan, type PiLaunchToolPlan } from "../runs/shared/pi-args.ts";
-import { injectOutputPathSystemPrompt, normalizeSingleOutputOverride, resolveSingleOutputPath } from "../runs/shared/single-output.ts";
+import { applyThinkingSuffix, resolvePiLaunchToolPlan, type PiLaunchToolPlan } from "../runs/shared/child-tool-plan.ts";
+import { buildEffectiveSystemPrompt } from "../runs/shared/effective-system-prompt.ts";
+import { normalizeSingleOutputOverride, resolveSingleOutputPath } from "../runs/shared/single-output.ts";
 import { getArtifactPaths, getArtifactsDir } from "../shared/artifacts.ts";
 import { resolveEffectiveThinking } from "../shared/model-info.ts";
-import { assertThinkingWithinCeiling, decodeThinkingCeiling, intersectThinkingCeilings, SUBAGENT_THINKING_CEILING_ENV, type ThinkingLevel } from "../shared/thinking-ceiling.ts";
-import { SUBAGENT_LIFECYCLE_ARTIFACT_VERSION, type ArtifactDirPreference, type ArtifactPaths, type JsonSchemaObject, type OutputMode } from "../shared/types.ts";
+import { assertThinkingWithinCeiling, intersectThinkingCeilings, type ThinkingLevel } from "../shared/thinking-ceiling.ts";
+import { SUBAGENT_LIFECYCLE_ARTIFACT_VERSION, type ArtifactDirPreference, type ArtifactPaths, type IntercomBridgeConfig, type IntercomBridgeMode, type JsonSchemaObject, type OutputMode } from "../shared/types.ts";
 import { capabilityCeilingAgentRestrictionMessage, intersectSubagentCapabilityCeilings, type ResolvedSubagentCapabilityCeiling, type SubagentCapabilityAudit } from "../runs/shared/capability-ceiling.ts";
 import { resolvePermissionRules } from "../runs/shared/permissions.ts";
 import type { ResolvedMcpDirectToolSelection } from "../runs/shared/mcp-direct-tool-allowlist.ts";
 import { resolveStepBehavior } from "../shared/settings.ts";
 import { canPreferForkFromSnapshot, resolveSubagentLaunchContext } from "../shared/fork-context.ts";
 import { loadConfig } from "../extension/config.ts";
-import { agentDefinitionDigest, AGENT_DEFINITION_PROJECTION_VERSION, launchBindingDigest, stableJsonDigest } from "../shared/launch-contract.ts";
+import { applyIntercomBridgeToAgent, resolveIntercomBridge, validateIntercomBridgeConfig } from "../intercom/intercom-bridge.ts";
+import { AGENT_DEFINITION_PROJECTION_VERSION, resolveLaunchBinding, stableJsonDigest } from "../shared/launch-contract.ts";
 import { DIRS, TEMP_ROOT_DIR } from "../shared/types.ts";
 import { processTerminalCandidatePath, processTerminalPath } from "../runs/background/process-terminal.ts";
 import { resultFilePath } from "../runs/background/result-files.ts";
 import { nestedResultsPath } from "../runs/shared/nested-events.ts";
 import { normalizeExtensionBindings, type ExtensionBindings } from "../runs/shared/extension-bindings.ts";
+import { resolveRequiredChildExtensions } from "../shared/required-child-extensions.ts";
 
-export const SUBAGENT_LAUNCH_CONTRACT_VERSION = 2 as const;
+// v3: the contract reports the resolved Intercom bridge state and binds its
+// prompt and tools into launchContractDigest, matching execution (#2127).
+export const SUBAGENT_LAUNCH_CONTRACT_VERSION = 3 as const;
+
+/** Stands in for the parent session target when the host does not supply one; only custom templates that name the session read it. */
+const PREFLIGHT_ORCHESTRATOR_TARGET = "preflight";
 
 export type SubagentLaunchContractReasonCode =
 	| "missing_agent"
@@ -38,7 +45,8 @@ export type SubagentLaunchContractReasonCode =
 	| "unsupported_mode"
 	| "restricted_agent"
 	| "thinking_ceiling"
-	| "invalid_extension_bindings";
+	| "invalid_extension_bindings"
+	| "invalid_intercom_bridge";
 
 export type SubagentLaunchContractDiagnosticCode = SubagentLaunchContractReasonCode | "host_required" | "snapshot_warning" | "workspace_scope_authority";
 
@@ -65,21 +73,37 @@ export interface SubagentLaunchContractInput {
 	skill?: string | string[] | boolean;
 	output?: string | boolean;
 	outputMode?: OutputMode;
-	outputSchema?: JsonSchemaObject;
+	outputSchema?: JsonSchemaObject | false;
 	extensionBindings?: ExtensionBindings;
 	artifacts?: boolean;
 	artifactDir?: ArtifactDirPreference;
 	parentSessionFile?: string | null;
+	/** Parent session whose host-required child extension snapshot is preflighted. */
+	parentSessionId?: string;
 	/** Current parent leaf required before an implicit `defaultContext: fork` stays `fork`. */
 	parentLeafId?: string | null;
 	sessionRoot?: string;
+	/** Caller directory used as a root keyed by the child run id ("preflight" placeholder when runId is omitted). */
 	sessionDir?: string;
 	runId?: string;
 	/** Root run id supplied by a host when projecting nested async lifecycle paths. */
 	nestedRootRunId?: string;
 	capabilityCeiling?: ResolvedSubagentCapabilityCeiling;
 	inheritedCapabilityCeiling?: ResolvedSubagentCapabilityCeiling;
+	/** Per-launch bridge config; replaces the global `intercomBridge` config exactly as the tool and delegation overrides do. */
+	intercomBridge?: IntercomBridgeConfig;
+	/**
+	 * Supervisor session target the host will hand to the child. Only a custom
+	 * bridge instruction file that names the session needs it; the default
+	 * template is session-independent.
+	 */
+	orchestratorTarget?: string;
 }
+
+/** Bridge activation before tool capability ceilings are applied. */
+export type SubagentLaunchContractIntercomBridge =
+	| { active: true; mode: Exclude<IntercomBridgeMode, "off"> }
+	| { active: false; mode: IntercomBridgeMode };
 
 export interface SubagentLaunchContractAgentCandidate {
 	name: string;
@@ -121,6 +145,7 @@ export interface SubagentLaunchContractTools {
 	toolExtensionPaths: string[];
 	runtimeExtensions: string[];
 	configuredExtensions: string[];
+	requiredExtensionIds: string[];
 	extensionArgs: string[];
 	disableAmbientExtensions: boolean;
 	fanoutAuthorized: boolean;
@@ -152,7 +177,6 @@ export interface SubagentLaunchContract {
 	agent: SubagentLaunchContractAgent;
 	context: "fresh" | "fork";
 	model?: string;
-	modelCandidates: string[];
 	thinking?: string;
 	thinkingCeiling?: ThinkingLevel;
 	systemPromptMode: AgentConfig["systemPromptMode"];
@@ -161,6 +185,7 @@ export interface SubagentLaunchContract {
 	inheritSkills: boolean;
 	skills: SubagentLaunchContractSkills;
 	tools: SubagentLaunchContractTools;
+	intercomBridge: SubagentLaunchContractIntercomBridge;
 	roots: SubagentLaunchContractRoots;
 	protocol: {
 		lifecycleArtifactVersion: number;
@@ -256,6 +281,15 @@ export async function resolveSubagentLaunchContract(input: SubagentLaunchContrac
 	if (input.artifactDir !== undefined && input.artifactDir !== "project" && input.artifactDir !== "session" && input.artifactDir !== "temp") {
 		return { ok: false, code: "invalid_artifact_dir", message: `Unsupported artifactDir '${String(input.artifactDir)}'; expected 'project', 'session', or 'temp'.`, diagnostics };
 	}
+	const bridgeOverride = input.intercomBridge === undefined ? undefined : validateIntercomBridgeConfig({ value: input.intercomBridge, label: "intercomBridge" });
+	if (bridgeOverride && !bridgeOverride.ok) {
+		return { ok: false, code: "invalid_intercom_bridge", message: bridgeOverride.error, diagnostics };
+	}
+	// Execution always derives a non-empty target, so an empty one here would
+	// silently deactivate the bridge and break parity instead of proving it.
+	if (input.orchestratorTarget !== undefined && (typeof input.orchestratorTarget !== "string" || !input.orchestratorTarget.trim())) {
+		return { ok: false, code: "invalid_intercom_bridge", message: "orchestratorTarget must be a non-empty string when provided.", diagnostics };
+	}
 	const scope = resolveExecutionAgentScope(input.agentScope);
 	const parentProvider = input.preferredProvider ?? input.parentModel?.provider;
 	const discovery = discoverAgentSnapshot(effectiveCwd, scope, parentProvider, { includeChains: false });
@@ -275,20 +309,32 @@ export async function resolveSubagentLaunchContract(input: SubagentLaunchContrac
 	if (!resolvedAgent.agent) {
 		return { ok: false, code: "missing_agent", message: formatUnknownAgentError(input.agent, unknownAgentDiagnosticContext(discovered)), diagnostics };
 	}
-	const agent = resolvedAgent.agent;
+	const definitionAgent = resolvedAgent.agent;
 	let extensionBindings: ExtensionBindings | undefined;
 	try {
 		extensionBindings = normalizeExtensionBindings(input.extensionBindings)?.value;
 	} catch (error) {
 		return { ok: false, code: "invalid_extension_bindings", message: error instanceof Error ? error.message : String(error), diagnostics };
 	}
-	if (extensionBindings !== undefined && (agent.runner?.type === "external-cli" || agent.runner?.type === "external-job")) {
-		return { ok: false, code: "unsupported_mode", message: `extensionBindings is not supported for runner.type='${agent.runner.type}'.`, diagnostics };
+	if (extensionBindings !== undefined && (definitionAgent.runner?.type === "external-cli" || definitionAgent.runner?.type === "external-job")) {
+		return { ok: false, code: "unsupported_mode", message: `extensionBindings is not supported for runner.type='${definitionAgent.runner.type}'.`, diagnostics };
 	}
-	const context = resolveLaunchContractContext(input, agent);
+	const context = resolveLaunchContractContext(input, definitionAgent);
 	if (context === "fork") {
-		diagnostics.push({ code: "host_required", severity: "host-required", message: "Exact fork session branching and fork-thinking downgrade checks require Pi host session and model-registry snapshots." });
+		diagnostics.push({ code: "host_required", severity: "host-required", message: "Exact fork session branching requires Pi host session snapshots." });
 	}
+	// Execution rewrites the discovered agent through the bridge before any
+	// other launch resolution, so preflight must hash the same rewritten agent.
+	const bridge = resolveIntercomBridge({
+		config: loadConfig().intercomBridge,
+		...(bridgeOverride ? { override: bridgeOverride.value } : {}),
+		context,
+		orchestratorTarget: input.orchestratorTarget ?? PREFLIGHT_ORCHESTRATOR_TARGET,
+	});
+	if (bridge.active && bridge.interpolatesOrchestratorTarget && input.orchestratorTarget === undefined) {
+		diagnostics.push({ code: "host_required", severity: "host-required", message: "The intercomBridge instruction file names the supervisor session; supply orchestratorTarget to bind the exact child prompt." });
+	}
+	const agent = applyIntercomBridgeToAgent(definitionAgent, bridge);
 	const effectiveCapabilityCeiling = intersectSubagentCapabilityCeilings(input.capabilityCeiling, input.inheritedCapabilityCeiling);
 	const restrictionMessage = capabilityCeilingAgentRestrictionMessage(agent.name, effectiveCapabilityCeiling);
 	if (restrictionMessage) return { ok: false, code: "restricted_agent", message: restrictionMessage, diagnostics };
@@ -300,6 +346,7 @@ export async function resolveSubagentLaunchContract(input: SubagentLaunchContrac
 		...(input.outputMode !== undefined ? { outputMode: input.outputMode } : {}),
 		...(skillInput !== undefined ? { skills: skillInput } : {}),
 		...(input.model !== undefined ? { model: input.model } : {}),
+		...(input.outputSchema !== undefined ? { outputSchema: input.outputSchema } : {}),
 	});
 	const requestedSkills = behavior.skills === false ? [] : behavior.skills;
 	const resolvedSkills = resolveSkillsWithFallback(
@@ -315,6 +362,9 @@ export async function resolveSubagentLaunchContract(input: SubagentLaunchContrac
 	if (resolvedSkills.missing.length > 0) diagnostics.push({ code: "missing_skill", severity: "error", message: `Missing skills: ${resolvedSkills.missing.join(", ")}` });
 
 	const externalRunner = agent.runner?.type === "external-cli" || agent.runner?.type === "external-job";
+	if (externalRunner && behavior.outputSchema) {
+		return { ok: false, code: "unsupported_mode", message: `Agent '${agent.name}' uses runner.type='${agent.runner?.type}' and does not support: structured output.`, diagnostics };
+	}
 	const availableModels = normalizeAvailableModels(input.availableModels);
 	const preferredProvider = agent.modelProvider ?? input.preferredProvider ?? input.parentModel?.provider;
 	const modelScopes = resolveModelScopesForAgent(discovered.modelScope, agent.name, input.parentModel);
@@ -330,21 +380,15 @@ export async function resolveSubagentLaunchContract(input: SubagentLaunchContrac
 		discovered.maxThinking,
 		input.thinkingCeiling,
 		input.inheritedThinkingCeiling,
-		decodeThinkingCeiling(process.env[SUBAGENT_THINKING_CEILING_ENV]),
 	);
-	const model = externalRunner ? undefined : applyThinkingSuffix(primaryModel, effectiveThinkingConfig, input.thinking !== undefined);
-	const modelCandidates = externalRunner
-		? []
-		: buildModelCandidates(primaryModel, agent.fallbackModels, availableModels, preferredProvider, {
+	const model = externalRunner ? undefined : applyThinkingSuffix(resolveModelSelection(primaryModel, availableModels, preferredProvider, {
 			scope: modelScopes,
 			primaryModelFromParent: modelOrigin === "inherited" || inheritsParentModel(input.model, agent.model, input.parentModel),
 			origin: modelOrigin,
-		})
-			.map((candidate) => applyThinkingSuffix(candidate, effectiveThinkingConfig, input.thinking !== undefined) ?? candidate);
+		}).model, effectiveThinkingConfig, input.thinking !== undefined);
 	if (!externalRunner) {
 		try {
 			assertThinkingWithinCeiling({ model, configThinking: effectiveThinkingConfig, ceiling: thinkingCeiling, agent: agent.name, runId });
-			for (const candidate of modelCandidates) assertThinkingWithinCeiling({ model: candidate, configThinking: effectiveThinkingConfig, ceiling: thinkingCeiling, agent: agent.name, runId });
 		} catch (error) {
 			const message = error instanceof Error ? error.message : String(error);
 			diagnostics.push({ code: "thinking_ceiling", severity: "error", message });
@@ -354,6 +398,7 @@ export async function resolveSubagentLaunchContract(input: SubagentLaunchContrac
 	let toolPlan: PiLaunchToolPlan;
 	const permissionRules = resolvePermissionRules(loadConfig().permissions, agent.permissions);
 	const fast = input.fast ?? agent.fast;
+	const requiredExtensions = externalRunner ? [] : resolveRequiredChildExtensions(input.parentSessionId);
 	try {
 		toolPlan = resolvePiLaunchToolPlan({
 			tools: agent.tools,
@@ -361,13 +406,13 @@ export async function resolveSubagentLaunchContract(input: SubagentLaunchContrac
 			allowNestedSubagents: agent.allowNestedSubagents,
 			extensions: agent.extensions,
 			subagentOnlyExtensions: agent.subagentOnlyExtensions,
+			requiredExtensions,
 			mcpDirectTools: agent.mcpDirectTools,
 			cwd: effectiveCwd,
 			requireReadTool: resolvedSkills.resolved.length > 0,
-			structuredOutput: Boolean(input.outputSchema),
+			structuredOutput: Boolean(behavior.outputSchema),
 			fast,
 			model,
-			modelCandidates,
 			capabilityCeiling: effectiveCapabilityCeiling,
 			agentName: agent.name,
 			permissionRules,
@@ -381,7 +426,10 @@ export async function resolveSubagentLaunchContract(input: SubagentLaunchContrac
 	const artifactsDir = artifactsEnabled ? getArtifactsDir(input.parentSessionFile ?? null, effectiveCwd, input.artifactDir) : undefined;
 	const artifactPaths = artifactsDir ? getArtifactPaths(artifactsDir, runId, agent.name, 0) : undefined;
 	const outputPath = resolveSingleOutputPath(behavior.output, effectiveCwd, effectiveCwd, artifactsDir ? path.join(artifactsDir, "outputs", runId) : undefined);
-	const sessionRoot = input.sessionDir ? path.resolve(input.sessionDir) : input.sessionRoot ? path.join(path.resolve(input.sessionRoot), runId) : undefined;
+	// An explicit sessionDir is a root keyed by the child run id, matching the
+	// sibling sessionRoot derivation; hosts omitting runId get the documented
+	// deterministic "preflight" placeholder.
+	const sessionRoot = input.sessionDir ? path.join(path.resolve(input.sessionDir), runId) : input.sessionRoot ? path.join(path.resolve(input.sessionRoot), runId) : undefined;
 	const sessionDir = sessionRoot ? path.join(sessionRoot, "run-0") : undefined;
 	const lifecycleAsyncDir = input.nestedRootRunId
 		? path.join(TEMP_ROOT_DIR, "nested-subagent-runs", input.nestedRootRunId, runId)
@@ -396,17 +444,23 @@ export async function resolveSubagentLaunchContract(input: SubagentLaunchContrac
 	if (resolvedSkills.missing.length > 0) {
 		return { ok: false, code: "missing_skill", message: `Missing skills: ${resolvedSkills.missing.join(", ")}`, diagnostics };
 	}
-	let effectiveSystemPrompt = agent.systemPrompt?.trim() ?? "";
-	if (resolvedSkills.resolved.length > 0) {
-		const skillInjection = buildSkillInjection(resolvedSkills.resolved);
-		effectiveSystemPrompt = effectiveSystemPrompt ? `${effectiveSystemPrompt}\n\n${skillInjection}` : skillInjection;
-	}
-	const memoryInjection = buildAgentMemoryInjection(agent, effectiveCwd);
-	if (memoryInjection) effectiveSystemPrompt = effectiveSystemPrompt ? `${effectiveSystemPrompt}\n\n${memoryInjection}` : memoryInjection;
-	effectiveSystemPrompt = injectOutputPathSystemPrompt(effectiveSystemPrompt, outputPath, agent);
+	const effectiveThinking = resolveEffectiveThinking(model, effectiveThinkingConfig);
+	const binding = resolveLaunchBinding({
+		agent,
+		task: input.task ?? "",
+		model,
+		...(fast !== undefined ? { fast } : {}),
+		...(effectiveThinking ? { thinking: effectiveThinking } : {}),
+		systemPrompt: buildEffectiveSystemPrompt({ agent, resolvedSkills: resolvedSkills.resolved, cwd: effectiveCwd, ...(outputPath ? { outputPath } : {}) }),
+		skills: requestedSkills,
+		toolPlan,
+		...(outputPath ? { outputPath } : {}),
+		outputMode: behavior.outputMode,
+		...(behavior.outputSchema ? { structuredOutputSchema: behavior.outputSchema } : {}),
+		...(extensionBindings ? { extensionBindings } : {}),
+	});
 	const candidates = candidateList(input.agent, agent, discovery.all);
 	const shadowedCandidates = candidates.filter((candidate) => !candidate.selected);
-	const definitionDigest = agentDefinitionDigest(agent);
 	const contractBase: Omit<SubagentLaunchContract, "digest"> = {
 		version: SUBAGENT_LAUNCH_CONTRACT_VERSION,
 		runId,
@@ -417,13 +471,12 @@ export async function resolveSubagentLaunchContract(input: SubagentLaunchContrac
 			source: agent.source,
 			filePath: agent.filePath,
 			definitionProjectionVersion: AGENT_DEFINITION_PROJECTION_VERSION,
-			definitionDigest,
+			definitionDigest: binding.definitionDigest,
 			shadowedCandidates,
 		},
 		context,
 		...(model ? { model } : {}),
-		modelCandidates,
-		...(resolveEffectiveThinking(model, effectiveThinkingConfig) ? { thinking: resolveEffectiveThinking(model, effectiveThinkingConfig) } : {}),
+		...(effectiveThinking ? { thinking: effectiveThinking } : {}),
 		...(thinkingCeiling ? { thinkingCeiling } : {}),
 		systemPromptMode: agent.systemPromptMode,
 		inheritProjectContext: agent.inheritProjectContext,
@@ -447,12 +500,15 @@ export async function resolveSubagentLaunchContract(input: SubagentLaunchContrac
 			toolExtensionPaths: toolPlan.toolExtensionPaths,
 			runtimeExtensions: toolPlan.runtimeExtensions,
 			configuredExtensions: toolPlan.configuredExtensions,
-			extensionArgs: toolPlan.extensionArgs,
+			requiredExtensionIds: toolPlan.requiredExtensions.map(({ id }) => id),
+			// Required paths are private launch authority; preflight exposes their safe IDs above.
+			extensionArgs: toolPlan.extensionArgs.filter((extensionPath) => !requiredExtensions.some(({ path }) => path === extensionPath)),
 			disableAmbientExtensions: toolPlan.disableAmbientExtensions,
 			fanoutAuthorized: toolPlan.fanoutAuthorized,
 			...(toolPlan.capabilityCeiling ? { capabilityCeiling: toolPlan.capabilityCeiling } : {}),
 			...(toolPlan.capabilityAudit ? { capabilityAudit: toolPlan.capabilityAudit } : {}),
 		},
+		intercomBridge: bridge.active && bridge.mode !== "off" ? { active: true, mode: bridge.mode } : { active: false, mode: bridge.mode },
 		roots: {
 			cwd: effectiveCwd,
 			...(sessionRoot ? { sessionRoot } : {}),
@@ -474,28 +530,7 @@ export async function resolveSubagentLaunchContract(input: SubagentLaunchContrac
 			packageVersion: packageVersion(),
 		},
 		diagnostics,
-		launchContractDigest: launchBindingDigest({
-			task: input.task ?? "",
-			definitionDigest,
-			...(model ? { model } : {}),
-			modelCandidates,
-			...(fast !== undefined ? { fast } : {}),
-			...(resolveEffectiveThinking(model, effectiveThinkingConfig) ? { thinking: resolveEffectiveThinking(model, effectiveThinkingConfig) } : {}),
-			systemPrompt: effectiveSystemPrompt,
-			systemPromptMode: agent.systemPromptMode,
-			inheritProjectContext: agent.inheritProjectContext,
-			inheritGlobalContext: agent.inheritGlobalContext,
-			inheritSkills: agent.inheritSkills,
-			skills: requestedSkills,
-			tools: toolPlan.effectiveToolAllowlist,
-			...(toolPlan.excludeTools.length > 0 ? { excludeTools: toolPlan.excludeTools } : {}),
-			extensions: toolPlan.extensionArgs,
-			mcpDirectTools: toolPlan.effectiveMcpTools,
-			...(outputPath ? { outputPath } : {}),
-			outputMode: behavior.outputMode,
-			...(input.outputSchema ? { structuredOutputSchema: input.outputSchema } : {}),
-			...(extensionBindings ? { extensionBindings } : {}),
-		}),
+		launchContractDigest: binding.launchContractDigest,
 	};
 	return { ok: true, contract: { ...contractBase, digest: digestContract(contractBase) } };
 }

@@ -39,8 +39,11 @@ Every call has an `action`. The default is `run`, so omitting `action` starts a 
 | `interrupt` | Signal a process-backed run. | `runId`, optional `cwd`, `attemptId`, `signal`, `escalateAfterMs`, `killAfterMs`, `reason` |
 | `mark-background` | Mark a run as not needed before the final answer. | `runId`, optional `cwd` |
 | `reconcile` | Re-read durable artifacts and repair stale/orphaned state when possible. | `runId`, optional `cwd` |
+| `prune` | Delete old terminal runs under `<cwd>/<runsDir>`. Dry run unless `yes` is true. | optional `cwd`, `runsDir`, `keep` (default 50), `olderThanDays`, `yes` |
 
-State is file-based under `.pi/agent/runs/<run-id>/`. `status`/`logs`/`wait` read those files; `interrupt` sends a real OS signal; `mark-background` updates run metadata; `reconcile` repairs local metadata from durable attempt artifacts without relaunching work. Recent runs also write a global locator pointer, so existing-run actions can often resolve a `runId` even when `cwd` is omitted or the run was launched from another cwd.
+State is file-based under `.pi/agent/runs/<run-id>/`. `status`/`logs`/`wait` read those files; `interrupt` sends a real OS signal; `mark-background` updates run metadata; `reconcile` repairs local metadata from durable attempt artifacts without relaunching work. Nothing deletes run directories automatically: `prune` (also `/subagent prune [--yes] [--keep N] [--older-than DAYS]` from the prompt, or `pruneSubagentRuns` from the code API) keeps the newest `keep` fully terminal runs, optionally restricted to runs older than `olderThanDays`, reports the selection with byte counts, and deletes only when `yes` is true. Runs with a non-terminal run, attempt, or task status are skipped even when stale (`reconcile` them first), unreadable or malformed run records are skipped, ordering and `olderThanDays` use the record's `updatedAt`, and a deleted run's global locator is removed only when it points at the same cwd and runs dir. Deletion is fenced: the runs directory must resolve (after symlinks) inside the cwd, symlinked entries are never followed, and each run is re-validated under its run lock (with an exact `updatedAt` generation check) and renamed away before removal, with the lock held through locator cleanup, so a concurrent mutation is never partially deleted: it waits and then either fails or, via `beginRunRecord`, starts a fresh record strictly after the deletion completed. Recent runs also write a global locator pointer, so existing-run actions can often resolve a `runId` even when `cwd` is omitted or the run was launched from another cwd.
+
+Cancellation kinds: `interrupt` on an async (durable-worker) run records `failureKind: "user_cancelled"` whether the interrupt lands before or during model execution. `abort` means the caller dropped its own tool call (the parent `AbortSignal` fired), and `cancelled` means the child process died from an external signal that no interrupt or abort requested.
 
 `reconcileSubagentRun()` returns `status:"running"` only when current liveness evidence says the run may still be executing. If verified cleanup cannot complete safely, it returns `status:"cleanup-blocked"` with a stable `cleanupBlocked.reason` and the affected attempt IDs; callers should surface that state rather than treating it as ordinary execution. Process ownership uses Linux boot ID plus kernel start ticks, or a bundled macOS `proc_pidinfo` helper with microsecond process start time. Missing or unverifiable platform identity fails closed and is never signal authority.
 
@@ -76,6 +79,8 @@ import {
   interruptSubagent,
   reconcileSubagentRun,
   recordSubagentChildEvent,
+  pruneSubagentRuns,
+  formatPruneSubagentRunsSummary,
 } from "@agwab/pi-subagent/api";
 
 const run = await runSubagent({
@@ -91,6 +96,9 @@ const logs = await getSubagentLogs({ cwd: process.cwd(), runId: run.runId });
 await waitForSubagent({ cwd: process.cwd(), runId: run.runId, timeoutMs: 300000 });
 await interruptSubagent({ cwd: process.cwd(), runId: run.runId, reason: "caller cancelled" });
 await reconcileSubagentRun({ cwd: process.cwd(), runId: run.runId });
+const prune = await pruneSubagentRuns({ cwd: process.cwd(), keep: 50, olderThanDays: 30 }); // dry run
+console.log(formatPruneSubagentRunsSummary(prune));
+await pruneSubagentRuns({ cwd: process.cwd(), keep: 50, olderThanDays: 30, yes: true });
 await recordSubagentChildEvent({
   cwd: process.cwd(),
   runId: run.runId,
@@ -103,7 +111,7 @@ await recordSubagentChildEvent({
 
 `runSubagent` accepts the same run options as the tool, plus an optional `signal`. Existing-run helpers accept `runId`, optional `cwd`, optional `attemptId`, and optional `runsDir`; when `cwd` is omitted they use the global locator index first and fall back to the current cwd for legacy records. The API is intentionally object-only and does not expose the lower-level runner internals.
 
-The code API is ESM-only. Import `@agwab/pi-subagent/api`; do not deep-import internal files such as `src/orchestrate/*` because only documented package subpaths are public.
+The code API is ESM-only. Import `@agwab/pi-subagent/api`; do not deep-import internal files such as `src/orchestrate/*` because only documented package subpaths are public. Every export is listed with its signature in [`api.md`](./api.md).
 
 ### General durable launch barrier
 
@@ -280,7 +288,7 @@ Interrupt a process-backed run:
 { "action": "interrupt", "runId": "run_..." }
 ```
 
-`interrupt` is conservative. It can signal runs with registered process metadata. Unsupported or already-terminal runs return explicit status rather than pretending cancellation succeeded.
+`interrupt` is conservative. It can signal runs with registered process metadata. Unsupported or already-terminal runs return explicit status rather than pretending cancellation succeeded. The default signal is `SIGTERM`, which a headless Pi child treats as a graceful stop (it aborts the running tool, terminates the tool's subprocesses, and exits); `SIGINT` makes Pi exit immediately and can leave tool subprocesses such as a running shell command behind, so pass it only when you want that. If the run is still active after `escalateAfterMs` (1 s) the signal is re-sent as `SIGTERM`, and after `killAfterMs` (3 s) as `SIGKILL`.
 
 ### Existing-run resolution
 
@@ -397,7 +405,7 @@ completed -> capture status/diff artifacts, then remove the worktree
 failed/cancelled -> capture status/diff artifacts, keep the worktree for debugging
 ```
 
-Worktree evidence is recorded in `result.json` under `workspace.worktreeCleanupStatus`, `workspace.worktreeStatusPath`, and `workspace.worktreeDiffPath`.
+Worktree evidence is recorded in `result.json` under `workspace.worktreeCleanupStatus`, `workspace.worktreeStatusPath`, and `workspace.worktreeDiffPath`. The status/diff artifacts cover tracked and untracked changes but exclude Pi runtime state the child session writes inside the worktree (`.pi/agent/runs/**`, `.pi/workflows/index.json`, `.pi/workflows/index.lock`); other files under `.pi/` are reported like any other change.
 
 Kept worktrees (from failed or cancelled runs) live in `.pi-subagent-worktrees/` **next to** the repository root, not inside it, and are never pruned automatically. To clean up after debugging:
 
@@ -415,9 +423,13 @@ Backend is optional. When omitted, the engine uses auto-selection:
 |---|---|
 | `visible: true` | `tmux` |
 | `sandbox: true` | `headless`, unless tmux/visible is explicit |
+| worktree isolation requested (`worktree`, `workspace: "worktree"`, `worktreePolicy: "required"`, or `workspace: "auto"` with a sandbox) | `headless` |
+| effective cwd (the `cwd` argument, or the extension context's cwd when the argument is omitted) is a directory other than the parent process cwd | `headless` |
 | normal `agent`/`task` | `inline` |
 
 Supported explicit backend values are `auto`, `inline`, `headless`, and `tmux`. Most users should omit `backend`. Use `visible: true` only when you want a tmux-backed visible worker.
+
+`inline` runs the child session inside the parent Pi process and inherits the parent's ambient extensions. An extension that re-registers a built-in tool (for example a `bash` wrapper) binds that tool to the parent's process cwd, so inline cannot guarantee that tools operate inside a managed worktree or in another `cwd`. Auto-selection therefore uses `headless` for those requests, and an explicit `backend: "inline"` combined with a worktree request is rejected as a validation error instead of silently running against the shared checkout.
 
 Child sessions load Pi's normal ambient extensions and skills by default, so package tools such as web access are available when enabled in Pi settings. Pass `extensions: []` or `skills: []` for a hermetic child. Recursive subagent spawning is blocked by excluding the `subagent` tool from child sessions.
 
@@ -493,21 +505,31 @@ Timeout notes:
 Runs write durable evidence under:
 
 ```text
-.pi/agent/runs/<run-id>/
-├── run.json
-├── events.jsonl
-└── attempts/
-    └── <attempt-id>/
-        ├── result.json
-        ├── worker.json
-        ├── stdout.log
-        ├── stderr.log
-        └── output.log
+.pi/agent/runs/
+├── .locks/<run-id>.lock      # per-run mutation lock (directory), beside the run
+└── <run-id>/
+    ├── run.json
+    ├── events.jsonl
+    └── attempts/
+        └── <attempt-id>/
+            ├── result.json
+            ├── worker.json
+            ├── task.md
+            ├── system-prompt.md
+            ├── stdout.log
+            ├── stderr.log
+            └── output.log
 ```
+
+Run locks live in the hidden `.locks/` directory beside the run directories (earlier versions kept `run.lock` inside each run directory), so a lock stays a stable fence while its run directory is renamed or removed by `prune`. Two engine versions mutating the same run concurrently do not exclude each other; in practice a run is only ever mutated by the engine that launched it.
+
+`worker.json` is the launch payload a detached worker reads once at startup. Long prompt strings are not inlined: the task text is stored in `task.md` and the compiled system prompt (when present) in `system-prompt.md`, and `worker.json` references them as `input.taskRef` / `input.systemPromptRef` with `{ path, bytes, sha256 }`. The worker resolves each reference from the payload's own directory and refuses a sidecar whose size or digest does not match, so the payload digest recorded by the durable launch barrier still binds the prompt bytes. Payloads written by earlier versions with inline `input.task` / `input.systemPrompt` remain valid and are accepted unchanged; a payload may not carry both forms of the same field. Callers that already persist the identical prompt bytes elsewhere may hard-link to these sidecars.
+
+`result.json` carries `metadata.provider`, `metadata.model`, `metadata.usage` (token/cost totals summed across the run's assistant messages), and `metadata.stopReason` on every backend; headless and tmux derive them from Pi's JSON event stream, inline from the SDK session's messages.
 
 `run.json` records a `parentSessionId` field: the Pi session id of the session that launched the run, injected from the tool context (not a model-settable argument). Consumers (e.g. status panels) can use it to scope a shared per-`cwd` runs directory to the session that owns each run. The field is omitted when no session id is available, and older records simply lack it.
 
-Recent runs also write a small locator file under Pi's global subagent-run index. A locator contains the `runId`, absolute `cwd`, optional `runsDir`, optional `parentSessionId`, optional `correlationId`, and `updatedAt`. It is not authoritative evidence and can become stale if the pointed-to run directory is moved or deleted; use `run.json`, `events.jsonl`, and attempt `result.json` as the source of truth.
+Recent runs also write a small locator file under Pi's global subagent-run index. Locators older than `PI_SUBAGENT_RUN_LOCATOR_PRUNE_AFTER_MS` (default 30 days; a negative value disables pruning) are swept in the background the first time a process writes a locator, at most 500 per sweep, and again whenever the run panel lists the index. A locator contains the `runId`, absolute `cwd`, optional `runsDir`, optional `parentSessionId`, optional `correlationId`, and `updatedAt`. It is not authoritative evidence and can become stale if the pointed-to run directory is moved or deleted; use `run.json`, `events.jsonl`, and attempt `result.json` as the source of truth.
 
 Older `schemaVersion: 1` artifacts under `<run-id>/<task-id>/` are still readable for compatibility.
 
@@ -530,6 +552,35 @@ Status filters are `all`, `running`, `completed`, and `failed`. In the `all` sta
 Stale or malformed locators are counted in the header and skipped. Active runs whose process metadata is dead and whose heartbeat/update timestamp is stale are rendered read-only as `failed` with failure `stale`; the panel does not mutate run records. It may prune old stale locator pointers only; use `action:"reconcile"` to repair local registry state from durable artifacts when possible.
 
 The panel is for human inspection; existing-run tool actions remain the programmatic interface.
+
+## Environment variables
+
+Operator-facing:
+
+| Variable | Default | Effect |
+|---|---|---|
+| `PI_SUBAGENT_RUN_INDEX_DIR` | `~/.pi/agent/subagent-runs` | Directory for the global run-locator index used to resolve a `runId` without `cwd`. |
+| `PI_SUBAGENT_RUN_LOCATOR_PRUNE_AFTER_MS` | 30 days | Age after which locators are swept (background sweep on locator writes and when the panel lists runs). Negative disables pruning. |
+| `PI_SUBAGENT_HEARTBEAT_MS` | `5000` | Durable-worker heartbeat interval written to the attempt record; reconciliation treats missing heartbeats as liveness evidence. |
+| `PI_SUBAGENT_EVENT_READ_CACHE_MAX` | `64` | Maximum `events.jsonl` files kept in the in-process read cache used by status/wait/panel. `0` disables the cache. |
+| `PI_CODING_AGENT_DIR` | `~/.pi/agent` | Pi's agent directory; the sandbox grants write access to exactly its `settings.json.lock`, `auth.json.lock`, and `trust.json.lock`. |
+
+Internal (set by the engine for its own child processes; do not set by hand):
+
+| Variable | Set by | Purpose |
+|---|---|---|
+| `PI_SUBAGENT_DURABLE_WORKER_BINDING_JSON` | async launcher | Binds a durable worker to its run/attempt; stripped from tmux child environments. |
+| `PI_SUBAGENT_TMUX_OWNERSHIP_TOKEN` | tmux runner | Ownership token verified before a tmux session is signalled. |
+| `PI_SUBAGENT_TOOL_RESULT_BUDGET_MAX_CHARS`, `…_STATE_PATH`, `…_FORCE_EVICT_FRACTION` | headless runner | Carries the `toolResultBudget` option and context-recovery state into the headless child. |
+
+Test-only seams (used by `npm run validate`; no effect in normal operation unless set):
+
+| Variable | Purpose |
+|---|---|
+| `PI_SUBAGENT_DURABLE_WORKER_START_DELAY_MS` | Delays worker execution start so interrupt checks can race it. |
+| `PI_SUBAGENT_DURABLE_WORKER_TERMINAL_WRITE_DELAY_MS` | Delays the worker's terminal write to exercise late-commit paths. |
+| `PI_SUBAGENT_PANEL_NOW_MS` | Fixes the panel's notion of "now" for deterministic rendering. |
+| `PI_SUBAGENT_CHECK_MODEL`, `PI_SUBAGENT_CHECK_THINKING` | Pins model-backed check scenarios to a provider/model and thinking level; without credentials those scenarios report `skipped`. |
 
 ## Development validation
 

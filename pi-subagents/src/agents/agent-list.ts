@@ -90,8 +90,17 @@ export function getAgentListEntries(
 		}));
 }
 
-function getToolReturn(entry: AgentListEntry): "wait_here" | "later_message" {
-	return entry.async === false ? "wait_here" : "later_message";
+/** Controls how launch timing is described in the agent roster. */
+export interface AgentListRenderOptions {
+	/**
+	 * The session awaits every launch (headless parent), so no helper reports
+	 * later regardless of its own `async` setting.
+	 */
+	awaitAllLaunches?: boolean;
+}
+
+function getToolReturn(entry: AgentListEntry, awaitAllLaunches: boolean): "wait_here" | "later_message" {
+	return awaitAllLaunches || entry.async === false ? "wait_here" : "later_message";
 }
 
 function getRunsAs(entry: AgentListEntry): "visible_terminal" | "hidden_process" {
@@ -172,83 +181,120 @@ function renderLimitLines(entry: AgentListEntry): string[] {
 	].filter((line): line is string => line !== undefined);
 }
 
-export function renderAgentListReminder(entries: AgentListEntry[]): string {
-	const hasModelInfo = entries.some(
-		(entry) => buildModelRef(entry.model, entry.thinking) || entry.allowModelOverride !== false,
-	);
-	const hasIdleTimeout = entries.some((entry) => entry.idleTimeout !== undefined);
-	const hasTimeLimits = entries.some((entry) => entry.timeout !== undefined || entry.idleTimeout !== undefined);
-	const hasContextWarn = entries.some((entry) => getContextWarnPercent(entry) !== undefined);
-	const hasForkedContextWarn = entries.some(
-		(entry) => entry.sessionMode === "fork" && getContextWarnPercent(entry) !== undefined,
-	);
-	const hasHiddenContextReport = entries.some((entry) => entry.reportContextUsage === false);
-	const hasVerifiedFanOut = entries.some((entry) => entry.llmAsVerifier === true);
-	const agentLines =
-		entries.length === 0
-			? ["No agents are spawnable in this session."]
-			: entries.map((entry) => {
-					return [
-						`- \`${entry.name}\`: ${entry.description}`,
-						`  tool_return: ${getToolReturn(entry)}`,
-						`  runs_as: ${getRunsAs(entry)}`,
-						`  context: ${getContext(entry)}`,
-						`  completion: ${getCompletion(entry)}`,
-						renderDefaultModelLine(entry),
-						renderModelsLine(entry),
-						...renderSpawningLines(entry),
-						renderVerifiedFanOutLine(entry),
-						...renderLimitLines(entry),
-					]
-						.filter(Boolean)
-						.join("\n");
-				});
+type AgentListReminderFlags = {
+	hasModelInfo: boolean;
+	hasIdleTimeout: boolean;
+	hasTimeLimits: boolean;
+	hasContextWarn: boolean;
+	hasForkedContextWarn: boolean;
+	hasHiddenContextReport: boolean;
+	hasVerifiedFanOut: boolean;
+};
+
+function getAgentListReminderFlags(entries: AgentListEntry[]): AgentListReminderFlags {
+	return {
+		hasModelInfo: entries.some(
+			(entry) => buildModelRef(entry.model, entry.thinking) || entry.allowModelOverride !== false,
+		),
+		hasIdleTimeout: entries.some((entry) => entry.idleTimeout !== undefined),
+		hasTimeLimits: entries.some((entry) => entry.timeout !== undefined || entry.idleTimeout !== undefined),
+		hasContextWarn: entries.some((entry) => getContextWarnPercent(entry) !== undefined),
+		hasForkedContextWarn: entries.some(
+			(entry) => entry.sessionMode === "fork" && getContextWarnPercent(entry) !== undefined,
+		),
+		hasHiddenContextReport: entries.some((entry) => entry.reportContextUsage === false),
+		hasVerifiedFanOut: entries.some((entry) => entry.llmAsVerifier === true),
+	};
+}
+
+function renderAgentListEntry(entry: AgentListEntry, awaitAllLaunches: boolean): string {
+	return [
+		`- \`${entry.name}\`: ${entry.description}`,
+		`  tool_return: ${getToolReturn(entry, awaitAllLaunches)}`,
+		`  runs_as: ${getRunsAs(entry)}`,
+		`  context: ${getContext(entry)}`,
+		`  completion: ${getCompletion(entry)}`,
+		renderDefaultModelLine(entry),
+		renderModelsLine(entry),
+		...renderSpawningLines(entry),
+		renderVerifiedFanOutLine(entry),
+		...renderLimitLines(entry),
+	]
+		.filter(Boolean)
+		.join("\n");
+}
+
+function renderAgentListEntries(entries: AgentListEntry[], awaitAllLaunches: boolean): string[] {
+	if (entries.length === 0) return ["No agents are spawnable in this session."];
+	return entries.map((entry) => renderAgentListEntry(entry, awaitAllLaunches));
+}
+
+function renderToolReturnRules(awaitAllLaunches: boolean): string[] {
+	const waitRule = "- tool_return=wait_here means the subagent tool call waits until the helper finishes.";
+	if (awaitAllLaunches) {
+		return [
+			`${waitRule} In this session every launch waits, so read the report in the tool result and continue.`,
+		];
+	}
+	return [
+		waitRule,
+		"- tool_return=later_message means the tool call starts the helper and returns before the work is done; do not invent its findings.",
+	];
+}
+
+function renderOptionalRule(enabled: boolean, rule: string): string[] {
+	return enabled ? [rule] : [];
+}
+
+function renderAgentListRules(flags: AgentListReminderFlags, awaitAllLaunches: boolean): string[] {
+	return [
+		"- Agent names are exact values for subagent.agent or children[].agent.",
+		...renderToolReturnRules(awaitAllLaunches),
+		"- runs_as=visible_terminal means a human can watch or type into the helper session. runs_as=hidden_process means no visible terminal is opened.",
+		"- context=fresh_chat_needs_full_brief means write a self-contained task with objective, files, constraints, and expected output.",
+		"- context=copy_of_this_chat means the helper starts from this conversation; give scope, boundary, and expected output without repeating all background.",
+		"- completion=exits_automatically means the helper should finish and close itself. completion=human_or_agent_must_finish means the session stays open until the human or helper explicitly completes it.",
+		...renderOptionalRule(
+			flags.hasModelInfo,
+			"- `default_model:` runs when model/thinking are omitted. `models:` lists accepted overrides; `models: any model ref` accepts any available model. An agent with no `models:` line ignores model and thinking overrides. For a listed ref, copy it exactly and split `provider/model:thinking` into model=`provider/model`, thinking=`thinking`. Never use an unlisted model when an explicit list is present.",
+		),
+		...renderOptionalRule(
+			flags.hasTimeLimits,
+			"- `timeout: X` stops this agent when its whole run reaches X. `idle-timeout: X` stops it when it makes no output for X." +
+				(flags.hasIdleTimeout ? " A steer you send is not its output." : "") +
+				" A stop is not a failure. The result holds the partial work, or it says that the agent made no output. Read the result text. It tells you what to do next.",
+		),
+		...renderOptionalRule(
+			flags.hasContextWarn,
+			"- `context-warn: Y%` makes this agent wrap up and report before its own context window fills, so its work is not lost to compaction. When a result says the agent stopped early, the stop saved the report. Do not resume an agent that stopped this way. Start a new agent for the unfinished work.",
+		),
+		...renderOptionalRule(
+			flags.hasForkedContextWarn,
+			"- A `copy_of_this_chat` agent with `context-warn` starts with this conversation already using part of its window, so it has less room for its own work.",
+		),
+		...renderOptionalRule(
+			flags.hasHiddenContextReport,
+			"- `report-context-usage: false` hides the token counts in the result. When this agent stops early, the result still reports it.",
+		),
+		...renderOptionalRule(
+			flags.hasVerifiedFanOut,
+			"- `llm-as-a-verifier: true` means one launch runs several independent attempts of the task and an LLM verifier picks the best one; you receive exactly one result. Wait for that result before you launch this agent again. It needs a clean Git tree — the launch fails immediately otherwise.",
+		),
+		"- If the user names an agent that is not listed, say it was not found and stop; do not suggest a different listed agent.",
+	];
+}
+
+export function renderAgentListReminder(entries: AgentListEntry[], options: AgentListRenderOptions = {}): string {
+	const awaitAllLaunches = options.awaitAllLaunches === true;
+	const flags = getAgentListReminderFlags(entries);
+	const agentLines = renderAgentListEntries(entries, awaitAllLaunches);
 	const body = [
 		"You can launch separate helper agents with the subagent tool. Use this roster to choose exact agent names and to understand how each launched agent behaves.",
 		"<subagent-roster>",
 		agentLines.join("\n\n"),
 		"</subagent-roster>",
 		"<subagent-rules>",
-		"- Agent names are exact values for subagent.agent or children[].agent.",
-		"- tool_return=wait_here means the subagent tool call waits until the helper finishes.",
-		"- tool_return=later_message means the tool call starts the helper and returns before the work is done; do not invent its findings.",
-		"- runs_as=visible_terminal means a human can watch or type into the helper session. runs_as=hidden_process means no visible terminal is opened.",
-		"- context=fresh_chat_needs_full_brief means write a self-contained task with objective, files, constraints, and expected output.",
-		"- context=copy_of_this_chat means the helper starts from this conversation; give scope, boundary, and expected output without repeating all background.",
-		"- completion=exits_automatically means the helper should finish and close itself. completion=human_or_agent_must_finish means the session stays open until the human or helper explicitly completes it.",
-		...(hasModelInfo
-			? [
-					"- `default_model:` runs when model/thinking are omitted. `models:` lists accepted overrides; `models: any model ref` accepts any available model. An agent with no `models:` line ignores model and thinking overrides. For a listed ref, copy it exactly and split `provider/model:thinking` into model=`provider/model`, thinking=`thinking`. Never use an unlisted model when an explicit list is present.",
-				]
-			: []),
-		...(hasTimeLimits
-			? [
-					"- `timeout: X` stops this agent when its whole run reaches X. `idle-timeout: X` stops it when it makes no output for X." +
-						(hasIdleTimeout ? " A steer you send is not its output." : "") +
-						" A stop is not a failure. The result holds the partial work, or it says that the agent made no output. Read the result text. It tells you what to do next.",
-				]
-			: []),
-		...(hasContextWarn
-			? [
-					"- `context-warn: Y%` makes this agent wrap up and report before its own context window fills, so its work is not lost to compaction. When a result says the agent stopped early, the stop saved the report. Do not resume an agent that stopped this way. Start a new agent for the unfinished work.",
-				]
-			: []),
-		...(hasForkedContextWarn
-			? [
-					"- A `copy_of_this_chat` agent with `context-warn` starts with this conversation already using part of its window, so it has less room for its own work.",
-				]
-			: []),
-		...(hasHiddenContextReport
-			? [
-					"- `report-context-usage: false` hides the token counts in the result. When this agent stops early, the result still reports it.",
-				]
-			: []),
-		...(hasVerifiedFanOut
-			? [
-					"- `llm-as-a-verifier: true` means one launch runs several independent attempts of the task and an LLM verifier picks the best one; you receive exactly one result. Wait for that result before you launch this agent again. It needs a clean Git tree — the launch fails immediately otherwise.",
-				]
-			: []),
-		"- If the user names an agent that is not listed, say it was not found and stop; do not suggest a different listed agent.",
+		...renderAgentListRules(flags, awaitAllLaunches),
 		"</subagent-rules>",
 	].join("\n");
 	return `<system-reminder>\n${body}\n</system-reminder>`;

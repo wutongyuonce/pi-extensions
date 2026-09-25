@@ -124,6 +124,21 @@ describe("timeout resume guard", () => {
 		});
 	});
 
+	it("names the no-output limit when an idle-timeout blocks resume", async () => {
+		const dir = createTestDir();
+		const bin = writeExecutable(dir, "marker-pi", "#!/usr/bin/env bash\nexit 0\n");
+		await withFakePi(bin, async () => {
+			const sessionFile = writeTimedOutSession(dir, "idle-blocked-child.jsonl", { blocksResume: true });
+			writeSubagentTimeoutSidecar(sessionFile, { kind: "idle-timeout", blocksResume: true });
+			const tool = registerResumeTool(createResumeRuntime());
+
+			await assert.rejects(
+				() => tool.execute("call-idle", { sessionFile }, undefined),
+				/stopped this sub-agent because it went past its limit for time without output/,
+			);
+		});
+	});
+
 	it("still resumes a timed-out session under the default report policy", async () => {
 		const dir = createTestDir();
 		const bin = writeExecutable(dir, "quiet-pi", "#!/usr/bin/env bash\nexit 0\n");

@@ -1,0 +1,10 @@
+id: ts-isnan-check
+language: typescript
+severity: warning
+message: x !== x to check NaN - use Number.isNaN(x)
+metadata:
+  weight: 3
+  category: slop
+rule:
+  kind: binary_expression
+  pattern: "$X !== $X"

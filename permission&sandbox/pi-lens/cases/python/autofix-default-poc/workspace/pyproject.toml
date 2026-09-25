@@ -1,0 +1,7 @@
+[project]
+name = "python-autofix-default-poc"
+version = "0.0.0"
+requires-python = ">=3.11"
+
+[tool.ruff]
+line-length = 88

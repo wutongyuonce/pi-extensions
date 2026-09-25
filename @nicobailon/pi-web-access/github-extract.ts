@@ -394,14 +394,8 @@ async function removeCloneRuntimeAsync(parentPath: string, runtimePath: string):
 async function sweepStaleCloneRuntimes(parentPath: string): Promise<void> {
 	const normalizedParentPath = resolvePath(parentPath);
 	const bootId = process.platform === "linux" ? await readLinuxBootIdAsync() : null;
-	let directory: Awaited<ReturnType<typeof opendirAsync>>;
 	try {
-		directory = await opendirAsync(normalizedParentPath);
-	} catch {
-		return;
-	}
-
-	try {
+		const directory = await opendirAsync(normalizedParentPath);
 		for await (const entry of directory) {
 			if (!entry.name.startsWith("runtime-")) continue;
 			try {
@@ -422,12 +416,6 @@ async function sweepStaleCloneRuntimes(parentPath: string): Promise<void> {
 	} catch {
 		// Cleanup is opportunistic. A changing or unreadable cache must not stop
 		// GitHub extraction from falling back to the API.
-	} finally {
-		try {
-			await directory.close();
-		} catch {
-			// The directory may already have been closed externally.
-		}
 	}
 }
 

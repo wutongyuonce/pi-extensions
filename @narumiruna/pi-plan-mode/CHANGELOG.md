@@ -1,5 +1,56 @@
 # @narumitw/pi-plan-mode
 
+## 0.58.3
+
+### Patch Changes
+
+- 26e8801: Make Plan-mode shortcut changes explicitly take effect after `/reload` or restarting Pi. Keep startup shortcut registrations stable, remove ineffective live rebinding, and show the configured and startup-loaded values with reload guidance in Settings. Other settings retain their existing reload behavior.
+- Updated dependencies [e6db042]
+  - @narumitw/pi-tui-kit@0.65.1
+
+## 0.58.2
+
+### Patch Changes
+
+- 8abd5b7: Keep generated extension runtime graphs inside Pi's Jiti-loaded TypeScript path to avoid duplicate peer-runtime evaluation during startup. Add measured generated runtimes for Context Management, Herdr, and TypeSafe Search.
+
+## 0.58.1
+
+### Patch Changes
+
+- 67a3049: Adapt provider, transcript, usage, deferred-tool, and telemetry behavior to Pi's current runtime contracts, including accurate cache-warming accounting and exclusion from ordinary generation traces.
+
+## 0.58.0
+
+### Minor Changes
+
+- b745330: Add persistent fresh implementation model and thinking defaults with a same-as-plan fallback.
+- 0ef037d: Add one-shot model and thinking selection before fresh ready-plan implementation.
+
+### Patch Changes
+
+- 7c9a062: Defer automatic ready-plan fresh session handoffs until lifecycle dispatch and prompt cleanup finish.
+- Updated dependencies [4485b49]
+- Updated dependencies [6b1e009]
+  - @narumitw/pi-tui-kit@0.62.0
+
+## 0.57.1
+
+### Patch Changes
+
+- 31b3dde: Remove the implementation model and thinking selectors, restoring Plan implementation handoffs to the current model and normal thinking behavior.
+
+## 0.57.0
+
+### Minor Changes
+
+- e2af16b: Add optional implementation model and thinking defaults plus per-menu implementation options for same-session and fresh-session handoffs. Apply choices only at implementation start without changing Pi defaults or automatically restoring the planner's model after a run ends.
+
+### Patch Changes
+
+- Updated dependencies [317f7bd]
+  - @narumitw/pi-tui-kit@0.61.0
+
 ## 0.56.0
 
 ### Minor Changes

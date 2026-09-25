@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 import { createHash } from "node:crypto";
 import { spawn } from "node:child_process";
-import { readFile } from "node:fs/promises";
+import { readFile, realpath } from "node:fs/promises";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createJiti } from "jiti";
 
@@ -18,19 +19,232 @@ if (!payloadPath) {
 	process.exit(2);
 }
 
+// Primitive signal handling from the very first statement: a stop that lands
+// while the runtime modules are still importing is remembered and replayed
+// once the real cancellation path exists, instead of killing the worker
+// before it can record anything.
+let earlySignal;
+const rememberEarlySignal = (signal) => {
+	earlySignal ??= signal;
+};
+process.on("SIGINT", () => rememberEarlySignal("SIGINT"));
+process.on("SIGTERM", () => rememberEarlySignal("SIGTERM"));
+
 const jiti = createJiti(import.meta.url, { interopDefault: false });
-const [orchestration, artifacts, launchBarrier, constants, processIdentity] =
-	await Promise.all([
+const [
+	orchestration,
+	artifacts,
+	launchBarrier,
+	constants,
+	processIdentity,
+	payloadModule,
+] = await Promise.all([
 	jiti.import("../orchestrate/run.ts"),
 	jiti.import("../artifacts/index.ts"),
 	jiti.import("../durable-launch-barrier.ts"),
 	jiti.import("../core/constants.ts"),
 	jiti.import("../process-identity.ts"),
-	]);
+	jiti.import("../durable-worker-payload.ts"),
+]);
 
-const payloadBytes = await readFile(payloadPath);
+const executionAbort = new AbortController();
+
+function requestCancel(signal) {
+	executionAbort.abort(
+		constants.userCancelledAbortReason(`durable worker received ${signal}`),
+	);
+	process.exitCode = 130;
+}
+
+// Keep handling repeated signals: escalation re-sends SIGTERM, and a `once`
+// handler would let the second delivery kill the worker before it records a
+// terminal result. A signal remembered during module import is replayed now.
+process.on("SIGINT", () => requestCancel("SIGINT"));
+process.on("SIGTERM", () => requestCancel("SIGTERM"));
+if (earlySignal !== undefined) requestCancel(earlySignal);
+
+/**
+ * The payload lives at `<runsDir>/<runId>/attempts/<attemptId>/worker.json`
+ * and the worker is spawned with the run's cwd, so the run/attempt reference
+ * can be recovered from the path alone when the payload itself is unreadable.
+ * Returns undefined when the path does not have that shape.
+ */
+async function referenceFromPayloadPath(path) {
+	const attemptDir = dirname(path);
+	const attemptsDir = dirname(attemptDir);
+	const runDir = dirname(attemptsDir);
+	const runsDir = dirname(runDir);
+	if (basename(attemptsDir) !== "attempts") return undefined;
+	const runId = basename(runDir);
+	const attemptId = basename(attemptDir);
+	const safe = /^[A-Za-z0-9._-]+$/u;
+	if (!safe.test(runId) || !safe.test(attemptId)) return undefined;
+	// The registry stores the logical cwd (it may be a symlinked spelling of
+	// process.cwd()); use it so the terminal commit matches the record.
+	let record;
+	try {
+		record = JSON.parse(await readFile(join(runDir, "run.json"), "utf8"));
+	} catch {
+		record = undefined;
+	}
+	const cwd =
+		typeof record?.cwd === "string" && record.cwd.length > 0 ? record.cwd : process.cwd();
+	const runsDirRelative =
+		typeof record?.runsDir === "string" && record.runsDir.length > 0
+			? record.runsDir
+			: relative(cwd, runsDir);
+	if (runsDirRelative.startsWith("..") || isAbsolute(runsDirRelative)) return undefined;
+	return { cwd, runId, attemptId, runsDir: runsDirRelative };
+}
+
+const TERMINAL_STATUSES_EARLY = new Set(["completed", "failed", "cancelled"]);
+
+function spawnTerminalFinalizer({ ref, attemptId, status, worker, cwd }) {
+	const finalizerPath = fileURLToPath(
+		new URL("./terminal-finalizer.mjs", import.meta.url),
+	);
+	const finalizerPayload = Buffer.from(
+		JSON.stringify({ ref, attemptId, status, worker }),
+	).toString("base64url");
+	const finalizer = spawn(process.execPath, [finalizerPath, finalizerPayload], {
+		cwd,
+		detached: true,
+		stdio: "ignore",
+		env: {
+			PATH: "/usr/bin:/bin",
+			LC_ALL: "C",
+			LANG: "C",
+		},
+	});
+	finalizer.unref();
+}
+
+/**
+ * The launcher has already recorded the attempt as running. If the payload
+ * cannot be resolved (missing, truncated, or tampered prompt sidecar, or a
+ * malformed reference) the attempt must still end in a terminal state, so
+ * write a guard failure from the plain fields of the raw payload and hand the
+ * commit to the finalizer exactly like a normal failure.
+ */
+async function failUnresolvedPayload(raw, error) {
+	const message = error instanceof Error ? error.message : String(error);
+	console.error(message);
+	// Prefer the payload's own plain fields; fall back to the reference encoded
+	// in the payload path when the payload is unreadable or malformed.
+	// The path-derived reference wins whenever it exists: it is where the
+	// launcher put this payload. Raw fields are used only when they are safe
+	// and the path gives no answer.
+	const fromPath = await referenceFromPayloadPath(payloadPath);
+	const safeId = /^[A-Za-z0-9._-]+$/u;
+	const rawId = (value) => (typeof value === "string" && safeId.test(value) ? value : undefined);
+	const cwd = fromPath?.cwd ?? (typeof raw?.cwd === "string" && raw.cwd.length > 0 ? raw.cwd : undefined);
+	const runId = fromPath?.runId ?? rawId(raw?.runId);
+	const attemptId = fromPath?.attemptId ?? rawId(raw?.attemptId);
+	if (cwd === undefined || runId === undefined || attemptId === undefined) {
+		process.exit(1);
+	}
+	const runsDir =
+		fromPath?.runsDir ??
+		(typeof raw?.input?.runsDir === "string" && raw.input.runsDir.length > 0 ? raw.input.runsDir : undefined);
+	// Never replace the canonical artifacts of an attempt that is no longer
+	// current (already terminal, superseded, or cancelled before this worker
+	// started): the registry is authoritative and a later finalizer would only
+	// find contradictory state.
+	const record = await artifacts.readRunRecord({ cwd, runId, runsDir }).catch(() => null);
+	const attempt = record?.attempts?.find((candidate) => candidate.attemptId === attemptId);
+	if (
+		attempt !== undefined &&
+		(TERMINAL_STATUSES_EARLY.has(attempt.status) || record.activeAttemptId !== attemptId)
+	) {
+		console.error(
+			`durable worker attempt ${attemptId} is no longer active (${attempt.status}); exiting without writing artifacts`,
+		);
+		process.exit(1);
+	}
+	try {
+		const worker = await processIdentity.captureProcessIdentity(process.pid);
+		const store = await artifacts.createAttemptArtifactStore({ cwd, runId, attemptId, runsDir });
+		const stderr = await store.writeTextArtifact("stderr", `${message}\n`);
+		const status = executionAbort.signal.aborted ? "cancelled" : "failed";
+		const backend = ["inline", "headless", "tmux"].includes(raw?.backend) ? raw.backend : "headless";
+		const startedAt =
+			typeof raw?.startedAt === "string" && Number.isFinite(Date.parse(raw.startedAt))
+				? raw.startedAt
+				: new Date().toISOString();
+		await store.writeResult({
+			backend,
+			status,
+			failureKind: executionAbort.signal.aborted ? "user_cancelled" : "guard_failure",
+			cwd,
+			startedAt,
+			completedAt: new Date().toISOString(),
+			workspace: { mode: "shared", cwd },
+			sandbox: { enabled: Boolean(raw?.input?.sandbox) },
+			exitCode: null,
+			signal: null,
+			artifacts: [store.refFor("worker"), stderr],
+			correlationId: raw?.input?.correlationId,
+			metadata: { contextLengthExceeded: false },
+		});
+		spawnTerminalFinalizer({ ref: { cwd, runId, runsDir }, attemptId, status, worker, cwd });
+	} catch (writeError) {
+		console.error(writeError instanceof Error ? (writeError.stack ?? writeError.message) : String(writeError));
+	}
+	process.exit(1);
+}
+
+let payloadBytes;
+try {
+	payloadBytes = await readFile(payloadPath);
+} catch (error) {
+	await failUnresolvedPayload(undefined, new Error(`durable worker payload could not be read: ${error instanceof Error ? error.message : String(error)}`));
+}
+// The launch digest covers the payload file exactly as written. Prompt
+// sidecars are bound through the size/SHA-256 references inside it and are
+// verified before use, so resolving them here does not weaken the digest.
 const launchPayloadSha256 = createHash("sha256").update(payloadBytes).digest("hex");
-const payload = JSON.parse(payloadBytes.toString("utf8"));
+let rawPayload;
+try {
+	rawPayload = JSON.parse(payloadBytes.toString("utf8"));
+} catch (error) {
+	await failUnresolvedPayload(undefined, new Error(`durable worker payload is not valid JSON: ${error instanceof Error ? error.message : String(error)}`));
+}
+let payload;
+try {
+	payloadModule.assertDurableWorkerPayloadShape(rawPayload);
+	payload = await payloadModule.resolveDurableWorkerPayload(rawPayload, payloadPath);
+	// The payload must describe exactly the attempt directory it was read
+	// from: ids, cwd, and the effective runs directory all bind to the path,
+	// so a tampered envelope cannot redirect bookkeeping elsewhere.
+	const located = await referenceFromPayloadPath(payloadPath);
+	if (located === undefined)
+		throw new Error(`durable worker payload location ${payloadPath} is not an attempt directory`);
+	if (located.runId !== payload.runId || located.attemptId !== payload.attemptId)
+		throw new Error(
+			`durable worker payload ids (${payload.runId}/${payload.attemptId}) do not match the payload location ${payloadPath}`,
+		);
+	const physical = async (path) => {
+		try {
+			return await realpath(path);
+		} catch {
+			return resolve(path);
+		}
+	};
+	const payloadCwd = await physical(payload.cwd);
+	const locatedCwd = await physical(located.cwd);
+	if (payloadCwd !== locatedCwd)
+		throw new Error(
+			`durable worker payload cwd (${payloadCwd}) does not match the run's cwd (${locatedCwd})`,
+		);
+	const payloadRunsDir = await physical(resolve(payload.cwd, payload.input.runsDir ?? ".pi/agent/runs"));
+	const locatedRunsDir = await physical(resolve(located.cwd, located.runsDir));
+	if (payloadRunsDir !== locatedRunsDir)
+		throw new Error(
+			`durable worker payload runsDir (${payloadRunsDir}) does not match the payload location (${locatedRunsDir})`,
+		);
+} catch (error) {
+	await failUnresolvedPayload(rawPayload, error);
+}
 const { input, cwd, runId, attemptId } = payload;
 const heartbeatMs = Math.max(
 	50,
@@ -43,7 +257,6 @@ let terminalWritePromise;
 let heartbeat;
 let preparedExecution;
 let terminalResult;
-const executionAbort = new AbortController();
 
 const TERMINAL_STATUSES = new Set(["completed", "failed", "cancelled"]);
 
@@ -160,13 +373,6 @@ function failureKindFromError(error) {
 	return constants.isFailureKind(kind) ? kind : "internal";
 }
 
-function requestCancel(signal) {
-	executionAbort.abort(new Error(`durable worker received ${signal}`));
-	process.exitCode = 130;
-}
-
-process.once("SIGINT", () => requestCancel("SIGINT"));
-process.once("SIGTERM", () => requestCancel("SIGTERM"));
 
 const workerIdentity = await processIdentity.captureProcessIdentity(process.pid);
 const workerProcessMetadata = {
@@ -175,24 +381,42 @@ const workerProcessMetadata = {
 	workerProcessGroupId: workerIdentity.processGroupId,
 	workerProcessBirthIdentity: workerIdentity.birthIdentity,
 };
-const workerRecord = await artifacts.updateAttemptWorkerProcess({
+// Ownership bookkeeping runs before the guarded execution block. The registry
+// returns the record unchanged when this attempt is no longer active or is
+// already terminal; that is lost ownership, and the worker must exit without
+// touching the attempt's artifacts. Any other failure still ends the attempt
+// through the terminal path.
+try {
+	const workerRecord = await artifacts.updateAttemptWorkerProcess({
 		...runRef,
 		attemptId,
 		process: workerProcessMetadata,
 	});
-const persistedWorker = workerRecord.attempts.find(
-	(candidate) => candidate.attemptId === attemptId,
-);
-if (
-	workerRecord.activeAttemptId !== attemptId ||
-	persistedWorker?.process?.workerPid !== workerIdentity.pid ||
-	persistedWorker.process.workerProcessGroupId !== workerIdentity.processGroupId ||
-	persistedWorker.process.workerProcessBirthIdentity !==
-		workerIdentity.birthIdentity
-)
-	throw new Error(
-		"durable worker ownership metadata was not committed to the active attempt",
+	const persistedWorker = workerRecord.attempts.find(
+		(candidate) => candidate.attemptId === attemptId,
 	);
+	if (
+		workerRecord.activeAttemptId !== attemptId ||
+		persistedWorker === undefined ||
+		TERMINAL_STATUSES_EARLY.has(persistedWorker.status)
+	) {
+		console.error(
+			`durable worker attempt ${attemptId} is no longer active; exiting without writing artifacts`,
+		);
+		process.exit(1);
+	}
+	if (
+		persistedWorker.process?.workerPid !== workerIdentity.pid ||
+		persistedWorker.process.workerProcessGroupId !== workerIdentity.processGroupId ||
+		persistedWorker.process.workerProcessBirthIdentity !==
+			workerIdentity.birthIdentity
+	)
+		throw new Error(
+			"durable worker ownership metadata was not committed to the active attempt",
+		);
+} catch (error) {
+	await failUnresolvedPayload(rawPayload, error);
+}
 heartbeat = setInterval(() => {
 	void artifacts
 		.recordAttemptHeartbeat({ ...runRef, attemptId })
@@ -320,26 +544,11 @@ try {
 	if (heartbeat !== undefined) clearInterval(heartbeat);
 }
 if (terminalResult !== undefined) {
-	const finalizerPath = fileURLToPath(
-		new URL("./terminal-finalizer.mjs", import.meta.url),
-	);
-	const finalizerPayload = Buffer.from(
-		JSON.stringify({
-			ref: runRef,
-			attemptId,
-			status: terminalResult.status,
-			worker: workerIdentity,
-		}),
-	).toString("base64url");
-	const finalizer = spawn(process.execPath, [finalizerPath, finalizerPayload], {
+	spawnTerminalFinalizer({
+		ref: runRef,
+		attemptId,
+		status: terminalResult.status,
+		worker: workerIdentity,
 		cwd,
-		detached: true,
-		stdio: "ignore",
-		env: {
-			PATH: "/usr/bin:/bin",
-			LC_ALL: "C",
-			LANG: "C",
-		},
 	});
-	finalizer.unref();
 }

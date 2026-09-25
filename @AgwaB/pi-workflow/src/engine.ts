@@ -1,4 +1,12 @@
-import { appendFile, mkdir, rename, stat, writeFile } from "node:fs/promises";
+import { createHash } from "node:crypto";
+import {
+	appendFile,
+	mkdir,
+	rename,
+	rm,
+	stat,
+	writeFile,
+} from "node:fs/promises";
 import { dirname, extname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { Worker } from "node:worker_threads";
@@ -27,6 +35,7 @@ import {
 	isTerminalWorkflowStatus,
 	isTerminalTaskStatus,
 	listRunRecords,
+	readIndex,
 	makeRunId,
 	readJson,
 	readRunRecord,
@@ -85,6 +94,7 @@ import {
 	recordDynamicEventAndUpdateState,
 	type DynamicControllerStatus,
 } from "./dynamic-state.js";
+import { remainingDynamicNestedWorkflowDepth } from "./dynamic-nested-depth.js";
 import {
 	DynamicControllerBudgetBlocked,
 	DynamicControllerNestedApprovalBlocked,
@@ -105,6 +115,7 @@ import {
 	isDynamicCompiledTaskPayload,
 	normalizeDynamicAgentRequest,
 	readDynamicGeneratedTaskResult,
+	restoreDynamicGeneratedResourceWarnings,
 } from "./dynamic-generated-task-runtime.js";
 import {
 	optionalEventString,
@@ -147,6 +158,8 @@ import {
 } from "./loop-runtime.js";
 import { acknowledgeSubagentTaskInterrupted } from "./subagent-backend.js";
 import {
+	bindWorkflowLaunchSignal,
+	createWorkflowStopPendingError,
 	createWorkflowStopSignal,
 	isWorkflowStopRequestedError,
 	throwIfWorkflowStopRequested,
@@ -159,6 +172,7 @@ import {
 	finalCompiledPromptMeasurement,
 	executeSupportTask,
 	normalizeDynamicControllerOutput,
+	dynamicOutputTaskSpecIds,
 	prepareArtifactGraphRetryTask,
 	prepareDagTask,
 	readArtifactGraphControl,
@@ -170,6 +184,13 @@ import {
 	DIRECT_DYNAMIC_RUNTIME_VERSION,
 	ensureDirectDynamicRuntimeBundle,
 } from "./dynamic-runtime-bundle.js";
+import {
+	assertWorkflowAutoLaunchBindingCurrent,
+	assertWorkflowAutoLaunchBindingFrozen,
+	sealWorkflowAutoLaunchBindingCompiled,
+	workflowAutoLaunchBindingSettings,
+	type WorkflowAutoLaunchBinding,
+} from "./workflow-auto-binding.js";
 import {
 	hasFatalPartialOutputIssue,
 	readWorkflowPartialOutputLedger,
@@ -199,21 +220,19 @@ import {
 } from "./foreach-batch-capability.js";
 import { workflowStateRootIdentity } from "./workflow-state-root.js";
 import {
-	EXECUTION_PROFILE_FOREACH_BATCH,
-	type ProfiledArtifactGraphStage,
+	applyWorkflowExecutionProfile,
+	workflowDefinitionFingerprint,
 } from "./execution-profile.js";
 import {
 	type CompiledDynamicWorkflowTask,
 	type CompiledTask,
 	type CompiledWorkflow,
-	type ExecutionProfileForeachBatch,
-	type ExecutionProfileStageOverride,
 	type WorkflowForeachBatchRecord,
 	WORKFLOW_RUN_TYPE,
 	type WorkflowRunLaunchCapture,
 	type WorkflowRunLaunchMetadata,
 	type WorkflowRunRecord,
-	type WorkflowRunExecutionProfile,
+	type WorkflowCapturedExecutionProfile,
 	type WorkflowRunRouting,
 	type WorkflowTaskRunRecord,
 } from "./types.js";
@@ -319,10 +338,14 @@ export interface WorkflowRunOptions {
 	dynamicUi?: DynamicWorkflowUi;
 	runId?: string;
 	parentRunId?: string;
-	/** Router-pass audit record persisted on the run record (opt-in --route). */
+	/** Optional routing audit record persisted on the run record. */
 	routing?: WorkflowRunRouting;
 	/** Creation-surface provenance; exact command text is persisted only in a private sidecar. */
 	launch?: WorkflowRunLaunchCapture;
+	/** In-memory auto-selection snapshot, checked before any substantive dispatch. */
+	autoLaunchBinding?: WorkflowAutoLaunchBinding;
+	/** Owned foreground cancellation, never persisted with run authority. */
+	launchSignal?: AbortSignal;
 	/**
 	 * Overrides for inputs the workflow spec declares (for example depth).
 	 * Keys the spec does not declare are ignored.
@@ -334,6 +357,11 @@ export interface WorkflowRunOptions {
 	 * recorded on the run record. Unknown names fail closed.
 	 */
 	executionProfile?: string;
+	/**
+	 * Pre-resolved user profile captured by an interactive/tool launch surface.
+	 * A declared executionProfile takes precedence when both are supplied.
+	 */
+	executionProfileOverride?: WorkflowCapturedExecutionProfile;
 }
 
 interface WorkflowScheduleOptions {
@@ -363,7 +391,9 @@ export async function runWorkflowSpec(
 	cwd: string,
 	options: WorkflowRunDiagnosticOptions = {},
 ): Promise<WorkflowRunRecord> {
+	options.launchSignal?.throwIfAborted();
 	const loaded = await loadWorkflowSpec(specPath, cwd);
+	options.launchSignal?.throwIfAborted();
 	return runLoadedWorkflowSpec(
 		cwd,
 		loaded.specPath,
@@ -382,8 +412,19 @@ export async function runDynamicTask(
 			'This dynamic workflow needs a task. Usage: /workflow dynamic "<task>"',
 		);
 	}
+	if (
+		options.launch?.schema === "pi-workflow-run-launch-v2" &&
+		options.launch.requestKind === "direct-dynamic" &&
+		!options.autoLaunchBinding
+	)
+		throw new Error(
+			"Auto-confirmed dynamic launch is missing its in-memory selection binding. Run /workflow auto again.",
+		);
+	options.launchSignal?.throwIfAborted();
 	const specPath = await ensureDirectDynamicRuntimeBundle(cwd);
+	options.launchSignal?.throwIfAborted();
 	const loaded = await loadWorkflowSpec(specPath, cwd);
+	options.launchSignal?.throwIfAborted();
 	return runLoadedWorkflowSpec(
 		cwd,
 		loaded.specPath,
@@ -410,11 +451,108 @@ async function runLoadedWorkflowSpec(
 	diagnosticsPolicy: PromptSchemaDiagnosticsPolicy,
 	provenance?: WorkflowRunRecord["provenance"],
 ): Promise<WorkflowRunRecord> {
+	options.launchSignal?.throwIfAborted();
 	if (options.launch) assertValidWorkflowRunLaunchCapture(options.launch);
+	if (options.launch?.schema === "pi-workflow-run-launch-v2") {
+		const actualRequestKind =
+			diagnosticsPolicy === "excluded-direct-dynamic"
+				? "direct-dynamic"
+				: "named-workflow";
+		if (options.launch.requestKind !== actualRequestKind)
+			throw new Error(
+				"Auto-confirmed launch metadata does not match the requested execution path. Run /workflow auto again.",
+			);
+		if (!options.autoLaunchBinding)
+			throw new Error(
+				options.launch.requestKind === "named-workflow"
+					? "Auto-confirmed named launch is missing its in-memory selection binding. Run /workflow auto again."
+					: "Auto-confirmed dynamic launch is missing its in-memory selection binding. Run /workflow auto again.",
+			);
+		if (
+			options.launch.requestKind === "direct-dynamic" &&
+			options.autoLaunchBinding.runtimeVersion !== DIRECT_DYNAMIC_RUNTIME_VERSION
+		)
+			throw new Error(
+				"Auto selection is stale: direct dynamic runtime changed before launch. Run /workflow auto again.",
+			);
+		const taskSha256 = createHash("sha256")
+			.update(options.task?.trim() ?? "", "utf8")
+			.digest("hex");
+		if (taskSha256 !== options.launch.selection.taskSha256)
+			throw new Error(
+				"Auto selection is stale: task changed before launch. Run /workflow auto again.",
+			);
+		const effectiveRuntime = {
+			...(options.runtimeDefaults?.model
+				? { model: options.runtimeDefaults.model }
+				: {}),
+			...(options.runtimeDefaults?.thinking
+				? { thinking: options.runtimeDefaults.thinking }
+				: {}),
+			...(options.runtimeOverrides?.model
+				? { model: options.runtimeOverrides.model }
+				: {}),
+			...(options.runtimeOverrides?.thinking
+				? { thinking: options.runtimeOverrides.thinking }
+				: {}),
+		};
+		if (
+			effectiveRuntime.model !== options.launch.selection.effectiveRuntime.model ||
+			effectiveRuntime.thinking !==
+				options.launch.selection.effectiveRuntime.thinking
+		)
+			throw new Error(
+				"Auto selection is stale: runtime changed before launch. Run /workflow auto again.",
+			);
+		if (
+			options.autoLaunchBinding &&
+			(options.autoLaunchBinding.candidateId !==
+				options.launch.selection.candidateId ||
+				options.autoLaunchBinding.candidateIdentitySha256 !==
+					options.launch.selection.candidateIdentitySha256)
+		)
+			throw new Error(
+				"Auto selection is stale: candidate identity changed before launch. Run /workflow auto again.",
+			);
+	}
+	if (options.autoLaunchBinding)
+		await assertWorkflowAutoLaunchBindingCurrent(
+			cwd,
+			options.autoLaunchBinding,
+			spec,
+			options.task,
+			specPath,
+			workflowAutoLaunchBindingSettings({
+				executionProfile: options.executionProfile,
+				executionProfileOverride: options.executionProfileOverride,
+				runtimeDefaults: options.runtimeDefaults,
+				runtimeOverrides: options.runtimeOverrides,
+			}),
+		);
+	const capturedProfile = !options.executionProfile
+		? options.executionProfileOverride
+		: undefined;
+	if (capturedProfile) {
+		const capturedDefinition = capturedProfile.definitionFingerprint;
+		if (
+			typeof capturedDefinition !== "string" ||
+			!/^[a-f0-9]{64}$/.test(capturedDefinition)
+		) {
+			throw new Error(
+				"pre-resolved execution profile has an invalid definition fingerprint",
+			);
+		}
+		if (capturedDefinition !== workflowDefinitionFingerprint(spec)) {
+			throw new Error(
+				"Workflow definition changed after the saved profile was resolved; the run was not started. Retry the launch so the profile can be revalidated.",
+			);
+		}
+	}
 	spec = applyDeclaredWorkflowInputOverrides(spec, options.inputOverrides);
 	const appliedProfile = applyWorkflowExecutionProfile(
 		spec,
 		options.executionProfile,
+		options.executionProfileOverride,
 	);
 	spec = appliedProfile.spec;
 	const compiled = await compileWorkflow(spec, {
@@ -425,6 +563,11 @@ async function runLoadedWorkflowSpec(
 		runtimeDefaults: options.runtimeDefaults,
 		availableModels: options.availableModels,
 	});
+	if (options.autoLaunchBinding)
+		options.autoLaunchBinding = sealWorkflowAutoLaunchBindingCompiled(
+			options.autoLaunchBinding,
+			compiled,
+		);
 
 	// Diagnostics are an explicit named-workflow policy. Direct-dynamic uses its
 	// approved runtime bundle and intentionally does not adopt named-spec warnings.
@@ -452,9 +595,9 @@ async function runLoadedWorkflowSpec(
 		: undefined;
 	if (launchCapture) assertValidWorkflowRunLaunchCapture(launchCapture);
 	const runId = options.runId ?? makeRunId();
+	options.launchSignal?.throwIfAborted();
 	await assertWorkflowRunAvailable(cwd, runId);
-	if (launchCapture?.command.state === "captured")
-		await prepareWorkflowLaunchCommandArtifactPath(cwd, runId);
+	options.launchSignal?.throwIfAborted();
 	const { run } = await createRunRecord(cwd, compiled, specPath, {
 		runId,
 		parentRunId: options.parentRunId,
@@ -464,41 +607,70 @@ async function runLoadedWorkflowSpec(
 	if (provenance) run.provenance = provenance;
 	if (options.routing) run.routing = options.routing;
 	if (appliedProfile.record) run.executionProfile = appliedProfile.record;
-	const initialized = await withRunLease(
-		cwd,
-		run.runId,
-		async (leaseSignal) => {
-		await assertRunLeaseOwnership(cwd, run.runId, leaseSignal);
-		const existing = await readJson(workflowRunPath(cwd, run.runId));
-		if (existing !== undefined) {
-			throw new Error(
-				`Cannot initialize workflow run ${run.runId}: a persisted run already exists`,
-			);
-		}
-		await assertRunLeaseOwnership(cwd, run.runId, leaseSignal);
-		await initializeRunRecordDirectories(cwd, run);
-		await assertRunLeaseOwnership(cwd, run.runId, leaseSignal);
-		if (launchCapture)
-			run.launch = await persistWorkflowRunLaunch(
-				cwd,
-				run.runId,
-				launchCapture,
-			);
-		await assertRunLeaseOwnership(cwd, run.runId, leaseSignal);
-		await writeStaticRunArtifacts(cwd, run, compiled, spec);
-		await writeRunRecord(cwd, run, leaseSignal);
-		const persisted = await readRunRecord(cwd, run.runId);
-		if (
-			persisted.runId !== run.runId ||
-			persisted.createdAt !== run.createdAt
-		) {
-			throw new Error(
-				`Cannot initialize workflow run ${run.runId}: persisted run identity changed`,
-			);
-		}
-		return persisted;
-		},
-	);
+	let initialized: WorkflowRunRecord | undefined;
+	try {
+		if (launchCapture?.command.state === "captured")
+			await prepareWorkflowLaunchCommandArtifactPath(cwd, runId);
+		options.launchSignal?.throwIfAborted();
+		initialized = await withRunLease(cwd, run.runId, async (leaseSignal) => {
+			options.launchSignal?.throwIfAborted();
+			await assertRunLeaseOwnership(cwd, run.runId, leaseSignal);
+			const existing = await readJson(workflowRunPath(cwd, run.runId));
+			if (existing !== undefined) {
+				throw new Error(
+					`Cannot initialize workflow run ${run.runId}: a persisted run already exists`,
+				);
+			}
+			await assertRunLeaseOwnership(cwd, run.runId, leaseSignal);
+			options.launchSignal?.throwIfAborted();
+			await initializeRunRecordDirectories(cwd, run);
+			await assertRunLeaseOwnership(cwd, run.runId, leaseSignal);
+			options.launchSignal?.throwIfAborted();
+			if (launchCapture)
+				run.launch = await persistWorkflowRunLaunch(cwd, run.runId, launchCapture);
+			// Sidecar persistence does not commit permission to execute. Cancellation
+			// still prevents publication and the first scheduler dispatch.
+			options.launchSignal?.throwIfAborted();
+			await assertRunLeaseOwnership(cwd, run.runId, leaseSignal);
+			await writeStaticRunArtifacts(cwd, run, compiled, spec);
+			options.launchSignal?.throwIfAborted();
+			if (options.autoLaunchBinding) {
+				// Agent files are not copied into the workflow bundle, so recheck the
+				// complete accepted source set before the first scheduler dispatch too.
+				await assertWorkflowAutoLaunchBindingCurrent(
+					cwd,
+					options.autoLaunchBinding,
+					spec,
+					options.task,
+					specPath,
+					workflowAutoLaunchBindingSettings({
+						executionProfile: options.executionProfile,
+						executionProfileOverride: options.executionProfileOverride,
+						runtimeDefaults: options.runtimeDefaults,
+						runtimeOverrides: options.runtimeOverrides,
+					}),
+				);
+				await assertWorkflowAutoLaunchBindingFrozen(
+					cwd,
+					run.runId,
+					options.autoLaunchBinding,
+				);
+			}
+			options.launchSignal?.throwIfAborted();
+			await writeRunRecord(cwd, run, leaseSignal);
+			const persisted = await readRunRecord(cwd, run.runId);
+			if (persisted.runId !== run.runId || persisted.createdAt !== run.createdAt) {
+				throw new Error(
+					`Cannot initialize workflow run ${run.runId}: persisted run identity changed`,
+				);
+			}
+			return persisted;
+		});
+	} catch (error) {
+		if (options.autoLaunchBinding)
+			await removeUnpublishedAutoRunDirectory(cwd, run.runId);
+		throw error;
+	}
 	if (!initialized) {
 		throw new Error(
 			`Could not acquire supervisor lease to initialize ${run.runId}; another supervisor may be active`,
@@ -509,12 +681,59 @@ async function runLoadedWorkflowSpec(
 		dynamicUi: options.dynamicUi,
 		availableModels: options.availableModels,
 	};
-	const scheduled =
-		(await scheduleRun(cwd, initialized.runId, compiled, scheduleOptions)) ??
-		(await readRunRecord(cwd, initialized.runId));
-	if (shouldWatchRun(scheduled))
-		watchRun(cwd, scheduled.runId, scheduleOptions);
-	return scheduled;
+	const unbindLaunchSignal = bindWorkflowLaunchSignal(cwd, initialized.runId, options.launchSignal);
+	let launchStop: Promise<void> | undefined;
+	const requestLaunchStop = (): Promise<void> => {
+		if (!options.launchSignal?.aborted) return Promise.resolve();
+		// Persist once; the in-memory signal already fences dispatch while this
+		// write is pending. Drain it before removing the launch-owned fence.
+		return launchStop ??= requestWorkflowStop(cwd, initialized.runId).then(() => undefined);
+	};
+	const onLaunchAbort = () => {
+		// The stop intent is durable and the scheduler/lease path owns cleanup.
+		// Do not report cancellation as success while an already-created run settles.
+		void requestLaunchStop().catch(() => undefined);
+	};
+	options.launchSignal?.addEventListener("abort", onLaunchAbort, { once: true });
+	try {
+		await requestLaunchStop();
+		let scheduled =
+			(await scheduleRun(cwd, initialized.runId, compiled, scheduleOptions)) ??
+			(await readRunRecord(cwd, initialized.runId));
+		if (options.launchSignal?.aborted) {
+			await requestLaunchStop();
+			// Terminal status alone does not prove the durable intent was cleared.
+			// Retry the terminal-capable finalizer under the normal supervisor lease.
+			const current = await readRunRecord(cwd, initialized.runId);
+			scheduled = (await confirmRequestedWorkflowStop(cwd, initialized.runId, current)).run;
+		}
+		if (shouldWatchRun(scheduled)) watchRun(cwd, scheduled.runId, scheduleOptions);
+		return scheduled;
+	} finally {
+		options.launchSignal?.removeEventListener("abort", onLaunchAbort);
+		try {
+			await launchStop;
+		} finally {
+			unbindLaunchSignal();
+		}
+	}
+}
+
+/** A stale auto source must not leave an unregistered run snapshot discoverable as a workflow. */
+async function removeUnpublishedAutoRunDirectory(
+	cwd: string,
+	runId: string,
+): Promise<void> {
+	const runFile = workflowRunPath(cwd, runId);
+	try {
+		await stat(runFile);
+		return;
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") return;
+	}
+	await rm(dirname(runFile), { recursive: true, force: true }).catch(
+		() => undefined,
+	);
 }
 
 function normalizeWorkflowRunLaunchCapture(
@@ -524,19 +743,18 @@ function normalizeWorkflowRunLaunchCapture(
 	profileName: string | undefined,
 ): WorkflowRunLaunchCapture {
 	const runtimeTask = task?.trim() ?? "";
-	return {
-		...capture,
+	const normalized = {
 		profile: directDynamic
-			? { kind: "not-applicable" }
+			? ({ kind: "not-applicable" } as const)
 			: profileName
-				? { kind: "named", name: profileName }
-				: { kind: "base" },
+				? ({ kind: "named", name: profileName } as const)
+				: ({ kind: "base" } as const),
 		task: {
 			characters: Array.from(runtimeTask).length,
-			lines:
-				runtimeTask.length === 0 ? 0 : runtimeTask.split(/\r\n|\r|\n/).length,
+			lines: runtimeTask.length === 0 ? 0 : runtimeTask.split(/\r\n|\r|\n/).length,
 		},
 	};
+	return { ...capture, ...normalized };
 }
 
 async function persistWorkflowRunLaunch(
@@ -546,12 +764,20 @@ async function persistWorkflowRunLaunch(
 ): Promise<WorkflowRunLaunchMetadata> {
 	const command =
 		capture.command.state === "captured"
-			? await writeWorkflowLaunchCommandArtifact(
-					cwd,
-					runId,
-					capture.command.text,
-				)
+			? await writeWorkflowLaunchCommandArtifact(cwd, runId, capture.command.text)
 			: capture.command;
+	if (capture.schema === "pi-workflow-run-launch-v2") {
+		return {
+			schema: capture.schema,
+			source: capture.source,
+			requestKind: capture.requestKind,
+			routingMode: capture.routingMode,
+			profile: capture.profile,
+			task: capture.task,
+			selection: capture.selection,
+			command,
+		};
+	}
 	return {
 		schema: capture.schema,
 		source: capture.source,
@@ -560,127 +786,6 @@ async function persistWorkflowRunLaunch(
 		profile: capture.profile,
 		task: capture.task,
 		command,
-	};
-}
-
-/**
- * Resolve a named execution profile into per-stage overrides. Explicit
- * selection only: no profile name means no change; an empty mapping is
- * identity and is still recorded. Nested dag children use canonical ids.
- */
-function applyWorkflowExecutionProfile<Spec>(
-	spec: Spec,
-	profileName: string | undefined,
-): { spec: Spec; record?: WorkflowRunExecutionProfile } {
-	if (!profileName) return { spec };
-	const profiles = (
-		spec as {
-			executionProfiles?: Record<
-				string,
-				Record<string, ExecutionProfileStageOverride>
-			>;
-		}
-	).executionProfiles;
-	const mapping = profiles?.[profileName];
-	if (!mapping || typeof mapping !== "object" || Array.isArray(mapping)) {
-		const available = Object.keys(profiles ?? {}).sort((left, right) =>
-			left.localeCompare(right),
-		);
-		throw new Error(
-			available.length
-				? `unknown execution profile "${profileName}"; spec declares: ${available.join(", ")}`
-				: `unknown execution profile "${profileName}"; this workflow declares no executionProfiles`,
-		);
-	}
-	const graph = (spec as { artifactGraph?: { stages?: unknown[] } })
-		.artifactGraph;
-	if (!graph || !Array.isArray(graph.stages)) {
-		throw new Error(
-			`execution profile "${profileName}" requires an artifact-graph workflow`,
-		);
-	}
-	const applyToStages = (stages: unknown[], namespace?: string): unknown[] =>
-		stages.map((stage) => {
-			if (!stage || typeof stage !== "object" || Array.isArray(stage))
-				return stage;
-			const record = stage as ProfiledArtifactGraphStage;
-			const id = record.id;
-			const canonicalId =
-				typeof id === "string"
-					? namespace
-						? `${namespace}.${id}`
-						: id
-					: undefined;
-			const override = canonicalId ? mapping[canonicalId] : undefined;
-			const nested =
-				record.type === "dag" && Array.isArray(record.stages)
-					? { stages: applyToStages(record.stages, canonicalId) }
-					: {};
-			if (override === undefined && !("stages" in nested)) return stage;
-			return {
-				...record,
-				...(override?.model === undefined ? {} : { model: override.model }),
-				...(override?.thinking === undefined
-					? {}
-					: { thinking: override.thinking }),
-				...(override?.foreachBatch === undefined
-					? {}
-					: {
-							[EXECUTION_PROFILE_FOREACH_BATCH]:
-								cloneExecutionProfileForeachBatch(override.foreachBatch),
-						}),
-				...nested,
-			};
-		});
-	const nextSpec = {
-		...(spec as Record<string, unknown>),
-		artifactGraph: {
-			...(graph as Record<string, unknown>),
-			stages: applyToStages(graph.stages),
-		},
-	} as Spec;
-	return {
-		spec: nextSpec,
-		record: {
-			name: profileName,
-			stageOverrides: Object.fromEntries(
-				Object.entries(mapping).map(([stageId, override]) => [
-					stageId,
-					cloneExecutionProfileStageOverride(override),
-				]),
-			),
-		},
-	};
-}
-
-function cloneExecutionProfileStageOverride(
-	override: ExecutionProfileStageOverride,
-): ExecutionProfileStageOverride {
-	return {
-		...(override.model === undefined ? {} : { model: override.model }),
-		...(override.thinking === undefined ? {} : { thinking: override.thinking }),
-		...(override.foreachBatch === undefined
-			? {}
-			: {
-					foreachBatch: cloneExecutionProfileForeachBatch(
-						override.foreachBatch,
-					),
-				}),
-	};
-}
-
-function cloneExecutionProfileForeachBatch(
-	batch: ExecutionProfileForeachBatch,
-): ExecutionProfileForeachBatch {
-	return {
-		maxItems: 2,
-		...(batch.groupBy === undefined
-			? {}
-			: {
-					groupBy: Array.isArray(batch.groupBy)
-						? [...batch.groupBy]
-						: batch.groupBy,
-				}),
 	};
 }
 
@@ -771,7 +876,7 @@ export async function waitForRun(
 	onWaitProgress?.(run);
 
 	while (hasActiveSchedulerWork(run)) {
-		const timeoutMessage = await stillRunningAfterWaitMessage(cwd, run, timeout);
+		const timeoutMessage = await stillRunningAfterWaitMessage(run, timeout);
 		const scheduled = await awaitWithinWorkflowWaitBoundary(
 			scheduleRun(cwd, run.runId, undefined, scheduleOptions),
 			deadline - Date.now(),
@@ -821,8 +926,7 @@ export interface StopRunSummary {
 function assertBlockedRunResumable(run: WorkflowRunRecord): void {
 	if (run.status !== "blocked") return;
 	const blockers = run.tasks.filter(
-		(task) =>
-			task.status === "blocked" && !isBlockedTaskResumableForResume(task),
+		(task) => task.status === "blocked" && !isBlockedTaskResumableForResume(task),
 	);
 	if (blockers.length === 0) return;
 	const details = blockers
@@ -862,28 +966,37 @@ export async function stopRun(
 	runIdOrPrefix: string,
 ): Promise<StopRunSummary> {
 	const current = await readRunRecord(cwd, runIdOrPrefix);
-	if (isTerminalWorkflowStatus(current.status)) {
+	if (isTerminalWorkflowStatus(current.status) && !(await readWorkflowStopIntent(cwd, current.runId))) {
 		throw new Error(
 			`stop requires a non-terminal run; ${current.runId} is ${current.status}`,
 		);
 	}
 	await requestWorkflowStop(cwd, current.runId);
+	return confirmRequestedWorkflowStop(cwd, current.runId, current);
+}
+
+/** Confirm an already-durable exact-run request, including terminal cleanup. */
+async function confirmRequestedWorkflowStop(
+	cwd: string,
+	runId: string,
+	current: WorkflowRunRecord,
+): Promise<StopRunSummary> {
 	const confirmation = await confirmStopRunUntil(
 		cwd,
-		current.runId,
+		runId,
 		Date.now() + STOP_RUN_LEASE_WAIT_MS,
 		current,
 	);
 	if (confirmation.stopped) return confirmation.stopped;
-	const latest = await readRunRecord(cwd, current.runId).catch(
+	const latest = await readRunRecord(cwd, runId).catch(
 		() => confirmation.latest,
 	);
 	if (
 		hasActiveSchedulerWork(latest) ||
-		(await readWorkflowStopIntent(cwd, current.runId))
+		(await readWorkflowStopIntent(cwd, runId))
 	) {
-		throw new Error(
-			`Workflow stop requested for ${current.runId}, but active work or descendant workflow stop could not be confirmed within ${STOP_RUN_LEASE_WAIT_MS}ms; stop intent remains durable and cancellation is still pending`,
+		throw createWorkflowStopPendingError(
+			`Workflow stop requested for ${runId}, but active work or descendant workflow stop could not be confirmed within ${STOP_RUN_LEASE_WAIT_MS}ms; stop intent remains durable and cancellation is still pending. Retry /workflow stop ${runId}`,
 		);
 	}
 	return { run: latest, interruptedTaskIds: workflowStoppedTaskIds(latest) };
@@ -1135,8 +1248,7 @@ function workflowStoppedTaskIds(run: WorkflowRunRecord): string[] {
 	return run.tasks
 		.filter(
 			(task) =>
-				task.status === "interrupted" &&
-				task.statusDetail === "workflow_stopped",
+				task.status === "interrupted" && task.statusDetail === "workflow_stopped",
 		)
 		.map((task) => task.taskId);
 }
@@ -1659,13 +1771,8 @@ function dependencyResumeInvalidationPlan(
 		const dependencies = logicalDependenciesBySpecId.get(task.specId) ?? [];
 		if (
 			!hasDurableDependencyInvalidationState(task) ||
-			!dependencies.some((dependency) =>
-				resumableSourceSpecIds.has(dependency),
-			) ||
-			!dependencyResumeInvalidationEnabled(
-				compiledBySpecId.get(task.specId),
-				task,
-			)
+			!dependencies.some((dependency) => resumableSourceSpecIds.has(dependency)) ||
+			!dependencyResumeInvalidationEnabled(compiledBySpecId.get(task.specId), task)
 		) {
 			continue;
 		}
@@ -1787,10 +1894,7 @@ function dependencyResumeInvalidationPlan(
 		invalidatedTaskIds,
 		foreachGroups,
 		taskOwnership,
-		unaffectedRunSignature: unaffectedRunStructureSignature(
-			run,
-			affectedTaskIds,
-		),
+		unaffectedRunSignature: unaffectedRunStructureSignature(run, affectedTaskIds),
 		unaffectedCompiledSignature: unaffectedCompiledStructureSignature(
 			compiledFlow,
 			affectedSpecIds,
@@ -2301,8 +2405,7 @@ function assertUnsupportedLegacyPreparedInvalidation(
 		!Array.isArray(journal.invalidatedTaskIds) ||
 		!journal.invalidatedTaskIds.every((taskId) => typeof taskId === "string") ||
 		new Set(journal.sourceTaskIds).size !== journal.sourceTaskIds.length ||
-		new Set(journal.invalidatedTaskIds).size !==
-			journal.invalidatedTaskIds.length
+		new Set(journal.invalidatedTaskIds).size !== journal.invalidatedTaskIds.length
 	) {
 		return;
 	}
@@ -2350,10 +2453,7 @@ export async function resumeRun(
 	assertRunResumableForResume(current);
 
 	const resetTaskIds: string[] = [];
-	const updated = await withRunLease(
-		cwd,
-		current.runId,
-		async (leaseSignal) => {
+	const updated = await withRunLease(cwd, current.runId, async (leaseSignal) => {
 		assertResumeLeaseActive(leaseSignal);
 		const run = await readRunRecord(cwd, current.runId);
 		assertRunResumableForResume(run);
@@ -2362,9 +2462,7 @@ export async function resumeRun(
 		const activeCompiledFlow = await readCompiledWorkflow(cwd, run.runId);
 		assertResumeLeaseActive(leaseSignal);
 		if (!activeCompiledFlow) {
-			throw new Error(
-				`Cannot resume ${run.runId}: compiled workflow is missing`,
-			);
+			throw new Error(`Cannot resume ${run.runId}: compiled workflow is missing`);
 		}
 		assertUnsupportedLegacyPreparedInvalidation(run, activeCompiledFlow);
 		const prepared = preparedInvalidationPlan(run, activeCompiledFlow);
@@ -2388,8 +2486,7 @@ export async function resumeRun(
 				for (const task of run.tasks) {
 					if (resetTaskForResume(task)) resetTaskIds.push(task.taskId);
 				}
-				if (resetTaskIds.length > 0)
-					await writeRunRecord(cwd, run, leaseSignal);
+				if (resetTaskIds.length > 0) await writeRunRecord(cwd, run, leaseSignal);
 			});
 			return run;
 		}
@@ -2412,12 +2509,7 @@ export async function resumeRun(
 			});
 		}
 		await resumeLeaseMutation(cwd, run.runId, leaseSignal, () =>
-			quarantineDependencyInvalidationArtifacts(
-				cwd,
-				run,
-				planned,
-				leaseSignal,
-			),
+			quarantineDependencyInvalidationArtifacts(cwd, run, planned, leaseSignal),
 		);
 		if (run.invalidationJournal?.artifactState !== "quarantined") {
 			await resumeLeaseMutation(cwd, run.runId, leaseSignal, async () => {
@@ -2470,8 +2562,7 @@ export async function resumeRun(
 			await writeRunRecord(cwd, run, leaseSignal);
 		});
 		return run;
-		},
-	);
+	});
 	if (!updated)
 		throw new Error(
 			`Could not acquire supervisor lease for ${current.runId}; another supervisor may be active`,
@@ -2502,6 +2593,9 @@ export async function resumeSupervisors(
 				watchRun(cwd, run.runId, options);
 			}
 		}
+		// A project that has never run a workflow gets no `.pi/workflows/`
+		// state from merely starting Pi; the index is created with the first run.
+		if (runs.length === 0 && (await readIndex(cwd)) === undefined) return;
 		await updateIndex(cwd).catch((error) =>
 			recordSupervisorError(cwd, "index", error),
 		);
@@ -2534,8 +2628,7 @@ export function watchRun(
 			const refreshed = await refreshRun(cwd, runId);
 			const afterMtime = await readRunMtimeMs(cwd, runId);
 			const currentMtime = afterMtime ?? beforeMtime;
-			if (currentMtime !== undefined)
-				supervisorRunMtimes.set(key, currentMtime);
+			if (currentMtime !== undefined) supervisorRunMtimes.set(key, currentMtime);
 
 			if (hasActiveSchedulerWork(refreshed)) {
 				const unchanged =
@@ -2557,8 +2650,7 @@ export function watchRun(
 			const failures = (supervisorErrorCounts.get(key) ?? 0) + 1;
 			supervisorErrorCounts.set(key, failures);
 			void recordSupervisorError(cwd, runId, error).finally(() => {
-				if (failures >= MAX_SUPERVISOR_CONSECUTIVE_ERRORS)
-					unwatchRun(cwd, runId);
+				if (failures >= MAX_SUPERVISOR_CONSECUTIVE_ERRORS) unwatchRun(cwd, runId);
 			});
 		});
 	}, POLL_INTERVAL_MS);
@@ -2627,14 +2719,11 @@ export async function scheduleRun(
 		)
 			return run;
 
-		const compiledFlow =
-			compiled ?? (await readCompiledWorkflow(cwd, run.runId));
+		const compiledFlow = compiled ?? (await readCompiledWorkflow(cwd, run.runId));
 		if (!compiledFlow) return run;
 
 		if (compiledFlow.type !== WORKFLOW_RUN_TYPE) {
-			throw new Error(
-				`unsupported compiled workflow type: ${compiledFlow.type}`,
-			);
+			throw new Error(`unsupported compiled workflow type: ${compiledFlow.type}`);
 		}
 		await scheduleDag(cwd, run, compiledFlow, options, leaseSignal);
 		assertScheduleLeaseActive(leaseSignal);
@@ -2865,8 +2954,7 @@ function foreachBatchLogicalSlotsAvailable(
 	if (compiledTask.stageMaxConcurrency === undefined) return true;
 	const runningInStage = run.tasks.filter(
 		(candidate) =>
-			candidate.stageId === compiledTask.stageId &&
-			candidate.status === "running",
+			candidate.stageId === compiledTask.stageId && candidate.status === "running",
 	).length;
 	return (
 		runningInStage + 2 <=
@@ -2889,10 +2977,10 @@ function sameForeachBatchRecordGrouping(
 	const grouping = compiled.foreachGenerated?.batch;
 	return Boolean(
 		grouping &&
-		grouping.enabled === true &&
-		record.grouping.enabled === grouping.enabled &&
-		record.grouping.groupBy === grouping.groupBy &&
-		record.grouping.groupKey === grouping.groupKey,
+			grouping.enabled === true &&
+			record.grouping.enabled === grouping.enabled &&
+			record.grouping.groupBy === grouping.groupBy &&
+			record.grouping.groupKey === grouping.groupKey,
 	);
 }
 
@@ -2904,8 +2992,10 @@ function sameOptionalForeachMetadata(
 	memberCompiled: CompiledTask,
 ): boolean {
 	return (
-		record.placeholderSpecId === leaderCompiled.foreachGenerated?.placeholderSpecId &&
-		record.placeholderSpecId === memberCompiled.foreachGenerated?.placeholderSpecId &&
+		record.placeholderSpecId ===
+			leaderCompiled.foreachGenerated?.placeholderSpecId &&
+		record.placeholderSpecId ===
+			memberCompiled.foreachGenerated?.placeholderSpecId &&
 		record.placeholderSpecId === leaderTask.foreachGenerated?.placeholderSpecId &&
 		record.placeholderSpecId === memberTask.foreachGenerated?.placeholderSpecId &&
 		record.stageId === leaderTask.stageId &&
@@ -2943,7 +3033,9 @@ async function revalidatePreparedForeachBatch(
 	const leaderCompiled = compiledFlow.tasks[leaderIndex];
 	const memberCompiled = compiledFlow.tasks[memberIndex];
 	if (!leaderTask || !memberTask || !leaderCompiled || !memberCompiled)
-		throw new Error(`foreach batch ${record.batchId} prepared members are missing`);
+		throw new Error(
+			`foreach batch ${record.batchId} prepared members are missing`,
+		);
 	if (
 		!sameOptionalForeachMetadata(
 			record,
@@ -2953,7 +3045,9 @@ async function revalidatePreparedForeachBatch(
 			memberCompiled,
 		)
 	)
-		throw new Error(`foreach batch ${record.batchId} prepared generation/grouping metadata drifted`);
+		throw new Error(
+			`foreach batch ${record.batchId} prepared generation/grouping metadata drifted`,
+		);
 	const [preparedLeader, preparedMember] = await Promise.all([
 		prepareDagTask(cwd, run, compiledFlow, leaderIndex, validationSnapshot),
 		prepareDagTask(cwd, run, compiledFlow, memberIndex, validationSnapshot),
@@ -2965,7 +3059,9 @@ async function revalidatePreparedForeachBatch(
 		memberSurface !== record.executionSurfaceSha256 ||
 		leaderSurface !== memberSurface
 	)
-		throw new Error(`foreach batch ${record.batchId} prepared execution surface drifted`);
+		throw new Error(
+			`foreach batch ${record.batchId} prepared execution surface drifted`,
+		);
 	return preparedLeader;
 }
 
@@ -3098,9 +3194,7 @@ async function launchForeachBatchAt(
 		});
 		const batchId = foreachBatchId(leaderTask, memberTask);
 		if (
-			(run.foreachBatches ?? []).some(
-				(candidate) => candidate.batchId === batchId,
-			)
+			(run.foreachBatches ?? []).some((candidate) => candidate.batchId === batchId)
 		)
 			throw new Error(`foreach batch ${batchId} already has a durable record`);
 		const preparedAt = new Date().toISOString();
@@ -3141,19 +3235,20 @@ async function launchForeachBatchAt(
 			batchPrompt,
 			batchPromptSha256: sha256Text(batchPrompt),
 		};
-		record.capabilitySubjectSha256 =
-			foreachBatchCapabilitySubjectSha256(record);
+		record.capabilitySubjectSha256 = foreachBatchCapabilitySubjectSha256(record);
 		run.foreachBatches ??= [];
 		run.foreachBatches.push(record);
 		leaderTask.foreachBatch = {
 			batchId,
 			role: "leader",
 			phase: "prepared",
+			physicalAttempt: 1,
 		};
 		memberTask.foreachBatch = {
 			batchId,
 			role: "member",
 			phase: "prepared",
+			physicalAttempt: 1,
 		};
 		await persistFinalPromptMetadata(cwd, run, leaderTask, preparedLeader);
 		await persistFinalPromptMetadata(cwd, run, memberTask, preparedMember);
@@ -3383,8 +3478,7 @@ async function scheduleDagPass(
 			await writeRunRecord(cwd, run);
 			continue;
 		}
-		if (!dependenciesReady(compiledTask, bySpecId, compiledFlow, task))
-			continue;
+		if (!dependenciesReady(compiledTask, bySpecId, compiledFlow, task)) continue;
 
 		if (compiledTask.kind === "loop" && compiledTask.loopPlaceholder) {
 			const changed = await scheduleLoop(
@@ -3428,12 +3522,7 @@ async function scheduleDagPass(
 			if (
 				!batchMember ||
 				!batchMemberCompiled ||
-				!dependenciesReady(
-					batchMemberCompiled,
-					bySpecId,
-					compiledFlow,
-					batchMember,
-				)
+				!dependenciesReady(batchMemberCompiled, bySpecId, compiledFlow, batchMember)
 			)
 				continue;
 			if (
@@ -3444,12 +3533,7 @@ async function scheduleDagPass(
 					maxConcurrency,
 				)
 			) {
-				if (
-					foreachBatchLogicalCapacityAtLeastTwo(
-						compiledTask,
-						maxConcurrency,
-					)
-				)
+				if (foreachBatchLogicalCapacityAtLeastTwo(compiledTask, maxConcurrency))
 					return false;
 			} else {
 				const batchOutcome = await launchForeachBatchAt(
@@ -3561,15 +3645,10 @@ async function applyFailFastCancellation(
 						);
 					}
 				} else {
-				setTaskTerminal(
-					task,
-					"interrupted",
-					FAIL_FAST_CANCELLED_STATUS_DETAIL,
-					{
+					setTaskTerminal(task, "interrupted", FAIL_FAST_CANCELLED_STATUS_DETAIL, {
 						exitCode: 130,
 						lastMessage: "cancelled by workflow fail-fast policy",
-					},
-				);
+					});
 				}
 			} catch (error) {
 				const message = `fail-fast cancellation failed; backend handle preserved: ${error instanceof Error ? error.message : String(error)}`;
@@ -3627,8 +3706,7 @@ async function suspendedDynamicControllerStillWaiting(
 	const generatedTasks = generatedTaskIds
 		.map((specId) => run.tasks.find((candidate) => candidate.specId === specId))
 		.filter(
-			(candidate): candidate is WorkflowTaskRunRecord =>
-				candidate !== undefined,
+			(candidate): candidate is WorkflowTaskRunRecord => candidate !== undefined,
 		);
 	let waiting = generatedTasks.some(
 		(generated) => !isTerminalTaskStatus(generated.status),
@@ -3640,11 +3718,18 @@ async function suspendedDynamicControllerStillWaiting(
 	) {
 		return true;
 	}
-	for (const nestedRunId of controllerState?.waitingNestedWorkflowRunIds ??
-		[]) {
-		const nestedRun = await readRunRecord(cwd, nestedRunId).catch(
-			() => undefined,
-		);
+	for (const nestedRunId of controllerState?.waitingNestedWorkflowRunIds ?? []) {
+		let nestedRun = await readRunRecord(cwd, nestedRunId).catch(() => undefined);
+		// Reconcile a nested backend before deciding that a suspended controller
+		// is still waiting; the child backend may complete without updating this
+		// parent run record.
+		if (nestedRun && !isTerminalWorkflowStatus(nestedRun.status)) {
+			try {
+				nestedRun = await refreshRun(cwd, nestedRunId);
+			} catch (error) {
+				if (!isRefreshPollAggregateError(error)) throw error;
+			}
+		}
 		if (nestedRun && isResumableDynamicApprovalBlockedRun(nestedRun)) {
 			return false;
 		}
@@ -3931,11 +4016,7 @@ function foreachMaterializationJournal(
 			runTask.taskId === "" ||
 			journalSpecIds.has(task.id) ||
 			journalTaskIds.has(runTask.taskId) ||
-			!sameForeachJournalOwnershipTuple(
-				task,
-				runTask,
-				journal.placeholderSpecId,
-			)
+			!sameForeachJournalOwnershipTuple(task, runTask, journal.placeholderSpecId)
 		) {
 			throw new Error(
 				`Cannot recover foreach materialization for ${run.runId}: journal task mapping is invalid`,
@@ -3990,9 +4071,7 @@ function assertPreparedForeachReplayOwnership(
 		}
 	}
 
-	const expectedSpecIds = new Set(
-		journal.generatedTasks.map((task) => task.id),
-	);
+	const expectedSpecIds = new Set(journal.generatedTasks.map((task) => task.id));
 	const compiledOrder = foreachReplayStructuralOrder(
 		compiledFlow.tasks,
 		(task) => compiledTaskSpecId(task),
@@ -4050,9 +4129,7 @@ function applyForeachMaterializationJournal(
 	compiledFlow: CompiledWorkflow,
 	journal: ForeachMaterializationJournal,
 ): void {
-	const expectedSpecIds = new Set(
-		journal.generatedTasks.map((task) => task.id),
-	);
+	const expectedSpecIds = new Set(journal.generatedTasks.map((task) => task.id));
 	const replacePlaceholder =
 		journal.replacePlaceholder && expectedSpecIds.size > 0;
 	const expectedRunTaskBySpecId = new Map(
@@ -4187,11 +4264,7 @@ function applyForeachMaterializationJournal(
 		}
 		retainedPlaceholder = run.tasks[runPlaceholderIndex];
 		if (presentRunTasks.length === 0) {
-			run.tasks.splice(
-				runPlaceholderIndex + 1,
-				0,
-				...journal.generatedRunTasks,
-			);
+			run.tasks.splice(runPlaceholderIndex + 1, 0, ...journal.generatedRunTasks);
 		}
 	}
 	if (!retainEmptyPlaceholderDependency) {
@@ -4229,8 +4302,7 @@ function applyForeachMaterializationJournal(
 	}
 	const dispatchParent = run.tasks.find(
 		(task) =>
-			task.specId === journal.placeholderSpecId &&
-			task.dispatchMap !== undefined,
+			task.specId === journal.placeholderSpecId && task.dispatchMap !== undefined,
 	);
 	if (dispatchParent) {
 		assertArtifactGraphSourceRuntimeMetadataCurrent(
@@ -4301,6 +4373,16 @@ async function materializeForeachTask(
 	const sourceTasks = run.tasks.filter((task) =>
 		sourceStageIds.includes(task.stageId ?? ""),
 	);
+	const missingSourceStageIds = sourceStageIds.filter(
+		(stageId) => !sourceTasks.some((task) => task.stageId === stageId),
+	);
+	if (sourceStageIds.length === 0 || missingSourceStageIds.length > 0) {
+		setTaskTerminal(templateRunTask, "blocked", "foreach_expansion_blocked", {
+			lastMessage: `foreach source is missing from the authoritative run task record: ${missingSourceStageIds.join(", ") || "no source stage declared"}`,
+		});
+		await writeRunRecord(cwd, run);
+		return true;
+	}
 	const streaming = foreachStreamingEnabled(template);
 	const dispatchContext = foreachDispatchMapContext(template, sourceTasks);
 	if (dispatchContext && "error" in dispatchContext) {
@@ -4341,7 +4423,9 @@ async function materializeForeachTask(
 
 	const items = extracted.items ?? [];
 	const itemMetas = extracted.itemMetas ?? [];
-	const sourceTaskBySpecId = new Map(sourceTasks.map((task) => [task.specId, task]));
+	const sourceTaskBySpecId = new Map(
+		sourceTasks.map((task) => [task.specId, task]),
+	);
 	const lineages = itemMetas.map((meta) => {
 		const upstream = sourceTaskBySpecId.get(meta.sourceSpecId)?.foreachGenerated
 			?.sourceLineageDigest;
@@ -4357,8 +4441,7 @@ async function materializeForeachTask(
 					reservedSpecIds: new Set(
 						compiledFlow.tasks
 							.filter(
-								(task) =>
-									task.foreachGenerated?.placeholderSpecId !== template.id,
+								(task) => task.foreachGenerated?.placeholderSpecId !== template.id,
 							)
 							.map((task) => compiledTaskSpecId(task)),
 					),
@@ -4375,10 +4458,7 @@ async function materializeForeachTask(
 
 	const generatedWithItemMetadata =
 		streaming || dispatchContext
-			? generatedTasksWithItemMetadata(
-					generated.tasks,
-					extracted.itemMetas ?? [],
-				)
+			? generatedTasksWithItemMetadata(generated.tasks, extracted.itemMetas ?? [])
 			: { tasks: generated.tasks };
 	if (generatedWithItemMetadata.error || !generatedWithItemMetadata.tasks) {
 		setTaskTerminal(templateRunTask, "blocked", "foreach_expansion_blocked", {
@@ -4447,46 +4527,46 @@ async function materializeForeachTask(
 		return true;
 	}
 
-function globalForeachDispatchCollision(
-	run: WorkflowRunRecord,
-	compiledFlow: CompiledWorkflow,
-	generatedTasks: readonly CompiledTask[],
-	generatedRunTasks: readonly WorkflowTaskRunRecord[],
-): string | undefined {
-	const taskIdOwner = new Map<string, string>();
-	for (const task of run.tasks) {
-		const owner = taskIdOwner.get(task.taskId);
-		if (owner !== undefined) {
-			return `workflow task id "${task.taskId}" is globally ambiguous between ${owner} and ${task.specId}`;
+	function globalForeachDispatchCollision(
+		run: WorkflowRunRecord,
+		compiledFlow: CompiledWorkflow,
+		generatedTasks: readonly CompiledTask[],
+		generatedRunTasks: readonly WorkflowTaskRunRecord[],
+	): string | undefined {
+		const taskIdOwner = new Map<string, string>();
+		for (const task of run.tasks) {
+			const owner = taskIdOwner.get(task.taskId);
+			if (owner !== undefined) {
+				return `workflow task id "${task.taskId}" is globally ambiguous between ${owner} and ${task.specId}`;
+			}
+			taskIdOwner.set(task.taskId, task.specId);
 		}
-		taskIdOwner.set(task.taskId, task.specId);
-	}
-	for (const task of generatedRunTasks) {
-		const owner = taskIdOwner.get(task.taskId);
-		if (owner !== undefined) {
-			return `foreach generated task id "${task.taskId}" collides with ${owner}`;
+		for (const task of generatedRunTasks) {
+			const owner = taskIdOwner.get(task.taskId);
+			if (owner !== undefined) {
+				return `foreach generated task id "${task.taskId}" collides with ${owner}`;
+			}
+			taskIdOwner.set(task.taskId, task.specId);
 		}
-		taskIdOwner.set(task.taskId, task.specId);
-	}
 
-	const specIdOwner = new Map<string, string>();
-	for (const task of compiledFlow.tasks) {
-		const specId = compiledTaskSpecId(task);
-		const owner = specIdOwner.get(specId);
-		if (owner !== undefined) {
-			return `compiled task spec id "${specId}" is globally ambiguous`;
+		const specIdOwner = new Map<string, string>();
+		for (const task of compiledFlow.tasks) {
+			const specId = compiledTaskSpecId(task);
+			const owner = specIdOwner.get(specId);
+			if (owner !== undefined) {
+				return `compiled task spec id "${specId}" is globally ambiguous`;
+			}
+			specIdOwner.set(specId, specId);
 		}
-		specIdOwner.set(specId, specId);
-	}
-	for (const task of generatedTasks) {
-		const owner = specIdOwner.get(task.id);
-		if (owner !== undefined) {
-			return `foreach generated spec id "${task.id}" collides with ${owner}`;
+		for (const task of generatedTasks) {
+			const owner = specIdOwner.get(task.id);
+			if (owner !== undefined) {
+				return `foreach generated spec id "${task.id}" collides with ${owner}`;
+			}
+			specIdOwner.set(task.id, task.id);
 		}
-		specIdOwner.set(task.id, task.id);
+		return undefined;
 	}
-	return undefined;
-}
 
 	const nextIndex = nextTaskRecordIndex(run);
 	const generatedRunTasks = generatedTasks.map((task, offset) =>
@@ -4654,9 +4734,7 @@ async function materializeStreamingForeachTask(input: {
 	partialLedgerPathsBySourceSpecId: Map<string, ReadonlySet<string>>;
 }): Promise<boolean> {
 	const sourceTaskSpecIdSet = new Set(input.sourceTaskSpecIds);
-	const perItemDispatch = workflowExperimentalFlagEnabled(
-		PER_ITEM_DISPATCH_ENV,
-	);
+	const perItemDispatch = workflowExperimentalFlagEnabled(PER_ITEM_DISPATCH_ENV);
 	const existingGeneratedTasks = input.compiledFlow.tasks.filter(
 		(task) =>
 			task.foreachGenerated?.placeholderSpecId === input.placeholderSpecId,
@@ -4726,9 +4804,7 @@ async function materializeStreamingForeachTask(input: {
 			dependsOn,
 			...(perItemActivated
 				? {
-						contextDependsOn: [
-							...new Set([...dependsOn, itemMeta.sourceSpecId]),
-						],
+						contextDependsOn: [...new Set([...dependsOn, itemMeta.sourceSpecId])],
 					}
 				: {}),
 			foreachGenerated: {
@@ -4744,9 +4820,7 @@ async function materializeStreamingForeachTask(input: {
 			},
 		};
 	});
-	const existingGeneratedSpecIds = existingGeneratedTasks.map(
-		(task) => task.id,
-	);
+	const existingGeneratedSpecIds = existingGeneratedTasks.map((task) => task.id);
 	const exactPartialMatches = new Map<CompiledTask, CompiledTask>();
 	if (!input.waitingForSources) {
 		const finalEvidenceError = matchStreamingFinalEvidence(
@@ -4767,8 +4841,7 @@ async function materializeStreamingForeachTask(input: {
 	}
 	for (const task of generatedTasksWithItemDeps) {
 		const existing =
-			existingGeneratedTaskBySpecId.get(task.id) ??
-			exactPartialMatches.get(task);
+			existingGeneratedTaskBySpecId.get(task.id) ?? exactPartialMatches.get(task);
 		if (
 			existing &&
 			!sameForeachIdentityTuple(
@@ -4818,11 +4891,7 @@ async function materializeStreamingForeachTask(input: {
 		) {
 			compiledInsertIndex += 1;
 		}
-		input.compiledFlow.tasks.splice(
-			compiledInsertIndex,
-			0,
-			...newGeneratedTasks,
-		);
+		input.compiledFlow.tasks.splice(compiledInsertIndex, 0, ...newGeneratedTasks);
 
 		let runInsertIndex = input.index + 1;
 		while (
@@ -5018,10 +5087,7 @@ async function extractArtifactGraphForeachItems(
 				const partial = await extractPartialForeachItems(cwd, task, path);
 				if (partial.error) return { error: partial.error };
 				if (partial.ledgerPaths) {
-					partialLedgerPathsBySourceSpecId.set(
-						task.specId,
-						partial.ledgerPaths,
-					);
+					partialLedgerPathsBySourceSpecId.set(task.specId, partial.ledgerPaths);
 				}
 				for (const item of partial.items) {
 					items.push(item.item);
@@ -5428,17 +5494,15 @@ async function executeDynamicControllerTask(
 		activeRuntimeRecorded = true;
 		const elapsedMs = Math.max(0, Date.now() - activeRuntimeStartedAt);
 		if (elapsedMs === 0) return;
-		await recordDynamicRuntimeUsage(
-			cwd,
-			run.runId,
-			task.specId,
-			elapsedMs,
-		).catch(() => undefined);
+		await recordDynamicRuntimeUsage(cwd, run.runId, task.specId, elapsedMs).catch(
+			() => undefined,
+		);
 	};
 
 	const stop = createWorkflowStopSignal(cwd, run.runId);
 	try {
 		const structuredOutput = await runDynamicControllerWorker({
+			attemptStartedAt: activeRuntimeStartedAt,
 			cwd,
 			run,
 			compiledFlow,
@@ -5472,6 +5536,20 @@ async function executeDynamicControllerTask(
 			task.specId,
 		);
 		await throwIfWorkflowStopRequested(cwd, run.runId);
+		for (const specId of dynamicOutputTaskSpecIds(
+			normalizeDynamicControllerOutput(structuredOutput).control,
+		)) {
+			const exported = run.tasks.find((candidate) => candidate.specId === specId);
+			if (
+				!exported ||
+				exported.status !== "completed" ||
+				!exported.artifactGraph?.enabled
+			) {
+				unrunBranchBlockers.push(
+					`dynamic exported output is not a completed artifact task: ${specId}`,
+				);
+			}
+		}
 		const outputForOutcome =
 			unrunBranchBlockers.length > 0
 				? dynamicControllerOutputWithBranchBlockers(
@@ -5520,9 +5598,7 @@ async function executeDynamicControllerTask(
 		await recordDynamicControllerStatus(cwd, run.runId, {
 			controllerSpecId: task.specId,
 			status: outcome.controllerStatus,
-			...(outcome.taskStatus === "completed"
-				? {}
-				: { message: outcome.message }),
+			...(outcome.taskStatus === "completed" ? {} : { message: outcome.message }),
 			blockers: outcome.blockers,
 			omissions: outcome.omissions,
 		});
@@ -5629,6 +5705,7 @@ function dynamicDecisionLoopModuleUrl(): string {
 }
 
 async function runDynamicControllerWorker(input: {
+	attemptStartedAt: number;
 	cwd: string;
 	run: WorkflowRunRecord;
 	compiledFlow: CompiledWorkflow;
@@ -5693,13 +5770,18 @@ async function runDynamicControllerWorker(input: {
 	const replayedOpIds = new Set<string>();
 	let settled = false;
 	let currentGeneratedTaskIds = generatedTaskIds;
-	const timeoutMs = remainingDynamicRuntimeMs(
-		input.dynamic,
-		state.controllers[input.controllerTask.specId]?.counters.runtimeMs ?? 0,
-	);
-
+	const deadline =
+		input.attemptStartedAt +
+		remainingDynamicRuntimeMs(
+			input.dynamic,
+			state.controllers[input.controllerTask.specId]?.counters.runtimeMs ?? 0,
+		);
+	const timeoutMs = Math.max(0, deadline - Date.now());
+	const attemptAbort = new AbortController();
+	const attemptInput = { ...input, stopSignal: attemptAbort.signal };
 	return await new Promise<unknown>((resolvePromise, rejectPromise) => {
 		let opQueue = Promise.resolve();
+		let handlerFailure: { error: unknown } | undefined;
 		let timer: ReturnType<typeof setTimeout> | undefined;
 		const finish = (callback: () => void): void => {
 			if (settled) return;
@@ -5707,8 +5789,17 @@ async function runDynamicControllerWorker(input: {
 			if (timer) clearTimeout(timer);
 			input.stopSignal?.removeEventListener("abort", abortStop);
 			worker.removeAllListeners();
-			void worker.terminate().catch(() => undefined);
-			callback();
+			attemptAbort.abort(
+				input.stopSignal?.reason ??
+					new DynamicControllerBudgetBlocked(
+						"dynamic controller attempt settled; owned helper cancelled",
+					),
+			);
+			// Join the handler's terminal helper event and both worker terminations.
+			void Promise.all([worker.terminate(), opQueue]).then(
+				() => (handlerFailure ? rejectPromise(handlerFailure.error) : callback()),
+				rejectPromise,
+			);
 		};
 		const abortStop = (): void => {
 			finish(() => rejectPromise(input.stopSignal?.reason));
@@ -5733,7 +5824,8 @@ async function runDynamicControllerWorker(input: {
 		worker.on("message", (message) => {
 			const runHandler = async (): Promise<void> => {
 				if (settled) return;
-				await handleDynamicWorkerMessage(input, message, {
+				await handleDynamicWorkerMessage(attemptInput, message, {
+					deadline,
 					helperCallCounts,
 					workflowCallCounts,
 					agentOpIds,
@@ -5759,7 +5851,8 @@ async function runDynamicControllerWorker(input: {
 				});
 			};
 			opQueue = opQueue.then(runHandler, runHandler).catch((error) => {
-				finish(() => rejectPromise(error));
+				handlerFailure = { error };
+				if (!settled) finish(() => rejectPromise(error));
 			});
 		});
 		worker.on("error", (error) => finish(() => rejectPromise(error)));
@@ -5852,6 +5945,7 @@ async function handleDynamicWorkerMessage(
 	},
 	message: any,
 	state: {
+		deadline: number;
 		helperCallCounts: Map<string, number>;
 		workflowCallCounts: Map<string, number>;
 		agentOpIds: Set<string>;
@@ -6047,6 +6141,7 @@ async function handleDynamicWorkerMessage(
 				helperId,
 				callIndex: count,
 				helperInput: message.input,
+				deadline: state.deadline,
 				isSettled: state.isSettled,
 				stopSignal: input.stopSignal,
 			});
@@ -6085,7 +6180,14 @@ async function handleDynamicWorkerMessage(
 			budgetRemaining: await currentDynamicBudgetRemaining(input),
 		});
 	} catch (error) {
-		if (state.isSettled()) return;
+		if (state.isSettled()) {
+			if (
+				error === input.stopSignal?.reason ||
+				error instanceof DynamicControllerBudgetBlocked
+			)
+				return;
+			throw error;
+		}
 		if (isWorkflowStopRequestedError(error) || input.stopSignal?.aborted) {
 			state.finish(() => state.reject(error));
 			return;
@@ -6225,9 +6327,7 @@ async function assertPriorDynamicOpsReplayed(
 	const omitted = required.filter((opId) => !replayedOpIds.has(opId));
 	if (omitted.length > 0 || replayPrefix.cursor < replayPrefix.opIds.length) {
 		const remaining =
-			omitted.length > 0
-				? omitted
-				: replayPrefix.opIds.slice(replayPrefix.cursor);
+			omitted.length > 0 ? omitted : replayPrefix.opIds.slice(replayPrefix.cursor);
 		throw new Error(
 			`dynamic controller omitted previously recorded operation(s): ${remaining.join(", ")}`,
 		);
@@ -6319,6 +6419,11 @@ async function currentDynamicBudgetRemaining(input: {
 			input.controllerTask.specId,
 			state.controllers[input.controllerTask.specId]?.generatedTaskIds ?? [],
 		),
+		await remainingDynamicNestedWorkflowDepth(
+			input.cwd,
+			input.run.runId,
+			input.dynamic.budget.maxNestedWorkflowDepth,
+		),
 	);
 }
 
@@ -6386,11 +6491,11 @@ function dynamicBudgetRemaining(
 				runningAgents?: number;
 				graphMutations?: number;
 				helperRuns?: number;
-				nestedWorkflowDepth?: number;
 				runtimeMs?: number;
 		  }
 		| undefined,
-	runningAgents = counters?.runningAgents ?? 0,
+	runningAgents: number,
+	nestedDepthRemaining: number,
 ): Record<string, number> {
 	return {
 		maxAgents: Math.max(0, dynamic.budget.maxAgents - (counters?.agents ?? 0)),
@@ -6399,11 +6504,7 @@ function dynamicBudgetRemaining(
 			0,
 			remainingDynamicRuntimeMs(dynamic, counters?.runtimeMs ?? 0),
 		),
-		maxNestedWorkflowDepth: Math.max(
-			0,
-			dynamic.budget.maxNestedWorkflowDepth -
-				(counters?.nestedWorkflowDepth ?? 0),
-		),
+		maxNestedWorkflowDepth: nestedDepthRemaining,
 		maxGraphMutations: Math.max(
 			0,
 			dynamic.budget.maxGraphMutations - (counters?.graphMutations ?? 0),
@@ -6454,8 +6555,7 @@ async function runDynamicHelperWorker(input: {
 			if (timer) clearTimeout(timer);
 			input.stopSignal?.removeEventListener("abort", abortStop);
 			worker.removeAllListeners();
-			void worker.terminate().catch(() => undefined);
-			callback();
+			void worker.terminate().then(callback, rejectPromise);
 		};
 		const abortStop = (): void => {
 			finish(() => rejectPromise(input.stopSignal?.reason));
@@ -6487,9 +6587,7 @@ async function runDynamicHelperWorker(input: {
 		worker.on("exit", (code) => {
 			if (!settled && code !== 0) {
 				finish(() =>
-					rejectPromise(
-						new Error(`dynamic helper worker exited with code ${code}`),
-					),
+					rejectPromise(new Error(`dynamic helper worker exited with code ${code}`)),
 				);
 			}
 		});
@@ -6601,7 +6699,7 @@ parentPort.on("message", (message) => {
     graph: {
       generatedTaskIds: () => [...generatedTaskIds],
       generatedBranchTaskIds: () => [...(workerData.generatedBranchTaskIds || [])],
-      generatedTaskSpecId: (taskId) => workerData.controllerStageId + "." + taskId,
+      generatedTaskSpecId: (taskId) => workerData.controllerStageId + "." + String(taskId).trim().toLowerCase().replace(/[^a-z0-9_.-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 64),
     },
     budget: { remaining: () => ({ ...budgetRemaining }), check: budgetCheck },
     tools: { available: () => toJson(workerData.availableTools || []) },
@@ -6735,9 +6833,7 @@ async function repairMissingDynamicGeneratedTask(
 		);
 	}
 	const request = normalizeDynamicAgentRequest(event.payload.request);
-	let compiledTask = input.compiledFlow.tasks.find(
-		(task) => task.id === specId,
-	);
+	let compiledTask = input.compiledFlow.tasks.find((task) => task.id === specId);
 	compiledTask ??= isDynamicCompiledTaskPayload(event.payload.compiledTask)
 		? event.payload.compiledTask
 		: await buildDynamicGeneratedCompiledTask({
@@ -6765,6 +6861,7 @@ async function repairMissingDynamicGeneratedTask(
 		requestId: request.id,
 		branchId: optionalEventString(event.payload.branchId),
 	});
+	restoreDynamicGeneratedResourceWarnings(input.compiledFlow, compiledTask);
 	const existingCompiledIndex = input.compiledFlow.tasks.findIndex(
 		(task) => task.id === specId,
 	);
@@ -6786,11 +6883,7 @@ async function repairMissingDynamicGeneratedTask(
 		nextTaskRecordIndex(input.run),
 	);
 	input.run.tasks.splice(insertAt, 0, runTask);
-	await writeCompiledRunArtifact(
-		input.cwd,
-		input.run.runId,
-		input.compiledFlow,
-	);
+	await writeCompiledRunArtifact(input.cwd, input.run.runId, input.compiledFlow);
 	await writeRunRecord(input.cwd, input.run);
 	return runTask;
 }
@@ -6902,6 +6995,7 @@ async function runDynamicAgentRequest(input: {
 			branchId: generationBranchId,
 		});
 		if (input.isSettled?.()) return undefined;
+		restoreDynamicGeneratedResourceWarnings(input.compiledFlow, compiledTask);
 		if (!previousGenerated) {
 			await recordDynamicEventAndUpdateState(input.cwd, input.run.runId, {
 				controllerSpecId: input.controllerTask.specId,
@@ -6917,8 +7011,7 @@ async function runDynamicAgentRequest(input: {
 			});
 		}
 		const existingRunIndex = runTask ? input.run.tasks.indexOf(runTask) : -1;
-		const existingCompiledIndex =
-			input.compiledFlow.tasks.indexOf(compiledTask);
+		const existingCompiledIndex = input.compiledFlow.tasks.indexOf(compiledTask);
 		const insertAt =
 			existingRunIndex >= 0
 				? existingRunIndex
@@ -7019,11 +7112,10 @@ export function dynamicControllerOutcomeFromOutput(
 	options: { requireOutput?: boolean } = {},
 ): DynamicControllerOutcome {
 	const { control } = normalizeDynamicControllerOutput(structuredOutput);
-	const status =
-		typeof control.status === "string" ? control.status : undefined;
+	const status = typeof control.status === "string" ? control.status : undefined;
 	const blockers = dynamicControlStringArray(control.blockers);
 	const omissions = dynamicControlStringArray(control.omissions);
-	const outputTasks = dynamicControlStringArray(control.outputTasks);
+	const outputTasks = dynamicOutputTaskSpecIds(control);
 
 	if (status === "blocked" || (blockers.length > 0 && status !== "stopped")) {
 		return {
@@ -7073,10 +7165,7 @@ export function dynamicControllerOutcomeFromOutput(
 			statusDetail: "dynamic_stopped",
 			message:
 				blockers.length > 0
-					? dynamicControllerIssueMessage(
-							"dynamic controller stopped",
-							blockers,
-						)
+					? dynamicControllerIssueMessage("dynamic controller stopped", blockers)
 					: "dynamic controller stopped",
 			lifecycleStatus: "completed",
 			controllerStatus: "complete",
@@ -7112,9 +7201,7 @@ async function auditDirectDynamicControllerRun(
 ): Promise<WorkflowRunRecord["dynamicAudit"]> {
 	try {
 		const { control } = normalizeDynamicControllerOutput(structuredOutput);
-		const outputTaskIds = new Set(
-			dynamicControlStringArray(control.outputTasks),
-		);
+		const outputTaskIds = new Set(dynamicControlStringArray(control.outputTasks));
 		const generated = run.tasks.filter(
 			(candidate) =>
 				candidate.dynamicGenerated?.controllerSpecId === controllerTask.specId,
@@ -7145,10 +7232,7 @@ async function auditDirectDynamicControllerRun(
 				taskId: candidate.taskId,
 				specId: candidate.specId,
 				refs: await readJson(
-					join(
-						dirname(fromProjectPath(cwd, candidate.files.result)),
-						"refs.json",
-					),
+					join(dirname(fromProjectPath(cwd, candidate.files.result)), "refs.json"),
 				).catch(() => undefined),
 			});
 		}

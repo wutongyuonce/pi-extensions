@@ -8,6 +8,8 @@ import { contextModeLabel } from "../runs/shared/context-mode.ts";
 import { formatWorkflowJsonPreview } from "../workflows/scripted-workflow.ts";
 import { hostStepReportName, hostStepVerdictLabel } from "../runs/shared/host-step-status.ts";
 import { isStaleExtensionContextError } from "../shared/extension-context.ts";
+import { inlineWorkflowRenderKey } from "./render.ts";
+import { formatWorkflowChecklistBottleneck, formatWorkflowChecklistPhase, formatWorkflowChecklistSummary, projectWorkflowChecklist, type WorkflowChecklistPhase, type WorkflowChecklistProjection } from "../workflows/workflow-checklist.ts";
 
 export const FLEET_STATUS_WIDGET_KEY = "subagent-fleet-status";
 
@@ -16,6 +18,35 @@ const MAX_AGENT_ROWS = 6;
 const REFRESH_MS = 500;
 
 type Theme = ExtensionContext["ui"]["theme"];
+
+const FLEET_AGENT_IDENTITY_COLORS = [
+	"mdLink",
+	"mdHeading",
+	"syntaxFunction",
+	"syntaxKeyword",
+	"syntaxNumber",
+	"syntaxType",
+	"syntaxVariable",
+	"customMessageLabel",
+	"toolTitle",
+	"thinkingMedium",
+	"thinkingHigh",
+	"mdQuote",
+	"bashMode",
+	"userMessageText",
+	"mdCode",
+	"syntaxOperator",
+] as const satisfies readonly Exclude<Parameters<Theme["fg"]>[0], "accent" | "success" | "error" | "warning" | "muted" | "dim">[];
+
+export function fleetAgentIdentityColor(identity: string): (typeof FLEET_AGENT_IDENTITY_COLORS)[number] {
+	let hash = 2166136261;
+	for (let i = 0; i < identity.length; i++) {
+		hash ^= identity.charCodeAt(i);
+		hash = Math.imul(hash, 16777619);
+	}
+	return FLEET_AGENT_IDENTITY_COLORS[(hash >>> 0) % FLEET_AGENT_IDENTITY_COLORS.length]!;
+}
+
 type FleetStatusTui = {
 	requestRender(): void;
 };
@@ -25,6 +56,7 @@ type FleetStatusEntry = {
 	parentKey?: string;
 	workflowWrapper?: boolean;
 	agent: string;
+	displayLabel?: string;
 	modelThinking?: string;
 	description?: string;
 	startedAt: number;
@@ -35,14 +67,17 @@ type FleetStatusEntry = {
 	projectPane?: HerdrProjectPaneSnapshot;
 	nestedChildren?: NestedRunSummary[];
 	workflowRows?: AsyncStatusWorkflowRow[];
+	workflowChecklist?: WorkflowChecklistProjection;
 };
 
 type FleetNestedRow = {
 	name: string;
+	agentIdentity?: string;
 	state: NestedRunSummary["state"] | NestedStepSummary["status"];
 	modelThinking?: string;
 	activity?: string;
 	startedAt?: number;
+	endedAt?: number;
 	depth: number;
 	overflow?: number;
 };
@@ -50,6 +85,7 @@ type FleetNestedRow = {
 type FleetTreeRow =
 	| { kind: "owner"; entry: FleetStatusEntry }
 	| { kind: "child"; entry: FleetStatusEntry; last: boolean }
+	| { kind: "workflow-phase"; ownerKey: string; phase: WorkflowChecklistPhase; last: boolean }
 	| { kind: "workflow"; ownerKey: string; row: AsyncStatusWorkflowRow; last: boolean }
 	| { kind: "nested"; ownerKey: string; row: FleetNestedRow; last: boolean };
 
@@ -57,6 +93,7 @@ export interface FleetStatusOptions {
 	refreshMs?: number;
 	maxAgentRows?: number;
 	placement?: FleetViewPlacement;
+	onWorkflowCoverageChange?: (ui: ExtensionContext["ui"], coverage: ReadonlyMap<string, string>) => void;
 }
 
 export function resolveFleetViewPlacement(value: unknown): FleetViewPlacement {
@@ -67,14 +104,21 @@ export function formatFleetElapsed(ms: number): string {
 	return `${Math.max(0, Math.round(ms / 1000))}s`;
 }
 
-export function formatFleetTokens(count: number, window?: number): string {
+function detailElapsed(row: Pick<AsyncStatusWorkflowRow, "startedAt" | "endedAt" | "durationMs"> & { state: string }): string | undefined {
+	const duration = row.state === "running" && row.startedAt !== undefined
+		? Date.now() - row.startedAt
+		: row.durationMs ?? (row.startedAt !== undefined && row.endedAt !== undefined ? row.endedAt - row.startedAt : undefined);
+	return duration !== undefined ? formatFleetElapsed(duration) : undefined;
+}
+
+export function formatFleetTokens(count: number, window?: number, windowCount = 1): string {
 	const compact = (value: number): string => value >= 1_000_000
 		? `${(value / 1_000_000).toFixed(1)}M`
 		: value >= 1_000
 			? `${(value / 1_000).toFixed(1)}k`
 			: `${Math.max(0, Math.round(value))}`;
 	return window !== undefined
-		? `↓ ${compact(window)} window · ${compact(count)} spent`
+		? `↓ ${compact(window)} ${windowCount > 1 ? "Σ windows" : "window"} · ${compact(count)} spent`
 		: `↓ ${compact(count)} tokens`;
 }
 
@@ -115,6 +159,18 @@ function visibleWorkflowRows(rows: AsyncStatusWorkflowRow[] | undefined, visible
 	for (let index = rows.length - 1; index >= 0 && selected.size < visibleLimit; index--) selected.add(index);
 	const visible = [...selected].sort((left, right) => left - right).map((index) => rows[index]!);
 	return [{ name: `… +${rows.length - visible.length} hidden workflow steps`, state: "complete", overflow: rows.length - visible.length }, ...visible];
+}
+
+function visibleWorkflowPhases(checklist: WorkflowChecklistProjection | undefined, visibleLimit: number): WorkflowChecklistPhase[] {
+	const phases = checklist?.phases ?? [];
+	if (phases.length <= visibleLimit) return phases;
+	const selected = new Set<number>();
+	for (const [index, phase] of phases.entries()) {
+		if (phase.state !== "complete") selected.add(index);
+		if (selected.size >= visibleLimit) break;
+	}
+	for (let index = phases.length - 1; index >= 0 && selected.size < visibleLimit; index--) selected.add(index);
+	return [...selected].sort((left, right) => left - right).map((index) => phases[index]!);
 }
 
 function isWorkflowRowTerminal(row: AsyncStatusWorkflowRow): boolean {
@@ -169,11 +225,13 @@ function nestedFleetRows(children: NestedRunSummary[] | undefined, visibleLimit:
 					const activity = nestedActivity(step);
 					rows.push({
 						name: step.agent,
+						agentIdentity: step.agent,
 						state: step.status,
 						depth,
 						...(modelThinking ? { modelThinking } : {}),
 						...(activity ? { activity } : {}),
 						...(step.startedAt !== undefined ? { startedAt: step.startedAt } : {}),
+						...(step.endedAt !== undefined ? { endedAt: step.endedAt } : {}),
 					});
 					if (!appendRuns(step.children, depth + 1)) {
 						omitted += nestedStepDisplayCount(steps, stepIndex + 1);
@@ -191,11 +249,13 @@ function nestedFleetRows(children: NestedRunSummary[] | undefined, visibleLimit:
 				const activity = nestedActivity(child);
 				rows.push({
 					name: nestedRunLabel(child),
+					agentIdentity: child.agent ?? child.agents?.join("\0") ?? child.id,
 					state: child.state,
 					depth,
 					...(modelThinking ? { modelThinking } : {}),
 					...(activity ? { activity } : {}),
 					...(child.startedAt !== undefined ? { startedAt: child.startedAt } : {}),
+					...(child.endedAt !== undefined ? { endedAt: child.endedAt } : {}),
 				});
 			}
 			if (!appendRuns(child.children, depth + 1)) {
@@ -224,10 +284,11 @@ function fleetTreeRows(entries: FleetStatusEntry[]): FleetTreeRow[] {
 		if (entry.parentKey && entryKeys.has(entry.parentKey)) continue;
 		rows.push({ kind: "owner", entry });
 		const attached = childrenByParent.get(entry.key) ?? [];
+		const workflowPhases = visibleWorkflowPhases(entry.workflowChecklist, attached.length > 0 ? 2 : 4);
 		const workflowRows = visibleWorkflowRows(entry.workflowRows, attached.length > 0 ? 2 : 4);
 		for (const [index, child] of attached.entries()) {
 			const nested = nestedFleetRows(child.nestedChildren, 3);
-			const laterRows = index < attached.length - 1 || workflowRows.length > 0 || Boolean(entry.nestedChildren?.length);
+			const laterRows = index < attached.length - 1 || workflowPhases.length > 0 || workflowRows.length > 0 || Boolean(entry.nestedChildren?.length);
 			rows.push({ kind: "child", entry: child, last: !laterRows && nested.length === 0 });
 			for (const [nestedIndex, row] of nested.entries()) rows.push({
 				kind: "nested",
@@ -236,6 +297,12 @@ function fleetTreeRows(entries: FleetStatusEntry[]): FleetTreeRow[] {
 				last: nestedIndex === nested.length - 1 && !laterRows,
 			});
 		}
+		for (const [index, phase] of workflowPhases.entries()) rows.push({
+			kind: "workflow-phase",
+			ownerKey: entry.key,
+			phase,
+			last: index === workflowPhases.length - 1 && workflowRows.length === 0 && !entry.nestedChildren?.length,
+		});
 		for (const [index, row] of workflowRows.entries()) rows.push({ kind: "workflow", ownerKey: entry.key, row, last: index === workflowRows.length - 1 && !entry.nestedChildren?.length });
 		const nested = nestedFleetRows(entry.nestedChildren, attached.length > 0 ? 3 : 4);
 		for (const [index, row] of nested.entries()) rows.push({ kind: "nested", ownerKey: entry.key, row, last: index === nested.length - 1 });
@@ -298,6 +365,7 @@ function projectPaneEntries(state: SubagentState): FleetStatusEntry[] {
 }
 
 export function collectFleetStatusEntries(state: SubagentState): FleetStatusEntry[] {
+	const now = Date.now();
 	const entries: FleetStatusEntry[] = [];
 	const activeWorkflowKeys = new Set([...state.asyncJobs.values()]
 		.filter((job) => job.mode === "workflow" && isActiveState(job.status))
@@ -358,12 +426,20 @@ export function collectFleetStatusEntries(state: SubagentState): FleetStatusEntr
 
 	for (const job of state.asyncJobs.values()) {
 		if (!isActiveState(job.status)) continue;
-		const startedAt = job.startedAt ?? job.updatedAt ?? Date.now();
+		const startedAt = job.startedAt ?? job.updatedAt ?? now;
 		const linkedParentKey = linkedWorkflowParentKey(job.parentWorkflowRunId, activeWorkflowKeys);
 		if (job.mode === "workflow") {
 			const latestEmit = job.workflow?.emits?.length ? formatWorkflowJsonPreview(job.workflow.emits.at(-1), 120) : undefined;
 			const workflowSteps = workflowStepsWithoutMaterializedChildren(job.steps, materializedChildrenByWorkflow.get(`async:${job.asyncId}`));
 			const workflowRows = projectAsyncWorkflowRows(workflowSteps, job.workflowGraph ?? job.hostSteps, job.preflight);
+			const workflowChecklist = projectWorkflowChecklist({
+				graph: job.workflowGraph,
+				steps: job.steps,
+				hostSteps: job.hostSteps,
+				preflight: job.preflight,
+				trace: job.workflow?.trace,
+				now,
+			});
 			entries.push({
 				key: `async:${job.asyncId}`,
 				...(linkedParentKey ? { parentKey: linkedParentKey } : {}),
@@ -375,6 +451,7 @@ export function collectFleetStatusEntries(state: SubagentState): FleetStatusEntr
 				...(job.totalTokens?.window !== undefined ? { window: job.totalTokens.window } : {}),
 				state: job.status,
 				...(workflowRows.length ? { workflowRows } : {}),
+				...(workflowChecklist.total ? { workflowChecklist } : {}),
 				...(job.nestedChildren?.length ? { nestedChildren: job.nestedChildren } : {}),
 			});
 			continue;
@@ -408,7 +485,8 @@ export function collectFleetStatusEntries(state: SubagentState): FleetStatusEntr
 			entries.push({
 				key: `async:${job.asyncId}:${index}`,
 				...(linkedParentKey ? { parentKey: linkedParentKey } : {}),
-				agent: step.label ? `${step.label} (${step.agent})` : step.agent,
+				agent: step.agent,
+				...(step.label ? { displayLabel: `${step.label} (${step.agent})` } : {}),
 				...(modelThinking ? { modelThinking } : {}),
 				description: step.description ?? job.description,
 				startedAt: step.startedAt ?? startedAt,
@@ -460,7 +538,11 @@ export class SubagentFleetStatus {
 	private selectedKey = "main";
 	private inspectorOpen = false;
 	private lastRenderKey = "";
+	private lastPaint: { width: number; theme: Theme } | undefined;
+	private prepaint: { key: string; width: number; theme: Theme; lines: string[] } | undefined;
 	private entries: FleetStatusEntry[] = [];
+	private workflowSnapshots = new Map<string, { snapshot: string; childRows: Set<string> }>();
+	private readonly onWorkflowCoverageChange: FleetStatusOptions["onWorkflowCoverageChange"];
 	private readonly state: SubagentState;
 	private readonly openInspector: (itemKey: string) => Promise<void> | void;
 	private readonly refreshMs: number;
@@ -477,10 +559,14 @@ export class SubagentFleetStatus {
 		this.refreshMs = options.refreshMs ?? REFRESH_MS;
 		this.maxAgentRows = options.maxAgentRows ?? MAX_AGENT_ROWS;
 		this.placement = options.placement ?? "belowEditor";
+		this.onWorkflowCoverageChange = options.onWorkflowCoverageChange;
 	}
 
 	setContext(ctx: ExtensionContext): void {
-		if (!ctx.hasUI) return;
+		if (!ctx.hasUI) {
+			this.clearUiRegistration();
+			return;
+		}
 		const ui = ctx.ui;
 		if (this.ui === ui) {
 			this.ctx = ctx;
@@ -510,6 +596,7 @@ export class SubagentFleetStatus {
 	}
 
 	refresh(): void {
+		this.prepaint = undefined;
 		const ctx = this.getActiveUiContext();
 		if (!ctx) return;
 		if (this.state.widgetsSuspended) {
@@ -517,6 +604,52 @@ export class SubagentFleetStatus {
 			return;
 		}
 		this.entries = collectFleetStatusEntries(this.state);
+		this.workflowSnapshots.clear();
+		if (this.active && !this.inspectorOpen && !this.state.fleetInspectorOpen && this.onWorkflowCoverageChange) {
+			const childrenByParent = new Map<string, AsyncJobState[]>();
+			for (const child of this.state.asyncJobs.values()) {
+				if (!child.parentWorkflowRunId) continue;
+				const children = childrenByParent.get(child.parentWorkflowRunId) ?? [];
+				children.push(child);
+				childrenByParent.set(child.parentWorkflowRunId, children);
+			}
+			const attachedByParent = new Map<string, FleetStatusEntry[]>();
+			for (const entry of this.entries) {
+				if (!entry.parentKey) continue;
+				const attached = attachedByParent.get(entry.parentKey) ?? [];
+				attached.push(entry);
+				attachedByParent.set(entry.parentKey, attached);
+			}
+			for (const job of this.state.asyncJobs.values()) {
+				// Fleet does not expand attached workflow wrappers or step descendants.
+				// Unknown/unsupported coverage deliberately retains the async tree.
+				if (job.mode !== "workflow" || !isActiveState(job.status) || job.parentWorkflowRunId
+					|| job.nestedChildren?.length || job.steps?.some((step) => step.children?.length)) continue;
+				const key = `async:${job.asyncId}`;
+				const children = childrenByParent.get(job.asyncId) ?? [];
+				const attached = attachedByParent.get(key) ?? [];
+				if (children.length && job.status !== "running") continue;
+				// Even without workflow rows, these children plus their owner cannot fit.
+				if (attached.length >= this.maxAgentRows) continue;
+				const rowKeys = new Set<string>();
+				let unsupported = false;
+				for (const child of children) {
+					if (!isActiveState(child.status) || (child.mode !== "single" && child.mode !== "parallel" && child.mode !== "chain")
+						|| child.hostSteps?.length || child.workflowGraph
+						|| childrenByParent.has(child.asyncId) || child.nestedChildren?.length
+						|| child.steps?.some((step) => step.children?.length || step.runner || !isActiveState(step.status))) {
+						unsupported = true; break;
+					}
+					const count = child.steps?.length || child.agents?.length || 0;
+					if (!count || (child.stepsTotal ?? 0) > count || (child.chainStepCount ?? 0) > count) {
+						unsupported = true; break;
+					}
+					for (let index = 0; index < count; index++) rowKeys.add(`async:${child.asyncId}:${child.steps?.[index]?.index ?? index}`);
+				}
+				if (unsupported || attached.length !== rowKeys.size || attached.some((entry) => !rowKeys.has(entry.key))) continue;
+				this.workflowSnapshots.set(key, { snapshot: inlineWorkflowRenderKey(job, children), childRows: rowKeys });
+			}
+		}
 		this.clampSelection();
 		if (this.inspectorOpen || this.state.fleetInspectorOpen) {
 			this.lastRenderKey = "";
@@ -532,16 +665,35 @@ export class SubagentFleetStatus {
 		}
 
 		const renderKey = this.getRenderKey();
+		if (!this.active) this.clearWorkflowCoverage();
+		// The async widget paints above the roster, so recompute coverage (structure and row fit) now.
+		// Clearing it instead would flash the full workflow tree on every live-stat tick.
+		else if (renderKey !== this.lastRenderKey && this.lastPaint) {
+			const { width, theme } = this.lastPaint;
+			this.prepaint = { key: renderKey, width, theme, lines: this.render(width, theme) };
+		}
 		if (!this.widgetRegistered) {
 			ctx.ui.setWidget(FLEET_STATUS_WIDGET_KEY, (tui, theme) => {
 				this.tui = tui;
 				return {
-					render: (width: number) => this.render(width, theme),
+					render: (width: number) => {
+						this.lastPaint = { width, theme };
+						const prepaint = this.prepaint;
+						this.prepaint = undefined;
+						if (prepaint && prepaint.key === this.lastRenderKey && prepaint.key === this.getRenderKey()
+							&& prepaint.width === width && prepaint.theme === theme && !this.state.widgetsSuspended
+							&& !this.inspectorOpen && !this.state.fleetInspectorOpen) return prepaint.lines;
+						return this.render(width, theme);
+					},
 					invalidate: () => {
 						this.lastRenderKey = "";
+						this.prepaint = undefined;
 					},
 					dispose: () => {
 						if (this.tui !== tui) return;
+						this.prepaint = undefined;
+						this.lastPaint = undefined;
+						this.clearWorkflowCoverage();
 						this.widgetRegistered = false;
 						this.tui = undefined;
 					},
@@ -623,26 +775,37 @@ export class SubagentFleetStatus {
 	}
 
 	render(width: number, theme: Theme): string[] {
-		if (!this.hasInlineSurface()) return [];
+		if (!this.hasInlineSurface() || this.state.widgetsSuspended || this.inspectorOpen || this.state.fleetInspectorOpen) {
+			this.clearWorkflowCoverage();
+			return [];
+		}
 		if (!this.active) {
+			this.clearWorkflowCoverage();
 			const workEntries = this.entries.filter((entry) => !entry.surface);
 			const projectEntries = this.entries.filter((entry) => entry.surface === "project-pane");
-			const tokens = workEntries.reduce((total, entry) => total + entry.tokens, 0);
-			const nativeEntries = workEntries.filter((entry) => !entry.external);
+			// Workflow totals can overlap child usage and omit live lanes. Do not
+			// present either wrapper totals or an active-only sum as workflow spend.
+			const hasWorkflow = workEntries.some((entry) => entry.workflowWrapper);
+			const nativeEntries = workEntries.filter((entry) => !entry.external && !entry.workflowWrapper && !entry.parentKey);
+			const tokens = nativeEntries.reduce((total, entry) => total + entry.tokens, 0);
 			const window = nativeEntries.length > 0 && nativeEntries.every((entry) => entry.window !== undefined)
 				? nativeEntries.reduce((total, entry) => total + entry.window!, 0)
 				: undefined;
 			const capacity = this.state.activeAsyncCapacity;
-			const hasNativeRows = workEntries.some((entry) => !entry.external);
+			const hasNativeRows = nativeEntries.length > 0 || hasWorkflow;
 			const showNativeSummary = hasNativeRows || Boolean(capacity?.used);
-			const asyncRuns = capacity && showNativeSummary ? `Async runs ${capacity.used}/${capacity.limit || "∞"}` : "";
+			const asyncRuns = capacity && showNativeSummary && (capacity.used > 0 || capacity.limit > 0) ? `Async runs ${capacity.used}/${capacity.limit || "∞"}` : "";
 			const activeEntries = activeLeafAgentCount(workEntries);
 			const noun = workEntries.some((entry) => entry.external) ? "job" : "agent";
 			const agents = activeEntries > 0 ? `${activeEntries} active ${noun}${activeEntries === 1 ? "" : "s"}` : "";
 			const paneAttention = projectEntries.filter((entry) => entry.projectPane && projectPaneNeedsAttention(entry.projectPane)).length;
 			const panes = projectEntries.length > 0 ? `${projectEntries.length} pane${projectEntries.length === 1 ? "" : "s"}${paneAttention ? ` (${paneAttention} ⚠)` : ""}` : "";
 			const label = [agents, asyncRuns, panes].filter(Boolean).join(" · ");
-			const detail = [showNativeSummary ? formatFleetTokens(tokens, window) : undefined, "↓/← to inspect"].filter(Boolean).join(" · ");
+			const nativeUsage = formatFleetTokens(tokens, window, nativeEntries.length);
+			const usage = hasWorkflow
+				? nativeEntries.length > 0 ? `standalone: ${nativeUsage} · workflow usage on child rows` : "usage on child rows"
+				: nativeUsage;
+			const detail = [showNativeSummary ? usage : undefined, "↓/← to inspect"].filter(Boolean).join(" · ");
 			return [truncateToWidth(`  ${theme.fg("muted", label)}${label && detail ? " · " : ""}${theme.fg("dim", detail)}`, width)];
 		}
 		const roster = this.rosterKeys();
@@ -668,11 +831,33 @@ export class SubagentFleetStatus {
 				lines.push(this.renderEntry(rosterIndex, selectedIndex, row.entry, width, theme, row.kind === "child" ? (row.last ? "└─" : "├─") : undefined));
 			} else if (row.kind === "workflow") {
 				lines.push(this.renderWorkflowRow(row.row, row.last, width, theme));
+			} else if (row.kind === "workflow-phase") {
+				lines.push(this.renderWorkflowPhaseRow(row.phase, row.last, width, theme));
 			} else {
 				lines.push(this.renderNestedRow(row.row, row.last, width, theme));
 			}
 		}
 		if (hiddenBelow > 0) lines.push(rightAlign("", theme.fg("dim", `↓ ${hiddenBelow} more`), width));
+		if (this.ui && this.widgetRegistered && this.onWorkflowCoverageChange) {
+			const coverage = new Map<string, string>();
+			for (const [key, { snapshot, childRows }] of this.workflowSnapshots) {
+				const ownerIndex = tree.findIndex((row) => row.kind === "owner" && row.entry.key === key);
+				const owner = tree[ownerIndex];
+				if (owner?.kind !== "owner" || ownerIndex < start) continue;
+				const count = childRows.size + (owner.entry.workflowRows?.length ?? 0) + (owner.entry.workflowChecklist?.phases.length ?? 0);
+				if (!count || ownerIndex + count >= start + visibleCount) continue;
+				const descendants = tree.slice(ownerIndex + 1, ownerIndex + count + 1);
+				if (!descendants.every((row) => (row.kind === "workflow" && row.ownerKey === key && !row.row.overflow
+					&& visibleWidth(this.renderWorkflowRow(row.row, row.last, Infinity, theme)) <= width)
+					|| (row.kind === "workflow-phase" && row.ownerKey === key
+						&& visibleWidth(this.renderWorkflowPhaseRow(row.phase, row.last, Infinity, theme)) <= width)
+					|| (row.kind === "child" && childRows.has(row.entry.key)
+						&& visibleWidth(this.renderEntry(rosterIndexByKey.get(row.entry.key) ?? 0, selectedIndex, row.entry, 0, theme, row.last ? "└─" : "├─", true)) <= width))) continue;
+				if (childRows.size && visibleWidth(this.renderEntry(rosterIndexByKey.get(key) ?? 0, selectedIndex, owner.entry, 0, theme, undefined, true)) > width) continue;
+				coverage.set(key.slice("async:".length), snapshot);
+			}
+			this.onWorkflowCoverageChange(this.ui, coverage);
+		}
 		this.renderProjectPaneSection(lines, selectedIndex, width, theme, rosterIndexByKey);
 		return lines;
 	}
@@ -688,15 +873,20 @@ export class SubagentFleetStatus {
 	}
 
 
-	private renderEntry(rosterIndex: number, selectedIndex: number, entry: FleetStatusEntry, width: number, theme: Theme, branch?: string): string {
-		const agent = entry.modelThinking ? `${entry.agent} (${entry.modelThinking})` : entry.agent;
+	private renderEntry(rosterIndex: number, selectedIndex: number, entry: FleetStatusEntry, width: number, theme: Theme, branch?: string, unclipped = false): string {
+		const label = entry.displayLabel ?? entry.agent;
+		const agent = entry.modelThinking ? `${label} (${entry.modelThinking})` : label;
 		const prefix = branch ? `    ${branch}` : " ";
-		const left = `${prefix} ${this.bullet(rosterIndex, selectedIndex, theme)} ${theme.fg("muted", agent)} · ${entry.state}`;
+		const checklist = entry.workflowWrapper && entry.workflowChecklist
+			? ` · checklist ${formatWorkflowChecklistSummary(entry.workflowChecklist)}${entry.workflowChecklist.bottleneck ? ` · bottleneck ${formatWorkflowChecklistBottleneck(entry.workflowChecklist.bottleneck)}` : ""}`
+			: "";
+		const left = `${prefix} ${this.bullet(rosterIndex, selectedIndex, theme)} ${theme.fg(fleetAgentIdentityColor(entry.agent), agent)} · ${entry.state}${checklist}`;
 		const elapsed = Date.now() - entry.startedAt;
 		const rightText = entry.projectPane
 			? `${entry.projectPane.summary ?? "—"} · ${formatFleetElapsed(Date.now() - entry.projectPane.refreshedAt)} ago`
-				: entry.external ? formatFleetElapsed(elapsed) : `${formatFleetElapsed(elapsed)} · ${formatFleetTokens(entry.tokens, entry.window)}`;
+				: entry.external ? formatFleetElapsed(elapsed) : `${formatFleetElapsed(elapsed)} · ${entry.workflowWrapper ? "usage on child rows" : formatFleetTokens(entry.tokens, entry.window)}`;
 		const right = theme.fg("dim", rightText);
+		if (unclipped) return `${left} ${right}`;
 		return rightAlign(left, right, width);
 	}
 
@@ -706,9 +896,9 @@ export class SubagentFleetStatus {
 		if (row.overflow !== undefined) return truncateToWidth(`${indent}${marker} ${theme.fg("dim", `+${row.overflow} nested leaves`)}`, width);
 		const modelThinking = row.modelThinking ? ` (${row.modelThinking})` : "";
 		const activity = row.activity ? ` · ${row.activity}` : "";
-		const left = `${indent}${marker} ${nestedStatusGlyph(row.state, theme)} ${theme.fg("muted", `${row.name}${modelThinking}`)} · ${row.state}${activity}`;
-		const elapsed = row.startedAt !== undefined ? ` · ${formatFleetElapsed(Date.now() - row.startedAt)}` : "";
-		return truncateToWidth(`${left}${theme.fg("dim", elapsed)}`, width);
+		const left = `${indent}${marker} ${nestedStatusGlyph(row.state, theme)} ${theme.fg(fleetAgentIdentityColor(row.agentIdentity ?? row.name), `${row.name}${modelThinking}`)} · ${row.state}${activity}`;
+		const elapsed = detailElapsed(row);
+		return truncateToWidth(`${left}${elapsed !== undefined ? theme.fg("dim", ` · ${elapsed}`) : ""}`, width);
 	}
 
 	private workflowRowGlyph(row: AsyncStatusWorkflowRow, theme: Theme): string {
@@ -730,6 +920,20 @@ export class SubagentFleetStatus {
 		return theme.fg("warning", state);
 	}
 
+	private renderWorkflowPhaseRow(phase: WorkflowChecklistPhase, last: boolean, width: number, theme: Theme): string {
+		const marker = last ? "└─" : "├─";
+		const glyph = phase.state === "complete"
+			? theme.fg("success", "✓")
+			: phase.state === "running"
+				? theme.fg("accent", "●")
+				: phase.state === "blocked" || phase.state === "failed"
+					? theme.fg("error", phase.state === "blocked" ? "!" : "✗")
+					: phase.state === "queued"
+						? theme.fg("muted", "◦")
+						: theme.fg("warning", "■");
+		return truncateToWidth(`    ${marker} ${glyph} ${theme.fg("muted", formatWorkflowChecklistPhase(phase))}`, width);
+	}
+
 	private renderWorkflowRow(row: AsyncStatusWorkflowRow, last: boolean, width: number, theme: Theme): string {
 		const marker = last ? "└─" : "├─";
 		const indent = "    ";
@@ -747,7 +951,7 @@ export class SubagentFleetStatus {
 		].filter((value): value is string => Boolean(value)).join(" · ") : "";
 		const left = `${indent}${marker} ${this.workflowRowGlyph(row, theme)} ${theme.fg("muted", `${kind}${row.name}${context ? ` ${context}` : ""}${modelThinking}`)} · ${this.workflowRowStateLabel(row, theme)}${activity}${hints ? ` · ${hints}` : ""}`;
 		const details = [
-			row.startedAt !== undefined ? formatFleetElapsed(Date.now() - row.startedAt) : undefined,
+			detailElapsed(row),
 			row.tokens !== undefined ? formatFleetTokens(row.tokens, row.window) : undefined,
 			row.provider ? `provider:${row.provider}` : undefined,
 			row.role ? `role:${row.role}` : undefined,
@@ -803,12 +1007,22 @@ export class SubagentFleetStatus {
 					entry.surface,
 					entry.parentKey,
 					entry.agent,
+					entry.displayLabel,
 					entry.state,
 					entry.modelThinking,
 					entry.description,
 					entry.external,
 					Math.round((now - entry.startedAt) / 1000),
 					entry.tokens,
+					entry.workflowChecklist ? [
+						entry.workflowChecklist.total,
+						entry.workflowChecklist.done,
+						entry.workflowChecklist.running,
+						entry.workflowChecklist.queued,
+						entry.workflowChecklist.blocked,
+						entry.workflowChecklist.failed,
+						entry.workflowChecklist.phases.map((phase) => [phase.key, phase.state, phase.done, phase.total, phase.running, phase.queued, phase.blocked, phase.failed, phase.items.map((item) => [item.key, item.state, item.currentTool, item.currentPath, item.durationMs, item.toolCount, item.error])]),
+					] : undefined,
 					visibleWorkflowRows(entry.workflowRows, entry.parentKey ? 2 : 4).map((row) => [
 						row.kind,
 						row.name,
@@ -817,6 +1031,8 @@ export class SubagentFleetStatus {
 						row.modelThinking,
 						row.activity,
 						row.startedAt,
+						row.endedAt,
+						row.durationMs,
 						row.tokens,
 						row.provider,
 						row.role,
@@ -830,10 +1046,12 @@ export class SubagentFleetStatus {
 					]),
 					nestedFleetRows(entry.nestedChildren, entry.parentKey ? 3 : 4).map((row) => [
 						row.name,
+						row.agentIdentity,
 						row.state,
 						row.modelThinking,
 						row.activity,
 						row.startedAt,
+						row.endedAt,
 						row.depth,
 						row.overflow,
 					]),
@@ -859,6 +1077,8 @@ export class SubagentFleetStatus {
 	}
 
 	private clearWidget(): void {
+		this.prepaint = undefined;
+		this.clearWorkflowCoverage();
 		if (!this.widgetRegistered) return;
 		try {
 			this.ui?.setWidget(FLEET_STATUS_WIDGET_KEY, undefined);
@@ -872,6 +1092,8 @@ export class SubagentFleetStatus {
 	}
 
 	private clearUiRegistration(): void {
+		this.prepaint = undefined;
+		this.clearWorkflowCoverage();
 		if (this.timer) clearInterval(this.timer);
 		this.timer = undefined;
 
@@ -901,5 +1123,9 @@ export class SubagentFleetStatus {
 		if (cleanupErrors.length > 1) {
 			throw new AggregateError(cleanupErrors, "Failed to clean up FleetView UI registration");
 		}
+	}
+
+	private clearWorkflowCoverage(): void {
+		if (this.ui) this.onWorkflowCoverageChange?.(this.ui, new Map());
 	}
 }

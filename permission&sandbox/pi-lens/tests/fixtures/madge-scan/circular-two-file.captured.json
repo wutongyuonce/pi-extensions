@@ -1,0 +1,25 @@
+{
+	"provenance": {
+		"tool": "madge",
+		"version": "8.0.0",
+		"binary": "~/.pi-lens/tools/node_modules/madge/bin/cli.js (the managed install DependencyChecker resolves)",
+		"upstream": "pahen/madge 8.0.0: bin/cli.js:258-268 (res.circular() -> output.circular), lib/output.js:71-73 (opts.json -> printJSON(circular)), lib/api.js:103 (circular() -> cyclic(this.tree))",
+		"workspace": "index.ts -> src/a.ts, src/a.ts <-> src/b.ts (the cycle), src/orphan.ts (orphan), tsconfig.json",
+		"platform": "linux-x64",
+		"capturedAt": "2026-09-25",
+		"command": "node <madge>/bin/cli.js --circular --extensions ts,tsx,js,jsx,mjs,cjs --ts-config __WORKSPACE__/tsconfig.json --json __WORKSPACE__",
+		"argv": [
+			"--circular",
+			"--extensions",
+			"ts,tsx,js,jsx,mjs,cjs",
+			"--ts-config",
+			"__WORKSPACE__/tsconfig.json",
+			"--json",
+			"__WORKSPACE__"
+		],
+		"note": "The argv is buildMadgeArgs(projectRoot, projectRoot) verbatim - what runScanProject spawns. Re-captured without --warning after #3436 removed it (bin/cli.js:195 gates it on !program.json, so it was inert under --json and did not change these bytes). Two facts this capture pins: madge emits cycle members relative to the TARGET directory (src/a.ts, not an absolute path and not a.ts), and it exits 1 when it found a cycle (bin/cli.js:266-267), so a reader keying off status would drop real findings."
+	},
+	"exitCode": 1,
+	"stdout": "[\n  [\n    \"src/a.ts\",\n    \"src/b.ts\"\n  ]\n]\n",
+	"stderr": ""
+}

@@ -15,6 +15,7 @@ import {
 import { writeResumeTaskArtifact } from "../launch/prompt-artifacts.ts";
 import { buildResumePiArgs, getResumeCwd } from "../launch/resume.ts";
 import { buildInteractiveShellCommand } from "../launch/shell-command.ts";
+import { getSkillVisibilitySpec, PI_SUBAGENT_SKILL_VISIBILITY } from "../launch/skill-visibility.ts";
 import { createZellijCommandSurface } from "../mux/zellij-placement.ts";
 import { getZellijShellCommand, resolveZellijTarget } from "../mux/zellij-runtime.ts";
 import { closeSurfaceAsync } from "../mux/io.ts";
@@ -112,6 +113,7 @@ async function getWrapUpLaunchParts(running: RunningSubagent, signal?: AbortSign
 	if (invocationMetadata.extensions !== undefined) {
 		env.PI_SUBAGENT_EXTENSIONS = invocationMetadata.extensions.join(",");
 	}
+	env[PI_SUBAGENT_SKILL_VISIBILITY] = getSkillVisibilitySpec(invocationMetadata.skills);
 	const deniedTools = new Set(invocationMetadata.denyTools);
 	for (const toolName of SPAWNING_TOOL_NAMES) deniedTools.add(toolName);
 	if (deniedTools.size > 0) env.PI_DENY_TOOLS = [...deniedTools].join(",");

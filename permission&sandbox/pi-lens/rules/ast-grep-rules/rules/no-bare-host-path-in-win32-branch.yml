@@ -1,0 +1,27 @@
+id: no-bare-host-path-in-win32-branch
+language: TypeScript
+severity: warning
+metadata:
+  category: pi-lens-self-scan
+message: "Use win32 path operations inside a branch committed to Windows path semantics"
+note: |
+  A branch guarded by isWindowsPath/isFullyQualifiedWin32 has committed to
+  Windows path parsing. Host-default dirname/basename/join/relative/sep
+  follows the process OS and is wrong for a Windows-shaped path on POSIX.
+
+  SCOPE (review-verified, #1339): same-function consequence only. The
+  original #1150 defect — a bare dirname inside an UNGUARDED helper that
+  the guarded branch calls (cross-function) — is NOT reachable by this
+  engine and stays review-enforced via AGENTS.md defect-shape 2. The
+  rule's fixture file encodes that miss as a documented negative; flip it
+  to a positive only if cross-function reach is ever added. What this
+  rule does catch is the in-branch shape (#1152 class).
+rule:
+  all:
+    - kind: if_statement
+    - has:
+        field: condition
+        regex: "\\b(isWindowsPath|isFullyQualifiedWin32)\\s*\\("
+    - has:
+        field: consequence
+        regex: "(?s)\\bpath\\.(dirname|basename|join|relative)\\s*\\(|\\bpath\\.sep\\b|(^|[^.])\\b(dirname|basename|join|relative)\\s*\\("

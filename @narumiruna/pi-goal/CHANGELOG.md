@@ -1,5 +1,29 @@
 # @narumitw/pi-goal
 
+## 0.54.8
+
+### Patch Changes
+
+- 8abd5b7: Keep generated extension runtime graphs inside Pi's Jiti-loaded TypeScript path to avoid duplicate peer-runtime evaluation during startup. Add measured generated runtimes for Context Management, Herdr, and TypeSafe Search.
+
+## 0.54.7
+
+### Patch Changes
+
+- 67a3049: Adapt provider, transcript, usage, deferred-tool, and telemetry behavior to Pi's current runtime contracts, including accurate cache-warming accounting and exclusion from ordinary generation traces.
+
+## 0.54.6
+
+### Patch Changes
+
+- e894777: Treat premature provider stream endings, such as `Upstream stream ended before terminal chunk`, as retryable provider errors instead of terminal agent failures.
+
+## 0.54.5
+
+### Patch Changes
+
+- ea85bd8: Ignore stale extension contexts after session replacement or reload so detached prompt emits, delayed goal timers, and in-flight /goal commands cannot surface extension errors or crash Pi.
+
 ## 0.54.4
 
 ### Patch Changes

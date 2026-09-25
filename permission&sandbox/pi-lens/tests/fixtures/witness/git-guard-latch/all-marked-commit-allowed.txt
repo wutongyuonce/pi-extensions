@@ -1,0 +1,28 @@
+=== turn 1 (blockers raised): context message ===
+[pi-lens automated check — not a user request] Address 🔴 blockers before continuing; ℹ️ advisories are informational only.
+
+Unresolved from this turn — src/app.ts:
+🔴 STOP — 2 issue(s) must be fixed:
+  L1: alpha is unsafe
+  L2: beta is unsafe
+
+keep working
+--- turn 1: git commit ---
+block: true
+reason: 🔴 COMMIT BLOCKED (--lens-guard): unresolved blockers must be fixed before commit/push.
+🔴 STOP — 2 issue(s) must be fixed:
+  L1: alpha is unsafe
+  L2: beta is unsafe
+Run lens_diagnostics mode=all for full details, then commit again.
+
+=== turn 2 (every blocker marked false-positive): context message ===
+(nothing injected)
+--- turn 2: git commit (allowed: banner and gate agree) ---
+block: false
+reason: (none)
+
+=== turn 3 (an unrelated file edited): context message ===
+(nothing injected)
+--- turn 3: git commit (allowed: the marked blockers stay gone) ---
+block: false
+reason: (none)

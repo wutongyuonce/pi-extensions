@@ -22,6 +22,48 @@ function setup() {
 }
 
 describe("child exit signal", () => {
+	it("reports the tri-state outcome: accepted for done, accepted for ping without a completion marker, owned for refused", () => {
+		const { dir, sessionFile, entries, writeExitSignal } = setup();
+		const originalSession = process.env.PI_SUBAGENT_SESSION;
+		process.env.PI_SUBAGENT_SESSION = sessionFile;
+		try {
+			const done = writeExitSignal({ type: "done", outputTokens: 3 });
+			assert.equal(done, "accepted");
+			assert.equal(entries.length, 1);
+
+			// A fresh session for the accepted-ping case: after a done, a ping
+			// write is refused by first-wins semantics.
+			const pingSession = join(dir, "ping-child.jsonl");
+			writeFileSync(pingSession, "");
+			process.env.PI_SUBAGENT_SESSION = pingSession;
+			const ping = writeExitSignal({ type: "ping", name: "child", message: "help" }, { supersede: true });
+			assert.equal(ping, "accepted");
+			// A ping is not a normal completion, so no completion marker is appended.
+			assert.equal(entries.length, 1);
+
+			process.env.PI_SUBAGENT_SESSION = sessionFile;
+			const refused = writeExitSignal({ type: "ping", name: "child", message: "again" }, { supersede: true });
+			assert.equal(refused, "owned");
+		} finally {
+			if (originalSession == null) delete process.env.PI_SUBAGENT_SESSION;
+			else process.env.PI_SUBAGENT_SESSION = originalSession;
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
+	it("returns no-session outside a subagent context", () => {
+		const { dir, writeExitSignal } = setup();
+		const originalSession = process.env.PI_SUBAGENT_SESSION;
+		delete process.env.PI_SUBAGENT_SESSION;
+		try {
+			assert.equal(writeExitSignal({ type: "done", outputTokens: 0 }), "no-session");
+		} finally {
+			if (originalSession == null) delete process.env.PI_SUBAGENT_SESSION;
+			else process.env.PI_SUBAGENT_SESSION = originalSession;
+			rmSync(dir, { recursive: true, force: true });
+		}
+	});
+
 	it("marks context pressure on a normal completion", () => {
 		const { dir, sessionFile, entries, writeExitSignal, readSidecar } = setup();
 		const originalSession = process.env.PI_SUBAGENT_SESSION;

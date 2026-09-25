@@ -1,0 +1,1797 @@
+import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
+import test from "node:test";
+import type { AgentRunOptions, AgentUsage } from "../src/agent.js";
+import { WorkflowError, WorkflowErrorCode } from "../src/errors.js";
+import { type JournalEntry, parseWorkflowScript, runWorkflow } from "../src/workflow.js";
+
+/** Agent runner that counts real invocations and echoes a per-call result. */
+function countingAgent() {
+  const state = { calls: 0 };
+  return {
+    state,
+    runner: {
+      async run(prompt: string) {
+        state.calls++;
+        return `ran:${prompt}`;
+      },
+    },
+  };
+}
+
+/** Minimal fake agent runner that reports a fixed usage via onUsage. */
+function fakeAgent(usage: Partial<AgentUsage>, result: unknown = "ok") {
+  return {
+    async run(_prompt: string, options: { onUsage?: (u: AgentUsage) => void }) {
+      options.onUsage?.({
+        input: 0,
+        output: 0,
+        cacheRead: 0,
+        cacheWrite: 0,
+        total: 0,
+        cost: 0,
+        ...usage,
+      });
+      return result;
+    },
+  };
+}
+
+const twoAgentScript = `export const meta = { name: 'usage_demo', description: 'two agents' }
+const a = await agent('first', { label: 'a' })
+const b = await agent('second', { label: 'b' })
+return { a, b }`;
+
+function createDeferred<T = void>(): { promise: Promise<T>; resolve: (value: T | PromiseLike<T>) => void } {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  const promise = new Promise<T>((r) => {
+    resolve = r;
+  });
+  return { promise, resolve };
+}
+
+test("runWorkflow concurrency caps parallel agents", async () => {
+  let active = 0;
+  let maxActive = 0;
+  const release = createDeferred<void>();
+  const started: Array<string> = [];
+  const runner = {
+    async run(prompt: string) {
+      active++;
+      maxActive = Math.max(maxActive, active);
+      started.push(prompt);
+      await release.promise;
+      active--;
+      return `ok:${prompt}`;
+    },
+  };
+  const script = `export const meta = { name: 'concurrency_cap', description: 'cap parallelism' }
+const xs = await parallel(['a','b','c','d'].map((p) => () => agent(p, { label: p })))
+return xs`;
+
+  const run = runWorkflow(script, { agent: runner, concurrency: 2, persistLogs: false });
+  while (started.length < 2) await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(started.length, 2, "only the first two agents should start before the gate opens");
+  release.resolve();
+  const result = await run;
+
+  assert.equal(maxActive, 2);
+  assert.deepEqual(result.result, ["ok:a", "ok:b", "ok:c", "ok:d"]);
+  assert.equal(result.agentCount, 4);
+});
+
+test("named agent threads can be re-entered around a separate reviewer", async () => {
+  const calls: Array<{ prompt: string; thread?: string }> = [];
+  const result = await runWorkflow(
+    `export const meta = { name: 'thread_reentry', description: 're-enter implementer' }
+const first = await agent('implement', { thread: 'implementer' })
+const review = await agent('review', { thread: 'reviewer' })
+const second = await agent('address review', { thread: 'implementer' })
+return { first, review, second }`,
+    {
+      agent: {
+        async run(prompt, options) {
+          calls.push({ prompt, thread: options?.thread });
+          return `${options?.thread}:${prompt}`;
+        },
+      },
+      persistLogs: false,
+    },
+  );
+
+  assert.deepEqual(calls, [
+    { prompt: "implement", thread: "implementer" },
+    { prompt: "review", thread: "reviewer" },
+    { prompt: "address review", thread: "implementer" },
+  ]);
+  assert.deepEqual(JSON.parse(JSON.stringify(result.result)), {
+    first: "implementer:implement",
+    review: "reviewer:review",
+    second: "implementer:address review",
+  });
+});
+
+test("concurrent calls on one named thread are rejected before a second agent starts", async () => {
+  let starts = 0;
+  await assert.rejects(
+    runWorkflow(
+      `export const meta = { name: 'thread_concurrency', description: 'reject overlap' }
+return await parallel([
+  () => agent('first', { thread: 'implementer' }),
+  () => agent('second', { thread: 'implementer' })
+])`,
+      {
+        agent: {
+          async run() {
+            starts++;
+            await new Promise((resolve) => setTimeout(resolve, 20));
+            return "ok";
+          },
+        },
+        persistLogs: false,
+      },
+    ),
+    /same-thread calls must be sequential/,
+  );
+  assert.equal(starts, 1);
+});
+
+test("named threads reject worktree isolation", async () => {
+  await assert.rejects(
+    runWorkflow(
+      `export const meta = { name: 'thread_worktree', description: 'reject worktree' }
+return await agent('work', { thread: 'implementer', isolation: 'worktree' })`,
+      { agent: countingAgent().runner, persistLogs: false },
+    ),
+    /cannot use worktree isolation/,
+  );
+});
+
+test("threaded calls are live resume barriers and are not journaled", async () => {
+  const firstJournal: JournalEntry[] = [];
+  const first = countingAgent();
+  await runWorkflow(
+    `export const meta = { name: 'thread_resume', description: 'thread barrier' }
+const before = await agent('before')
+const threaded = await agent('threaded', { thread: 'implementer' })
+const after = await agent('after')
+return { before, threaded, after }`,
+    {
+      agent: first.runner,
+      runId: "thread-run",
+      persistLogs: false,
+      onAgentJournal: (entry) => firstJournal.push(entry),
+    },
+  );
+  assert.deepEqual(
+    firstJournal.map((entry) => entry.index),
+    [0, 2],
+  );
+
+  const resumed = countingAgent();
+  await runWorkflow(
+    `export const meta = { name: 'thread_resume', description: 'thread barrier' }
+const before = await agent('before')
+const threaded = await agent('threaded', { thread: 'implementer' })
+const after = await agent('after')
+return { before, threaded, after }`,
+    {
+      agent: resumed.runner,
+      runId: "thread-run",
+      persistLogs: false,
+      resumeJournal: new Map(firstJournal.map((entry) => [`thread-run:${entry.index}`, entry])),
+      resumeFromRunId: "thread-run",
+    },
+  );
+  assert.equal(resumed.state.calls, 2, "the prefix replays, then the threaded call and all later calls run live");
+});
+
+test("a timed-out named turn fully settles before retrying the thread", async () => {
+  let calls = 0;
+  let active = 0;
+  let maxActive = 0;
+  const result = await runWorkflow(
+    `export const meta = { name: 'thread_timeout_retry', description: 'safe retry' }
+return await agent('work', { thread: 'implementer', timeoutMs: 5, retries: 1 })`,
+    {
+      agent: {
+        async run(_prompt, options) {
+          calls++;
+          active++;
+          maxActive = Math.max(maxActive, active);
+          if (calls === 1) {
+            await new Promise<void>((_resolve, reject) => {
+              options?.signal?.addEventListener("abort", () => reject(new Error("aborted")), { once: true });
+            }).finally(() => active--);
+          } else {
+            active--;
+            return "ok";
+          }
+        },
+      },
+      persistLogs: false,
+    },
+  );
+
+  assert.equal(result.result, "ok");
+  assert.equal(maxActive, 1);
+});
+
+test("runWorkflow retries recoverable empty output then succeeds", async () => {
+  let calls = 0;
+  const journal: JournalEntry[] = [];
+  const result = await runWorkflow(
+    `export const meta = { name: 'retry_success', description: 'retry success' }
+const a = await agent('work', { label: 'a' })
+return a`,
+    {
+      agent: {
+        async run() {
+          calls++;
+          return calls === 1 ? "" : "ok";
+        },
+      },
+      agentRetries: 1,
+      persistLogs: false,
+      onAgentJournal: (entry) => journal.push(entry),
+    },
+  );
+
+  assert.equal(result.result, "ok");
+  assert.equal(calls, 2);
+  assert.equal(result.agentCount, 1, "retries should not allocate extra logical agent slots");
+  assert.equal(journal.length, 1, "only the final success is journaled");
+});
+
+test("runWorkflow reconciles timeout fallback with exact abort-teardown usage", { timeout: 2_500 }, async () => {
+  const exactUsage: AgentUsage = {
+    input: 900,
+    output: 100,
+    total: 1_000,
+    cost: 0.5,
+    cacheRead: 0,
+    cacheWrite: 0,
+  };
+  const result = await runWorkflow(
+    `export const meta = { name: 'timeout_usage', description: 'timeout usage' }
+return await agent('short prompt', { label: 'slow', timeoutMs: 5 })`,
+    {
+      agent: {
+        async run(prompt: string, options?: AgentRunOptions) {
+          void prompt;
+          return new Promise((resolve, reject) => {
+            void resolve;
+            options?.signal?.addEventListener(
+              "abort",
+              () => {
+                setTimeout(() => {
+                  options.onUsage?.(exactUsage);
+                  reject(new Error("aborted after exact usage"));
+                }, 1_100);
+              },
+              { once: true },
+            );
+          });
+        },
+      },
+      persistLogs: false,
+    },
+  );
+
+  assert.equal(result.result, null);
+  assert.deepEqual(result.tokenUsage, exactUsage);
+});
+
+test("runWorkflow waits for timed-out teardown before starting a retry", { timeout: 3_000 }, async () => {
+  let calls = 0;
+  let active = 0;
+  let maxActive = 0;
+  const releaseFirstAttempt = createDeferred<void>();
+  const run = runWorkflow(
+    `export const meta = { name: 'slow_teardown', description: 'slow timeout teardown' }
+return await agent('stuck', { label: 'stuck', timeoutMs: 5, retries: 1 })`,
+    {
+      agent: {
+        async run(prompt: string) {
+          void prompt;
+          calls++;
+          active++;
+          maxActive = Math.max(maxActive, active);
+          try {
+            if (calls === 1) {
+              await releaseFirstAttempt.promise;
+              throw new Error("aborted after slow teardown");
+            }
+            return "retry-result";
+          } finally {
+            active--;
+          }
+        },
+      },
+      persistLogs: false,
+    },
+  );
+
+  await new Promise((resolve) => setTimeout(resolve, 1_050));
+  assert.equal(calls, 1, "a retry must not overlap a timed-out runner still tearing down");
+  releaseFirstAttempt.resolve(undefined);
+  const result = await run;
+
+  assert.equal(result.result, "retry-result");
+  assert.equal(calls, 2);
+  assert.equal(maxActive, 1);
+});
+
+test("runWorkflow returns null when recoverable retries are exhausted", async () => {
+  let calls = 0;
+  const logs: string[] = [];
+  const journal: JournalEntry[] = [];
+  const result = await runWorkflow(
+    `export const meta = { name: 'retry_exhausted', description: 'retry exhausted' }
+const a = await agent('work', { label: 'a' })
+return a`,
+    {
+      agent: {
+        async run() {
+          calls++;
+          return "";
+        },
+      },
+      agentRetries: 1,
+      persistLogs: false,
+      onLog: (message) => logs.push(message),
+      onAgentJournal: (entry) => journal.push(entry),
+    },
+  );
+
+  assert.equal(result.result, null);
+  assert.equal(calls, 2);
+  assert.equal(result.agentCount, 1);
+  assert.equal(journal.length, 0, "failed/null recoverable results are not journaled");
+  assert.ok(
+    logs.some((message) => /retrying/i.test(message)),
+    "logs should mention retrying",
+  );
+  assert.ok(
+    logs.some((message) => /exhausted/i.test(message)),
+    "logs should mention exhaustion",
+  );
+});
+
+test("runWorkflow does not retry nonrecoverable errors", async () => {
+  let calls = 0;
+  await assert.rejects(
+    runWorkflow(
+      `export const meta = { name: 'no_retry_nonrecoverable', description: 'nonrecoverable' }
+const a = await agent('work', { label: 'a' })
+return a`,
+      {
+        agent: {
+          async run() {
+            calls++;
+            throw new WorkflowError("hard stop", WorkflowErrorCode.SCRIPT_VALIDATION_ERROR, { recoverable: false });
+          },
+        },
+        agentRetries: 2,
+        persistLogs: false,
+      },
+    ),
+    (error: unknown) => error instanceof WorkflowError && error.code === WorkflowErrorCode.SCRIPT_VALIDATION_ERROR,
+  );
+  assert.equal(calls, 1);
+});
+
+test("per-agent retries override run-level retries", async () => {
+  let calls = 0;
+  const result = await runWorkflow(
+    `export const meta = { name: 'agent_retry_override', description: 'override' }
+const a = await agent('work', { label: 'a', retries: 1 })
+return a`,
+    {
+      agent: {
+        async run() {
+          calls++;
+          return calls === 1 ? "" : "ok";
+        },
+      },
+      agentRetries: 0,
+      persistLogs: false,
+    },
+  );
+
+  assert.equal(result.result, "ok");
+  assert.equal(calls, 2);
+});
+
+test("runWorkflow accumulates real per-agent usage (incl. cost + cache tokens)", async () => {
+  const result = await runWorkflow(twoAgentScript, {
+    agent: fakeAgent({ input: 100, output: 40, total: 140, cost: 0.002, cacheRead: 50, cacheWrite: 10 }),
+    persistLogs: false,
+  });
+
+  assert.equal(result.agentCount, 2);
+  assert.equal(result.tokenUsage?.input, 200);
+  assert.equal(result.tokenUsage?.output, 80);
+  assert.equal(result.tokenUsage?.total, 280);
+  assert.ok(Math.abs((result.tokenUsage?.cost ?? 0) - 0.004) < 1e-9, "should be within tolerance");
+  assert.equal(result.tokenUsage?.cacheRead, 100, "cacheRead accumulates across agents");
+  assert.equal(result.tokenUsage?.cacheWrite, 20, "cacheWrite accumulates across agents");
+});
+
+test("runWorkflow streams cumulative token usage before an agent returns", async () => {
+  const release = createDeferred<void>();
+  const usageEvents: number[] = [];
+  const finalizedUsageEvents: number[] = [];
+  let settled = false;
+  const run = runWorkflow(
+    `export const meta = { name: 'live_usage', description: 'live token usage' }
+     return await agent('work', { label: 'worker' })`,
+    {
+      agent: {
+        async run(prompt, options) {
+          void prompt;
+          options?.onUsageProgress?.({ input: 7, output: 3, total: 10, cost: 0.01, cacheRead: 0, cacheWrite: 0 });
+          options?.onUsageProgress?.({ input: 17, output: 8, total: 25, cost: 0.02, cacheRead: 0, cacheWrite: 0 });
+          await release.promise;
+          options?.onUsage?.({ input: 12, output: 8, total: 20, cost: 0.02, cacheRead: 0, cacheWrite: 0 });
+          return "done";
+        },
+      },
+      persistLogs: false,
+      onAgentUsage: (event) => usageEvents.push(event.tokenUsage.total),
+      onTokenUsage: (usage) => finalizedUsageEvents.push(usage.total),
+    },
+  ).finally(() => {
+    settled = true;
+  });
+
+  while (usageEvents.length < 2) {
+    await new Promise((resolve) => setTimeout(resolve, 0));
+  }
+  assert.equal(settled, false, "usage should be observable while the agent is still running");
+  assert.deepEqual(usageEvents, [10, 25]);
+  assert.deepEqual(finalizedUsageEvents, [], "progress estimates must not change finalized budget accounting");
+
+  release.resolve();
+  const result = await run;
+  assert.equal(result.tokenUsage?.total, 20, "the exact terminal total must replace the progress estimate");
+});
+
+test("onAgentEnd reports cumulative settled usage across retries", async () => {
+  let attempts = 0;
+  let endedTokens: number | undefined;
+  let endedUsage: AgentUsage | undefined;
+  const result = await runWorkflow(
+    `export const meta = { name: 'retry_usage', description: 'retry usage' }
+     return await agent('work', { label: 'worker', retries: 1 })`,
+    {
+      agent: {
+        async run(prompt, options) {
+          void prompt;
+          attempts++;
+          const total = attempts === 1 ? 40 : 25;
+          options?.onUsageProgress?.({ input: 0, output: 100, total: 100, cost: 0, cacheRead: 0, cacheWrite: 0 });
+          options?.onUsage?.({ input: 0, output: total, total, cost: 0, cacheRead: 0, cacheWrite: 0 });
+          return attempts === 1 ? "" : "done";
+        },
+      },
+      persistLogs: false,
+      onAgentEnd: (event) => {
+        endedTokens = event.tokens;
+        endedUsage = event.tokenUsage;
+      },
+    },
+  );
+
+  assert.equal(result.result, "done");
+  assert.equal(attempts, 2);
+  assert.equal(endedTokens, 65);
+  assert.equal(endedUsage?.total, 65);
+});
+
+test("meta.model is parsed and routes as the default model for agents", async () => {
+  let seenModel: string | undefined;
+  const recorder = {
+    async run(_p: string, o: { model?: string }) {
+      seenModel = o.model;
+      return "ok";
+    },
+  };
+  const script = `export const meta = { name: 'm', description: 'd', model: 'meta/default-model' }
+await agent('x', { label: 'x' })
+return 1`;
+  await runWorkflow(script, { agent: recorder, persistLogs: false });
+  assert.equal(seenModel, "meta/default-model", "an agent with no model/tier/phase route uses meta.model");
+});
+
+test("runWorkflow preserves authoritative cost-only terminal usage", async () => {
+  const result = await runWorkflow(
+    `export const meta = { name: 'cost_only', description: 'cost-only provider usage' }
+     return await agent('work', { label: 'worker' })`,
+    {
+      agent: fakeAgent({ input: 0, output: 0, total: 0, cost: 0.25, cacheRead: 0, cacheWrite: 0 }),
+      persistLogs: false,
+    },
+  );
+
+  assert.equal(result.tokenUsage?.total, 0);
+  assert.equal(result.tokenUsage?.cost, 0.25);
+});
+
+test("runWorkflow falls back to an estimate when provider reports total === 0", async () => {
+  const result = await runWorkflow(twoAgentScript, {
+    agent: fakeAgent({ total: 0 }, "a result string"),
+    persistLogs: false,
+  });
+
+  assert.equal(result.tokenUsage?.input, 0);
+  assert.equal(result.tokenUsage?.output, 0);
+  assert.ok((result.tokenUsage?.total ?? 0) > 0, "estimate should be positive");
+  assert.equal(result.tokenUsage?.cost, 0);
+});
+
+test("agents default to the first declared phase when the script omits phase()", async () => {
+  // Regression for the "(no phase) has agents, declared phase 0/0" bug: a script
+  // that declares meta.phases but never calls phase() should still group its
+  // agents under the first declared phase, not an orphan "(no phase)" bucket.
+  const phases: Array<string | undefined> = [];
+  const noop = {
+    async run() {
+      return "ok";
+    },
+  };
+  await runWorkflow(
+    `export const meta = { name: 'p', description: 'd', phases: [{ title: 'Research' }, { title: 'Synthesize' }] }
+     await agent('a', { label: 'x' })
+     return {}`,
+    { agent: noop, persistLogs: false, onAgentStart: (e) => phases.push(e.phase) },
+  );
+  assert.deepEqual(phases, ["Research"]);
+});
+
+test("explicit phase() overrides the default first phase", async () => {
+  const phases: Array<string | undefined> = [];
+  const noop = {
+    async run() {
+      return "ok";
+    },
+  };
+  await runWorkflow(
+    `export const meta = { name: 'p', description: 'd', phases: [{ title: 'A' }, { title: 'B' }] }
+     phase('B')
+     await agent('a', { label: 'x' })
+     return {}`,
+    { agent: noop, persistLogs: false, onAgentStart: (e) => phases.push(e.phase) },
+  );
+  assert.deepEqual(phases, ["B"]);
+});
+
+test("no declared phases => agent phase stays undefined (no synthetic phase)", async () => {
+  const phases: Array<string | undefined> = [];
+  const noop = {
+    async run() {
+      return "ok";
+    },
+  };
+  await runWorkflow(
+    `export const meta = { name: 'p', description: 'd' }
+     await agent('a', { label: 'x' })
+     return {}`,
+    { agent: noop, persistLogs: false, onAgentStart: (e) => phases.push(e.phase) },
+  );
+  assert.deepEqual(phases, [undefined]);
+});
+
+test("runWorkflow routes models: explicit opts.model > phase model > default", async () => {
+  const seen: Array<string | undefined> = [];
+  const capturingAgent = {
+    async run(_prompt: string, options: { model?: string; onUsage?: (u: AgentUsage) => void }) {
+      seen.push(options.model);
+      return "ok";
+    },
+  };
+
+  const script = `export const meta = {
+    name: 'routing', description: 'model routing',
+    phases: [{ title: 'A', model: 'phase-a-model' }, { title: 'B' }]
+  }
+  phase('A')
+  await agent('explicit wins', { label: 'e', model: 'explicit-model' })
+  await agent('phase routed', { label: 'p' })
+  phase('B')
+  await agent('no model -> default', { label: 'n' })
+  return {}`;
+
+  await runWorkflow(script, { agent: capturingAgent, persistLogs: false });
+
+  assert.deepEqual(seen, ["explicit-model", "phase-a-model", undefined]);
+});
+
+test("runWorkflow plumbs opts.tier through to the agent with correct precedence", async () => {
+  // Regression guard: tier must reach WorkflowAgent.run() (it was previously
+  // dropped). Precedence: explicit model > tier > phase model.
+  const seen: Array<{ model?: string; tier?: string }> = [];
+  const capturingAgent = {
+    async run(_prompt: string, options: { model?: string; tier?: string }) {
+      seen.push({ model: options.model, tier: options.tier });
+      return "ok";
+    },
+  };
+
+  const script = `export const meta = {
+    name: 'tier_routing', description: 'tier routing',
+    phases: [{ title: 'A', model: 'phase-a-model' }]
+  }
+  phase('A')
+  await agent('tier beats phase', { label: 't', tier: 'small' })
+  await agent('explicit beats tier', { label: 'e', tier: 'small', model: 'explicit-model' })
+  return {}`;
+
+  await runWorkflow(script, { agent: capturingAgent, persistLogs: false });
+
+  // 1) tier set, no explicit model: model is left undefined so the tier (resolved
+  //    inside run()) wins over the phase model; tier is forwarded.
+  assert.deepEqual(seen[0], { model: undefined, tier: "small" });
+  // 2) explicit model + tier: explicit model is forwarded and still wins.
+  assert.deepEqual(seen[1], { model: "explicit-model", tier: "small" });
+});
+
+const resumeScript = `export const meta = { name: 'resume_demo', description: 'resume' }
+const a = await agent('first', { label: 'a' })
+const b = await agent('second', { label: 'b' })
+return { a, b }`;
+
+test("resume replays cached results without re-running agents", async () => {
+  const first = countingAgent();
+  const journal: JournalEntry[] = [];
+  const r1 = await runWorkflow(resumeScript, {
+    agent: first.runner,
+    persistLogs: false,
+    runId: "resume-run",
+    onAgentJournal: (e) => journal.push(e),
+  });
+  assert.equal(first.state.calls, 2);
+  assert.equal(journal.length, 2);
+  assert.deepEqual(
+    journal.map((e) => e.index),
+    [0, 1],
+  );
+
+  const second = countingAgent();
+  const r2 = await runWorkflow(resumeScript, {
+    agent: second.runner,
+    persistLogs: false,
+    runId: "resume-run",
+    resumeJournal: new Map(journal.map((e) => [`${e.runId}:${e.index}`, e])),
+  });
+  assert.equal(second.state.calls, 0, "no live runs on a full cache hit");
+  assert.equal(JSON.stringify(r2.result), JSON.stringify(r1.result));
+});
+
+test("unthreaded agent journal hashes remain compatible with pre-thread runs", async () => {
+  const journal: JournalEntry[] = [];
+  await runWorkflow(
+    `export const meta = { name: 'hash_compat', description: 'stable unthreaded hash' }
+return await agent('work')`,
+    {
+      agent: countingAgent().runner,
+      persistLogs: false,
+      onAgentJournal: (entry) => journal.push(entry),
+    },
+  );
+
+  const oldIdentity = JSON.stringify({
+    prompt: "work",
+    model: null,
+    tier: null,
+    phase: null,
+    agentType: null,
+    agentDef: null,
+    schema: null,
+  });
+  assert.equal(journal[0]?.hash, createHash("sha256").update(oldIdentity).digest("hex"));
+});
+
+test("resume re-runs only the changed call (hash mismatch)", async () => {
+  const first = countingAgent();
+  const journal: JournalEntry[] = [];
+  await runWorkflow(resumeScript, {
+    agent: first.runner,
+    persistLogs: false,
+    runId: "resume-run-2",
+    onAgentJournal: (e) => journal.push(e),
+  });
+
+  const editedScript = resumeScript.replace("'second'", "'second-edited'");
+  const second = countingAgent();
+  await runWorkflow(editedScript, {
+    agent: second.runner,
+    persistLogs: false,
+    runId: "resume-run-2",
+    resumeJournal: new Map(journal.map((e) => [`${e.runId}:${e.index}`, e])),
+  });
+  assert.equal(second.state.calls, 1, "only the edited call re-runs");
+});
+
+const threeCallScript = `export const meta = { name: 'prefix', description: 'prefix resume' }
+const a = await agent('A', { label: 'a' })
+const b = await agent('B', { label: 'b' })
+const c = await agent('C', { label: 'c' })
+return { a, b, c }`;
+
+test("resume re-runs the changed call AND everything after it (longest-unchanged-prefix)", async () => {
+  const first = countingAgent();
+  const journal: JournalEntry[] = [];
+  await runWorkflow(threeCallScript, {
+    agent: first.runner,
+    persistLogs: false,
+    runId: "prefix-run",
+    onAgentJournal: (e) => journal.push(e),
+  });
+  assert.equal(first.state.calls, 3);
+
+  // Edit the MIDDLE call (index 1). Index 0 is an unchanged prefix → cache hit.
+  // Index 1 changed → re-run; index 2 is unchanged but AFTER the first miss, so
+  // it must re-run too (the bug was serving it stale from the journal).
+  const editedScript = threeCallScript.replace("'B'", "'B-edited'");
+  const second = countingAgent();
+  await runWorkflow(editedScript, {
+    agent: second.runner,
+    persistLogs: false,
+    runId: "prefix-run",
+    resumeJournal: new Map(journal.map((e) => [`${e.runId}:${e.index}`, e])),
+  });
+  assert.equal(second.state.calls, 2, "edited call (1) + its suffix (2) re-run; only the prefix (0) is cached");
+});
+
+test("resume in parallel(): editing one thunk re-runs that index and every later one", async () => {
+  // Three identical-prompt thunks; editing the middle one must invalidate it and
+  // the same-or-later index, not just the single changed call.
+  const script = (mid: string) => `export const meta = { name: 'par_prefix', description: 'parallel prefix' }
+  const xs = await parallel([
+    () => agent('x', { label: 'p0' }),
+    () => agent('${mid}', { label: 'p1' }),
+    () => agent('x', { label: 'p2' }),
+  ])
+  return xs`;
+  const first = countingAgent();
+  const journal: JournalEntry[] = [];
+  await runWorkflow(script("x"), {
+    agent: first.runner,
+    persistLogs: false,
+    runId: "par-prefix-run",
+    onAgentJournal: (e) => journal.push(e),
+  });
+  assert.equal(first.state.calls, 3);
+
+  const second = countingAgent();
+  await runWorkflow(script("x-edited"), {
+    agent: second.runner,
+    persistLogs: false,
+    runId: "par-prefix-run",
+    resumeJournal: new Map(journal.map((e) => [`${e.runId}:${e.index}`, e])),
+  });
+  assert.equal(second.state.calls, 2, "changed thunk (index 1) + later index (2) re-run; index 0 cached");
+});
+
+test("callSeq is deterministic under parallel()", async () => {
+  const journal: JournalEntry[] = [];
+  const script = `export const meta = { name: 'par', description: 'parallel order' }
+  const xs = await parallel(['p0','p1','p2'].map((p) => () => agent(p, { label: p })))
+  return xs`;
+  await runWorkflow(script, {
+    agent: countingAgent().runner,
+    persistLogs: false,
+    onAgentJournal: (e) => journal.push(e),
+  });
+  assert.deepEqual(
+    journal.map((e) => e.index).sort((a, b) => a - b),
+    [0, 1, 2],
+  );
+});
+
+test("workflow() runs a nested saved workflow and shares the global agent counter", async () => {
+  const child = `export const meta = { name: 'child', description: 'c' }
+const r = await agent('child task', { label: 'c' })
+return { child: r }`;
+  const parent = `export const meta = { name: 'parent', description: 'p' }
+const a = await agent('parent task', { label: 'p' })
+const nested = await workflow('child', { foo: 1 })
+return { a, nested }`;
+
+  const result = await runWorkflow<{ a: string; nested: { child: string } }>(parent, {
+    agent: countingAgent().runner,
+    persistLogs: false,
+    loadSavedWorkflow: (name) => (name === "child" ? child : undefined),
+  });
+
+  assert.equal(result.agentCount, 2);
+  assert.equal(result.result.nested.child, "ran:child task");
+});
+
+test("nested workflows share named agent threads with their parent", async () => {
+  const turns = new Map<string, string[]>();
+  const runner = {
+    async run(prompt: string, options?: { thread?: string }) {
+      const thread = options?.thread ?? "one-shot";
+      const prior = turns.get(thread) ?? [];
+      prior.push(prompt);
+      turns.set(thread, prior);
+      return prior.join(" -> ");
+    },
+  };
+  const child = `export const meta = { name: 'child_thread', description: 'continue parent thread' }
+return await agent('child', { thread: 'implementer' })`;
+  const parent = `export const meta = { name: 'parent_thread', description: 'share thread with child' }
+const first = await agent('parent-before', { thread: 'implementer' })
+const nested = await workflow('child')
+const last = await agent('parent-after', { thread: 'implementer' })
+return { first, nested, last }`;
+
+  const result = await runWorkflow<{ first: string; nested: string; last: string }>(parent, {
+    agent: runner,
+    persistLogs: false,
+    loadSavedWorkflow: (name) => (name === "child" ? child : undefined),
+  });
+
+  assert.deepEqual(turns.get("implementer"), ["parent-before", "child", "parent-after"]);
+  assert.deepEqual(JSON.parse(JSON.stringify(result.result)), {
+    first: "parent-before",
+    nested: "parent-before -> child",
+    last: "parent-before -> child -> parent-after",
+  });
+});
+
+test("a nested threaded call invalidates later parent journal entries", async () => {
+  const script = `export const meta = { name: 'parent_resume_barrier', description: 'propagate child barrier' }
+const before = await agent('before')
+await workflow('child')
+const after = await agent('after')
+const confirmed = await checkpoint('confirm', { default: false })
+return { before, after, confirmed }`;
+  const child = `export const meta = { name: 'child_resume_barrier', description: 'thread barrier' }
+return await agent('threaded child', { thread: 'implementer' })`;
+  const journal: JournalEntry[] = [];
+  await runWorkflow(script, {
+    agent: countingAgent().runner,
+    runId: "nested-thread-barrier",
+    persistLogs: false,
+    loadSavedWorkflow: (name) => (name === "child" ? child : undefined),
+    confirm: async () => true,
+    onAgentJournal: (entry) => journal.push(entry),
+  });
+
+  const resumed = countingAgent();
+  let confirmations = 0;
+  const result = await runWorkflow<{ before: string; after: string; confirmed: boolean }>(script, {
+    agent: resumed.runner,
+    runId: "nested-thread-barrier",
+    persistLogs: false,
+    loadSavedWorkflow: (name) => (name === "child" ? child : undefined),
+    resumeJournal: new Map(journal.map((entry) => [`${entry.runId}:${entry.index}`, entry])),
+    resumeFromRunId: "nested-thread-barrier",
+    confirm: async () => {
+      confirmations++;
+      return false;
+    },
+  });
+
+  assert.equal(resumed.state.calls, 2, "the child thread and later parent agent both run live");
+  assert.equal(confirmations, 1, "the later parent checkpoint also runs live");
+  assert.equal(result.result.confirmed, false);
+});
+
+test("sequential nested workflows assign distinct opaque agent identities", async () => {
+  const agentIds: string[] = [];
+  const childScript = `export const meta = { name: 'child', description: 'one child agent' }
+return await agent('child work', { label: 'worker' })`;
+  await runWorkflow(
+    `export const meta = { name: 'parent', description: 'two sequential child workflows' }
+const first = await workflow('child')
+const second = await workflow('child')
+return [first, second]`,
+    {
+      agent: fakeAgent(),
+      loadSavedWorkflow: (name) => (name === "child" ? childScript : undefined),
+      onAgentStart: (event) => agentIds.push(event.id),
+      persistLogs: false,
+    },
+  );
+
+  assert.equal(agentIds.length, 2);
+  assert.equal(new Set(agentIds).size, 2);
+});
+
+test("parallel sibling workflows can each use the one allowed nesting level", async () => {
+  const agentIds: string[] = [];
+  const childScript = `export const meta = { name: 'child', description: 'parallel child' }
+return await agent('child work', { label: 'worker' })`;
+  const result = await runWorkflow<string[]>(
+    `export const meta = { name: 'parent', description: 'parallel child workflows' }
+return await parallel([
+  () => workflow('child'),
+  () => workflow('child'),
+])`,
+    {
+      agent: fakeAgent({}, "child-result"),
+      loadSavedWorkflow: (name) => (name === "child" ? childScript : undefined),
+      onAgentStart: (event) => agentIds.push(event.id),
+      persistLogs: false,
+    },
+  );
+
+  assert.deepEqual(result.result, ["child-result", "child-result"]);
+  assert.equal(new Set(agentIds).size, 2);
+});
+
+test("workflow() nesting is one level deep (second level throws)", async () => {
+  const map: Record<string, string> = {
+    gc: `export const meta = { name: 'gc', description: 'g' }
+await agent('gc', { label: 'g' })
+return 1`,
+    child: `export const meta = { name: 'child', description: 'c' }
+await workflow('gc')
+return 2`,
+  };
+  const parent = `export const meta = { name: 'parent', description: 'p' }
+let err = null
+try { await workflow('child') } catch (e) { err = String(e && e.message || e) }
+return { err }`;
+
+  const result = await runWorkflow<{ err: string }>(parent, {
+    agent: countingAgent().runner,
+    persistLogs: false,
+    loadSavedWorkflow: (name) => map[name],
+  });
+  assert.match(result.result.err, /one level deep/);
+});
+
+test("sequential nested workflow() calls at the same depth get distinct child run ids (no cross-child id/deltaKey collision)", async () => {
+  // `shared.depth` alone would give BOTH of these sequential children the
+  // same `${runId}-nested1` suffix (depth returns to 0 between them, since
+  // only one level of nesting is ever live at a time) — and each child's own
+  // callSeq restarts at 0, so their first agent() calls would then compute
+  // the identical deltaKey (also used as the onAgentStart/onAgentEnd event
+  // id — see item 2's identity model), corrupting SharedStore deltas and
+  // misattributing events. child1's agent() call is deliberately left
+  // un-awaited — realistically, that's exactly when the collision bites:
+  // the stray can still be in SharedRuntime.inFlight (only the top-level
+  // frame drains, not each nested frame) when child2 starts and mints an id.
+  const seenIds = new Set<string>();
+  let duplicateId: string | undefined;
+  const runner = {
+    async run(prompt: string) {
+      if (prompt === "child1-stray") {
+        await new Promise((resolve) => setTimeout(resolve, 30));
+        return "child1-stray-done";
+      }
+      return `ran:${prompt}`;
+    },
+  };
+  const scripts: Record<string, string> = {
+    child1: `export const meta = { name: 'child1', description: 'c1' }
+// Deliberately NOT awaited.
+agent('child1-stray', { label: 'stray' })
+return 'child1-done'`,
+    child2: `export const meta = { name: 'child2', description: 'c2' }
+const r = await agent('child2-live', { label: 'live' })
+return r`,
+  };
+  const parent = `export const meta = { name: 'parent', description: 'p' }
+const a = await workflow('child1')
+const b = await workflow('child2')
+return { a, b }`;
+
+  const result = await runWorkflow<{ a: string; b: string }>(parent, {
+    agent: runner,
+    persistLogs: false,
+    loadSavedWorkflow: (name) => scripts[name],
+    onAgentStart: (event) => {
+      if (seenIds.has(event.id)) duplicateId = event.id;
+      seenIds.add(event.id);
+    },
+  });
+  assert.equal(result.result.a, "child1-done");
+  assert.equal(result.result.b, "ran:child2-live");
+  assert.equal(
+    duplicateId,
+    undefined,
+    "child1's un-awaited stray and child2's live call must never share an id/deltaKey",
+  );
+});
+
+test("runWorkflow budget gates on accumulated tokens", async () => {
+  const script = `export const meta = { name: 'budget_demo', description: 'budget' }
+const a = await agent('first', { label: 'a' })
+let second = null
+try { second = await agent('second', { label: 'b' }) } catch (e) { second = 'blocked' }
+return { a, second }`;
+
+  const result = await runWorkflow<{ a: unknown; second: unknown }>(script, {
+    agent: fakeAgent({ input: 100, output: 0, total: 100, cost: 0 }),
+    tokenBudget: 100,
+    persistLogs: false,
+  });
+
+  assert.equal(result.result.second, "blocked");
+});
+
+test("runWorkflow initialTokenUsage seeds the run-wide budget so it holds cumulatively across resume (#A2)", async () => {
+  // Simulates what WorkflowManager.resume() passes: a prior execution already
+  // spent 60 (persisted). This fresh execution's own SharedRuntime must start
+  // counting from there — 'a' (allowed: seeded 60 + budget 100 leaves 40
+  // headroom) then spends 60 more, landing at 120; 'b' must then be blocked,
+  // even though neither the seed alone (60) nor 'a' alone (60) would trip it.
+  const script = `export const meta = { name: 'seeded_budget', description: 'seed' }
+const a = await agent('a', { label: 'a' })
+let blocked = false
+try { await agent('b', { label: 'b' }) } catch (e) { blocked = (e && e.code) === 'TOKEN_BUDGET_EXHAUSTED' }
+return { a, blocked }`;
+
+  const result = await runWorkflow<{ a: unknown; blocked: boolean }>(script, {
+    agent: fakeAgent({ input: 60, output: 0, total: 60, cost: 0 }),
+    tokenBudget: 100,
+    initialTokenUsage: { input: 60, output: 0, total: 60, cost: 0, cacheRead: 0, cacheWrite: 0 },
+    persistLogs: false,
+  });
+
+  assert.equal(result.result.a, "ok", "'a' itself is allowed to run (remaining was 40 > 0 before it)");
+  assert.equal(
+    result.result.blocked,
+    true,
+    "'b' must be blocked once the seeded + this-run spend sums past the budget",
+  );
+  assert.equal(result.tokenUsage?.total, 120, "final total reflects the seed (60) plus 'a's spend (60); 'b' never ran");
+});
+
+test("runWorkflow initialTokenUsage integrates correctly with phase() sub-budgets (seeded baseline isn't corrupted)", async () => {
+  // phase()'s sub-budget deliberately re-bases from shared.spent AT the
+  // phase() call (see workflow.ts's phase(): "Re-declaring re-bases from the
+  // current spent"), so a seed doesn't make the phase's OWN ceiling trip any
+  // sooner than usual — it only shifts the visible baseline. This mirrors the
+  // existing "phase sub-budget throws..." test's budget/spend shape exactly,
+  // plus a seed, to confirm seeding doesn't corrupt that mechanism.
+  const script = `export const meta = { name: 'seeded_phase_budget', description: 'seed' }
+const spentAtStart = budget.spent()
+phase('noisy', { budget: 100 })
+let blocked = false
+await agent('a', { label: '1' })
+try { await agent('b', { label: '2' }) } catch (e) { blocked = (e && e.code) === 'TOKEN_BUDGET_EXHAUSTED' }
+return { spentAtStart, blocked }`;
+
+  const result = await runWorkflow<{ spentAtStart: number; blocked: boolean }>(script, {
+    agent: fakeAgent({ input: 100, output: 0, total: 100, cost: 0 }),
+    initialTokenUsage: { input: 40, output: 0, total: 40, cost: 0, cacheRead: 0, cacheWrite: 0 },
+    persistLogs: false,
+  });
+
+  assert.equal(
+    result.result.spentAtStart,
+    40,
+    "budget.spent() reflects the seed before any agent in this execution runs",
+  );
+  assert.equal(
+    result.result.blocked,
+    true,
+    "the phase sub-budget still gates normally on top of a seeded run-wide total",
+  );
+});
+
+test("token budget exhaustion inside parallel() halts (non-recoverable, not swallowed)", async () => {
+  // A warm-up agent spends the whole budget (soft gate: spent accrues after it
+  // finishes); the agent() inside parallel() then hits the gate and must
+  // propagate the non-recoverable error, not become a null in the result array.
+  const script = `export const meta = { name: 'pb', description: 'budget in parallel' }
+await agent('warmup', { label: 'w' })
+const xs = await parallel([() => agent('x', { label: '1' })])
+return xs`;
+  await assert.rejects(
+    () =>
+      runWorkflow(script, {
+        agent: fakeAgent({ input: 100, output: 0, total: 100, cost: 0 }),
+        tokenBudget: 100,
+        persistLogs: false,
+      }),
+    /budget/i,
+    "exhausted budget must reject the run, not become a null in the result array",
+  );
+});
+
+test("non-recoverable agent-limit propagates out of pipeline() too", async () => {
+  const script = `export const meta = { name: 'mp', description: 'agent limit pipeline' }
+const xs = await pipeline([0, 1, 2, 3], (n) => agent('x' + n, { label: 'p' + n }))
+return xs`;
+  await assert.rejects(
+    () =>
+      runWorkflow(script, {
+        agent: fakeAgent({ input: 1, output: 0, total: 1, cost: 0 }),
+        maxAgents: 2,
+        persistLogs: false,
+      }),
+    /limit/i,
+  );
+});
+
+test("phase sub-budget throws when a phase exceeds its ceiling (run total untouched)", async () => {
+  const script = `export const meta = { name: 'pb', description: 'phase budget' }
+phase('noisy', { budget: 100 })
+let blocked = false
+try {
+  await agent('a', { label: '1' })
+  await agent('b', { label: '2' })
+} catch (e) { blocked = (e && e.code) === 'TOKEN_BUDGET_EXHAUSTED' }
+phase('calm')
+const after = await agent('c', { label: '3' })
+return { blocked, after }`;
+  const res = await runWorkflow<{ blocked: boolean; after: unknown }>(script, {
+    agent: fakeAgent({ input: 100, output: 0, total: 100, cost: 0 }),
+    persistLogs: false,
+  });
+  assert.equal(res.result.blocked, true, "the 2nd agent in the phase hit the sub-budget");
+  assert.ok(res.result.after !== null, "a later phase still proceeds");
+});
+
+test("maxAgents is enforced under a parallel() fan-out (atomic slot reservation)", async () => {
+  // Four agents fan out with maxAgents=2. With the synchronous slot reservation,
+  // the 3rd agent() throws AGENT_LIMIT instead of all four passing the gate.
+  const script = `export const meta = { name: 'ma', description: 'agent limit' }
+const xs = await parallel([0, 1, 2, 3].map((i) => () => agent('x' + i, { label: 'a' + i })))
+return xs`;
+  await assert.rejects(
+    () =>
+      runWorkflow(script, {
+        agent: fakeAgent({ input: 1, output: 0, total: 1, cost: 0 }),
+        maxAgents: 2,
+        persistLogs: false,
+      }),
+    /limit/i,
+  );
+});
+
+test("a fan-out past maxAgents cancels queued agents instead of draining the reserved queue", async () => {
+  // A parallel() overshoot reserves and queues up to maxAgents agents behind the
+  // limiter. Before the fix, every reserved agent ran its real API call (spending)
+  // even though the fan-out had already rejected; now the breach short-circuits the
+  // still-queued agents so at most ~concurrency of them execute.
+  const fanout = 100;
+  const maxAgents = 50;
+  const concurrency = 4;
+  const calls = { count: 0 };
+  let release!: () => void;
+  const gate = new Promise<void>((r) => {
+    release = r;
+  });
+  const runner = {
+    async run(prompt: string) {
+      calls.count++;
+      await gate; // stay in-flight/queued while the limit breach propagates
+      return `ran:${prompt}`;
+    },
+  };
+  const script = `export const meta = { name: 'c4', description: 'fanout cancel' }
+const xs = await parallel(Array.from({ length: ${fanout} }, (_, i) => () => agent('x' + i, { label: 'a' + i })))
+return xs`;
+  const run = runWorkflow(script, { agent: runner, maxAgents, concurrency, persistLogs: false });
+  // The run now drains every in-flight agent() call (including these
+  // gate-blocked ones) before its own promise settles — see the run-fatal
+  // drain in runWorkflow's finally — so `run` will NOT reject until `gate`
+  // resolves. Release it concurrently instead of after awaiting the
+  // rejection (which would deadlock: nothing else ever calls release()).
+  const releaseSoon = new Promise<void>((r) => setTimeout(r, 20)).then(() => release());
+  await assert.rejects(run, /limit/i);
+  await releaseSoon;
+  // Deterministically exactly `concurrency`: the limiter runs the first
+  // `concurrency` submissions' bodies synchronously during the reservation
+  // pass (each immediately calls runner.run() and then suspends on `gate`);
+  // every submission after that suspends on the limiter's internal queue
+  // before it ever reaches runner.run(), and the batch is cancelled (via
+  // fanoutScope) before any of them get their turn.
+  assert.equal(calls.count, concurrency);
+});
+
+test("sibling parallel() batches are isolated: one breaching maxAgents does not cancel the other", async () => {
+  // Two independent parallel() fan-outs run CONCURRENTLY inside the same run
+  // (sharing one shared.agentCount / maxAgents), each isolated via its own
+  // .then(ok, err). Batch A (3 agents) never breaches; batch B (40 agents)
+  // does. Before batch-scoped cancellation, a run-global "limitReached" flag
+  // would wrongly cancel A's still-queued agents too, purely because B (an
+  // unrelated fan-out) breached the shared cap — that's the regression this
+  // guards against.
+  const maxAgents = 10;
+  const concurrency = 2;
+  const runner = {
+    async run(prompt: string) {
+      await new Promise((r) => setTimeout(r, 5));
+      return `ran:${prompt}`;
+    },
+  };
+  const script = `export const meta = { name: 'sib', description: 'sibling isolation' }
+const batchA = parallel(Array.from({ length: 3 }, (_, i) => () => agent('a' + i, { label: 'a' + i })))
+  .then((r) => ({ ok: true, r }), (e) => ({ ok: false, code: e && e.code }))
+const batchB = parallel(Array.from({ length: 40 }, (_, i) => () => agent('b' + i, { label: 'b' + i })))
+  .then((r) => ({ ok: true, r }), (e) => ({ ok: false, code: e && e.code }))
+const [a, b] = await Promise.all([batchA, batchB])
+return { a, b }`;
+  const res = await runWorkflow<{
+    a: { ok: boolean; r?: unknown[] };
+    b: { ok: boolean; code?: string };
+  }>(script, { agent: runner, maxAgents, concurrency, persistLogs: false });
+
+  assert.equal(res.result.a.ok, true, "batch A (never breaches) must resolve, not be cancelled by sibling B");
+  assert.equal(res.result.a.r?.length, 3);
+  assert.ok((res.result.a.r as unknown[]).every((r) => typeof r === "string" && r.startsWith("ran:")));
+
+  assert.equal(res.result.b.ok, false, "batch B (breaches maxAgents) must reject");
+  assert.equal(res.result.b.code, WorkflowErrorCode.AGENT_LIMIT_EXCEEDED);
+});
+
+test("a breach in a nested parallel() doesn't corrupt the outer batch's state", async () => {
+  // Outer parallel() of two thunks; one thunk runs an inner parallel() that
+  // breaches a low maxAgents. The breach should propagate as a rejection of
+  // the whole run (agent limit is non-recoverable) without throwing anything
+  // unexpected (e.g. an ALS/ordering bug corrupting shared.agentCount).
+  const runner = {
+    async run(prompt: string) {
+      return `ran:${prompt}`;
+    },
+  };
+  const script = `export const meta = { name: 'nest', description: 'nested fanout' }
+const xs = await parallel([
+  () => agent('outer-1', { label: 'outer-1' }),
+  () => parallel(Array.from({ length: 5 }, (_, i) => () => agent('inner' + i, { label: 'inner' + i }))),
+])
+return xs`;
+  await assert.rejects(
+    () => runWorkflow(script, { agent: runner, maxAgents: 2, concurrency: 2, persistLogs: false }),
+    /limit/i,
+  );
+});
+
+// ─── Additional edge case tests ─────────────────────────────────────────────────
+
+test("runWorkflow returns meta, logs, phases, and duration", async () => {
+  const ONE_AGENT = `export const meta = { name: 'meta_test', description: 'check metadata' }
+const a = await agent('test', { label: 'a' })
+return a`;
+
+  const result = await runWorkflow(ONE_AGENT, {
+    agent: fakeAgent({ total: 50 }),
+    persistLogs: false,
+  });
+
+  assert.equal(result.meta.name, "meta_test");
+  assert.equal(result.meta.description, "check metadata");
+  assert.ok(Array.isArray(result.logs), "result.logs should be an array");
+  assert.ok(Array.isArray(result.phases), "result.phases should be an array");
+  assert.ok(result.durationMs >= 0, "durationMs should be non-negative");
+  assert.ok(typeof result.runId === "string" && result.runId.length > 0, "runId should be a non-empty string");
+});
+
+test("runWorkflow handles empty script without phases gracefully", async () => {
+  const SIMPLE = `export const meta = { name: 'simple', description: 'simple' }
+const a = await agent('hello', { label: 'greeter' })
+return a`;
+
+  const result = await runWorkflow(SIMPLE, {
+    agent: fakeAgent({ total: 50 }, "done"),
+    persistLogs: false,
+  });
+  assert.equal(result.result, "done");
+  assert.equal(result.agentCount, 1);
+});
+
+test("runWorkflow parallel returns results in input order", async () => {
+  const script = `export const meta = { name: 'parallel_order', description: 'check order' }
+const results = await parallel([1,2,3].map(n => () => agent('task ' + n, { label: 't' + n })))
+return results`;
+
+  let callIndex = 0;
+  const agent = {
+    async run(prompt: string) {
+      return `result-${++callIndex}:${prompt}`;
+    },
+  };
+
+  const result = await runWorkflow<unknown[]>(script, { agent, persistLogs: false });
+  assert.ok(Array.isArray(result.result), "result.result should be an array");
+  assert.equal(result.result.length, 3);
+});
+
+test("runWorkflow pipeline stages in order", async () => {
+  const script = `export const meta = { name: 'pipeline_test', description: 'test pipeline' }
+const results = await pipeline(['a','b'], item => agent('stage1 ' + item), result => agent('stage2 ' + result))
+return results`;
+
+  const log: string[] = [];
+  const agent = {
+    async run(prompt: string) {
+      log.push(prompt);
+      return prompt.replace("stage1", "stage1-done").replace("stage2", "stage2-done");
+    },
+  };
+
+  const result = await runWorkflow<string[]>(script, { agent, persistLogs: false });
+  assert.ok(Array.isArray(result.result), "result.result should be an array");
+  assert.equal(result.result.length, 2);
+});
+
+test("pipeline forwards a recoverable null to the next stage with original item and index", async () => {
+  const script = `export const meta = { name: 'pipeline_null', description: 'null forwarding' }
+const results = await pipeline(
+  ['alpha'],
+  (item) => agent('first ' + item, { label: 'first' }),
+  (previousValue, originalItem, index) => ({ previousValue, originalItem, index }),
+)
+return results`;
+  const agent = {
+    async run() {
+      throw new Error("recoverable first-stage failure");
+    },
+  };
+
+  const result = await runWorkflow<Array<{ previousValue: null; originalItem: string; index: number }>>(script, {
+    agent,
+    persistLogs: false,
+  });
+
+  assert.deepEqual(
+    Array.from(result.result, ({ previousValue, originalItem, index }) => ({ previousValue, originalItem, index })),
+    [{ previousValue: null, originalItem: "alpha", index: 0 }],
+  );
+});
+
+test("runWorkflow agent with different labels", async () => {
+  const script = `export const meta = { name: 'label_test', description: 'labels' }
+const a = await agent('task1', { label: 'worker-1' })
+const b = await agent('task2', { label: 'worker-2' })
+return { a, b }`;
+
+  const seenLabels: string[] = [];
+  await runWorkflow(script, {
+    agent: countingAgent().runner,
+    persistLogs: false,
+    onAgentStart: (e) => seenLabels.push(e.label),
+  });
+
+  assert.deepEqual(seenLabels, ["worker-1", "worker-2"]);
+});
+
+test("runWorkflow with phases assignment to agents", async () => {
+  const script = `export const meta = { name: 'phase_test', description: 'phases', phases: [{ title: 'Phase1' }, { title: 'Phase2' }] }
+phase('Phase1')
+const a = await agent('phase1 work', { label: 'p1' })
+phase('Phase2')
+const b = await agent('phase2 work', { label: 'p2' })
+return { a, b }`;
+
+  const phases: string[] = [];
+  const agentPhases: string[] = [];
+  await runWorkflow(script, {
+    agent: countingAgent().runner,
+    persistLogs: false,
+    onPhase: (title) => phases.push(title),
+    onAgentStart: (e) => {
+      if (e.phase) agentPhases.push(e.phase);
+    },
+  });
+
+  assert.ok(phases.includes("Phase1"), "should contain Phase1");
+  assert.ok(phases.includes("Phase2"), "should contain Phase2");
+});
+
+test("runWorkflow can send args to the script", async () => {
+  const script = `export const meta = { name: 'args_test', description: 'test args' }
+return { received: args && args.value }`;
+
+  const result = await runWorkflow<{ received: unknown }>(script, {
+    agent: countingAgent().runner,
+    persistLogs: false,
+    args: { value: 42 },
+  });
+
+  // No agent calls means 0 agents
+  assert.equal(result.result.received, 42);
+});
+
+test("runWorkflow log function works inside script", async () => {
+  const script = `export const meta = { name: 'log_test', description: 'logging' }
+log('hello from script')
+return true`;
+
+  const result = await runWorkflow(script, {
+    agent: countingAgent().runner,
+    persistLogs: false,
+  });
+
+  assert.ok(
+    result.logs.some((l) => l.includes("hello from script")),
+    "should contain hello from script",
+  );
+});
+
+test("runWorkflow console.log works inside script", async () => {
+  const script = `export const meta = { name: 'console_test', description: 'console' }
+console.log('console log')
+console.warn('console warn')
+return true`;
+
+  const result = await runWorkflow(script, {
+    agent: countingAgent().runner,
+    persistLogs: false,
+  });
+
+  assert.ok(
+    result.logs.some((l) => l.includes("console log")),
+    "should contain console log",
+  );
+  assert.ok(
+    result.logs.some((l) => l.includes("console warn")),
+    "should contain console warn",
+  );
+});
+
+test("runWorkflow process.cwd() works inside script", async () => {
+  const script = `export const meta = { name: 'cwd_test', description: 'cwd' }
+return { cwd: process.cwd() }`;
+
+  const result = await runWorkflow<{ cwd: string }>(script, {
+    agent: countingAgent().runner,
+    persistLogs: false,
+  });
+
+  assert.equal(typeof result.result.cwd, "string");
+  assert.ok(result.result.cwd.length > 0, "result.cwd should not be empty");
+});
+
+test("runWorkflow budget object exposes spent() and remaining()", async () => {
+  const script = `export const meta = { name: 'budget_api', description: 'budget API' }
+try { const s = budget.spent(); const r = budget.remaining(); return { spent: s, remaining: typeof r } }
+catch(e) { return { error: String(e) } }`;
+
+  const result = await runWorkflow<{ spent: number; remaining: string }>(script, {
+    agent: fakeAgent({ total: 100 }),
+    persistLogs: false,
+  });
+
+  assert.equal(result.result.spent, 0); // before first agent
+  assert.equal(result.result.remaining, "number");
+});
+
+test("runWorkflow returns empty logs array when nothing logged", async () => {
+  const script = `export const meta = { name: 'no_log', description: 'no logs' }
+await agent('silent', { label: 's' })
+return 1`;
+
+  const result = await runWorkflow(script, {
+    agent: fakeAgent({ total: 10 }),
+    persistLogs: false,
+  });
+
+  assert.ok(Array.isArray(result.logs), "result.logs should be an array");
+});
+
+// ─── Runtime determinism hardening (P0-5) ───────────────────────────────────────
+
+const noopAgent = {
+  async run() {
+    return "ok";
+  },
+};
+
+function probe(expr: string): Promise<{ result: { err: string | null; val: unknown } }> {
+  const script = `export const meta = { name: 'det', description: 'determinism' }
+let err = null, val = null
+try { val = ${expr} } catch (e) { err = String((e && e.message) || e) }
+await agent('noop', { label: 'x' })
+return { err, val }`;
+  return runWorkflow(script, { agent: noopAgent, persistLogs: false });
+}
+
+test("parse-time guard rejects literal Date.now / Math.random / new Date()", async () => {
+  for (const expr of ["Math.random()", "Date.now()", "new Date()"]) {
+    await assert.rejects(
+      () =>
+        runWorkflow(
+          `export const meta = { name: 'lit', description: 'd' }\nconst v = ${expr}\nawait agent('x', { label: 'x' })\nreturn v`,
+          { agent: noopAgent, persistLogs: false },
+        ),
+      /deterministic|unavailable/i,
+      `${expr} literal should be rejected at parse time`,
+    );
+  }
+});
+
+test("parse-time guard preserves the source blocklist used by existing workflows", () => {
+  for (const forbidden of ["Date.now()", "Math.random()", "new Date()"]) {
+    const script = `export const meta = { name: 'blocked-prose', description: 'fixture' }
+// ${forbidden} is unavailable here.
+const warning = ${JSON.stringify(`Do not call ${forbidden}`)}
+return { warning }`;
+
+    assert.throws(() => parseWorkflowScript(script), /deterministic|unavailable/i);
+  }
+});
+
+test("runtime guard neuters computed-access bypasses the parse regex misses", async () => {
+  const r1 = await probe('Math["random"]()');
+  assert.match(r1.result.err ?? "", /unavailable|resume/i, 'Math["random"]() should throw at runtime');
+  const r2 = await probe('Date["now"]()');
+  assert.match(r2.result.err ?? "", /unavailable|resume/i, 'Date["now"]() should throw at runtime');
+  const r3 = await probe("(() => { const D = Date; return new D(); })()");
+  assert.match(r3.result.err ?? "", /unavailable|resume/i, "aliased no-arg Date should throw at runtime");
+});
+
+test("runtime determinism: new Date(arg) and Math.max still work", async () => {
+  const d = await probe("new Date(0).getTime()");
+  assert.equal(d.result.err, null, "new Date(0) should construct");
+  assert.equal(d.result.val, 0, "new Date(0).getTime() === 0");
+  const m = await probe("Math.max(1, 2, 3)");
+  assert.equal(m.result.err, null);
+  assert.equal(m.result.val, 3);
+});
+
+test("vm-realm builtins work and the constructor escape hits the neutered Date.now", async () => {
+  // The escape string is split so the parse-time regex doesn't flag it; at runtime
+  // the vm Function runs in the vm realm where Date.now is neutered.
+  const script = `export const meta = { name: 'vm', description: 'vm realm' }
+let escaped = null
+try { escaped = ({}).constructor.constructor('return Da' + 'te.now()')() } catch (e) { escaped = 'blocked:' + String((e && e.message) || e) }
+const arr = [1, 2, 3].map((x) => x * 2)
+const j = JSON.stringify({ a: 1 })
+const s = [...new Set([1, 1, 2])]
+await agent('noop', { label: 'x' })
+return { escaped, arr, j, s }`;
+  const r = await runWorkflow<{ escaped: string; arr: number[]; j: string; s: number[] }>(script, {
+    agent: noopAgent,
+    persistLogs: false,
+  });
+  // Spread to a host array: vm-realm arrays don't deepStrictEqual host literals.
+  assert.deepEqual([...r.result.arr], [2, 4, 6], "vm Array.map works");
+  assert.equal(r.result.j, '{"a":1}', "vm JSON works");
+  assert.deepEqual([...r.result.s], [1, 2], "vm Set works");
+  // ({}).constructor.constructor is the vm Function; its code runs in the vm realm
+  // where Date.now is neutered -> blocked (the old host-object escape is closed).
+  assert.match(r.result.escaped, /blocked/, "constructor escape via vm objects is closed");
+});
+
+// ── Run-fatal abort: a non-recoverable error that will fail the whole run
+// must stop in-flight siblings from continuing to spend, while preserving
+// parallel()'s null-on-recoverable-error contract and a script's own
+// try/catch around agent()/parallel(). ──
+
+/** An agent runner whose in-flight calls actually respect an abort signal. */
+function abortAwareAgent(delayMs: number) {
+  const state = { started: 0, completed: 0, aborted: 0 };
+  return {
+    state,
+    runner: {
+      async run(prompt: string, options: { signal?: AbortSignal } = {}) {
+        state.started++;
+        if (prompt === "failer") {
+          throw new WorkflowError("boom", WorkflowErrorCode.AGENT_EXECUTION_ERROR, { recoverable: false });
+        }
+        return await new Promise((resolve, reject) => {
+          const timer = setTimeout(() => {
+            state.completed++;
+            resolve(`done:${prompt}`);
+          }, delayMs);
+          options.signal?.addEventListener(
+            "abort",
+            () => {
+              clearTimeout(timer);
+              state.aborted++;
+              reject(new Error("aborted"));
+            },
+            { once: true },
+          );
+        });
+      },
+    },
+  };
+}
+
+test("onRunFatal consumes an asynchronous observer rejection without masking the workflow error", async () => {
+  let unhandled: unknown;
+  const onUnhandled = (reason: unknown) => {
+    unhandled = reason;
+  };
+  process.on("unhandledRejection", onUnhandled);
+  const script = `export const meta = { name: 'fatal_observer', description: 'fatal observer' }
+await agent('failer')`;
+  const runner = {
+    async run() {
+      throw new WorkflowError("primary workflow failure", WorkflowErrorCode.AGENT_EXECUTION_ERROR, {
+        recoverable: false,
+      });
+    },
+  };
+
+  try {
+    await assert.rejects(
+      runWorkflow(script, {
+        agent: runner,
+        persistLogs: false,
+        onRunFatal: async () => {
+          throw new Error("observer rejection");
+        },
+      }),
+      /primary workflow failure/,
+    );
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    assert.equal(unhandled, undefined, "observer rejection must be consumed");
+  } finally {
+    process.off("unhandledRejection", onUnhandled);
+  }
+});
+
+test("a run-fatal error aborts in-flight parallel() siblings instead of letting them run to completion", async () => {
+  const { state, runner } = abortAwareAgent(200);
+  const script = `export const meta = { name: 'fatal_abort', description: 'sibling abort' }
+const xs = await parallel([
+  () => agent('failer', { label: 'failer' }),
+  () => agent('sib1', { label: 'sib1' }),
+  () => agent('sib2', { label: 'sib2' }),
+])
+return xs`;
+  await assert.rejects(runWorkflow(script, { agent: runner, persistLogs: false }), /boom/);
+  // Both in-flight siblings must have been aborted before their (200ms)
+  // delay would otherwise have let them complete and return a result.
+  assert.equal(state.started, 3, "all three agent() calls actually started");
+  assert.equal(state.aborted, 2, "both siblings were aborted once the run's fate was sealed");
+  assert.equal(state.completed, 0, "no sibling ran to completion on a run that's already failing");
+});
+
+test("a script's own try/catch around parallel() preserves in-flight siblings — no run-fatal abort", async () => {
+  const { state, runner } = abortAwareAgent(20);
+  const script = `export const meta = { name: 'fatal_abort_caught', description: 'sibling survives caught failure' }
+let caught = false
+try {
+  await parallel([
+    () => agent('failer', { label: 'failer' }),
+    () => agent('sib1', { label: 'sib1' }),
+  ])
+} catch (e) {
+  caught = true
+}
+// A later agent() call must still work normally — the run's fate was never
+// sealed because the script caught parallel()'s escaping error.
+const after = await agent('after', { label: 'after' })
+return { caught, after }`;
+  const result = await runWorkflow<{ caught: boolean; after: string }>(script, {
+    agent: runner,
+    persistLogs: false,
+  });
+  assert.equal(result.result.caught, true, "the script's own try/catch saw parallel()'s escaping error");
+  assert.equal(result.result.after, "done:after", "a later agent() call still runs normally, unaborted");
+  assert.equal(state.aborted, 0, "the caught sibling was never aborted — the run's fate was never sealed");
+  assert.equal(state.completed, 2, "the caught sibling and the later agent() both ran to completion");
+});
+
+test("parallel()'s recoverable-error-to-null contract does not seal the run's fate (siblings unaffected)", async () => {
+  const { state, runner } = abortAwareAgent(20);
+  // A plain (non-WorkflowError) throw from a thunk is classified recoverable by
+  // wrapError()'s default — parallel() must swallow it to null, not rethrow,
+  // and must NOT abort the sibling still in flight.
+  const script = `export const meta = { name: 'recoverable_null', description: 'recoverable swallowed' }
+const xs = await parallel([
+  () => { throw new Error('plain failure') },
+  () => agent('sib', { label: 'sib' }),
+])
+return xs`;
+  const result = await runWorkflow<Array<unknown>>(script, { agent: runner, persistLogs: false });
+  assert.deepEqual(result.result, [null, "done:sib"], "the thrown thunk resolves to null; the sibling still succeeds");
+  assert.equal(state.aborted, 0, "a recoverable, swallowed-to-null error must never trigger a run-fatal abort");
+  assert.equal(state.completed, 1);
+});
+
+test("a parent script that catches a nested workflow()'s uncaught child error can still run agents afterward (isTopLevelRun gate)", async () => {
+  // Only the TOP-level frame is allowed to seal shared.runFatalController (see
+  // isTopLevelRun in runWorkflow's catch) — a NESTED frame reaching its own
+  // catch must never seal it, because the error hasn't finished propagating
+  // yet: the parent script may still catch workflow()'s rejection and
+  // continue normally. If a nested frame sealed it too (the mutation this
+  // test targets — dropping the isTopLevelRun guard), the shared runtime
+  // (shared between parent and child via sharedRuntime) would already be
+  // aborted by the time control returns to the parent's catch block, so the
+  // parent's own SUBSEQUENT agent() call would be aborted before it could
+  // even start — even though the parent legitimately handled the failure.
+  const { state, runner } = abortAwareAgent(20);
+  const child = `export const meta = { name: 'child', description: 'c' }
+await agent('failer', { label: 'child-failer' })
+return 1`;
+  const parent = `export const meta = { name: 'parent', description: 'p' }
+let caught = false
+try {
+  await workflow('child')
+} catch (e) {
+  caught = true
+}
+const after = await agent('after', { label: 'after' })
+return { caught, after }`;
+
+  const result = await runWorkflow<{ caught: boolean; after: string }>(parent, {
+    agent: runner,
+    persistLogs: false,
+    loadSavedWorkflow: (name) => (name === "child" ? child : undefined),
+  });
+  assert.equal(result.result.caught, true, "the parent's own try/catch saw the child workflow's escaping error");
+  assert.equal(result.result.after, "done:after", "a later agent() call must still run normally after the catch");
+  assert.equal(state.aborted, 0, "sealing at the child (nested) level must never abort the parent's own later agent");
+});
+
+// ── Un-awaited agent() calls must not outlive the run: the run drains every
+// spawned agent() call (awaited or not) before it is allowed to complete. ──
+
+test("an un-awaited agent() call is drained before the run completes", async () => {
+  let strayCompleted = false;
+  const runner = {
+    async run(prompt: string) {
+      if (prompt === "stray") {
+        await new Promise((resolve) => setTimeout(resolve, 30));
+        strayCompleted = true;
+        return "stray-done";
+      }
+      return "main-done";
+    },
+  };
+  const script = `export const meta = { name: 'stray_demo', description: 'un-awaited agent' }
+// Deliberately NOT awaited — a script bug the run must tolerate without
+// letting this call outlive the run's completion.
+agent('stray', { label: 'stray' })
+const main = await agent('main', { label: 'main' })
+return main`;
+  const journal: JournalEntry[] = [];
+  const result = await runWorkflow<string>(script, {
+    agent: runner,
+    persistLogs: false,
+    onAgentJournal: (entry) => journal.push(entry),
+  });
+  assert.equal(result.result, "main-done");
+  assert.equal(strayCompleted, true, "the run must not complete until the un-awaited agent has settled");
+  assert.ok(
+    journal.some((e) => e.result === "stray-done"),
+    "the stray agent's completion must be journaled before the run ends",
+  );
+});
+
+test("an un-awaited agent() call replays deterministically from the journal on resume", async () => {
+  const calls = { stray: 0, main: 0 };
+  const runner = {
+    async run(prompt: string) {
+      if (prompt === "stray") {
+        calls.stray++;
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        return "stray-done";
+      }
+      calls.main++;
+      return "main-done";
+    },
+  };
+  const script = `export const meta = { name: 'stray_resume_demo', description: 'un-awaited agent replay' }
+agent('stray', { label: 'stray' })
+const main = await agent('main', { label: 'main' })
+return main`;
+  const journalEntries = new Map<string, JournalEntry>();
+  const first = await runWorkflow<string>(script, {
+    agent: runner,
+    persistLogs: false,
+    runId: "prior-run",
+    onAgentJournal: (entry) => journalEntries.set(`${entry.runId}:${entry.index}`, entry),
+  });
+  assert.equal(first.result, "main-done");
+  assert.equal(calls.stray, 1);
+  assert.equal(calls.main, 1);
+
+  const second = await runWorkflow<string>(script, {
+    agent: runner,
+    persistLogs: false,
+    runId: "prior-run",
+    resumeJournal: journalEntries,
+    resumeFromRunId: "prior-run",
+  });
+  assert.equal(second.result, "main-done");
+  // Resume replays BOTH cached calls (including the un-awaited 'stray') from
+  // the journal — neither runner.run() is invoked again.
+  assert.equal(calls.stray, 1, "the un-awaited agent's cached result must replay, not re-run, on resume");
+  assert.equal(calls.main, 1, "the awaited agent's cached result must replay, not re-run, on resume");
+});

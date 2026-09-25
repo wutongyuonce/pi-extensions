@@ -1,0 +1,17 @@
+{
+  "source": {
+    "pull": 3382,
+    "head": "becd6dfff71dbaf37539b0dfa56395ab7cd575d0"
+  },
+  "check_runs": [
+    {
+      "name": "Lint & type-check",
+      "status": "completed",
+      "conclusion": "cancelled",
+      "started_at": "2026-09-24T00:00:00Z",
+      "id": 107709801964,
+      "check_suite": { "id": 97545991747 },
+      "details_url": "https://github.com/apmantza/pi-lens/actions/runs/36022234159/job/107709801964"
+    }
+  ]
+}

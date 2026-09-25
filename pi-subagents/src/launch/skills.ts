@@ -7,6 +7,7 @@ import {
 	stripFrontmatter,
 } from "@earendil-works/pi-coding-agent";
 import { getAgentConfigDir } from "../agents/definitions.ts";
+import { parseSkillListEntries, serializeSkillVisibility, type SkillListEntry } from "./skill-visibility.ts";
 
 type SkillAvailability = { mode: "all" } | { mode: "none" } | { mode: "only"; names: string[]; skills: Skill[] };
 
@@ -16,14 +17,12 @@ export interface SkillLaunchPlan {
 	injectSkills: Skill[];
 	betterSkillsActive: boolean;
 	launchArgs: string[];
+	/** Serialized `name=auto|manual` annotations forwarded to the child. */
+	visibilitySpec: string;
 }
 
-function splitSkillNames(raw: string | undefined): string[] {
-	if (!raw?.trim()) return [];
-	return raw
-		.split(",")
-		.map((name) => name.trim())
-		.filter(Boolean);
+function splitSkillNames(entries: SkillListEntry[]): string[] {
+	return entries.map((entry) => entry.name);
 }
 
 function includesBetterSkills(values: Array<string | undefined>): boolean {
@@ -94,8 +93,8 @@ function resolveSkillNames(names: string[], skills: Skill[]): Skill[] {
 	return names.map((name) => byName.get(name)!);
 }
 
-function resolveAvailability(rawSkills: string | undefined, skills: Skill[]): SkillAvailability {
-	const names = splitSkillNames(rawSkills);
+function resolveAvailability(entries: SkillListEntry[], skills: Skill[]): SkillAvailability {
+	const names = splitSkillNames(entries);
 	if (names.length === 0 || (names.length === 1 && names[0] === "all")) {
 		return { mode: "all" };
 	}
@@ -111,11 +110,19 @@ function resolveAvailability(rawSkills: string | undefined, skills: Skill[]): Sk
 }
 
 function resolveInjectSkills(
-	rawInjectSkills: string | undefined,
+	injectEntries: SkillListEntry[],
 	availability: SkillAvailability,
 	skills: Skill[],
 ): Skill[] {
-	const names = splitSkillNames(rawInjectSkills);
+	const annotated = injectEntries.filter((entry) => entry.visibility);
+	if (annotated.length > 0) {
+		throw new Error(
+			`inject-skills does not accept visibility annotations (got "${annotated
+				.map((entry) => `${entry.name}=${entry.visibility}`)
+				.join(", ")}"). Put them in the skills list instead.`,
+		);
+	}
+	const names = splitSkillNames(injectEntries);
 	if (names.length === 0 || (names.length === 1 && names[0] === "none")) return [];
 	if (names.includes("all") || names.includes("none")) {
 		throw new Error("Use `inject-skills: none` or a comma-separated skill name list.");
@@ -141,8 +148,10 @@ export async function buildSkillLaunchPlan(
 	agentDir?: string,
 	extensionSpecs?: string[],
 ): Promise<SkillLaunchPlan> {
-	const skillNames = splitSkillNames(rawSkills);
-	const injectNamesInput = splitSkillNames(rawInjectSkills);
+	const skillEntries = parseSkillListEntries(rawSkills);
+	const skillNames = splitSkillNames(skillEntries);
+	const injectEntries = parseSkillListEntries(rawInjectSkills);
+	const injectNamesInput = splitSkillNames(injectEntries);
 	const noInject = injectNamesInput.length === 0 || (injectNamesInput.length === 1 && injectNamesInput[0] === "none");
 	if (noInject && (skillNames.length === 0 || (skillNames.length === 1 && skillNames[0] === "all"))) {
 		return {
@@ -151,6 +160,7 @@ export async function buildSkillLaunchPlan(
 			injectSkills: [],
 			betterSkillsActive: false,
 			launchArgs: [],
+			visibilitySpec: "",
 		};
 	}
 	if (noInject && skillNames.length === 1 && skillNames[0] === "none") {
@@ -160,11 +170,12 @@ export async function buildSkillLaunchPlan(
 			injectSkills: [],
 			betterSkillsActive: false,
 			launchArgs: ["--no-skills"],
+			visibilitySpec: "",
 		};
 	}
 	const discovered = await discoverSkills(cwd, agentDir, extensionSpecs);
-	const availability = resolveAvailability(rawSkills, discovered.skills);
-	const injectSkills = resolveInjectSkills(rawInjectSkills, availability, discovered.skills);
+	const availability = resolveAvailability(skillEntries, discovered.skills);
+	const injectSkills = resolveInjectSkills(injectEntries, availability, discovered.skills);
 	const injectNames = injectSkills.map((skill) => skill.name);
 	const launchArgs: string[] = [];
 	if (availability.mode === "none") launchArgs.push("--no-skills");
@@ -178,6 +189,7 @@ export async function buildSkillLaunchPlan(
 		injectSkills,
 		betterSkillsActive: discovered.betterSkillsActive,
 		launchArgs,
+		visibilitySpec: serializeSkillVisibility(skillEntries),
 	};
 }
 

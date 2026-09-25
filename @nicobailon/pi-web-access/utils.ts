@@ -2,6 +2,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { spawn } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { isIP } from "node:net";
 import { homedir, hostname, tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -22,7 +23,13 @@ export function getWebSearchConfigDir(): string {
 		if (existsSync(join(legacyDir, "web-search.json"))) return cachedWebSearchConfigDir = legacyDir;
 		return cachedWebSearchConfigDir = xdgDir;
 	}
-	return cachedWebSearchConfigDir = join(homedir(), ".pi");
+	const agentDir = join(homedir(), ".pi", "agent");
+	if (existsSync(join(agentDir, "web-search.json"))) return cachedWebSearchConfigDir = agentDir;
+
+	const legacyDir = join(homedir(), ".pi");
+	if (existsSync(join(legacyDir, "web-search.json"))) return cachedWebSearchConfigDir = legacyDir;
+
+	return cachedWebSearchConfigDir = agentDir;
 }
 
 export function getWebSearchConfigPath(): string {
@@ -35,6 +42,13 @@ interface ApiBaseUrlOptions {
 	defaultValue: string;
 	environmentKey: string;
 	environmentValue: string | undefined;
+}
+
+export function isLoopbackHostname(hostnameValue: string): boolean {
+	const normalized = hostnameValue.replace(/^\[|\]$/g, "").replace(/\.$/, "").toLowerCase();
+	return normalized === "localhost"
+		|| normalized === "::1"
+		|| (isIP(normalized) === 4 && normalized.split(".", 1)[0] === "127");
 }
 
 export function resolveApiBaseUrl(options: ApiBaseUrlOptions): string {
@@ -55,7 +69,7 @@ export function resolveApiBaseUrl(options: ApiBaseUrlOptions): string {
 	} catch {
 		throw new Error(`${source} must be an absolute HTTP(S) URL`);
 	}
-	if (url.protocol !== "https:") {
+	if (url.protocol !== "https:" && (url.protocol !== "http:" || !isLoopbackHostname(url.hostname))) {
 		throw new Error(`${source} must be an absolute HTTPS URL`);
 	}
 	if (url.username || url.password) {
@@ -208,7 +222,7 @@ const proxyStorage = new AsyncLocalStorage<string | null>();
 
 export function normalizeProxyUrl(value: unknown, source: string): string | null {
 	if (value === undefined || value === null) return null;
-	if (typeof value !== "string") throw new Error(`${source} must be an http(s) proxy URL string`);
+	if (typeof value !== "string") throw new Error(`${source} must be an http(s) or socks proxy URL string`);
 	const trimmed = value.trim();
 	if (!trimmed) return null;
 	let parsed: URL;
@@ -217,8 +231,10 @@ export function normalizeProxyUrl(value: unknown, source: string): string | null
 	} catch {
 		throw new Error(`${source} must be a valid proxy URL: ${JSON.stringify(trimmed)}`);
 	}
-	if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
-		throw new Error(`${source} must use the http:// or https:// scheme: ${trimmed}`);
+	if (parsed.protocol !== "http:" && parsed.protocol !== "https:" &&
+		parsed.protocol !== "socks4:" && parsed.protocol !== "socks4a:" &&
+		parsed.protocol !== "socks5:" && parsed.protocol !== "socks5h:") {
+		throw new Error(`${source} must use the http://, https://, or socks scheme: ${trimmed}`);
 	}
 	if (!parsed.hostname) throw new Error(`${source} must include a proxy host: ${trimmed}`);
 	parsed.hash = "";
@@ -251,14 +267,19 @@ function loadConfiguredProxy(): string | null {
 }
 
 export function runWithProxy<T>(proxy: string | undefined, fn: () => T): T {
-	if (proxy === undefined) return fn();
+	if (proxy === undefined) {
+		const configured = loadConfiguredProxy();
+		if (configured === null) return fn();
+		installGlobalProxyFetch();
+		return proxyStorage.run(configured, fn);
+	}
 	const normalized = normalizeProxyUrl(proxy, "proxy");
+	if (normalized !== null) installGlobalProxyFetch();
 	return proxyStorage.run(normalized, fn);
 }
 
 export function getActiveProxy(): string | null {
-	const scoped = proxyStorage.getStore();
-	return scoped !== undefined ? scoped : loadConfiguredProxy();
+	return proxyStorage.getStore() ?? null;
 }
 
 export function hasScopedProxyDecision(): boolean {

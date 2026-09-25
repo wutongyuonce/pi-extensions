@@ -13,6 +13,13 @@ export const THINKING_LEVELS = [
 	"xhigh",
 ] as const;
 export const FAST_MODES = ["inherit", "off"] as const;
+export const WORKFLOW_PROFILE_ROLES = [
+	"planning",
+	"research-execution",
+	"synthesis",
+	"verification",
+	"final-judgment",
+] as const;
 export const APPROVAL_MODES = ["non-interactive", "on-request"] as const;
 export const WORKTREE_POLICIES = ["auto", "on", "off"] as const;
 export const TOOL_CLASSIFICATIONS = [
@@ -24,6 +31,7 @@ export const WORKFLOW_RUN_TYPE = "artifact-graph" as const;
 
 export type ThinkingLevel = (typeof THINKING_LEVELS)[number];
 export type FastMode = (typeof FAST_MODES)[number];
+export type WorkflowProfileRole = (typeof WORKFLOW_PROFILE_ROLES)[number];
 export type ApprovalMode = (typeof APPROVAL_MODES)[number];
 export type WorktreePolicy = (typeof WORKTREE_POLICIES)[number];
 export type ToolClassification = (typeof TOOL_CLASSIFICATIONS)[number];
@@ -136,16 +144,26 @@ export interface ExecutionProfileStageOverride {
 	foreachBatch?: ExecutionProfileForeachBatch;
 }
 
+/** Optional authored hints used only to compare existing execution candidates. */
+export interface WorkflowRoutingHints {
+	useWhen?: string[];
+	avoidWhen?: string[];
+	outputs?: string[];
+}
+
 export interface ArtifactGraphWorkflowSpec {
 	schemaVersion: 1;
 	name?: string;
 	description?: string;
+	routing?: WorkflowRoutingHints;
 	input?: unknown;
 	defaults?: WorkflowDefaults;
 	roles?: Record<string, RoleSpec>;
 	/**
-	 * Named execution profiles selected at run time. Stage keys are top-level ids
-	 * or canonical nested dag ids (`container.child`). Empty profiles are identity.
+	 * Named execution profiles selected at run time. Stage keys are top-level ids,
+	 * canonical nested dag/loop ids (`container.child`), loop exhaustion slots
+	 * (`loop.$onExhausted`), or dynamic decision slots (`stage.$planner`, etc.).
+	 * Empty profiles are identity.
 	 */
 	executionProfiles?: Record<
 		string,
@@ -187,6 +205,8 @@ export interface DynamicWorkflowNestedSpec {
 
 export interface DynamicDecisionLoopExecutionProfileSpec {
 	agent?: string;
+	/** Model-purpose metadata used only by workflow execution-profile presets. */
+	profileRole?: WorkflowProfileRole;
 	model?: string;
 	thinking?: ThinkingLevel;
 	tools?: WorkflowToolSpec[];
@@ -271,8 +291,11 @@ export interface ArtifactGraphStageSpec {
 	id: string;
 	type?: ArtifactGraphStageType;
 	prompt?: string;
+	injectRuntimeTask?: boolean;
 	agent?: string;
 	role?: string | string[];
+	/** Model-purpose metadata, distinct from the agent-context `role` field. */
+	profileRole?: WorkflowProfileRole;
 	cwd?: string;
 	model?: string;
 	thinking?: ThinkingLevel;
@@ -574,6 +597,12 @@ export interface CompiledDynamicWorkflowTask {
 	availableModels?: WorkflowModelInfo[];
 }
 
+export interface WorkflowResourcePolicy {
+	version: 1;
+	skillDiscovery: "ambient" | "disabled";
+	contextFiles: "disabled";
+}
+
 export interface CompiledArtifactGraphTask {
 	enabled: true;
 	output: {
@@ -609,6 +638,8 @@ export interface CompiledTask {
 	systemPromptMode?: string;
 	inheritProjectContext?: boolean;
 	inheritSkills?: boolean;
+	/** Absent means the task permanently retains pre-policy launch behavior. */
+	resourcePolicyVersion?: 1;
 	roleNames: string[];
 	task: string;
 	cwd: string;
@@ -649,6 +680,8 @@ export interface CompiledTask {
 		requestHash: string;
 		branchId?: string;
 		outputProfile?: string;
+		/** Captured diagnostics for event-only recovery; absent on legacy tasks. */
+		resourceWarnings?: string[];
 	};
 	/** Runtime-only synthetic carrier for one transparent foreach batch launch. */
 	foreachBatchSynthetic?: {
@@ -837,8 +870,7 @@ export interface WorkflowTaskTimingAggregateRecord {
 	incomplete?: boolean;
 }
 
-export interface LaunchBootstrapProvenanceRecord {
-	schema: "pi-workflow-launch-bootstrap-provenance-v1";
+export interface LaunchBootstrapProvenanceRecordBase {
 	identitySha256: string;
 	workflow: { type: string; specPathSha256: string };
 	runId: string;
@@ -848,6 +880,8 @@ export interface LaunchBootstrapProvenanceRecord {
 		launchRetry: number;
 		outputRetry: number;
 		resume: number;
+		/** Physical batch/fallback attempt; absent for legacy/non-batch records. */
+		physicalAttempt?: number;
 	};
 	sessionId?: string;
 	backend: { id: string; type: string; mode: string };
@@ -902,6 +936,23 @@ export interface LaunchBootstrapProvenanceRecord {
 	};
 }
 
+/** Byte-compatible launch provenance for tasks compiled before resource policy. */
+export interface LaunchBootstrapProvenanceRecordV1
+	extends LaunchBootstrapProvenanceRecordBase {
+	schema: "pi-workflow-launch-bootstrap-provenance-v1";
+}
+
+/** Explicit sealed resource-policy capture for newly compiled tasks. */
+export interface LaunchBootstrapProvenanceRecordV2
+	extends LaunchBootstrapProvenanceRecordBase {
+	schema: "pi-workflow-launch-bootstrap-provenance-v2";
+	resourcePolicy: WorkflowResourcePolicy;
+}
+
+export type LaunchBootstrapProvenanceRecord =
+	| LaunchBootstrapProvenanceRecordV1
+	| LaunchBootstrapProvenanceRecordV2;
+
 export interface LaunchBootstrapProvenanceHistory {
 	version: 1;
 	records: LaunchBootstrapProvenanceRecord[];
@@ -928,7 +979,7 @@ export interface WorkflowLaunchAuthorityRecord {
 				phase: "consumed";
 				backendRunId: string;
 				backendAttemptId: string;
-			};
+		  };
 }
 
 export interface WorkflowLaunchAuthorityHistory {
@@ -1053,6 +1104,8 @@ export interface WorkflowForeachBatchTaskState {
 	batchId: string;
 	role: "leader" | "member";
 	phase: WorkflowForeachBatchPhase;
+	/** Durable identity of the physical batch/singleton attempt owning this task. */
+	physicalAttempt?: number;
 	/** Prevent a malformed/failed batch from being selected again for this item. */
 	batchingDisabled?: true;
 }
@@ -1213,6 +1266,8 @@ export interface WorkflowTaskRunRecord {
 		result: string;
 	};
 	backendFiles?: Record<string, string>;
+	/** Host-owned raw byte integrity for the current materialized generation. */
+	rawArtifactIntegrity?: import("./workflow-raw-contract.js").RawIntegrity;
 	lastMessage?: string;
 	outputRetry?: {
 		attempts: number;
@@ -1301,17 +1356,29 @@ export interface WorkflowTaskResumeEvent {
 export type WorkflowRouteDecision = "direct" | "dynamic" | "workflow";
 export type WorkflowRouteDepth = "quick" | "standard" | "max";
 
-/**
- * Audit record for the opt-in `--route` router pass. Present only on runs
- * started through routing; default runs never carry this field.
- */
+/** Effective declared or user-saved profile frozen into a new run. */
 export interface WorkflowRunExecutionProfile {
-	/** Selected declared profile name. */
+	/** Selected declared or user-saved profile name. */
 	name: string;
-	/** Canonical stage-id → complete profile overrides applied at compile time. */
+	/** Definition identity captured with a user-saved profile before launch. */
+	definitionFingerprint?: string;
+	/** Canonical stage-id → captured profile overrides applied at compile time. */
 	stageOverrides: Record<string, ExecutionProfileStageOverride>;
 }
 
+/** A user profile resolved against one exact authored definition before launch. */
+export interface WorkflowCapturedExecutionProfile
+	extends WorkflowRunExecutionProfile {
+	definitionFingerprint: string;
+}
+
+/** Launch-time profile choice: declared spec id or a captured user profile. */
+export interface WorkflowExecutionProfileSelection {
+	executionProfile?: string;
+	executionProfileOverride?: WorkflowCapturedExecutionProfile;
+}
+
+/** Legacy routing audit retained for historical run records; new explicit launches omit it. */
 export interface WorkflowRunRouting {
 	requested: string;
 	decided: WorkflowRouteDecision;
@@ -1335,9 +1402,14 @@ export interface WorkflowRunProvenance {
 	[key: string]: unknown;
 }
 
-export type WorkflowRunLaunchSource =
+export type WorkflowRunLaunchV1Source =
 	| { kind: "slash-command"; action: "run" | "dynamic" }
 	| { kind: "tool"; name: "workflow_run" | "workflow_dynamic" };
+
+/** Includes `auto` for consumers that render either launch-provenance generation. */
+export type WorkflowRunLaunchSource =
+	| WorkflowRunLaunchV1Source
+	| { kind: "slash-command"; action: "auto" };
 
 export type WorkflowRunLaunchProfile =
 	| { kind: "named"; name: string }
@@ -1357,10 +1429,24 @@ export type WorkflowRunLaunchCommandMetadata =
 	  }
 	| { state: "unavailable"; reason: "not-a-command" };
 
-/** Structured creation-launch provenance. Exact command text lives in a private sidecar. */
-export interface WorkflowRunLaunchMetadata {
+export type WorkflowAutoRoute = "direct" | "named-workflow" | "direct-dynamic";
+
+/** Opaque selection facts recorded by a confirmed `/workflow auto` launch. */
+export interface WorkflowRunAutoSelectionMetadata {
+	/** Null means the user explicitly chose an unranked local manual fallback; non-null equals selected. */
+	recommendation: WorkflowAutoRoute | null;
+	selected: "named-workflow" | "direct-dynamic";
+	candidateId: string;
+	candidateIdentitySha256: string;
+	taskSha256: string;
+	confirmed: true;
+	effectiveRuntime: { model?: string; thinking?: ThinkingLevel };
+}
+
+/** Legacy structured launch provenance. Keep this exact v1 shape readable forever. */
+export interface WorkflowRunLaunchMetadataV1 {
 	schema: "pi-workflow-run-launch-v1";
-	source: WorkflowRunLaunchSource;
+	source: WorkflowRunLaunchV1Source;
 	requestKind: "named-workflow" | "direct-dynamic";
 	routingMode: "default-on" | "explicit-on" | "off";
 	profile: WorkflowRunLaunchProfile;
@@ -1368,18 +1454,44 @@ export interface WorkflowRunLaunchMetadata {
 	command: WorkflowRunLaunchCommandMetadata;
 }
 
-/** Non-persisted launch input carried from a launch surface to the engine. */
-export interface WorkflowRunLaunchCapture {
-	schema: "pi-workflow-run-launch-v1";
-	source: WorkflowRunLaunchSource;
+/** v2 is deliberately distinct from v1 rather than widening its strict enums. */
+export interface WorkflowRunLaunchMetadataV2 {
+	schema: "pi-workflow-run-launch-v2";
+	source: { kind: "slash-command"; action: "auto" };
 	requestKind: "named-workflow" | "direct-dynamic";
-	routingMode: "default-on" | "explicit-on" | "off";
+	routingMode: "auto-confirmed";
 	profile: WorkflowRunLaunchProfile;
 	task: { characters: number; lines: number };
+	selection: WorkflowRunAutoSelectionMetadata;
+	command: WorkflowRunLaunchCommandMetadata;
+}
+
+/** Structured creation-launch provenance. Exact command text lives in a private sidecar. */
+export type WorkflowRunLaunchMetadata =
+	| WorkflowRunLaunchMetadataV1
+	| WorkflowRunLaunchMetadataV2;
+
+export type WorkflowRunLaunchCaptureV1 = Omit<
+	WorkflowRunLaunchMetadataV1,
+	"command"
+> & {
 	command:
 		| { state: "captured"; text: string }
 		| { state: "unavailable"; reason: "not-a-command" };
-}
+};
+
+export type WorkflowRunLaunchCaptureV2 = Omit<
+	WorkflowRunLaunchMetadataV2,
+	"command"
+> & {
+	/** An auto launch is slash-command initiated and always retains its sidecar. */
+	command: { state: "captured"; text: string };
+};
+
+/** Non-persisted launch input carried from a launch surface to the engine. */
+export type WorkflowRunLaunchCapture =
+	| WorkflowRunLaunchCaptureV1
+	| WorkflowRunLaunchCaptureV2;
 
 /**
  * Deterministic claim-support accounting computed after a direct dynamic

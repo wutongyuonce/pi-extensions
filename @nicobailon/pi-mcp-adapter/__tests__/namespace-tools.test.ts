@@ -55,9 +55,9 @@ describe("namespaceProxyName", () => {
 
   it("uses provider-safe namespace names without encoded-form collisions", async () => {
     const { namespaceProxyName } = await importSync();
-    expect(namespaceProxyName("数")).toBe("mcp___mcpns_6570");
+    expect(namespaceProxyName("数")).toBe("mcp___mcpns__6570_");
     expect(namespaceProxyName("_6570_")).toBe("mcp___6570_");
-    expect(namespaceProxyName("_mcpns_6570")).toBe("mcp___mcpns_5f_6d_63_70_6e_73_5f_36_35_37_30");
+    expect(namespaceProxyName("_mcpns_6570")).toBe("mcp___mcpns___mcpns__6570");
     expect(namespaceProxyName("数")).toMatch(/^[A-Za-z0-9_]+$/);
   });
 });
@@ -70,12 +70,12 @@ describe("syncNamespaceProxyTools", () => {
     vi.restoreAllMocks();
   });
 
-  it("registers mcp__<server> for each proxy-only server with metadata", async () => {
+  it.each([undefined, true])("registers namespace proxies when namespaceProxyTools is %s", async (namespaceProxyTools) => {
     const { syncNamespaceProxyTools } = await importSync();
     const { pi, registered } = makePi();
 
     syncNamespaceProxyTools({
-      config: { mcpServers: { "context-mode": { command: "context-mode", lifecycle: "eager" } } },
+      config: { mcpServers: { "context-mode": { command: "context-mode", lifecycle: "eager" } }, settings: { namespaceProxyTools } },
       cache: CACHE_SHAPE([["context-mode", { tools: [{ name: "ctx_execute" }] }]]),
       envOverride: null,
       existingDirectNames: new Set(),
@@ -89,6 +89,54 @@ describe("syncNamespaceProxyTools", () => {
     expect(registered.has("mcp__context_mode")).toBe(true);
     const tool = registered.get("mcp__context_mode")!;
     expect(tool.execute).toBeTypeOf("function");
+  });
+
+  it("does not register namespace proxies when namespaceProxyTools is false", async () => {
+    const { syncNamespaceProxyTools } = await importSync();
+    const { pi } = makePi();
+
+    const result = syncNamespaceProxyTools({
+      config: { mcpServers: { demo: { command: "demo" } }, settings: { namespaceProxyTools: false } },
+      cache: CACHE_SHAPE([["demo", { tools: [{ name: "search" }] }]]),
+      envOverride: null,
+      existingDirectNames: new Set(),
+      existingNamespaceNames: new Set(),
+      pi,
+      getState: () => null,
+      getInitPromise: () => null,
+      getPiTools: () => [],
+    });
+
+    expect(pi.registerTool).not.toHaveBeenCalled();
+    expect(result).toEqual({ specs: [], added: [], updated: [], deactivated: [] });
+  });
+
+  it.each([true, false])("deactivates disabled namespace proxies with unregisterTool=%s", async (canUnregister) => {
+    const { syncNamespaceProxyTools } = await importSync();
+    const { pi, registered } = makePi();
+    if (!canUnregister) delete pi.unregisterTool;
+    let activeTools = ["mcp", "mcpScript", "demo_search", "mcp__demo"];
+    pi.getActiveTools = vi.fn(() => activeTools);
+    pi.setActiveTools = vi.fn((names: string[]) => { activeTools = names; });
+    registered.set("mcp__demo", { name: "mcp__demo", execute: vi.fn() });
+
+    const result = syncNamespaceProxyTools({
+      config: { mcpServers: { demo: { command: "demo" } }, settings: { namespaceProxyTools: false } },
+      cache: CACHE_SHAPE([["demo", { tools: [{ name: "search" }] }]]),
+      envOverride: null,
+      existingDirectNames: new Set(["demo_search"]),
+      activeDirectNames: new Set(["demo_search"]),
+      existingNamespaceNames: new Set(["mcp__demo"]),
+      pi,
+      getState: () => null,
+      getInitPromise: () => null,
+      getPiTools: () => [],
+    });
+
+    expect(pi.registerTool).not.toHaveBeenCalled();
+    expect(result.deactivated).toEqual(["mcp__demo"]);
+    expect(activeTools).toEqual(["mcp", "mcpScript", "demo_search"]);
+    if (canUnregister) expect(registered.has("mcp__demo")).toBe(false);
   });
 
   it("registers proxy-only servers that expose only resources", async () => {
@@ -266,7 +314,7 @@ describe("syncNamespaceProxyTools", () => {
     expect(registered.has("mcp__other")).toBe(false);
   });
 
-  it("exposes a `tool` and optional `args` parameter schema for dispatch", async () => {
+  it("exposes dispatch parameters with search-first describe guidance", async () => {
     const { syncNamespaceProxyTools } = await importSync();
     const { pi, registered } = makePi();
 
@@ -283,13 +331,18 @@ describe("syncNamespaceProxyTools", () => {
     });
 
     const tool = registered.get("mcp__context_mode")!;
-    expect(tool.parameters).toBeDefined();
     expect(tool.parameters).toMatchObject({
       properties: {
         tool: expect.anything(),
-        args: expect.anything(),
+        args: {
+          description: expect.stringMatching(/mcp\(\{ search:.*mcp\(\{ describe:/),
+        },
       },
     });
+    expect(JSON.stringify(tool.parameters)).toContain("exact tool name returned by search");
+    expect(JSON.stringify(tool.parameters)).toContain("When mcp is available");
+    expect(JSON.stringify(tool.parameters)).toContain("to inspect schemas; for unique names use");
+    expect(JSON.stringify(tool.parameters)).not.toContain("server/tool");
   });
 
   it("skips registration when an existing direct tool already uses mcp__<server>", async () => {
@@ -455,7 +508,7 @@ describe("syncNamespaceProxyTools", () => {
       getPiTools: () => [],
     });
 
-    expect(registered.has("mcp___mcpns_6570")).toBe(true);
+    expect(registered.has("mcp___mcpns__6570_")).toBe(true);
     expect(registered.has("mcp___6570_")).toBe(true);
   });
 
@@ -562,6 +615,42 @@ describe("syncNamespaceProxyTools", () => {
     expect(result.updated).toEqual(["mcp__my_server"]);
     expect(pi.registerTool).toHaveBeenCalledTimes(2);
     expect(registered.get("mcp__my_server")?.label).toBe("MCP: my_server");
+  });
+
+  it("rejects the fallback delayed call import after the namespace state changes", async () => {
+    vi.resetModules();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    const executeCall = vi.fn();
+    vi.doMock("../proxy-modes.ts", async () => {
+      await gate;
+      return { executeCall };
+    });
+    const { syncNamespaceProxyTools } = await importSync();
+    const { pi, registered } = makePi();
+    const state = {
+      owner: { isActive: () => true, signal: new AbortController().signal },
+    } as any;
+    let currentState = state;
+
+    syncNamespaceProxyTools({
+      config: { mcpServers: { demo: { command: "demo" } } },
+      cache: CACHE_SHAPE([["demo", { tools: [{ name: "search" }] }]]),
+      envOverride: null,
+      existingDirectNames: new Set(),
+      existingNamespaceNames: new Set(),
+      pi,
+      getState: () => currentState,
+      getInitPromise: () => null,
+      getPiTools: () => [],
+    });
+
+    const pending = registered.get("mcp__demo")!.execute("call-1", { tool: "search" }, undefined);
+    currentState = null as any;
+    release();
+
+    await expect(pending).rejects.toThrow("stale session");
+    expect(executeCall).not.toHaveBeenCalled();
   });
 
   it("preserves initialization error context", async () => {

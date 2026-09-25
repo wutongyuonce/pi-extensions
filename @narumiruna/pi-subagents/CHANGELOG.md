@@ -1,5 +1,17 @@
 # @narumitw/pi-subagents
 
+## 3.1.0
+
+### Minor Changes
+
+- aec9773: Allow each subagent job to attach validated local skills and trusted extensions with an attested initial tool allowlist.
+
+## 3.0.2
+
+### Patch Changes
+
+- 8abd5b7: Keep generated extension runtime graphs inside Pi's Jiti-loaded TypeScript path to avoid duplicate peer-runtime evaluation during startup. Add measured generated runtimes for Context Management, Herdr, and TypeSafe Search.
+
 ## 3.0.1
 
 ### Patch Changes

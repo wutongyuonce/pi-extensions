@@ -26,6 +26,7 @@ import { buildChildLaunchPlan, type ModelRegistryLike } from "./child-launch-pla
 import { CHILD_CONTEXT_BOUNDARY_SYSTEM_PROMPT } from "./context-boundary.ts";
 import { parseEnvString } from "./env.ts";
 import { getLaunchEnvCollisions } from "./launch-overrides.ts";
+import { PI_SUBAGENT_SKILL_VISIBILITY } from "./skill-visibility.ts";
 import {
 	resolveSubagentNoContextFiles,
 	resolveSubagentNoSession,
@@ -443,6 +444,11 @@ export function getBaseSubagentEnvVars(
 	if (prepared.effectiveExtensions !== undefined) {
 		envVars.PI_SUBAGENT_EXTENSIONS = prepared.effectiveExtensions.join(",");
 	}
+	// Unconditional on purpose: an inherited or frontmatter-injected value must
+	// never leak child-local annotations into a plain or `skills: all` grandchild.
+	// Uses the plan's validated spec so the launch-time grammar check is the
+	// single source of truth for what the child receives.
+	envVars[PI_SUBAGENT_SKILL_VISIBILITY] = prepared.skillLaunchPlan.visibilitySpec;
 	if (process.env.PI_SUBAGENT_ENABLE_SET_TAB_TITLE === "1") {
 		envVars.PI_SUBAGENT_ENABLE_SET_TAB_TITLE = "1";
 	}

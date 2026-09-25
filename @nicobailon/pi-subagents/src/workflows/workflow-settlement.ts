@@ -28,7 +28,10 @@ export interface WorkflowPublicChild {
 	output: string;
 	outputState: "present" | "absent";
 	structuredOutput?: unknown;
-	success: boolean;
+	/** Omitted for running launch receipts. */
+	success?: boolean;
+	state?: "running";
+	asyncDir?: string;
 	terminalOutcome?: WorkflowTerminalOutcome;
 	outputReference?: string;
 	outputPathMapping?: { requestedPath: string; savedPath: string };
@@ -209,6 +212,8 @@ export function planWorkflowSettlement(input: {
 		if (!resolution) resolution = classifyWorkflowSettlement(status);
 	}
 	const recovery = workflowRecoveryActions(receipt);
+	delete status.workflowReceiptPath;
+	if (receipt && input.receiptPath) status.workflowReceiptPath = input.receiptPath;
 	if (receipt) {
 		receipt = {
 			...receipt,
@@ -233,6 +238,7 @@ export function planWorkflowSettlement(input: {
 		timestamp: now,
 	};
 	const terminal = status.state === "complete" || status.state === "failed" || status.state === "partial" || status.state === "stopped";
+	if (!status.workflowReceiptPath) delete publicResult.workflowReceipt;
 	const completionEvent = terminal ? {
 		type: "subagent.workflow.completed",
 		state: status.state,

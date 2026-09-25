@@ -1,0 +1,5 @@
+{
+  "_comment": "Regenerate with `npm run astgrep:self-scan -- --update-baseline` AFTER triaging every new entry (fix the underlying finding, or confirm it's a legitimate exception and document why in the same PR). Never regenerate to silently swallow an unreviewed hit.",
+  "generatedAt": "2026-08-19T20:44:05.206Z",
+  "allowed": []
+}

@@ -105,6 +105,18 @@ export function isPerplexityAvailable(): boolean {
 	});
 }
 
+/** Hard ceiling on kept citations, matching the `numResults` clamp. */
+const MAX_CITATIONS = 20;
+
+// Preserve citation numbering by keeping the prefix through the highest cited index, capped at 20.
+function citationsToKeep(answer: string, available: number, numResults: number): number {
+	let highestCited = 0;
+	for (const match of answer.matchAll(/\[(\d{1,3})\]/g)) {
+		highestCited = Math.max(highestCited, Number(match[1]));
+	}
+	return Math.min(available, MAX_CITATIONS, Math.max(numResults, highestCited));
+}
+
 export async function searchWithPerplexity(query: string, options: SearchOptions = {}): Promise<SearchResponse> {
 	checkRateLimit();
 
@@ -184,7 +196,8 @@ export async function searchWithPerplexity(query: string, options: SearchOptions
 	const citations = Array.isArray(data.citations) ? data.citations : [];
 
 	const results: SearchResult[] = [];
-	for (let i = 0; i < Math.min(citations.length, numResults); i++) {
+	const citationCount = citationsToKeep(answer, citations.length, numResults);
+	for (let i = 0; i < citationCount; i++) {
 		const citation = citations[i];
 		if (typeof citation === "string") {
 			results.push({ title: `Source ${i + 1}`, url: citation, snippet: "" });

@@ -1,0 +1,10 @@
+id: ts-unnecessary-bind
+language: typescript
+severity: warning
+message: fn.bind(this) in arrow function context - arrow functions capture this lexically
+metadata:
+  weight: 2
+  category: slop
+rule:
+  kind: call_expression
+  pattern: "$FN.bind(this)"

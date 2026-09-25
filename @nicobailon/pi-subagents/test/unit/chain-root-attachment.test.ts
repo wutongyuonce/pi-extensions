@@ -43,21 +43,26 @@ describe("async chain root attachment", () => {
 			steps: [{ agent: "worker", status: "complete", sessionFile }],
 		});
 		writeJson(importedRoot.resultPath, {
+			sessionId: "publication-session",
+			toolCallId: "publication-tool-call",
 			state: "complete",
 			success: true,
 		results: [{ agent: "worker", output: "root output", success: true, sessionFile, usage: { input: 100, output: 50, cacheRead: 0, cacheWrite: 0, cost: 0.001, turns: 1 } }],
 		});
 
 		const result = await waitForImportedAsyncRoot(importedRoot, { pollIntervalMs: 1 });
+		fs.writeFileSync(path.join(importedRoot.asyncDir, "status.json"), "{malformed", "utf-8");
 
 		assert.deepEqual({
 			agent: result.agent,
+			importedPublication: result.importedPublication,
 			output: result.output,
 			exitCode: result.exitCode,
 			sessionFile: result.sessionFile,
 			usage: result.usage,
 		}, {
 			agent: "worker",
+			importedPublication: { sessionId: "publication-session", toolCallId: "publication-tool-call" },
 			output: "root output",
 			exitCode: 0,
 			sessionFile,
@@ -115,6 +120,40 @@ describe("async chain root attachment", () => {
 		assert.equal(result.exitCode, 0);
 	});
 
+	for (const proofState of [undefined, "pending"]) it(`waits past the terminal grace for workflow-owned single publication with ${proofState ?? "absent"} root proof`, async (t) => {
+		t.mock.timers.enable({ apis: ["setTimeout", "Date"], now: 0 });
+		const importedRoot = { ...root(), resultPath: path.join(tempDir, "root-run", "workflow-result.json") };
+		writeJson(path.join(importedRoot.asyncDir, "status.json"), {
+			runId: importedRoot.runId,
+			mode: "single",
+			parentWorkflowRunId: "workflow-parent",
+			state: "running",
+			pid: process.pid,
+			startedAt: 1,
+			...(proofState ? { processTerminal: { version: 1, runId: importedRoot.runId, runnerProcessInstanceId: "runner-instance", state: proofState } } : {}),
+			steps: [{ agent: "worker", status: "complete" }],
+		});
+
+		// The live publisher is this process; advance only the waiter's clock,
+		// leaving the real completed-step evidence intact until publication.
+		const waiting = waitForImportedAsyncRoot(importedRoot);
+		for (let poll = 0; poll < 3; poll++) {
+			t.mock.timers.tick(500);
+			await Promise.resolve();
+		}
+		assert.equal(Date.now(), 1_500);
+		assert.equal(fs.existsSync(importedRoot.resultPath), false);
+		writeJson(importedRoot.resultPath, {
+			state: "complete",
+			success: true,
+			results: [{ agent: "worker", output: "published after step completion", success: true }],
+		});
+		t.mock.timers.tick(500);
+		const result = await waiting;
+		assert.equal(result.success, true, result.error);
+		assert.equal(result.output, "published after step completion");
+	});
+
 	it("imports a failed root as a failed first chain step", async () => {
 		const importedRoot = root();
 		writeJson(path.join(importedRoot.asyncDir, "status.json"), {
@@ -137,6 +176,7 @@ describe("async chain root attachment", () => {
 		assert.equal(result.exitCode, 1);
 		assert.equal(result.error, "root failed");
 		assert.equal(result.output, "root failed");
+		assert.deepEqual(result.importedPublication, {});
 	});
 
 	it("imports a partial root without collapsing it to failed", async () => {
@@ -154,7 +194,7 @@ describe("async chain root attachment", () => {
 			state: "partial",
 			success: false,
 			summary: "Required file-only output was not produced: report.md",
-			results: [{ agent: "worker", output: "Required file-only output was not produced: report.md", error: "Required file-only output was not produced: report.md", success: false, effects: { fileMutation: { status: "observed", expected: true, attempted: true, evidence: { source: "tracked-files", trackedOnly: true, cwd: tempDir, changedFiles: ["input.md"], attemptedMutation: true } } } }],
+			results: [{ agent: "worker", output: "Required file-only output was not produced: report.md", error: "Required file-only output was not produced: report.md", success: false, effects: { fileMutation: { status: "observed", attempted: true, evidence: { source: "tracked-files", trackedOnly: true, cwd: tempDir, changedFiles: ["input.md"], attemptedMutation: true } } } }],
 		});
 
 		const result = await waitForImportedAsyncRoot(importedRoot, { pollIntervalMs: 1 });
@@ -167,7 +207,7 @@ describe("async chain root attachment", () => {
 
 	it("fails a partial root that never produced a result file", async () => {
 		const importedRoot = root();
-		const effects = { fileMutation: { status: "observed", expected: true, attempted: true, evidence: { source: "tracked-files", trackedOnly: true, cwd: tempDir, changedFiles: ["input.md"], attemptedMutation: true } } };
+		const effects = { fileMutation: { status: "observed", attempted: true, evidence: { source: "tracked-files", trackedOnly: true, cwd: tempDir, changedFiles: ["input.md"], attemptedMutation: true } } };
 		writeJson(path.join(importedRoot.asyncDir, "status.json"), {
 			runId: importedRoot.runId,
 			mode: "single",
@@ -188,14 +228,21 @@ describe("async chain root attachment", () => {
 		assert.deepEqual(result.effects?.fileMutation?.evidence?.changedFiles, ["input.md"]);
 	});
 
-	it("fails a terminal root that never produced a result file", async () => {
-		const importedRoot = root();
+	for (const fixture of [
+		{ name: "terminal root", status: { mode: "single", state: "complete" } },
+		{ name: "terminal workflow-owned single", status: { mode: "single", state: "complete", parentWorkflowRunId: "workflow-parent" } },
+		{ name: "running workflow-owned single with unavailable root proof", status: {
+			mode: "single", state: "running", parentWorkflowRunId: "workflow-parent",
+			processTerminal: { version: 1, runId: "root-run", runnerProcessInstanceId: "runner-instance", state: "unknown", reason: "runner-candidate-missing" },
+		} },
+		{ name: "selected child of running workflow-owned parallel root", index: 1, status: { mode: "parallel", state: "running", parentWorkflowRunId: "workflow-parent" } },
+	]) it(`fails closed without a result for ${fixture.name}`, async () => {
+		const importedRoot = root("root-run", fixture.index ?? 0);
 		writeJson(path.join(importedRoot.asyncDir, "status.json"), {
 			runId: importedRoot.runId,
-			mode: "single",
-			state: "complete",
+			...fixture.status,
 			startedAt: 1,
-			steps: [{ agent: "worker", status: "complete" }],
+			steps: [...(fixture.index ? [{ agent: "first", status: "running" }] : []), { agent: "worker", status: "complete" }],
 		});
 
 		const result = await waitForImportedAsyncRoot(importedRoot, {
@@ -203,8 +250,10 @@ describe("async chain root attachment", () => {
 			terminalResultGraceMs: 0,
 		});
 
+		assert.equal(result.agent, "worker");
 		assert.equal(result.exitCode, 1);
 		assert.match(result.error ?? "", /ended without a result file/);
+		assert.equal(result.importedPublication, undefined);
 	});
 
 	it("stops waiting when the parent timeout aborts an attached root", async () => {
@@ -232,5 +281,6 @@ describe("async chain root attachment", () => {
 		assert.equal(result.timedOut, true);
 		assert.equal(result.error, "parent timed out");
 		assert.equal(result.output, "parent timed out");
+		assert.equal(result.importedPublication, undefined);
 	});
 });

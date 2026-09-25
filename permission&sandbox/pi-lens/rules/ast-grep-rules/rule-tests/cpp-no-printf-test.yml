@@ -1,0 +1,19 @@
+id: cpp-no-printf
+valid:
+  - |
+    void report(int count) {
+        std::cout << "count: " << count << "\n";
+    }
+  - |
+    void log(const char* msg) {
+        fprintf(stderr, "%s\n", msg);
+    }
+invalid:
+  - |
+    void report(int count) {
+        printf("count: %d\n", count);
+    }
+  - |
+    void report(int count) {
+        std::printf("count: %d\n", count);
+    }

@@ -1,0 +1,85 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://pi-coding-agent.local/schemas/permissions.schema.json",
+  "title": "PI Permission Configuration",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "$schema": {
+      "type": "string"
+    },
+    "defaultPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["tools", "bash", "mcp", "skills"],
+      "properties": {
+        "tools": {
+          "$ref": "#/$defs/permissionState"
+        },
+        "bash": {
+          "$ref": "#/$defs/permissionState"
+        },
+        "mcp": {
+          "$ref": "#/$defs/permissionState"
+        },
+        "skills": {
+          "$ref": "#/$defs/permissionState"
+        },
+        "special": {
+          "$ref": "#/$defs/permissionState"
+        }
+      }
+    },
+    "tools": {
+      "description": "Pattern-based permissions for registered tools. Use exact names or `*` wildcards for canonical Pi built-ins and any extension-provided or third-party tools. Path-bearing built-ins also accept resource-qualified keys such as `read:/home/alice/project/generated/*` or `edit:c:/Users/alice/project/generated/*`.",
+      "$ref": "#/$defs/permissionMap"
+    },
+    "bash": {
+      "$ref": "#/$defs/permissionMap"
+    },
+    "mcp": {
+      "description": "Pattern-based permissions for targets invoked through a registered `mcp` tool when available.",
+      "$ref": "#/$defs/permissionMap"
+    },
+    "skills": {
+      "$ref": "#/$defs/permissionMap"
+    },
+    "special": {
+      "description": "Reserved permission checks. The coarse `external_directory` key remains supported, and resource-qualified keys like `external_directory:/home/alice/shared/*` or `external_directory:c:/Users/alice/shared/*` can scope outside-worktree file access by normalized directory resource.",
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "doom_loop": {
+          "$ref": "#/$defs/permissionState"
+        },
+        "external_directory": {
+          "description": "Coarse fallback for path-bearing file tools when they target paths outside the active working directory.",
+          "$ref": "#/$defs/permissionState"
+        }
+      },
+      "patternProperties": {
+        "^external_directory:.+$": {
+          "description": "Resource-qualified external directory rule. Use `external_directory:<normalized-absolute-directory>/*` to allow, deny, or ask for a specific outside directory.",
+          "$ref": "#/$defs/permissionState"
+        }
+      }
+    }
+  },
+  "required": ["defaultPolicy"],
+  "$defs": {
+    "permissionState": {
+      "type": "string",
+      "enum": ["allow", "deny", "ask"]
+    },
+    "permissionMap": {
+      "type": "object",
+      "propertyNames": {
+        "type": "string",
+        "minLength": 1
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/permissionState"
+      }
+    }
+  }
+}

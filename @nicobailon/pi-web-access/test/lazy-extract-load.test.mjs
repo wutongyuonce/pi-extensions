@@ -4,7 +4,7 @@ import { test } from "node:test";
 
 const indexUrl = new URL("../index.ts", import.meta.url).href;
 
-test("registers eagerly and loads content extraction on first use", () => {
+test("registers tool definitions and loads content extraction on first use", () => {
 	const child = spawnSync(process.execPath, ["--input-type=module"], {
 		input: buildChildScript(indexUrl),
 		encoding: "utf8",
@@ -73,7 +73,7 @@ function buildChildScript(moduleUrl) {
 		initializeExtension(pi);
 		assert.deepEqual(
 			tools.map((tool) => tool.name),
-			["web_search", "source_check", "fetch_content", "get_search_content"],
+			["web_search", "source_check", "fetch_content", "get_search_content", "web_enable"],
 		);
 		assert.ok(commands.includes("websearch"), "websearch command was not registered");
 		assert.ok(shortcuts.length > 0, "shortcuts were not registered");

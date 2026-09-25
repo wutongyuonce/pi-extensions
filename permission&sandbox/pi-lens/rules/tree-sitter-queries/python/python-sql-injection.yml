@@ -1,0 +1,67 @@
+# Python Security
+# Detects dynamic SQL passed into execute-like APIs.
+id: python-sql-injection
+name: SQL Injection Risk
+severity: error
+category: security
+defect_class: injection
+inline_tier: blocking
+language: python
+
+message: "Potential SQL injection sink — use parameterized queries"
+
+description: |
+  Dynamic SQL strings passed to execute-style APIs can enable SQL injection.
+  Catches:
+  - cursor.execute("SELECT " + var) — string concatenation (always unsafe)
+  - cursor.execute(dynamic_sql) — variable with NO params arg (could be unsafe)
+  
+  Suppressed:
+  - cursor.execute(query, params) — parameterized query (safe)
+  - session.execute(...) — receiver conventionally named for a SQLAlchemy session
+  - x.execute(select(...)) — statement builder in argument position (safe by
+    construction)
+  - db.query(...) / db.execute(stmt) where `db: Session` and `Session` is proven
+    from a same-file `sqlalchemy.orm` / `sqlalchemy.ext.asyncio` import, and
+    `stmt` is bound exactly once to a builder call
+  - cursor.execute(sql.SQL("...").format(sql.Identifier(...))) where `sql` is
+    an unshadowed same-file psycopg or psycopg2 import and every format argument
+    is an Identifier
+
+  Other raw, dynamic, or ambiguous SQL remains diagnostic so this rule fails
+  closed when it cannot prove the safe API provenance.
+  
+  ✅ FIX: use placeholders and parameter binding instead of string composition.
+
+query: |
+  (call
+    function: (attribute
+      object: (_) @OBJ
+      attribute: (identifier) @FN)
+    arguments: (argument_list
+      [(binary_operator) (identifier) (call)] @SQL
+      (_)*) @ARGS)
+
+metavars:
+  - OBJ
+  - FN
+  - SQL
+  - ARGS
+
+post_filter: py_sql_injection_sink
+
+has_fix: false
+
+tags:
+  - python
+  - security
+  - sql-injection
+  - cwe-89
+  - owasp-a03
+
+examples:
+  bad: |
+    cursor.execute("SELECT * FROM users WHERE id = " + user_id)
+  
+  good: |
+    cursor.execute("SELECT * FROM users WHERE id = %s", (user_id,))

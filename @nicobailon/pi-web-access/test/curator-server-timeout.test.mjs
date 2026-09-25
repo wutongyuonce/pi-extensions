@@ -122,6 +122,44 @@ test("curator replays search events after SSE reconnect", async () => {
 	}
 });
 
+test("curator add-search indexes do not collide with reserved initial provider results", async () => {
+	const { startCuratorServer } = await loadServer();
+	const handle = await startCuratorServer({
+		...baseOptions(20),
+		queries: ["initial one", "initial two"],
+		initialResultIndexCapacity: 6,
+	}, baseCallbacks(() => {}));
+
+	try {
+		const searchResponse = await fetch(new URL("/search", handle.url), {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({ token: "test-token", query: "added search" }),
+		});
+		assert.equal(searchResponse.status, 200);
+		const added = await searchResponse.json();
+		assert.equal(added.queryIndex, 6);
+
+		// Index 2 is a later provider result for the first initial query. Before
+		// reserving the initial range, the added search also received index 2.
+		handle.pushResult(2, {
+			query: "initial one",
+			slotIndex: 0,
+			answer: "late provider answer",
+			results: [],
+			provider: "brave",
+		});
+		handle.searchesDone();
+
+		const eventsUrl = new URL("/events", handle.url);
+		eventsUrl.searchParams.set("session", "test-token");
+		const events = await readEventStreamUntil(await fetch(eventsUrl), "event: done", "reserved-index replay");
+		assert.match(events, /"query":"initial one"[\s\S]*"queryIndex":2/);
+	} finally {
+		handle.close();
+	}
+});
+
 test("curator submit rejects contradictory summary metadata", async () => {
 	const { startCuratorServer } = await loadServer();
 	const handle = await startCuratorServer(baseOptions(20), baseCallbacks(() => {}));
@@ -256,6 +294,38 @@ test("curator state replay keeps all-provider entries that share one slot", asyn
 		assert.deepEqual(body.events.map((event) => event.data.provider), ["exa", "brave"]);
 		assert.deepEqual(body.events.map((event) => event.data.queryIndex), [0, 1]);
 		assert.deepEqual(body.events.map((event) => event.data.slotIndex), [0, 0]);
+	} finally {
+		handle.close();
+	}
+});
+
+test("curator exposes and signals approve remaining searches for this prompt", async () => {
+	const { startCuratorServer } = await loadServer();
+	let resolveSubmit;
+	const submitPromise = new Promise((resolve) => { resolveSubmit = resolve; });
+	const callbacks = baseCallbacks(() => {});
+	callbacks.onSubmit = resolveSubmit;
+	const handle = await startCuratorServer(baseOptions(20), callbacks);
+
+	try {
+		const pageResponse = await fetch(handle.url);
+		assert.equal(pageResponse.status, 200);
+		assert.match(await pageResponse.text(), /Approve \+ auto-summary remaining searches for this prompt/);
+
+		const response = await fetch(new URL("/submit", handle.url), {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				token: "test-token",
+				selected: [0],
+				summary: "Approved draft",
+				autoApproveRemainingSearches: true,
+			}),
+		});
+		assert.equal(response.status, 200);
+		const payload = await withTimeout(submitPromise, "approve remaining submit");
+		assert.equal(payload.summary, "Approved draft");
+		assert.equal(payload.autoApproveRemainingSearches, true);
 	} finally {
 		handle.close();
 	}

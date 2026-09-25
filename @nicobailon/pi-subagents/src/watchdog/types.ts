@@ -15,10 +15,10 @@ export const WATCHDOG_WARNING_CATEGORIES = [
 ] as const;
 export type WatchdogCategory = typeof WATCHDOG_WARNING_CATEGORIES[number];
 
-export const WATCHDOG_WARNING_CONFIDENCES = ["medium", "high"] as const;
-export type WatchdogConfidence = typeof WATCHDOG_WARNING_CONFIDENCES[number];
+export const WATCHDOG_WARNING_IMPORTANCES = ["low", "medium", "high"] as const;
+export type WatchdogImportance = typeof WATCHDOG_WARNING_IMPORTANCES[number];
 
-export const WATCHDOG_WARNING_SOURCES = ["main", "child", "async-completion", "lsp"] as const;
+export const WATCHDOG_WARNING_SOURCES = ["main", "child", "lsp"] as const;
 export type WatchdogWarningSource = typeof WATCHDOG_WARNING_SOURCES[number];
 
 export const WATCHDOG_LSP_DIAGNOSTIC_SEVERITIES = ["error", "warning", "info", "hint"] as const;
@@ -42,26 +42,17 @@ export const WATCHDOG_WARNING_STATES = [
 ] as const;
 export type WatchdogWarningState = typeof WATCHDOG_WARNING_STATES[number];
 
-export const WATCHDOG_LATE_WARNING_POLICIES = ["show-stale-no-autofollow"] as const;
-export type WatchdogLateWarningPolicy = typeof WATCHDOG_LATE_WARNING_POLICIES[number];
-
-export const WATCHDOG_DELIVERY_MODES = ["held"] as const;
-export type WatchdogDeliveryMode = typeof WATCHDOG_DELIVERY_MODES[number];
-
-export type WatchdogSyncBacklog = "off" | number;
-
 export interface WatchdogWarning {
 	severity: WatchdogSeverity;
+	importance: WatchdogImportance;
 	summary: string;
 	evidence: string;
 	recommendedAction: string;
 	category?: WatchdogCategory;
-	confidence?: WatchdogConfidence;
 	source?: WatchdogWarningSource;
 	agent?: string;
 	runId?: string;
 	stale?: boolean;
-	autoFollowAttempt?: number;
 	state?: WatchdogWarningState;
 }
 
@@ -81,15 +72,8 @@ export interface WatchdogWarningMessage {
 	details: WatchdogWarningDetails;
 }
 
-export interface WatchdogAutoFollowConfig {
-	blockers: boolean;
-	maxAttempts: number | null;
-	stalemateRepeats: number;
-}
-
 export interface WatchdogGuidanceConfig {
 	watchdogMd: boolean;
-	systemPromptPath: string | null;
 }
 
 export interface WatchdogScopeConfig {
@@ -110,17 +94,14 @@ export interface WatchdogChildOverrideConfig {
 	enabled?: boolean;
 	model?: string;
 	thinking?: string | false;
+	cadence?: Partial<WatchdogCadenceConfig>;
 }
 
 export interface WatchdogChildrenConfig extends WatchdogEndpointConfig {
 	watchdogTailTimeoutMs: number;
-	autoFollow: WatchdogAutoFollowConfig;
+	/** Mid-run cadence for child watchdogs; defaults to the top-level cadence. */
+	cadence?: Partial<WatchdogCadenceConfig>;
 	overrides: Record<string, WatchdogChildOverrideConfig>;
-}
-
-export interface WatchdogAsyncCompletionConfig {
-	enabled: boolean;
-	autoFollowBlockers: boolean;
 }
 
 export interface WatchdogLspConfig {
@@ -156,26 +137,33 @@ export interface WatchdogLspRuntimeSnapshot extends WatchdogLspResult {
 	updatedAt?: string;
 }
 
+export interface WatchdogRoleModelRule {
+	allow?: string[];
+	deny?: string[];
+	note?: string;
+}
+
+export interface WatchdogRulesConfig {
+	action: "warn" | "block";
+	roleModels: Record<string, WatchdogRoleModelRule>;
+}
+
 export interface ResolvedWatchdogConfig {
 	enabled: boolean;
-	delivery: WatchdogDeliveryMode;
-	showDuringRun: boolean;
-	syncBacklog: WatchdogSyncBacklog;
+	/** Main-only, bounded boundary clarification; never enabled for child reviews. */
+	clarification: boolean;
 	agentEndTimeoutMs: number;
-	lateWarningPolicy: WatchdogLateWarningPolicy;
 	severityThreshold: WatchdogSeverity;
 	maxWarnings: number | null;
 	guidance: WatchdogGuidanceConfig;
-	autoFollow: WatchdogAutoFollowConfig;
+	/** Consecutive identical boundary warnings before the watchdog stops continuing the run. */
+	stalemateRepeats: number;
 	scope: WatchdogScopeConfig;
 	cadence: WatchdogCadenceConfig;
 	main: WatchdogEndpointConfig;
 	children: WatchdogChildrenConfig;
-	asyncCompletion: WatchdogAsyncCompletionConfig;
 	lsp: WatchdogLspConfig;
-	compactAtPercent: number;
-	reviewRetryDelayMs: number;
-	maxReviewFailures: number;
+	rules?: WatchdogRulesConfig;
 }
 
 export interface WatchdogSettingsError {

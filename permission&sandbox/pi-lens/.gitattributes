@@ -1,0 +1,11 @@
+* text=auto eol=lf
+
+# CRLF regression fixture (#2473 review round 2, F2; verified DEFENSIVE, not
+# load-bearing, in review round 3 — clients/cargo-manifest.ts's normalizeToml
+# doc comment) — the whole point of this fixture is a literal \r\n byte
+# sequence; the blanket `eol=lf` above would silently normalize it away on
+# checkout, defeating the test on any machine/CI runner. `-text` disables
+# line-ending conversion entirely so the committed bytes are what every
+# checkout gets, cross-platform.
+tests/fixtures/cargo-workspace-modules/adv-e-crlf/** -text
+tests/fixtures/ci-failure-logs/infra-net-windows-crlf-prefix.real.log -text

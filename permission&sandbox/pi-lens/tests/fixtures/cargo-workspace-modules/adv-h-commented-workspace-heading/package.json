@@ -1,0 +1,5 @@
+{
+	"name": "adv-h-root",
+	"private": true,
+	"workspaces": ["packages/*"]
+}

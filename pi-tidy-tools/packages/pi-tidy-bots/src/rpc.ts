@@ -1,5 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { isAbsolute } from "node:path";
 
 export interface RpcSpawnOptions {
   name: string;
@@ -8,14 +9,111 @@ export interface RpcSpawnOptions {
   cwd: string;
   sessionDir: string;
   resume: boolean;
+  /** Exact previously verified history file; never combine with latest-session resume. */
+  sessionFile?: string;
   model?: string;
   approve: boolean;
+  /** Issue 92: trust the fleet-owned bot dir's project-local settings so
+   * bot-scoped packages load (pi's --approve = project trust, not tool
+   * auto-approve). */
+  trustProject?: boolean;
   bridgePath: string;
+  /** Issue 85: extra extensions loaded after bridge (MCP wrap etc.). */
+  extensions?: string[];
+  /** Tool allowlist — pi --tools (exact registered names). */
+  tools?: string[];
+  /** pi --no-builtin-tools. */
+  noBuiltinTools?: boolean;
+  /** pi --no-extensions (fleet -e flags still load). */
+  noExtensions?: boolean;
+  /** pi --no-skills. */
+  noSkills?: boolean;
+  /** Issue 132: extra child env (image provider id, fleet dir for outputs). */
+  env?: Record<string, string>;
+  /** Exact environment for an owned gateway child. When supplied, neither
+   * the parent environment nor legacy daemon credentials are injected.
+   * The caller owns HOME/profile/provider configuration and extension scope. */
+  isolatedEnv?: Record<string, string>;
+  /** Gateway-native transport limits; legacy transport behavior is unchanged. */
+  nativeProtocol?: {
+    maxFrameBytes: number;
+    onError: () => void;
+    privateControl?: boolean;
+  };
   daemonUrl: string;
   childSecret: string;
   onEvent: (event: RpcEvent) => void;
   onExit: (code: number | null, signal: string | null) => void;
   onLine?: (line: string) => void;
+}
+
+/**
+ * Pure argv builder for the rpc child — exported for unit tests (issue 82:
+ * rules ride --append-system-prompt only when present).
+ */
+export function rpcSpawnArgs(
+  options: Pick<
+    RpcSpawnOptions,
+    | "name"
+    | "sessionDir"
+    | "resume"
+    | "sessionFile"
+    | "model"
+    | "approve"
+    | "trustProject"
+    | "bridgePath"
+    | "extensions"
+    | "tools"
+    | "noBuiltinTools"
+    | "noExtensions"
+    | "noSkills"
+  >
+): string[] {
+  if (
+    options.sessionFile !== undefined &&
+    (!isAbsolute(options.sessionFile) ||
+      options.sessionFile.includes("\0") ||
+      options.resume)
+  )
+    throw new Error(
+      "Exact native session requires an absolute file and no latest-session resume"
+    );
+  return [
+    "--mode",
+    "rpc",
+    "--name",
+    options.name,
+    "--session-dir",
+    options.sessionDir,
+    ...(options.resume ? ["--continue"] : []),
+    ...(options.sessionFile ? ["--session", options.sessionFile] : []),
+    ...(options.model ? ["--model", options.model] : []),
+    ...(options.approve ? ["--approve"] : []),
+    ...(options.trustProject ? ["--approve"] : []),
+    ...(options.tools ? ["--tools", options.tools.join(",")] : []),
+    ...(options.noBuiltinTools ? ["--no-builtin-tools"] : []),
+    ...(options.noExtensions ? ["--no-extensions"] : []),
+    ...(options.noSkills ? ["--no-skills"] : []),
+    "-e",
+    options.bridgePath,
+    ...(options.extensions ?? []).flatMap((extension) => ["-e", extension]),
+  ];
+}
+
+/** Issue 158: reasons bound to ~90 chars (first line + ellipsis). */
+export const REASON_MAX_CHARS = 90;
+
+/**
+ * Issue 158: shared wire-bounding contract for step text. First line only
+ * (multi-line JS bodies never ride the wire) + hard truncate with an
+ * ellipsis. stepReason and stepLabel both route through this — the old
+ * contracts were inconsistent (40 vs unbounded, and reason could carry
+ * 3.4k-char mcpScript bodies).
+ */
+export function boundStepText(value: string, max: number): string {
+  const firstLine = value.trim().split("\n")[0] ?? "";
+  const collapsed = firstLine.replace(/\s+/g, " ").trim();
+  return collapsed.length > max ? `${collapsed.slice(0, max - 1)}…` : collapsed;
 }
 
 /** Compact, non-sensitive args digest for a tool step row (issue 36). */
@@ -30,8 +128,7 @@ export function stepLabel(toolName: string, args: unknown): string | undefined {
     }
     return undefined;
   };
-  const truncate = (value: string, max: number) =>
-    value.length > max ? `${value.slice(0, max)}…` : value;
+  const truncate = boundStepText;
   if (toolName === "message_agent") {
     const target = first("target");
     return target ? `→ ${target}` : undefined;
@@ -63,10 +160,19 @@ export type RpcEvent =
       toolName: string;
       reason: string;
       label?: string;
+      /** Issue 128: message_agent dispatch target (receipt enrichment). */
+      target?: string;
     }
   | { kind: "tool_output"; toolCallId: string; text: string }
-  | { kind: "tool_end"; toolCallId: string }
-  | { kind: "tool_result"; toolCallId: string; text: string; isError: boolean }
+  | {
+      /** Issue 66: the settle event — pi's tool_execution_end carries the
+       * result text, isError flag, and optional measured duration. */
+      kind: "tool_end";
+      toolCallId: string;
+      result: string;
+      isError: boolean;
+      elapsedMs?: number;
+    }
   | { kind: "usage"; inputTokens?: number; model?: string }
   | {
       kind: "ui_request";
@@ -76,6 +182,9 @@ export type RpcEvent =
       options?: string[];
       message?: string;
       placeholder?: string;
+      prefill?: string;
+      timeoutMs?: number;
+      invalidTimeout?: boolean;
     }
   | { kind: "event"; raw: Record<string, unknown> };
 
@@ -139,9 +248,14 @@ export function describeUiAnswer(method: string, answer: UiAnswer): string {
 }
 
 /** Pick the human-readable "why" from a tool call's arguments. */
-export function stepReason(args: unknown): string {
+export function stepReason(args: unknown, toolName?: string): string {
   if (args === null || typeof args !== "object") return "";
   const record = args as Record<string, unknown>;
+  // Issue 128: dispatch-class tools — the reason is a BOUNDED gist of the
+  // brief, never the full message (the label already carries the target).
+  if (toolName === "message_agent" && typeof record.message === "string") {
+    return boundStepText(record.message, 60);
+  }
   const candidates = [
     "reasoning",
     "reason",
@@ -155,11 +269,11 @@ export function stepReason(args: unknown): string {
   for (const key of candidates) {
     const value = record[key];
     if (typeof value === "string" && value.trim().length > 0)
-      return value.trim();
+      return boundStepText(value, REASON_MAX_CHARS);
   }
   for (const value of Object.values(record)) {
     if (typeof value === "string" && value.trim().length > 0)
-      return value.trim();
+      return boundStepText(value, REASON_MAX_CHARS);
   }
   return "";
 }
@@ -175,9 +289,47 @@ const textOfMessage = (message: any): string => {
 };
 
 /**
+ * Issue 66: tool results arrive as a string, a content-part array, or an
+ * object with .text — normalize to display text without dropping output.
+ */
+const toolResultText = (result: unknown): string => {
+  if (typeof result === "string") return result;
+  if (Array.isArray(result)) {
+    return result
+      .filter(
+        (part: any) => part?.type === "text" || typeof part?.text === "string"
+      )
+      .map((part: any) => String(part.text ?? ""))
+      .join("");
+  }
+  if (result && typeof result === "object") {
+    const text = (result as { text?: unknown }).text;
+    if (typeof text === "string") return text;
+  }
+  return "";
+};
+
+/**
  * One perpetual `pi --mode rpc` child. Strict LF JSONL framing (no readline —
  * pi's rpc protocol forbids readers that split on U+2028/U+2029).
  */
+/** Issue 149: prompt-class guard — 10 minutes. Accept-acks are <10ms; only
+ * a wedged-alive child can hit this, and the timeout means UNKNOWN. */
+export const PROMPT_CLASS_TIMEOUT_MS = 10 * 60_000;
+
+/** Correlated native refusal, distinct from transport loss or a timeout. */
+export class RpcCommandRejected extends Error {
+  readonly remoteError?: string;
+  constructor(remoteError?: string) {
+    super(
+      remoteError
+        ? `Native RPC command was rejected: ${remoteError}`
+        : "Native RPC command was rejected"
+    );
+    this.remoteError = remoteError;
+  }
+}
+
 export class RpcSession {
   readonly process: ChildProcess;
   private buffer = "";
@@ -199,8 +351,28 @@ export class RpcSession {
   private constructor(options: RpcSpawnOptions, process_: ChildProcess) {
     this.options = options;
     this.process = process_;
-    this.process.stdout?.setEncoding("utf8");
-    this.process.stdout?.on("data", (chunk: string) => this.ingest(chunk));
+    if (options.nativeProtocol) {
+      const decoder = new TextDecoder("utf-8", { fatal: true });
+      this.process.stdout?.on("data", (chunk: Buffer) => {
+        try {
+          if (!this.closed)
+            this.ingest(decoder.decode(chunk, { stream: true }));
+        } catch {
+          this.protocolFailed();
+        }
+      });
+      this.process.stdout?.on("end", () => {
+        try {
+          decoder.decode();
+          if (this.buffer.length) this.protocolFailed();
+        } catch {
+          this.protocolFailed();
+        }
+      });
+    } else {
+      this.process.stdout?.setEncoding("utf8");
+      this.process.stdout?.on("data", (chunk: string) => this.ingest(chunk));
+    }
     this.process.stderr?.setEncoding("utf8");
     this.process.stderr?.on("data", (chunk: string) => {
       for (const line of chunk.split("\n")) {
@@ -236,31 +408,57 @@ export class RpcSession {
   }
 
   static spawn(options: RpcSpawnOptions): RpcSession {
-    const args = [
-      "--mode",
-      "rpc",
-      "--name",
-      options.name,
-      "--session-dir",
-      options.sessionDir,
-      ...(options.resume ? ["--continue"] : []),
-      ...(options.model ? ["--model", options.model] : []),
-      ...(options.approve ? ["--approve"] : []),
-      "-e",
-      options.bridgePath,
-    ];
+    if (
+      options.nativeProtocol?.privateControl &&
+      options.isolatedEnv === undefined
+    )
+      throw new Error(
+        "Private native control requires an isolated owned child"
+      );
+    if (
+      options.nativeProtocol &&
+      (!Number.isSafeInteger(options.nativeProtocol.maxFrameBytes) ||
+        options.nativeProtocol.maxFrameBytes < 128)
+    )
+      throw new Error("Invalid native RPC frame limit");
+    if (options.isolatedEnv !== undefined) {
+      if (options.env !== undefined)
+        throw new Error(
+          "isolatedEnv cannot be combined with inherited env overrides"
+        );
+      if (
+        !options.piBin ||
+        !isAbsolute(options.piBin) ||
+        !isAbsolute(options.cwd) ||
+        !isAbsolute(options.sessionDir)
+      )
+        throw new Error(
+          "isolated RPC requires absolute executable, workspace and session paths"
+        );
+    }
+    const args = rpcSpawnArgs(options);
     const child = spawn(options.piBin ?? "pi", args, {
       cwd: options.cwd,
       env: {
-        ...process.env,
-        PI_TIDY_BOTS_CHILD: "1",
-        PI_TIDY_BOTS_NAME: options.name,
-        PI_TIDY_BOTS_DAEMON_URL: options.daemonUrl,
-        PI_TIDY_BOTS_CHILD_SECRET: options.childSecret,
+        ...(options.isolatedEnv ?? {
+          ...process.env,
+          PI_TIDY_BOTS_CHILD: "1",
+          PI_TIDY_BOTS_NAME: options.name,
+          PI_TIDY_BOTS_DAEMON_URL: options.daemonUrl,
+          PI_TIDY_BOTS_CHILD_SECRET: options.childSecret,
+          ...(options.env ?? {}),
+        }),
       },
-      stdio: ["pipe", "pipe", "pipe"],
+      stdio: options.nativeProtocol?.privateControl
+        ? ["pipe", "pipe", "pipe", "pipe"]
+        : ["pipe", "pipe", "pipe"],
     });
     return new RpcSession(options, child);
+  }
+
+  /** Issue 148: the spawned child's pid (for the daemon's ledger). */
+  get pid(): number | undefined {
+    return this.process.pid;
   }
 
   get alive(): boolean {
@@ -273,22 +471,40 @@ export class RpcSession {
 
   send(payload: Record<string, unknown>): void {
     if (!this.alive) throw new Error("rpc child is not running");
-    this.process.stdin?.write(`${JSON.stringify(payload)}\n`);
+    const frame = `${JSON.stringify(payload)}\n`;
+    const limit = this.options.nativeProtocol?.maxFrameBytes;
+    if (
+      limit &&
+      (Buffer.byteLength(frame) > limit ||
+        (this.process.stdin?.writableLength ?? 0) + Buffer.byteLength(frame) >
+          limit * 2)
+    )
+      throw new Error("Native RPC output limit exceeded");
+    this.process.stdin?.write(frame);
   }
 
   request<T = any>(
     payload: Record<string, unknown>,
-    timeoutMs = 30_000
+    timeoutMs = 30_000,
+    timeoutCode?: string
   ): Promise<T> {
     return new Promise<T>((resolve, reject) => {
       if (!this.alive) {
         reject(new Error("rpc child is not running"));
         return;
       }
+      if (this.options.nativeProtocol && this.pending.size >= 256) {
+        reject(new Error("Native RPC pending request limit exceeded"));
+        return;
+      }
       const id = randomUUID();
       const timer = setTimeout(() => {
         this.pending.delete(id);
-        reject(new Error(`rpc request timed out after ${timeoutMs}ms`));
+        reject(
+          new Error(
+            `${timeoutCode ?? "rpc request timed out"} after ${timeoutMs}ms`
+          )
+        );
       }, timeoutMs);
       this.pending.set(id, {
         resolve: (value: T) => {
@@ -300,21 +516,44 @@ export class RpcSession {
           reject(error);
         },
       });
-      this.send({ ...payload, id });
+      try {
+        this.send({ ...payload, id });
+      } catch (error) {
+        this.pending
+          .get(id)!
+          .reject(
+            error instanceof Error
+              ? error
+              : new Error("Native RPC write failed")
+          );
+        this.pending.delete(id);
+      }
     });
   }
 
+  /**
+   * Issue 149: prompt-class requests follow the ACCEPT-ACK contract — real
+   * pi resolves the request when the turn is accepted (<10ms measured), not
+   * when it finishes. The old shared 30s timeout misclassified long turns
+   * as delivery_failed while the reply still landed (phantom completion).
+   * The guard stays long — genuinely dead sessions are rejected by the
+   * exit handler immediately; only a wedged-but-alive child can hit this.
+   */
   async prompt(
     message: string,
     streamingBehavior?: "steer" | "followUp",
     images?: { type: "image"; data: string; mimeType: string }[]
   ): Promise<void> {
-    await this.request({
-      type: "prompt",
-      message,
-      ...(streamingBehavior ? { streamingBehavior } : {}),
-      ...(images ? { images } : {}),
-    });
+    await this.request(
+      {
+        type: "prompt",
+        message,
+        ...(streamingBehavior ? { streamingBehavior } : {}),
+        ...(images ? { images } : {}),
+      },
+      PROMPT_CLASS_TIMEOUT_MS,
+      "rpc_prompt_timeout"
+    );
   }
 
   async steer(message: string): Promise<void> {
@@ -325,11 +564,15 @@ export class RpcSession {
     message: string,
     images?: { type: "image"; data: string; mimeType: string }[]
   ): Promise<void> {
-    await this.request({
-      type: "follow_up",
-      message,
-      ...(images ? { images } : {}),
-    });
+    await this.request(
+      {
+        type: "follow_up",
+        message,
+        ...(images ? { images } : {}),
+      },
+      PROMPT_CLASS_TIMEOUT_MS,
+      "rpc_prompt_timeout"
+    );
   }
 
   async abort(): Promise<void> {
@@ -361,10 +604,30 @@ export class RpcSession {
     let index = this.buffer.indexOf("\n");
     while (index !== -1) {
       const line = this.buffer.slice(0, index).replace(/\r$/, "");
+      if (
+        this.options.nativeProtocol &&
+        Buffer.byteLength(line) + 1 > this.options.nativeProtocol.maxFrameBytes
+      )
+        throw new Error("Native RPC frame limit exceeded");
       this.buffer = this.buffer.slice(index + 1);
       if (line.trim().length > 0) this.handleLine(line);
       index = this.buffer.indexOf("\n");
     }
+    if (
+      this.options.nativeProtocol &&
+      Buffer.byteLength(this.buffer) > this.options.nativeProtocol.maxFrameBytes
+    )
+      throw new Error("Native RPC frame limit exceeded");
+  }
+
+  private protocolFailed(): void {
+    if (this.closed) return;
+    this.stop();
+    this.closed = true;
+    for (const pending of this.pending.values())
+      pending.reject(new Error("Native RPC observation lost"));
+    this.pending.clear();
+    this.options.nativeProtocol?.onError();
   }
 
   private handleLine(line: string): void {
@@ -373,18 +636,39 @@ export class RpcSession {
     try {
       parsed = JSON.parse(line) as Record<string, unknown>;
     } catch {
+      if (this.options.nativeProtocol)
+        throw new Error("Invalid native RPC JSON");
       return;
     }
+    if (
+      this.options.nativeProtocol &&
+      (!parsed ||
+        typeof parsed !== "object" ||
+        Array.isArray(parsed) ||
+        typeof parsed.type !== "string")
+    )
+      throw new Error("Invalid native RPC frame");
     const type = String(parsed.type ?? "");
 
     if (type === "response") {
+      if (
+        this.options.nativeProtocol &&
+        (typeof parsed.id !== "string" || typeof parsed.success !== "boolean")
+      )
+        throw new Error("Invalid native RPC response");
       const id = typeof parsed.id === "string" ? parsed.id : undefined;
       if (id) {
         const pending = this.pending.get(id);
         if (pending) {
           this.pending.delete(id);
           if (parsed.success === false) {
-            pending.reject(new Error(`rpc command failed: ${line}`));
+            const remoteError =
+              typeof parsed.error === "string" ? parsed.error : undefined;
+            pending.reject(
+              this.options.nativeProtocol
+                ? new RpcCommandRejected(remoteError)
+                : new Error(`rpc command failed: ${line}`)
+            );
           } else {
             pending.resolve(parsed);
           }
@@ -443,20 +727,50 @@ export class RpcSession {
         return;
       }
       case "tool_execution_start":
+        const toolName = String(parsed.toolName ?? "tool");
         this.options.onEvent({
           kind: "tool_start",
           toolCallId: String(parsed.toolCallId ?? ""),
-          toolName: String(parsed.toolName ?? "tool"),
-          reason: stepReason(parsed.args),
-          label: stepLabel(String(parsed.toolName ?? "tool"), parsed.args),
+          toolName,
+          reason: stepReason(parsed.args, toolName),
+          label: stepLabel(toolName, parsed.args),
+          // Issue 128: dispatch target — the daemon enriches the tool part
+          // with the structured receipt (avatar/title from bot config).
+          ...(toolName === "message_agent" &&
+          typeof (parsed.args as { target?: unknown } | undefined)?.target ===
+            "string"
+            ? {
+                target: (parsed.args as { target: string }).target,
+              }
+            : {}),
         });
         return;
-      case "tool_execution_end":
+      case "tool_execution_end": {
         this.options.onEvent({
           kind: "tool_end",
           toolCallId: String(parsed.toolCallId ?? ""),
+          result: toolResultText(parsed.result),
+          isError: parsed.isError === true,
+          elapsedMs:
+            typeof parsed.piTidyElapsedMs === "number"
+              ? parsed.piTidyElapsedMs
+              : undefined,
         });
         return;
+      }
+      case "tool_execution_update": {
+        // Partial result text while the tool runs — surfaces live output in
+        // full mode instead of starving it until settle (issue 66).
+        const partial = toolResultText(parsed.partialResult);
+        if (partial.length > 0) {
+          this.options.onEvent({
+            kind: "tool_output",
+            toolCallId: String(parsed.toolCallId ?? ""),
+            text: partial,
+          });
+        }
+        return;
+      }
       case "message_update": {
         const update = (parsed.assistantMessageEvent ?? {}) as Record<
           string,
@@ -492,6 +806,19 @@ export class RpcSession {
               typeof parsed.placeholder === "string"
                 ? parsed.placeholder
                 : undefined,
+            prefill:
+              typeof parsed.prefill === "string" ? parsed.prefill : undefined,
+            timeoutMs:
+              Number.isSafeInteger(parsed.timeout) &&
+              Number(parsed.timeout) > 0 &&
+              Number(parsed.timeout) <= 24 * 60 * 60 * 1000
+                ? Number(parsed.timeout)
+                : undefined,
+            invalidTimeout:
+              parsed.timeout !== undefined &&
+              (!Number.isSafeInteger(parsed.timeout) ||
+                Number(parsed.timeout) < 0 ||
+                Number(parsed.timeout) > 24 * 60 * 60 * 1000),
           });
         }
         return;

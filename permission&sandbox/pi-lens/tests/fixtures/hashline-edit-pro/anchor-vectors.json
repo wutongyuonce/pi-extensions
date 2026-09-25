@@ -1,0 +1,285 @@
+{
+  "upstream": {
+    "repo": "https://github.com/YuGiMob/pi-hashline-edit-pro",
+    "branch": "master",
+    "commit": "8f027ca1c2a0796ccf1c15bd5a0d12db5d9fb9f0",
+    "generatedWith": "xxhash-wasm@1.1.0",
+    "source": [
+      "src/hashline/alphabet.ts",
+      "src/hashline/hash.ts",
+      "src/hashline/hasher.ts",
+      "src/utils.ts (splitLines, truncateToBytes, getCached)",
+      "src/constants.ts (MAX_HASH_SOURCE_BYTES)"
+    ]
+  },
+  "xxh32": [
+    {
+      "input": "",
+      "h32": 46947589
+    },
+    {
+      "input": "a",
+      "h32": 1426945110
+    },
+    {
+      "input": "abc",
+      "h32": 852579327
+    },
+    {
+      "input": "hello world",
+      "h32": 3468387874
+    },
+    {
+      "input": "const x = 1;",
+      "h32": 3814902225
+    },
+    {
+      "input": "\tif (a) {",
+      "h32": 2404250160
+    },
+    {
+      "input": "  } ",
+      "h32": 3364993769
+    },
+    {
+      "input": "λ — ünïcødé ✓",
+      "h32": 228984124
+    },
+    {
+      "input": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+      "h32": 875119069
+    },
+    {
+      "input": "日本語のテキスト行",
+      "h32": 2633891701
+    }
+  ],
+  "lineAnchors": {
+    "simple": {
+      "content": "const a = 1;\nconst b = 2;\nconst c = 3;\n",
+      "hashes": [
+        "7rq",
+        "9oW",
+        "OTc"
+      ]
+    },
+    "duplicates": {
+      "content": "function f() {\n  return 1;\n}\n\nfunction g() {\n  return 1;\n}\n\n",
+      "hashes": [
+        "55R",
+        "ktm",
+        "AU6",
+        "AuN",
+        "bmW",
+        "cnX",
+        "doY",
+        "epZ"
+      ]
+    },
+    "emptyFile": {
+      "content": "",
+      "hashes": [
+        "AuN"
+      ]
+    },
+    "noTrailingNewline": {
+      "content": "line one\nline two",
+      "hashes": [
+        "Tm9",
+        "WCl"
+      ]
+    },
+    "trailingWhitespace": {
+      "content": "alpha   \nbeta\t\ngamma\n",
+      "hashes": [
+        "WXo",
+        "poj",
+        "6DM"
+      ]
+    },
+    "unicode": {
+      "content": "const s = \"日本語\";\nconst t = \"λ\";\n// ünïcødé\n",
+      "hashes": [
+        "Kzh",
+        "Fbb",
+        "C1Y"
+      ]
+    },
+    "longLine": {
+      "content": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\nxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx\ntail\n",
+      "hashes": [
+        "r18",
+        "s29",
+        "3Rh"
+      ]
+    },
+    "longMultibyteLine": {
+      "content": "ああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああ\nああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああああい\ntail\n",
+      "hashes": [
+        "qvN",
+        "rwO",
+        "3Rh"
+      ]
+    },
+    "astralAndTrim": {
+      "content": "🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂\n🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂🙂   \nx\n",
+      "hashes": [
+        "LmF",
+        "MnG",
+        "McY"
+      ]
+    },
+    "manyBlanks": {
+      "content": "\nline 1\nline 2\n\nline 4\nline 5\n\nline 7\nline 8\n\nline 10\nline 11\n\nline 13\nline 14\n\nline 16\nline 17\n\nline 19\nline 20\n\nline 22\nline 23\n\nline 25\nline 26\n\nline 28\nline 29\n\nline 31\nline 32\n\nline 34\nline 35\n\nline 37\nline 38\n\n",
+      "hashes": [
+        "AuN",
+        "PdE",
+        "CI3",
+        "DJ4",
+        "BwU",
+        "dsy",
+        "etz",
+        "G15",
+        "Sq3",
+        "Tr4",
+        "lmB",
+        "Cqa",
+        "Drb",
+        "Mvw",
+        "3i4",
+        "4j5",
+        "0Mi",
+        "i7M",
+        "j8N",
+        "As6",
+        "jBh",
+        "kCi",
+        "Ifr",
+        "zhE",
+        "0iF",
+        "xV1",
+        "A1b",
+        "B2c",
+        "LnJ",
+        "DBa",
+        "ECb",
+        "3vh",
+        "5Pi",
+        "6Qj",
+        "AZj",
+        "7lc",
+        "8md",
+        "OUf",
+        "Axn",
+        "Byo"
+      ]
+    },
+    "repeatedBlocks": {
+      "content": "export function alpha() {\n\tif (ready) {\n\t\tgo(1);\n\t}\n\treturn 0;\n}\n\nexport function beta() {\n\tif (ready) {\n\t\tgo(2);\n\t}\n\treturn 0;\n}\n\nexport function gamma() {\n\tif (ready) {\n\t\tgo(3);\n\t}\n\treturn 0;\n}\n\n",
+      "hashes": [
+        "Kil",
+        "dg7",
+        "mlq",
+        "vKS",
+        "EQj",
+        "AU6",
+        "AuN",
+        "ANE",
+        "BOF",
+        "IDn",
+        "JEo",
+        "KFp",
+        "LGq",
+        "MHr",
+        "iwq",
+        "jxr",
+        "mvZ",
+        "nwa",
+        "oxb",
+        "pyc",
+        "qzd"
+      ]
+    }
+  },
+  "storeCarried": {
+    "insertedFunctionAtTop": {
+      "description": "agent prepends a 4-line function; upstream carries every surviving anchor forward",
+      "before": "export function alpha() {\n\tif (ready) {\n\t\tgo(1);\n\t}\n\treturn 0;\n}\n\nexport function beta() {\n\tif (ready) {\n\t\tgo(2);\n\t}\n\treturn 0;\n}\n\nexport function gamma() {\n\tif (ready) {\n\t\tgo(3);\n\t}\n\treturn 0;\n}\n\n",
+      "after": "export function inserted() {\n\treturn 9;\n}\n\nexport function alpha() {\n\tif (ready) {\n\t\tgo(1);\n\t}\n\treturn 0;\n}\n\nexport function beta() {\n\tif (ready) {\n\t\tgo(2);\n\t}\n\treturn 0;\n}\n\nexport function gamma() {\n\tif (ready) {\n\t\tgo(3);\n\t}\n\treturn 0;\n}\n\n",
+      "removedHashes": [],
+      "hashesBefore": [
+        "Kil",
+        "dg7",
+        "mlq",
+        "vKS",
+        "EQj",
+        "AU6",
+        "AuN",
+        "ANE",
+        "BOF",
+        "IDn",
+        "JEo",
+        "KFp",
+        "LGq",
+        "MHr",
+        "iwq",
+        "jxr",
+        "mvZ",
+        "nwa",
+        "oxb",
+        "pyc",
+        "qzd"
+      ],
+      "hashesAfter": [
+        "vuB",
+        "8wx",
+        "AU6",
+        "AuN",
+        "Kil",
+        "dg7",
+        "mlq",
+        "vKS",
+        "EQj",
+        "LGq",
+        "MHr",
+        "ANE",
+        "BOF",
+        "IDn",
+        "JEo",
+        "KFp",
+        "pyc",
+        "qzd",
+        "iwq",
+        "jxr",
+        "mvZ",
+        "nwa",
+        "oxb",
+        "9xy",
+        "Ayz"
+      ]
+    },
+    "collidingBaseIndexUniqueContent": {
+      "description": "two distinct, each-unique-in-the-file line contents collide on baseIdx; the second is probed to a different slot even though it has no duplicate content, and an unrelated trailing append does not disturb either anchor",
+      "before": "const value29 = 29;\nconst value298 = 298;\n\nfunction noop() {}\n\n",
+      "after": "const value29 = 29;\nconst value298 = 298;\n\nfunction noop() {}\n\nfunction trailer() {\n\treturn 1;\n}\n",
+      "removedHashes": [],
+      "hashesBefore": [
+        "925",
+        "A36",
+        "AuN",
+        "JQO",
+        "KRP"
+      ],
+      "hashesAfter": [
+        "925",
+        "A36",
+        "AuN",
+        "JQO",
+        "KRP",
+        "J8s",
+        "kxJ",
+        "AU6"
+      ]
+    }
+  }
+}

@@ -26,6 +26,8 @@ export const CAPABILITIES = [
   "ws-auth-bearer",
   "turn-parts",
   "compaction",
+  "model-swap-hardening",
+  "operator-queue",
 ] as const;
 
 export const VersionResponseSchema = Type.Object({
@@ -80,6 +82,31 @@ export const TranscriptEntrySchema = Type.Object({
       Type.Literal("completion"),
     ])
   ),
+  receipt: Type.Optional(
+    Type.Object({
+      name: Type.String(),
+      avatar: Type.Optional(Type.String()),
+      title: Type.Optional(Type.String()),
+    })
+  ),
+  attachments: Type.Optional(
+    Type.Array(
+      Type.Object({
+        name: Type.Optional(Type.String()),
+        mediaType: Type.String(),
+      })
+    )
+  ),
+  summary: Type.Optional(Type.String()),
+  images: Type.Optional(
+    Type.Array(
+      Type.Object({
+        mediaType: Type.String(),
+        name: Type.Optional(Type.String()),
+        path: Type.String(),
+      })
+    )
+  ),
   text: Type.String(),
   ts: Type.String(),
   delivering: Type.Optional(Type.Boolean()),
@@ -96,6 +123,26 @@ export const RosterBotSchema = Type.Object({
   active: Type.Boolean(),
   lastActive: Type.String(),
   queued: Type.Number(),
+  queue: Type.Optional(
+    Type.Array(
+      Type.Object({
+        id: Type.String(),
+        text: Type.String(),
+        hasImage: Type.Boolean(),
+        filename: Type.Optional(Type.String()),
+      })
+    )
+  ),
+  /** Issue 80: present ONLY when the bot has consecutive empty-success
+   * turns (quota-exhaustion signature). Additive — existing consumers
+   * that ignore unknown fields are unaffected. */
+  emptyTurns: Type.Optional(
+    Type.Object({
+      streak: Type.Number(),
+      degraded: Type.Boolean(),
+      lastAt: Type.Optional(Type.String()),
+    })
+  ),
 });
 
 export const RosterPayloadSchema = Type.Object({
@@ -177,3 +224,34 @@ export const WsEventSchema = Type.Union([
   ConfigPayloadSchema,
   ConfigErrorPayloadSchema,
 ]);
+
+// ── Issue 159: operator attention queue ───────────────
+export const QueueReceiptSchema = Type.Object({
+  ref: Type.String(),
+  detail: Type.Optional(Type.String()),
+});
+
+export const OperatorQueueItemSchema = Type.Object({
+  id: Type.String(),
+  title: Type.String(),
+  receipts: Type.Array(QueueReceiptSchema),
+  source: Type.String(),
+  addedAt: Type.String(),
+  status: Type.Union([
+    Type.Literal("queued"),
+    Type.Literal("pinged"),
+    Type.Literal("cleared"),
+  ]),
+  pingedAt: Type.Optional(Type.String()),
+  clearedAt: Type.Optional(Type.String()),
+});
+
+export const OperatorQueueViewSchema = Type.Object({
+  pinged: Type.Union([OperatorQueueItemSchema, Type.Null()]),
+  queued: Type.Array(OperatorQueueItemSchema),
+  counts: Type.Object({
+    pinged: Type.Number(),
+    queued: Type.Number(),
+    cleared: Type.Number(),
+  }),
+});

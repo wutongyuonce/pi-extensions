@@ -3,10 +3,11 @@ import type { UiHostContext, UiResourceContent, UiResourceCsp } from "./types.ts
 // Use locally bundled AppBridge to avoid CDN Zod bundling issues
 const DEFAULT_APP_BRIDGE_MODULE_URL = "/app-bridge.bundle.js";
 const APP_SANDBOX = "allow-scripts allow-forms allow-modals allow-popups allow-downloads";
+const APP_PROXY_SANDBOX = `${APP_SANDBOX} allow-same-origin`;
+const APP_INNER_SANDBOX = APP_PROXY_SANDBOX;
 
 export interface HostHtmlTemplateInput {
   sessionToken: string;
-  uiResourceToken: string;
   serverName: string;
   toolName: string;
   toolArgs: Record<string, unknown>;
@@ -16,13 +17,13 @@ export interface HostHtmlTemplateInput {
   cacheToolConsent: boolean;
   hostContext?: UiHostContext;
   appBridgeModuleUrl?: string;
+  sandboxProxyUrl: string;
 }
 
 export function buildHostHtmlTemplate(input: HostHtmlTemplateInput): string {
   const hostContext = input.hostContext ?? {};
 
   const sessionToken = safeInlineJSON(input.sessionToken);
-  const uiResourceToken = safeInlineJSON(input.uiResourceToken);
   const toolArgs = safeInlineJSON(input.toolArgs);
   const serverName = safeInlineJSON(input.serverName);
   const toolName = safeInlineJSON(input.toolName);
@@ -31,6 +32,9 @@ export function buildHostHtmlTemplate(input: HostHtmlTemplateInput): string {
   const requireToolConsent = safeInlineJSON(input.requireToolConsent);
   const cacheToolConsent = safeInlineJSON(input.cacheToolConsent);
   const moduleUrl = safeInlineJSON(input.appBridgeModuleUrl ?? DEFAULT_APP_BRIDGE_MODULE_URL);
+  const sandboxProxyUrl = safeInlineJSON(input.sandboxProxyUrl);
+  const resourceCsp = safeInlineJSON(input.resource.meta.csp);
+  const resourcePermissions = safeInlineJSON(input.resource.meta.permissions);
 
   return `<!doctype html>
 <html lang="en">
@@ -112,7 +116,7 @@ export function buildHostHtmlTemplate(input: HostHtmlTemplateInput): string {
     </div>
   </header>
   <main>
-    <iframe id="mcp-app" sandbox="${APP_SANDBOX}" referrerpolicy="no-referrer"></iframe>
+    <iframe id="mcp-app" sandbox="${APP_PROXY_SANDBOX}" referrerpolicy="no-referrer"></iframe>
   </main>
   <div class="overlay" id="error-overlay">
     <div class="panel">
@@ -130,7 +134,6 @@ export function buildHostHtmlTemplate(input: HostHtmlTemplateInput): string {
     import { AppBridge, PostMessageTransport } from ${moduleUrl};
 
     const SESSION_TOKEN = ${sessionToken};
-    const UI_RESOURCE_TOKEN = ${uiResourceToken};
     const SERVER_NAME = ${serverName};
     const TOOL_NAME = ${toolName};
     const TOOL_ARGS = ${toolArgs};
@@ -138,6 +141,10 @@ export function buildHostHtmlTemplate(input: HostHtmlTemplateInput): string {
     const ALLOW_ATTRIBUTE = ${allowAttribute};
     const REQUIRE_TOOL_CONSENT = ${requireToolConsent};
     const CACHE_TOOL_CONSENT = ${cacheToolConsent};
+    const SANDBOX_PROXY_URL = ${sandboxProxyUrl};
+    const RESOURCE_CSP = ${resourceCsp};
+    const RESOURCE_PERMISSIONS = ${resourcePermissions};
+    const INNER_SANDBOX = ${safeInlineJSON(APP_INNER_SANDBOX)};
     const STREAM_CONTEXT_KEY = "pi-mcp-adapter/stream";
     const STREAM_PATCH_METHOD = "notifications/pi-mcp-adapter/ui-result-patch";
 
@@ -148,6 +155,7 @@ export function buildHostHtmlTemplate(input: HostHtmlTemplateInput): string {
     const errorOverlay = document.getElementById("error-overlay");
     const completionOverlay = document.getElementById("completion-overlay");
     const errorMessage = document.getElementById("error-message");
+    const sandboxProxyOrigin = new URL(SANDBOX_PROXY_URL).origin;
 
     document.getElementById("server-name").textContent = SERVER_NAME;
     document.getElementById("tool-name").textContent = TOOL_NAME;
@@ -205,9 +213,35 @@ export function buildHostHtmlTemplate(input: HostHtmlTemplateInput): string {
     const bridge = new AppBridge(
       null,
       { name: "pi", version: "1.0.0" },
-      { serverTools: {}, openLinks: {}, logging: {}, updateModelContext: {}, message: {} },
+      {
+        serverTools: {},
+        openLinks: {},
+        logging: {},
+        updateModelContext: {},
+        message: {},
+        sandbox: {
+          ...(RESOURCE_CSP ? { csp: RESOURCE_CSP } : {}),
+          ...(RESOURCE_PERMISSIONS ? { permissions: RESOURCE_PERMISSIONS } : {}),
+        },
+      },
       { hostContext: HOST_CONTEXT }
     );
+
+    let sandboxResourceSent = false;
+    bridge.onsandboxready = () => {
+      if (sandboxResourceSent) return;
+      sandboxResourceSent = true;
+      void bridge.sendSandboxResourceReady({
+        // The proxy performs a normal HTTP navigation to its session-bound
+        // resource route. Provider HTML never crosses this trusted document.
+        html: "",
+        sandbox: INNER_SANDBOX,
+        ...(RESOURCE_CSP ? { csp: RESOURCE_CSP } : {}),
+        ...(RESOURCE_PERMISSIONS ? { permissions: RESOURCE_PERMISSIONS } : {}),
+      }).catch((error) => {
+        showError("Failed to load MCP App resource: " + String(error));
+      });
+    };
 
     bridge.oncalltool = async (params) => {
       if (!consentGranted) {
@@ -240,7 +274,7 @@ export function buildHostHtmlTemplate(input: HostHtmlTemplateInput): string {
     // Also listen for raw postMessage events with custom types (notify, prompt, intent, etc.)
     // These bypass the AppBridge protocol but are used by some MCP UI implementations
     window.addEventListener("message", async (event) => {
-      if (event.source !== iframe.contentWindow) return;
+      if (event.source !== iframe.contentWindow || event.origin !== sandboxProxyOrigin) return;
       const data = event.data;
       if (!data || typeof data !== "object") return;
       
@@ -304,6 +338,12 @@ export function buildHostHtmlTemplate(input: HostHtmlTemplateInput): string {
     }
 
     // Connect bridge BEFORE loading iframe to ensure we're listening when the app sends ui/initialize
+    const sandboxMessageGuard = (event) => {
+      if (event.source === iframe.contentWindow && event.origin !== sandboxProxyOrigin) {
+        event.stopImmediatePropagation();
+      }
+    };
+    window.addEventListener("message", sandboxMessageGuard, true);
     try {
       const transport = new PostMessageTransport(iframe.contentWindow, iframe.contentWindow);
       await bridge.connect(transport);
@@ -315,7 +355,7 @@ export function buildHostHtmlTemplate(input: HostHtmlTemplateInput): string {
     const iframeLoaded = new Promise((resolve) => {
       iframe.onload = resolve;
     });
-    iframe.src = "/ui-app?resource=" + encodeURIComponent(UI_RESOURCE_TOKEN);
+    iframe.src = SANDBOX_PROXY_URL;
     await iframeLoaded;
 
     const eventSource = new EventSource("/events?session=" + encodeURIComponent(SESSION_TOKEN));
@@ -400,6 +440,15 @@ export function buildHostHtmlTemplate(input: HostHtmlTemplateInput): string {
 }
 
 export function buildCspMetaContent(csp: UiResourceCsp | undefined): string {
+  return buildCspContent(csp, APP_SANDBOX);
+}
+
+/** CSP for provider HTML navigated on the isolated proxy origin. */
+export function buildSandboxResourceCsp(csp: UiResourceCsp | undefined): string {
+  return buildCspContent(csp, APP_INNER_SANDBOX);
+}
+
+function buildCspContent(csp: UiResourceCsp | undefined, sandbox: string): string {
   const resourceDomains = sanitizeCspDomains(csp?.resourceDomains);
   const connectDomains = sanitizeCspDomains(csp?.connectDomains);
   const frameDomains = sanitizeCspDomains(csp?.frameDomains);
@@ -407,7 +456,7 @@ export function buildCspMetaContent(csp: UiResourceCsp | undefined): string {
 
   return [
     "default-src 'none'",
-    `sandbox ${APP_SANDBOX}`,
+    `sandbox ${sandbox}`,
     toDirective("script-src", ["'self'", "'unsafe-inline'"], resourceDomains),
     toDirective("style-src", ["'self'", "'unsafe-inline'"], resourceDomains),
     toDirective("font-src", ["'self'"], resourceDomains),
@@ -446,7 +495,9 @@ function sanitizeCspDomains(domains: unknown): string[] {
 }
 
 function safeInlineJSON(value: unknown): string {
-  return JSON.stringify(value)
+  const json = JSON.stringify(value);
+  if (json === undefined) return "undefined";
+  return json
     .replace(/</g, "\\u003c")
     .replace(/>/g, "\\u003e")
     .replace(/&/g, "\\u0026")

@@ -6,15 +6,17 @@ import { PROMPT_REDACTED } from "./utils.ts";
  * the agent name and its task (or workflow node label). The parent computes it
  * once and threads it two ways:
  *
- *  1. Into the child process via `PI_SUBAGENT_SESSION_NAME`, where the prompt
+ *  1. Into the child's runtime config as `sessionName`, where the prompt
  *     runtime calls `pi.setSessionName(...)` so the child's own session file
  *     is identifiable in `pi --resume` and host session browsers.
  *  2. Into the `sessionName` field of result/progress payloads, so hosts
  *     rendering the parent stream can label each child row.
  *
  * The name is display-only metadata. When the intercom bridge is active the
- * child keeps its machine intercom target as the session name instead — that
- * name is a routing address and must win (see subagent-prompt-runtime).
+ * child claims its machine intercom target as its pi-intercom session ID and
+ * keeps this readable name. With a pi-intercom that does not support the claim,
+ * the target stays the session name because it routes by name
+ * (see subagent-prompt-runtime).
  */
 
 /** Longest task excerpt kept in the name; the full string is capped below. */

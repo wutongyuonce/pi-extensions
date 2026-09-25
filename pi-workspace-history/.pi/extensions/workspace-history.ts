@@ -10,6 +10,7 @@ import {
   access,
   appendFile,
   mkdir,
+  opendir,
   readFile,
   realpath,
   rename,
@@ -25,7 +26,8 @@ import { homedir } from "node:os";
 import path from "node:path";
 
 const SNAPSHOT_TYPE = "workspace-history.snapshot";
-const SNAPSHOT_RETENTION_REF_PREFIX = "refs/workspace-history/snapshots";
+const SNAPSHOT_RETENTION_REF_PREFIX = "refs/wh/s";
+const ACTIVE_SESSION_LEASE_FILE = "active-session.json";
 
 const DEFAULT_MAX_SESSIONS_PER_WORKSPACE = 3;
 const DEFAULT_MAX_WORKSPACES = 10;
@@ -37,8 +39,13 @@ const SHADOW_REPO_LOCK_WAIT_MS = 5_000;
 const SHADOW_REPO_LOCK_STALE_MS = 15_000;
 const RESTORE_FILE_LOCK_RETRY_DELAYS_MS = [100, 250, 500] as const;
 const WORKSPACE_HISTORY_LOG_ENV = "PI_WORKSPACE_HISTORY_LOG";
+const MULTI_REPO_SCAN_MAX_DIRS = 256;
+const MULTI_REPO_SCAN_MAX_MS = 250;
+const MULTI_REPO_SCAN_BATCH_SIZE = 16;
+const MULTI_REPO_SCAN_CACHE_MS = 30_000;
 const PROJECT_MARKER_FILES = [
   ".git",
+  ".jj",
   "package.json",
   "pnpm-workspace.yaml",
   "pyproject.toml",
@@ -54,6 +61,7 @@ const PROJECT_MARKER_FILES = [
 type SnapshotKind = "baseline" | "before" | "after" | "manual";
 type WorkspaceComparison = "clean" | "dirty" | "missing";
 type NavigationMode = "conversationAndWorkspace" | "conversationOnly";
+type MultiRepoScanOutcome = "not-container" | "container" | "time-limit" | "directory-limit" | "error";
 
 const NAVIGATION_MODE_OPTIONS = [
   "Conversation and workspace",
@@ -121,6 +129,13 @@ interface PendingRecoveryState {
   createdAt: string;
 }
 
+interface MultiRepoContainerCache {
+  cwd: string;
+  rootMtimeMs: number;
+  checkedAt: number;
+  isContainer: boolean;
+}
+
 interface RuntimeState {
   pendingTurnId?: string;
   pendingBeforeCommit?: string;
@@ -166,6 +181,8 @@ interface RuntimeState {
   reusableRepoFailureNoticeShown?: boolean;
   validatedShadowGitDir?: string;
   warnedMissingSnapshotCommits?: Set<string>;
+  sessionLeaseOwnerId?: string;
+  multiRepoContainerCache?: MultiRepoContainerCache;
 }
 
 interface NavigationPrecheckResult {
@@ -203,6 +220,7 @@ interface WorkspaceStoragePaths {
   redoFile: string;
   recoveryFile: string;
   turnSnapshotsFile: string;
+  sessionLeaseFile: string;
   workspaceMetaFile: string;
   sessionMetaFile: string;
   logFile: string;
@@ -224,8 +242,17 @@ interface SessionMeta {
   lastUsedAt: string;
 }
 
+interface SessionLease {
+  version: 1;
+  sessionId: string;
+  ownerId: string;
+  processId: number;
+  createdAt: string;
+}
+
 const DEFAULT_EXCLUDES = [
   ".git",
+  ".jj",
   ".pi/workspace-history",
   "node_modules",
   "dist",
@@ -391,6 +418,149 @@ async function hasProjectMarker(cwd: string): Promise<boolean> {
   }
 }
 
+async function isInsideJujutsuMetadata(cwd: string): Promise<boolean> {
+  let current = await realpath(cwd).catch(() => path.resolve(cwd));
+  for (;;) {
+    if (normalizePathForComparison(path.basename(current)) === normalizePathForComparison(".jj")) {
+      return true;
+    }
+    const parent = path.dirname(current);
+    if (parent === current) {
+      return false;
+    }
+    current = parent;
+  }
+}
+
+async function countRepositoryRoots(directoryPaths: string[], deadline: number): Promise<number | undefined> {
+  const remainingMs = deadline - Date.now();
+  if (remainingMs <= 0) {
+    return undefined;
+  }
+
+  try {
+    const markers = await withTimeout(
+      Promise.all(directoryPaths.map(async (directoryPath) => {
+        const [hasGit, hasJujutsu] = await Promise.all([
+          pathExists(path.join(directoryPath, ".git")),
+          pathExists(path.join(directoryPath, ".jj")),
+        ]);
+        return hasGit || hasJujutsu;
+      })),
+      remainingMs,
+      "multi-repo marker scan",
+    );
+    return markers.filter(Boolean).length;
+  } catch {
+    return undefined;
+  }
+}
+
+async function isMultiRepoContainer(
+  ctx: ExtensionContext,
+  cwd: string,
+  state?: RuntimeState,
+): Promise<boolean> {
+  const normalizedCwd = normalizePathForComparison(cwd);
+  const rootStat = await stat(cwd).catch(() => undefined);
+  if (!rootStat?.isDirectory()) {
+    return false;
+  }
+
+  const now = Date.now();
+  const cached = state?.multiRepoContainerCache;
+  if (
+    cached &&
+    cached.cwd === normalizedCwd &&
+    cached.rootMtimeMs === rootStat.mtimeMs &&
+    now - cached.checkedAt < MULTI_REPO_SCAN_CACHE_MS
+  ) {
+    return cached.isContainer;
+  }
+
+  const startedAt = now;
+  const deadline = startedAt + MULTI_REPO_SCAN_MAX_MS;
+  const pendingDirectories: string[] = [];
+  let checkedDirs = 0;
+  let repoCount = 0;
+  let outcome: MultiRepoScanOutcome = "not-container";
+
+  const openPromise = opendir(cwd);
+  const directory = await withTimeout(
+    openPromise,
+    Math.max(1, deadline - Date.now()),
+    "multi-repo directory open",
+  ).catch(() => undefined);
+  if (!directory) {
+    outcome = Date.now() >= deadline ? "time-limit" : "error";
+    void openPromise.then((lateDirectory) => lateDirectory.close()).catch(() => undefined);
+  }
+
+  try {
+    for await (const entry of directory ?? []) {
+      if (Date.now() >= deadline) {
+        outcome = "time-limit";
+        break;
+      }
+      if (!entry.isDirectory() || entry.name.startsWith(".")) {
+        continue;
+      }
+      if (checkedDirs >= MULTI_REPO_SCAN_MAX_DIRS) {
+        outcome = "directory-limit";
+        break;
+      }
+
+      checkedDirs++;
+      pendingDirectories.push(path.join(cwd, entry.name));
+      if (pendingDirectories.length < MULTI_REPO_SCAN_BATCH_SIZE) {
+        continue;
+      }
+
+      const found = await countRepositoryRoots(pendingDirectories, deadline);
+      pendingDirectories.length = 0;
+      if (found === undefined) {
+        outcome = "time-limit";
+        break;
+      }
+      repoCount += found;
+      if (repoCount >= 2) {
+        outcome = "container";
+        break;
+      }
+    }
+
+    if (outcome === "not-container" && pendingDirectories.length > 0) {
+      const found = await countRepositoryRoots(pendingDirectories, deadline);
+      if (found === undefined) {
+        outcome = "time-limit";
+      } else {
+        repoCount += found;
+        if (repoCount >= 2) {
+          outcome = "container";
+        }
+      }
+    }
+  } catch {
+    outcome = "error";
+  }
+
+  const isContainer = outcome === "container";
+  if (state) {
+    state.multiRepoContainerCache = {
+      cwd: normalizedCwd,
+      rootMtimeMs: rootStat.mtimeMs,
+      checkedAt: Date.now(),
+      isContainer,
+    };
+  }
+  await logLine(
+    ctx,
+    `multi-repo scan done ${elapsedMs(startedAt)}ms outcome=${outcome} checkedDirs=${checkedDirs} repoCount=${repoCount}`,
+    state,
+  ).catch(() => undefined);
+  return isContainer;
+}
+
 function normalizePathForComparison(filePath: string): string {
   const normalized = path.normalize(filePath);
   return process.platform === "win32" ? normalized.toLowerCase() : normalized;
@@ -474,6 +644,8 @@ async function evaluateWorkspaceHistoryAvailability(ctx: ExtensionContext, state
     };
   } else if (settings.enabled === false) {
     availability = { enabled: false, reason: "disabled by configuration" };
+  } else if (await isInsideJujutsuMetadata(ctx.cwd)) {
+    availability = { enabled: false, reason: "current directory is inside Jujutsu metadata" };
   } else if (settings.enabled === true) {
     availability = { enabled: true };
   } else {
@@ -488,6 +660,8 @@ async function evaluateWorkspaceHistoryAvailability(ctx: ExtensionContext, state
       availability = { enabled: false, reason: "current directory is a filesystem root" };
     } else if (settings.requireProjectMarker && !(await hasProjectMarker(resolvedCwd))) {
       availability = { enabled: false, reason: "no project marker found" };
+    } else if (settings.requireProjectMarker && !(await pathExists(path.join(resolvedCwd, ".git"))) && !(await pathExists(path.join(resolvedCwd, ".jj"))) && (await isMultiRepoContainer(ctx, resolvedCwd, state))) {
+      availability = { enabled: false, reason: "workspace is a multi-repo container without a root repository" };
     } else {
       availability = { enabled: true };
     }
@@ -526,6 +700,7 @@ async function buildWorkspaceStoragePaths(ctx: ExtensionContext, settings: Works
     redoFile: path.join(sessionRoot, "redo.json"),
     recoveryFile: path.join(sessionRoot, "pending-recovery.json"),
     turnSnapshotsFile: path.join(sessionRoot, "turn-snapshots.json"),
+    sessionLeaseFile: path.join(sessionRoot, ACTIVE_SESSION_LEASE_FILE),
     workspaceMetaFile: path.join(workspaceRoot, "meta.json"),
     sessionMetaFile: path.join(sessionRoot, "meta.json"),
     logFile: path.join(settings.storageDir, "logs", "timemachine.log"),
@@ -557,6 +732,17 @@ async function ensureStorageDirs(ctx: ExtensionContext, state?: RuntimeState): P
 async function writeJsonFile(filePath: string, value: unknown): Promise<void> {
   await mkdir(path.dirname(filePath), { recursive: true });
   await writeFile(filePath, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+}
+
+async function writeJsonFileAtomically(filePath: string, value: unknown): Promise<void> {
+  await mkdir(path.dirname(filePath), { recursive: true });
+  const temporaryFile = `${filePath}.${process.pid}-${randomUUID()}.tmp`;
+  try {
+    await writeFile(temporaryFile, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+    await rename(temporaryFile, filePath);
+  } finally {
+    await unlink(temporaryFile).catch(() => undefined);
+  }
 }
 
 async function readJsonFile<T>(filePath: string): Promise<T | undefined> {
@@ -689,7 +875,7 @@ function notifyInvalidShadowRepoRecovery(ctx: ExtensionContext, state: RuntimeSt
   }
   if (!state?.invalidShadowRepoNoticeShown) {
     ctx.ui.notify(
-      "Workspace history found an invalid snapshot repository and rebuilt it. Older snapshots from this session may be unavailable.",
+      "Workspace history found a missing or invalid snapshot repository and rebuilt it. Older snapshots from this session may be unavailable.",
       "warning",
     );
   }
@@ -713,6 +899,73 @@ function isValidSessionMeta(value: unknown, sessionId: string): value is Session
     && value.sessionId === sessionId
     && isValidMetaTimestamp(value.createdAt)
     && isValidMetaTimestamp(value.lastUsedAt);
+}
+
+function isValidSessionLease(value: unknown, sessionId: string): value is SessionLease {
+  return isJsonRecord(value)
+    && value.version === 1
+    && value.sessionId === sessionId
+    && typeof value.ownerId === "string"
+    && value.ownerId.length > 0
+    && typeof value.processId === "number"
+    && Number.isInteger(value.processId)
+    && value.processId > 0
+    && isValidMetaTimestamp(value.createdAt);
+}
+
+function isProcessRunning(processId: number): boolean {
+  try {
+    process.kill(processId, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
+}
+
+async function acquireSessionLease(ctx: ExtensionContext, state?: RuntimeState): Promise<void> {
+  const paths = await ensureStorageDirs(ctx, state);
+  const ownerId = randomUUID();
+  await writeJsonFileAtomically(paths.sessionLeaseFile, {
+    version: 1,
+    sessionId: ctx.sessionManager.getSessionId(),
+    ownerId,
+    processId: process.pid,
+    createdAt: new Date().toISOString(),
+  } satisfies SessionLease);
+  if (state) {
+    state.sessionLeaseOwnerId = ownerId;
+  }
+}
+
+async function releaseSessionLease(ctx: ExtensionContext, state?: RuntimeState): Promise<void> {
+  const ownerId = state?.sessionLeaseOwnerId;
+  if (!ownerId) {
+    return;
+  }
+  const paths = await getWorkspaceStoragePaths(ctx, state);
+  const lease = await readJsonFile<unknown>(paths.sessionLeaseFile);
+  if (isValidSessionLease(lease, ctx.sessionManager.getSessionId()) && lease.ownerId === ownerId) {
+    await unlink(paths.sessionLeaseFile).catch((error) => {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+        throw error;
+      }
+    });
+  }
+  state.sessionLeaseOwnerId = undefined;
+}
+
+async function hasActiveSessionLease(sessionRoot: string, sessionId: string): Promise<boolean> {
+  const lease = await readJsonFile<unknown>(path.join(sessionRoot, ACTIVE_SESSION_LEASE_FILE));
+  return isValidSessionLease(lease, sessionId) && isProcessRunning(lease.processId);
+}
+
+async function hasActiveWorkspaceSession(workspaceRoot: string): Promise<boolean> {
+  const sessionsRoot = path.join(workspaceRoot, "sessions");
+  const sessionIds = await listSubdirectories(sessionsRoot);
+  const activeLeases = await Promise.all(sessionIds.map((sessionId) => {
+    return hasActiveSessionLease(path.join(sessionsRoot, sessionId), sessionId);
+  }));
+  return activeLeases.some(Boolean);
 }
 
 function isValidWorkspaceMeta(value: unknown, workspaceHash: string): value is WorkspaceMeta {
@@ -822,16 +1075,27 @@ async function cleanupWorkspaceHistory(ctx: ExtensionContext, state?: RuntimeSta
     const sessionRoot = path.join(paths.sessionsRoot, sessionId);
     const meta = await readJsonFile<unknown>(path.join(sessionRoot, "meta.json"));
     return isValidSessionMeta(meta, sessionId)
-      ? { sessionId, sessionRoot, lastUsedAt: meta.lastUsedAt }
+      ? {
+        sessionId,
+        sessionRoot,
+        lastUsedAt: meta.lastUsedAt,
+        active: sessionId === currentSessionId || await hasActiveSessionLease(sessionRoot, sessionId),
+      }
       : undefined;
   }))).filter((record): record is NonNullable<typeof record> => record !== undefined);
 
+  const activeSessionCount = sessionRecords.filter((record) => record.active).length;
   const removableSessions = sessionRecords
-    .filter((record) => record.sessionId !== currentSessionId)
+    .filter((record) => !record.active)
     .sort((a, b) => b.lastUsedAt.localeCompare(a.lastUsedAt));
 
-  for (const record of removableSessions.slice(Math.max(0, settings.maxSessionsPerWorkspace - 1))) {
+  const inactiveSessionCapacity = Math.max(0, settings.maxSessionsPerWorkspace - activeSessionCount);
+  for (const record of removableSessions.slice(inactiveSessionCapacity)) {
     try {
+      if (await hasActiveSessionLease(record.sessionRoot, record.sessionId)) {
+        await logLine(ctx, `cleanup session skipped after lease recheck sessionId=${record.sessionId}`, state);
+        continue;
+      }
       await fsRm(record.sessionRoot, { recursive: true, force: true });
     } catch (error) {
       await logLine(
@@ -849,16 +1113,27 @@ async function cleanupWorkspaceHistory(ctx: ExtensionContext, state?: RuntimeSta
     const workspaceRoot = path.join(workspacesRoot, workspaceId);
     const meta = await readJsonFile<unknown>(path.join(workspaceRoot, "meta.json"));
     return isValidWorkspaceMeta(meta, workspaceId)
-      ? { workspaceId, workspaceRoot, lastUsedAt: meta.lastUsedAt }
+      ? {
+        workspaceId,
+        workspaceRoot,
+        lastUsedAt: meta.lastUsedAt,
+        active: workspaceId === paths.workspaceHash || await hasActiveWorkspaceSession(workspaceRoot),
+      }
       : undefined;
   }))).filter((record): record is NonNullable<typeof record> => record !== undefined);
 
+  const activeWorkspaceCount = workspaceRecords.filter((record) => record.active).length;
   const removableWorkspaces = workspaceRecords
-    .filter((record) => record.workspaceId !== paths.workspaceHash)
+    .filter((record) => !record.active)
     .sort((a, b) => b.lastUsedAt.localeCompare(a.lastUsedAt));
 
-  for (const record of removableWorkspaces.slice(Math.max(0, settings.maxWorkspaces - 1))) {
+  const inactiveWorkspaceCapacity = Math.max(0, settings.maxWorkspaces - activeWorkspaceCount);
+  for (const record of removableWorkspaces.slice(inactiveWorkspaceCapacity)) {
     try {
+      if (await hasActiveWorkspaceSession(record.workspaceRoot)) {
+        await logLine(ctx, `cleanup workspace skipped after lease recheck workspaceId=${record.workspaceId}`, state);
+        continue;
+      }
       await fsRm(record.workspaceRoot, { recursive: true, force: true });
     } catch (error) {
       await logLine(
@@ -1303,10 +1578,15 @@ async function ensureShadowRepo(pi: ExtensionAPI, ctx: ExtensionContext, state?:
   await assertWorkspaceHistoryEnabled(ctx, state, "ensureShadowRepo");
   const paths = await ensureStorageDirs(ctx, state);
   if (state?.validatedShadowGitDir === paths.shadowGitDir) {
-    await syncShadowRepoExclude(ctx, state);
-    notifyInvalidShadowRepoRecovery(ctx, state, false);
-    await logLine(ctx, `ensure shadow repo cached done ${elapsedMs(startedAt)}ms`, state);
-    return;
+    if (await exists(path.join(paths.shadowGitDir, "HEAD"))) {
+      await syncShadowRepoExclude(ctx, state);
+      notifyInvalidShadowRepoRecovery(ctx, state, false);
+      await logLine(ctx, `ensure shadow repo cached done ${elapsedMs(startedAt)}ms`, state);
+      return;
+    }
+    clearShadowRepoRuntimeCaches(state);
+    state.invalidShadowRepoRecoveryPending = true;
+    await logLine(ctx, `ensure shadow repo cached path missing gitDir=${paths.shadowGitDir}`, state, true);
   }
 
   let rebuiltInvalidRepo = false;
@@ -2445,6 +2725,41 @@ async function ensureNoUnsnapshottedChanges(
   return { currentLeafId, currentSnapshot };
 }
 
+type TreeWorkspaceComparison = "identical" | "different" | "dirty" | "unknown";
+
+async function compareTreeWorkspace(
+  pi: ExtensionAPI,
+  ctx: ExtensionContext,
+  targetId: string,
+  state: RuntimeState,
+): Promise<TreeWorkspaceComparison> {
+  const currentId = ctx.sessionManager.getLeafId();
+  const current = getResolvedSnapshotData(currentId ? resolveSnapshotForTreeTarget(ctx, currentId, state) : undefined);
+  const target = getResolvedSnapshotData(resolveSnapshotForTreeTarget(ctx, targetId, state));
+  if (!current || !target) {
+    return "unknown";
+  }
+  try {
+    if (!await isSnapshotCommitAvailable(pi, ctx, current.commit, state)
+      || !await isSnapshotCommitAvailable(pi, ctx, target.commit, state)) {
+      return "unknown";
+    }
+    const comparison = await isWorkspaceDirtyAgainstCommit(pi, ctx, current.commit, state);
+    if (comparison !== "clean") {
+      return comparison === "dirty" ? "dirty" : "unknown";
+    }
+    const changedPaths = current.commit === target.commit ? [] : parseNullSeparatedPaths(await execGit(
+      pi,
+      ctx,
+      await gitArgs(ctx, state, "diff", "--name-only", "-z", "--no-renames", "--no-ext-diff", "--no-textconv", current.commit, target.commit, "--", "."),
+    ));
+    return (await filterSnapshotPaths(ctx, changedPaths, state)).length === 0 ? "identical" : "different";
+  } catch (error) {
+    await logLine(ctx, `tree workspace comparison unavailable target=${targetId} error=${String(error)}`, state);
+    return "unknown";
+  }
+}
+
 async function selectNavigationMode(
   ctx: ExtensionContext,
   title: string,
@@ -2833,6 +3148,8 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
     state.reusableRepoFailureNoticeShown = false;
     state.validatedShadowGitDir = undefined;
     state.warnedMissingSnapshotCommits = undefined;
+    state.sessionLeaseOwnerId = undefined;
+    state.multiRepoContainerCache = undefined;
 
     if (!await ensureWorkspaceHistoryAvailable(ctx, state, "session_start")) {
       return;
@@ -2840,6 +3157,7 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
 
     await getWorkspaceHistorySettings(ctx, state);
     await getWorkspaceStoragePaths(ctx, state);
+    await acquireSessionLease(ctx, state);
     state.pendingRecovery = await readPendingRecoveryState(ctx, state);
     if (state.pendingRecovery) {
       await logLine(ctx, `pending workspace recovery loaded commit=${state.pendingRecovery.commit}`, state);
@@ -2855,6 +3173,7 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
   pi.on("session_shutdown", async (_event, ctx) => {
     const state = getState(ctx);
     await state.reusableRepoUpdatePromise?.catch(() => undefined);
+    await releaseSessionLease(ctx, state);
   });
 
   pi.on("input", async (event, ctx) => {
@@ -3006,7 +3325,32 @@ export default function workspaceHistoryExtension(pi: ExtensionAPI) {
       return { cancel: true as const };
     };
 
-    const navigationMode = state.navigationMode ?? await selectNavigationMode(ctx, "Tree navigation", event.signal);
+    let navigationMode = state.navigationMode;
+    if (!navigationMode) {
+      const canCompare = ctx.hasUI && !state.internalNavigation && !event.preparation.userWantsSummary
+        && !state.pendingRecovery && !state.pendingRecoveryPromise && !state.pendingTurnId;
+      const comparison = canCompare
+        ? await compareTreeWorkspace(pi, ctx, event.preparation.targetId, state)
+        : undefined;
+      if (canCompare && event.signal.aborted) {
+        return { cancel: true };
+      }
+      if (comparison === "identical") {
+        // Keep files in place even if an external edit arrives after comparison.
+        // The existing conversation-only path captures and anchors that state.
+        navigationMode = "conversationOnly";
+        await logLine(ctx, `tree navigation skips choice: managed files identical target=${event.preparation.targetId}`, state);
+      } else {
+        const title = comparison === "different"
+          ? "Tree navigation — target files differ"
+          : comparison === "dirty"
+            ? "Tree navigation — current files have unsnapshotted changes"
+            : comparison === "unknown"
+              ? "Tree navigation — file changes could not be determined"
+              : "Tree navigation";
+        navigationMode = await selectNavigationMode(ctx, title, event.signal);
+      }
+    }
     if (!navigationMode) {
       await logLine(ctx, "session_before_tree cancelled: no navigation mode selected", state);
       return { cancel: true };

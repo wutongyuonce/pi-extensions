@@ -336,3 +336,75 @@ describe("cli token helper", () => {
     expect(missingLogs.join("\n")).toContain('No bearer token is stored for "remote".');
   });
 });
+
+describe("cli System One key helper", () => {
+  beforeEach(() => {
+    vi.resetModules();
+    process.env.PI_MCP_ADAPTER_TEST_AUTH_STORE = "memory";
+    delete process.env.SYSTEMONE_API_KEY;
+    delete process.env.TYPESAFE_API_KEY;
+    delete process.env.SYSTEMONE_ENDPOINT;
+  });
+
+  function keyStdin(text: string): NodeJS.ReadStream {
+    return Readable.from([text]) as unknown as NodeJS.ReadStream;
+  }
+
+  it("sets, reports, and removes a key without revealing it", async () => {
+    const { main } = await import("../cli.js");
+    const { resetTestSecureKeyring } = await import("../dist/secure-keyring.js");
+    resetTestSecureKeyring();
+    const logs: string[] = [];
+    expect(await main(["key", "set", "systemone"], line => logs.push(line), () => {}, keyStdin("cli-secret\n"))).toBe(0);
+    expect(logs.join("\n")).not.toContain("cli-secret");
+    const status: string[] = [];
+    expect(await main(["key", "status", "systemone"], line => status.push(line), () => {}, keyStdin(""))).toBe(0);
+    expect(status).toEqual(["source=keyring", "endpoint=https://api.typesafe.ai/v1/systemone"]);
+    expect(await main(["key", "remove", "systemone"], () => {}, () => {}, keyStdin(""))).toBe(0);
+  });
+
+  it("stores per endpoint and keeps the legacy provider alias working", async () => {
+    const { main } = await import("../cli.js");
+    const { resetTestSecureKeyring } = await import("../dist/secure-keyring.js");
+    resetTestSecureKeyring();
+    process.env.SYSTEMONE_ENDPOINT = "https://opencode.ai/zen/v1/systemone";
+    expect(await main(["key", "set", "typesafe"], () => {}, () => {}, keyStdin("zen-secret\n"))).toBe(0);
+    const status: string[] = [];
+    expect(await main(["key", "status", "typesafe"], line => status.push(line), () => {}, keyStdin(""))).toBe(0);
+    expect(status).toEqual(["source=keyring", "endpoint=https://opencode.ai/zen/v1/systemone"]);
+    delete process.env.SYSTEMONE_ENDPOINT;
+    expect(await main(["key", "status", "systemone"], () => {}, () => {}, keyStdin(""))).toBe(1);
+  });
+
+  it("refuses to store a key when the configured endpoint is invalid", async () => {
+    const { main } = await import("../cli.js");
+    process.env.SYSTEMONE_ENDPOINT = "http://evil.test/v1/systemone";
+    const errors: string[] = [];
+    expect(await main(["key", "set", "systemone"], () => {}, line => errors.push(line), keyStdin("never-stored\n"))).toBe(1);
+    expect(errors.join("\n")).toContain("SYSTEMONE_ENDPOINT is set but invalid");
+    expect(errors.join("\n")).not.toContain("never-stored");
+  });
+
+  it("explains that a legacy TypeSafe key is ignored on another endpoint", async () => {
+    const { main } = await import("../cli.js");
+    process.env.SYSTEMONE_ENDPOINT = "https://opencode.ai/zen/v1/systemone";
+    process.env.TYPESAFE_API_KEY = "legacy-secret";
+    const logs: string[] = [];
+    expect(await main(["key", "remove", "systemone"], line => logs.push(line), () => {}, keyStdin(""))).toBe(0);
+    expect(logs.join("\n")).toContain("ignored for https://opencode.ai/zen/v1/systemone");
+    expect(logs.join("\n")).not.toContain("legacy-secret");
+  });
+
+  it("rejects argv secrets and explains an environment override after removal", async () => {
+    const { main } = await import("../cli.js");
+    const errors: string[] = [];
+    expect(await main(["key", "set", "systemone", "argv-secret"], () => {}, line => errors.push(line), keyStdin(""))).toBe(1);
+    expect(errors.join("\n")).not.toContain("argv-secret");
+    expect(errors.join("\n")).toContain("must not be passed");
+    process.env.TYPESAFE_API_KEY = "environment-secret";
+    const logs: string[] = [];
+    expect(await main(["key", "remove", "systemone"], line => logs.push(line), () => {}, keyStdin(""))).toBe(0);
+    expect(logs.join("\n")).toContain("TYPESAFE_API_KEY is present and overrides");
+    expect(logs.join("\n")).not.toContain("environment-secret");
+  });
+});

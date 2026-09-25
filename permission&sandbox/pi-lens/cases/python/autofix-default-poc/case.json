@@ -1,0 +1,25 @@
+{
+	"name": "python-autofix-default-poc",
+	"description": "Validate Python smart-default autofix/cleanup behavior in a Ruff-configured workspace.",
+	"model": "opencode/minimax-m2.5-free",
+	"startupMode": "full",
+	"allowedTools": ["read", "write", "edit", "bash"],
+	"expectedFiles": ["src/main.py", "src/helpers.py"],
+	"expectedToolCalls": ["read", "write"],
+	"forbiddenChangedFiles": ["pyproject.toml"],
+	"expectedRuntimeMarkers": ["modified by auto-format/fix"],
+	"expectedWorkflow": {
+		"readBeforeFirstMutation": true,
+		"autoformatNoticeSeen": true,
+		"fileChangedNoticeSeen": true,
+		"readGuardTriggered": false,
+		"lspUsed": false
+	},
+	"maxFailedToolCalls": 1,
+	"maxToolCallCount": 20,
+	"allowedFailureKinds": [
+		"file_changed_notice",
+		"missing_module",
+		"autofix_notice"
+	]
+}

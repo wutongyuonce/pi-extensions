@@ -35,15 +35,47 @@ export const DEFAULT_FLUSH_RECENT_MESSAGES = 0;
  * including lower ones; `loadConfig` warns when a value below this is set.
  */
 export const DEFAULT_CONSOLIDATION_TIMEOUT_MS = 180000;
+/**
+ * Compact flush is one LLM turn over the conversation snapshot, awaited
+ * before compaction. 30s was cutting local-model prompts mid-prefill
+ * (#225); the value is a ceiling (cloud calls return early). Honor
+ * configured values verbatim; loadConfig warns below this.
+ */
+export const DEFAULT_FLUSH_COMPACT_TIMEOUT_MS = 60_000;
+
+/** Shutdown flush cap. Not configurable. */
+export const DEFAULT_FLUSH_SHUTDOWN_TIMEOUT_MS = 10_000;
+
 /** Wall-clock grace after overflow before an automatic consolidation may run. */
 export const DEFAULT_OVERFLOW_GRACE_MS = 180000;
 export const DEFAULT_FAILURE_INJECTION_MAX_AGE_DAYS = 7;
 export const DEFAULT_FAILURE_INJECTION_MAX_ENTRIES = 5;
 
+// ─── Session retention defaults ───
+/**
+ * Default session retention window in days. `0` means retention pruning is
+ * DISABLED by default -- existing searchable session history is never silently
+ * deleted. Users opt in by setting `sessionRetentionDays` to a positive value
+ * in their config; setting it back to `0` (or omitting it) disables pruning
+ * (see #183).
+ */
+export const DEFAULT_SESSION_RETENTION_DAYS = 0;
+
 // ─── File names ───
 export const MEMORY_FILE = "MEMORY.md";
 export const USER_FILE = "USER.md";
 export const STANDING_FILE = "STANDING.md";
+
+// ─── Markdown→SQLite sync state ───
+/**
+ * Key prefix for per-scope reconcile fingerprints in `extension_metadata`.
+ * Bump the version whenever `parseMarkdownMemoryEntry` or the reconcile body
+ * changes what a fingerprinted scope should produce — a stored fingerprint
+ * cannot see a parser change, so the prefix is what invalidates every scope.
+ * The corruption-rebuild strip reads this same constant, so bumping it keeps
+ * both sides in step.
+ */
+export const MDSYNC_METADATA_KEY_PREFIX = "mdsync:v1:";
 
 // ─── Standing instructions (#121) ───
 // A hard budget, deliberately separate from memoryCharLimit/userCharLimit.
@@ -196,16 +228,17 @@ Only act if there's something genuinely worth saving. If nothing stands out, jus
 // (review/flush/consolidation/correction all ask the model to respond with
 // this same {"operations":[...]} shape instead of calling the memory tool,
 // since direct mode is a single completeSimple() call with no tool loop).
+//
+// GUARD: this schema must not contain a parseable operations example.
+// The direct transports fall back to parsing the thinking channel (#197),
+// so a model restating this schema in its chain of thought would have any
+// valid example parsed into a live operation. Show the shape only in prose
+// or with a deliberately unparseable placeholder, and keep the empty
+// {"operations":[]} (in the prompts below) as the only literal example.
+// No angle-bracket placeholders either — those are still valid JSON that
+// models copy into real operations.
 const DIRECT_MEMORY_OPERATIONS_SCHEMA = `Respond with JSON only (no markdown fences):
-{
-  "operations": [
-    {
-      "action": "add",
-      "target": "memory",
-      "content": "entry text"
-    }
-  ]
-}
+{"operations": [ /* one operation object per entry, using the fields below */ ]}
 
 Operation fields:
 - action: "add" | "replace" | "remove"
@@ -213,7 +246,9 @@ Operation fields:
 - content: required for add/replace
 - old_text: required for replace/remove (substring match)
 - category: for failure target — failure | correction | insight | convention | tool-quirk | preference
-- failure_reason: optional context for failure entries`;
+- failure_reason: optional context for failure entries
+
+Put the JSON in the assistant text, not only in thinking.`;
 
 export const DIRECT_REVIEW_SYSTEM_PROMPT = `You review coding conversations and extract durable memories worth saving across sessions.
 

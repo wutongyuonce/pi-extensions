@@ -9,7 +9,8 @@ import { serializeAgent } from "../../src/agents/agent-serializer.ts";
 import { parseChain, serializeChain } from "../../src/agents/chain-serializer.ts";
 import { discoverAgents, discoverAgentsAll, inspectAgentDefinitionDirectory, type AgentConfig } from "../../src/agents/agents.ts";
 import { parseFrontmatter } from "../../src/agents/frontmatter.ts";
-import { buildPiArgs } from "../../src/runs/shared/pi-args.ts";
+import { buildInProcessChildLaunch } from "../../src/runs/shared/child-launch.ts";
+import { applyThinkingSuffix } from "../../src/runs/shared/child-tool-plan.ts";
 import { THINKING_LEVELS } from "../../src/shared/model-info.ts";
 
 const tempDirs: string[] = [];
@@ -99,6 +100,56 @@ afterEach(() => {
 		if (!dir) continue;
 		fs.rmSync(dir, { recursive: true, force: true });
 	}
+});
+
+describe("agent outputSchema frontmatter", () => {
+	it("parses and serializes an inline object schema", () => withTempHome(() => {
+		const project = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-output-schema-"));
+		tempDirs.push(project);
+		writeAgent(path.join(project, ".pi", "agents", "typed.md"), `---\nname: typed\ndescription: Typed agent\noutputSchema: {"type":"object","required":["ok"],"properties":{"ok":{"type":"boolean"}}}\n---\n\nReturn data.\n`);
+		const discovered = discoverAgents(project, "project");
+		const typed = discovered.agents.find((agent) => agent.name === "typed");
+		assert.deepEqual(typed?.outputSchema, { type: "object", required: ["ok"], properties: { ok: { type: "boolean" } } });
+		writeAgent(path.join(project, ".pi", "agents", "typed.md"), serializeAgent(typed!));
+		assert.deepEqual(discoverAgents(project, "project").agents.find((agent) => agent.name === "typed")?.outputSchema, typed?.outputSchema);
+	}));
+
+	it("rejects malformed, null, and array output schemas", () => withTempHome(() => {
+		const project = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-output-schema-invalid-"));
+		tempDirs.push(project);
+		for (const [name, value] of [["malformed", "{"], ["null", "null"], ["array", "[]"]]) {
+			writeAgent(path.join(project, ".pi", "agents", `${name}.md`), `---\nname: ${name}\ndescription: Invalid schema\noutputSchema: ${value}\n---\nBody\n`);
+		}
+		const discovered = discoverAgents(project, "project");
+		assert.deepEqual(discovered.agents.filter((agent) => ["malformed", "null", "array"].includes(agent.name)), []);
+		assert.equal(discovered.agentDiagnostics?.length, 3);
+		assert.match(discovered.agentDiagnostics?.find(({ name }) => name === "malformed")?.error ?? "", /JSON|position|property/i);
+		assert.equal(discovered.agentDiagnostics?.filter(({ error }) => /outputSchema.*object/i.test(error)).length, 2);
+	}));
+});
+
+describe("agent allowedAgents frontmatter", () => {
+	it("preserves omission and empty lists, round-trips canonical lists, and rejects malformed names", () => withTempHome(() => {
+		const project = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-allowed-agents-"));
+		tempDirs.push(project);
+		const dir = path.join(project, ".pi", "agents");
+		writeAgent(path.join(dir, "omitted.md"), "---\nname: omitted\ndescription: Omitted\n---\n\nPrompt.\n");
+		writeAgent(path.join(dir, "empty.md"), "---\nname: empty\ndescription: Empty\nallowedAgents:\n---\n\nPrompt.\n");
+		writeAgent(path.join(dir, "listed.md"), "---\nname: listed\ndescription: Listed\nallowedAgents: worker, scout\n---\n\nPrompt.\n");
+		writeAgent(path.join(dir, "blocked.md"), "---\nname: blocked\ndescription: Blocked\nallowedAgents:\n  - reviewer\n  - package.scout\n---\n\nPrompt.\n");
+		writeAgent(path.join(dir, "invalid.md"), "---\nname: invalid\ndescription: Invalid\nallowedAgents: bad name\n---\n\nPrompt.\n");
+
+		const discovered = discoverAgents(project, "project");
+		assert.equal(discovered.agents.find((entry) => entry.name === "omitted")?.allowedAgents, undefined);
+		assert.deepEqual(discovered.agents.find((entry) => entry.name === "empty")?.allowedAgents, []);
+		assert.deepEqual(discovered.agents.find((entry) => entry.name === "listed")?.allowedAgents, ["scout", "worker"]);
+		assert.deepEqual(discovered.agents.find((entry) => entry.name === "blocked")?.allowedAgents, ["package.scout", "reviewer"]);
+		assert.match(discovered.agentDiagnostics.find((entry) => entry.name === "invalid")?.error ?? "", /Invalid capability ceiling allowedAgents entry 'bad name'/u);
+
+		const listed = discovered.agents.find((entry) => entry.name === "listed")!;
+		writeAgent(path.join(dir, "listed.md"), serializeAgent(listed));
+		assert.deepEqual(discoverAgents(project, "project").agents.find((entry) => entry.name === "listed")?.allowedAgents, ["scout", "worker"]);
+	}));
 });
 
 describe("agent definition directory inspection", () => {
@@ -311,6 +362,8 @@ Review carefully.`);
 		tempDirs.push(project);
 		writeAgent(path.join(project, ".pi", "agents", "external.md"), `---\nname: external\ndescription: External\nrunner:\n  type: external-cli\n  command: node\nmodel: provider/model\n---\nBody`);
 		assert.match(discoverAgents(project, "project").agentDiagnostics?.[0]?.error ?? "", /unsupported Pi-only fields: model/);
+		writeAgent(path.join(project, ".pi", "agents", "external.md"), `---\nname: external\ndescription: External\nrunner:\n  type: external-cli\n  command: node\nallowedAgents: worker\n---\nBody`);
+		assert.match(discoverAgents(project, "project").agentDiagnostics?.[0]?.error ?? "", /unsupported Pi-only fields: allowedAgents/);
 	}));
 
 	it("keeps valid agents executable when another agent is malformed", () => withTempHome(() => {
@@ -384,6 +437,31 @@ body`);
 	}));
 });
 
+describe("agent advertise frontmatter", () => {
+	it("parses and serializes explicit prompt advertisement", () => withTempHome(() => {
+		const project = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-advertised-agent-"));
+		tempDirs.push(project);
+		writeAgent(path.join(project, ".pi", "agents", "worker.md"), `---
+name: worker
+description: Worker
+advertise: true
+---
+body`);
+
+		const worker = discoverAgents(project, "both").agents.find((agent) => agent.name === "worker")!;
+		assert.equal(worker.advertise, true);
+		assert.match(serializeAgent(worker), /^advertise: true$/m);
+	}));
+
+	it("rejects non-boolean advertise values", () => withTempHome(() => {
+		const project = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-invalid-advertise-"));
+		tempDirs.push(project);
+		writeAgent(path.join(project, ".pi", "agents", "worker.md"), "---\nname: worker\ndescription: Worker\nadvertise: yes\n---\nbody");
+
+		assert.match(discoverAgents(project, "project").agentDiagnostics?.[0]?.error ?? "", /invalid advertise frontmatter; expected true or false/);
+	}));
+});
+
 describe("agent aliases", () => {
 	it("parses and serializes agent aliases", () => withTempHome(() => {
 		const project = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-alias-agent-"));
@@ -444,9 +522,6 @@ skill:
 skillPath:
   - ./private-skills
   - ../shared-skills
-fallbackModels:
-  - openai/gpt-5-mini
-  - anthropic/claude-sonnet-4
 extensions:
   - ./extension-one.ts
   - ./extension-two.ts
@@ -464,7 +539,6 @@ Do work
 		assert.deepEqual(worker?.defaultReads, ["input-one.md", "input-two.md"]);
 		assert.deepEqual(worker?.skills, ["review-checklist", "safe-bash"]);
 		assert.deepEqual(worker?.skillPath, ["./private-skills", "../shared-skills"]);
-		assert.deepEqual(worker?.fallbackModels, ["openai/gpt-5-mini", "anthropic/claude-sonnet-4"]);
 		assert.deepEqual(worker?.extensions, [path.join(dir, ".pi", "agents", "extension-one.ts"), path.join(dir, ".pi", "agents", "extension-two.ts")]);
 		assert.deepEqual(worker?.subagentOnlyExtensions, [path.join(dir, ".pi", "agents", "child-only.ts"), path.join(dir, ".pi", "agents", "child-helper.ts")]);
 	});
@@ -497,7 +571,6 @@ tools: read-only, mcp:github/search_repositories
 defaultReads: input-one.md, input-two.md
 skills: review-checklist, safe-bash
 skillPath: ./private-skills, ../shared-skills
-fallbackModels: openai/gpt-5-mini, anthropic/claude-sonnet-4
 extensions: ./extension-one.ts, ./extension-two.ts
 subagentOnlyExtensions: ./child-only.ts, ./child-helper.ts
 ---
@@ -511,7 +584,6 @@ Do work
 		assert.deepEqual(worker?.defaultReads, ["input-one.md", "input-two.md"]);
 		assert.deepEqual(worker?.skills, ["review-checklist", "safe-bash"]);
 		assert.deepEqual(worker?.skillPath, ["./private-skills", "../shared-skills"]);
-		assert.deepEqual(worker?.fallbackModels, ["openai/gpt-5-mini", "anthropic/claude-sonnet-4"]);
 		assert.deepEqual(worker?.extensions, [path.join(dir, ".pi", "agents", "extension-one.ts"), path.join(dir, ".pi", "agents", "extension-two.ts")]);
 		assert.deepEqual(worker?.subagentOnlyExtensions, [path.join(dir, ".pi", "agents", "child-only.ts"), path.join(dir, ".pi", "agents", "child-helper.ts")]);
 	});
@@ -612,16 +684,14 @@ Do work
 		assert.equal(worker?.defaultContext, "fork");
 	});
 
-	it("loads packaged worker and oracle with fork defaultContext and advisor alias", () => {
+	it("loads packaged worker fresh and oracle forked with advisor alias", () => {
 		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-builtin-default-context-"));
 		tempDirs.push(dir);
 		const agents = discoverAgentsAll(dir).builtin;
 
-		for (const name of ["worker", "oracle"]) {
-			const agent = agents.find((candidate) => candidate.name === name);
-			assert.equal(agent?.defaultContext, "fork", `${name} should default to fork context`);
-		}
+		assert.equal(agents.find((candidate) => candidate.name === "worker")?.defaultContext, "fresh");
 		const oracle = agents.find((candidate) => candidate.name === "oracle");
+		assert.equal(oracle?.defaultContext, "fork");
 		assert.deepEqual(oracle?.aliases, ["advisor"]);
 		assert.doesNotMatch(oracle?.tools?.join(",") ?? "", /contact_supervisor/);
 		for (const name of ["scout", "researcher", "oracle", "reviewer"]) {
@@ -1362,62 +1432,6 @@ Review only.
 	}));
 });
 
-describe("agent frontmatter completionGuard", () => {
-	it("serializes disabled completion guard into agent frontmatter", () => {
-		const agent: AgentConfig = {
-			name: "test-runner",
-			description: "Test runner",
-			systemPrompt: "Validate changes",
-			systemPromptMode: "replace",
-			inheritProjectContext: false,
-			inheritSkills: false,
-			source: "project",
-			filePath: "/tmp/test-runner.md",
-			completionGuard: false,
-		};
-
-		const serialized = serializeAgent(agent);
-		assert.match(serialized, /completionGuard: false/);
-	});
-
-	it("omits enabled completion guard from serialized frontmatter", () => {
-		const agent: AgentConfig = {
-			name: "test-runner",
-			description: "Test runner",
-			systemPrompt: "Validate changes",
-			systemPromptMode: "replace",
-			inheritProjectContext: false,
-			inheritSkills: false,
-			source: "project",
-			filePath: "/tmp/test-runner.md",
-			completionGuard: true,
-		};
-
-		const serialized = serializeAgent(agent);
-		assert.doesNotMatch(serialized, /completionGuard:/);
-	});
-
-	it("parses completionGuard from discovered agent frontmatter", () => {
-		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-agent-completion-guard-"));
-		tempDirs.push(dir);
-		const agentsDir = path.join(dir, ".pi", "agents");
-		fs.mkdirSync(agentsDir, { recursive: true });
-		fs.writeFileSync(path.join(agentsDir, "test-runner.md"), `---
-name: test-runner
-description: Test runner
-completionGuard: false
----
-
-Validate changes
-`, "utf-8");
-
-		const result = discoverAgents(dir, "project");
-		const runner = result.agents.find((agent) => agent.name === "test-runner");
-		assert.equal(runner?.completionGuard, false);
-		assert.equal(runner?.extraFields?.completionGuard, undefined);
-	});
-});
-
 describe("agent frontmatter maxSubagentDepth", () => {
 	it("serializes maxSubagentDepth into agent frontmatter", () => {
 		const agent: AgentConfig = {
@@ -1514,19 +1528,19 @@ Do work
 			assert.ok(agent);
 			assert.equal(agent.thinking, false);
 
-			const { args } = buildPiArgs({
-				baseArgs: ["-p"],
-				task: "hello",
+			const { session } = buildInProcessChildLaunch({
+				host: "parent",
+				cwd: dir,
 				sessionEnabled: false,
-				model: agent.model,
-				thinking: agent.thinking,
+				model: applyThinkingSuffix(agent.model, agent.thinking),
 				inheritProjectContext: agent.inheritProjectContext,
+				inheritGlobalContext: agent.inheritGlobalContext,
 				inheritSkills: agent.inheritSkills,
+				childAgentName: agent.name,
+				childIndex: 0,
 			});
 
-			assert.ok(args.includes("--model"));
-			assert.ok(args.includes("glm-5.2-short-fast"));
-			assert.ok(!args.some((arg) => arg.includes(":false")));
+			assert.equal(session.model, "glm-5.2-short-fast");
 		}
 	});
 
@@ -1556,25 +1570,8 @@ Do work
 	});
 });
 
-describe("agent frontmatter fallbackModels", () => {
-	it("serializes fallbackModels into agent frontmatter", () => {
-		const agent: AgentConfig = {
-			name: "worker",
-			description: "Worker",
-			systemPrompt: "Do work",
-			systemPromptMode: "replace",
-			inheritProjectContext: false,
-			inheritSkills: false,
-			source: "project",
-			filePath: "/tmp/worker.md",
-			fallbackModels: ["openai/gpt-5-mini", "anthropic/claude-sonnet-4"],
-		};
-
-		const serialized = serializeAgent(agent);
-		assert.match(serialized, /fallbackModels: openai\/gpt-5-mini, anthropic\/claude-sonnet-4/);
-	});
-
-	it("parses fallbackModels from discovered agent frontmatter", () => {
+describe("removed agent frontmatter", () => {
+	it("rejects fallbackModels clearly", () => {
 		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-agent-fallback-frontmatter-"));
 		tempDirs.push(dir);
 		const agentsDir = path.join(dir, ".pi", "agents");
@@ -1589,8 +1586,7 @@ Do work
 `, "utf-8");
 
 		const result = discoverAgents(dir, "project");
-		const worker = result.agents.find((agent) => agent.name === "worker");
-		assert.deepEqual(worker?.fallbackModels, ["openai/gpt-5-mini", "anthropic/claude-sonnet-4"]);
+		assert.match(result.agentDiagnostics?.find((diagnostic) => diagnostic.name === "worker")?.error ?? "", /removed frontmatter field 'fallbackModels'/);
 	});
 });
 
@@ -1768,27 +1764,24 @@ Do work
 		assert.equal(worker?.extraFields?.fast, undefined);
 	});
 
-	it("adds the fast extension only for allowlisted native models", () => {
-		const allowed = buildPiArgs({
-			baseArgs: ["-p"],
-			task: "hello",
+	it("adds the fast extension only for native OpenAI-Codex models", () => {
+		const launch = {
+			host: "parent" as const,
+			cwd: process.cwd(),
 			sessionEnabled: false,
-			model: "openai-codex/gpt-5.6-luna:low",
-			fast: true,
 			inheritProjectContext: false,
+			inheritGlobalContext: false,
 			inheritSkills: false,
-		});
+			childAgentName: "worker",
+			childIndex: 0,
+			fast: true,
+		};
+		const allowed = buildInProcessChildLaunch({ ...launch, model: "openai-codex/gpt-6-sol:low" });
 
-		assert.ok(allowed.args.some((arg) => arg.endsWith("fast-mode-extension.ts")));
-		assert.throws(() => buildPiArgs({
-			baseArgs: ["-p"],
-			task: "hello",
-			sessionEnabled: false,
-			model: "anthropic/claude-sonnet-4",
-			fast: true,
-			inheritProjectContext: false,
-			inheritSkills: false,
-		}), /fast mode supports only/);
+		assert.ok(allowed.toolPlan.runtimeExtensions.some((extensionPath) => extensionPath.endsWith("fast-mode-extension.ts")));
+		assert.deepEqual(allowed.session.hooks.map((hook) => hook.name), ["pi-subagents:prompt-runtime", "pi-subagents:fast-mode"]);
+		assert.throws(() => buildInProcessChildLaunch({ ...launch, model: "anthropic/claude-sonnet-4" }), /fast mode supports only/);
+		assert.throws(() => buildInProcessChildLaunch({ ...launch, model: "openai/gpt-6-sol" }), /fast mode supports only/);
 	});
 });
 
@@ -1865,7 +1858,7 @@ Do work
 		}
 	});
 
-	it("worker and delegate include the child-facing supervisor tool", () => {
+	it("bundled standard agents keep bounded tool allowlists", () => {
 		const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-builtin-supervisor-tool-"));
 		const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-builtin-supervisor-tool-home-"));
 		tempDirs.push(dir);
@@ -1877,11 +1870,33 @@ Do work
 			process.env.HOME = homeDir;
 			process.env.USERPROFILE = homeDir;
 			const agents = discoverAgentsAll(dir).builtin;
-			for (const name of ["worker", "delegate"]) {
+			const expectedTools = {
+				worker: ["read", "grep", "find", "ls", "bash", "edit", "write", "contact_supervisor"],
+				delegate: ["read", "grep", "find", "ls", "bash", "edit", "write", "contact_supervisor"],
+				reviewer: ["read", "grep", "find", "ls", "watchdog_diff", "contact_supervisor"],
+				scout: ["read", "grep", "find", "ls", "bash", "write", "contact_supervisor"],
+				researcher: ["read", "write", "web_search", "fetch_content", "get_search_content", "source_check"],
+				"evidence-auditor": ["read", "web_search", "fetch_content", "get_search_content", "source_check"],
+			};
+			for (const [name, tools] of Object.entries(expectedTools)) {
 				const agent = agents.find((candidate) => candidate.name === name);
 				assert.ok(agent, `${name} builtin should be discovered`);
-				assert.deepEqual(agent?.tools, ["read", "grep", "find", "ls", "bash", "edit", "write", "contact_supervisor"]);
+				assert.deepEqual(agent?.tools, tools);
 			}
+
+			const auditor = agents.find((candidate) => candidate.name === "evidence-auditor");
+			assert.equal(auditor?.inheritProjectContext, true);
+			assert.equal(auditor?.inheritSkills, false);
+
+			const researcherPrompt = agents.find((candidate) => candidate.name === "researcher")?.systemPrompt ?? "";
+			assert.match(researcherPrompt, /search-result summaries as discovery aids, not final evidence/);
+			assert.match(researcherPrompt, /source_check.*decision-critical or disputed claims/);
+			assert.match(researcherPrompt, /direct evidence, source interpretation, and researcher inference distinctly/);
+			assert.match(researcherPrompt, /Record contradictions.*Record missing evidence/);
+			assert.match(researcherPrompt, /Never invent dates, quotations, citations, or unsupported precision/);
+			assert.match(researcherPrompt, /`source_check` must be registered by the loaded provider before launch/);
+			assert.match(researcherPrompt, /If a registered `source_check` call fails, continue/);
+			assert.match(researcherPrompt, /\*\*Support:\*\* direct evidence \| interpretation\. \*\*Confidence:\*\* high \| medium \| low/);
 		} finally {
 			if (previousHome === undefined) delete process.env.HOME;
 			else process.env.HOME = previousHome;

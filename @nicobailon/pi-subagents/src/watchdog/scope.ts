@@ -1,5 +1,3 @@
-export const WATCHDOG_AUTO_FOLLOW_PROMPT_MARKER = Symbol("subagent-watchdog-auto-follow-prompt");
-
 const MAX_SCOPE_ENTRIES = 8;
 const MAX_SCOPE_ENTRY_CHARS = 2_000;
 const MAX_SCOPE_TOTAL_CHARS = 16_000;
@@ -34,7 +32,7 @@ export class WatchdogScopeArtifact {
 		if (!this.entries.length) return "";
 		return [
 			"Current scope:",
-			"The following real user prompts are the current scope record, newest last. Newer prompts supersede and mutate older prompts: they may add, modify, or remove requirements. Flag work that serves no current scope item as category 'scope-drift'.",
+			"The following real user prompts are the current scope record, newest last. Side questions are additive, not scope drift or cancellation of older objectives; only explicit changes supersede requirements. Use watchdog_warn for evidence-backed reminders of forgotten authorized work, not dependencies still pending or explicit holds. The orchestrator owns task tracking. Flag unauthorized work as category 'scope-drift'.",
 			...this.entries.map((entry, index) => [
 				`Scope prompt ${index + 1} (${entry.createdAt}):`,
 				entry.prompt,
@@ -50,13 +48,4 @@ export class WatchdogScopeArtifact {
 			if (removed) total -= removed.prompt.length;
 		}
 	}
-}
-
-export function isWatchdogAutoFollowPromptEvent(event: unknown): boolean {
-	return Boolean(event && typeof event === "object" && (event as { [WATCHDOG_AUTO_FOLLOW_PROMPT_MARKER]?: unknown })[WATCHDOG_AUTO_FOLLOW_PROMPT_MARKER]);
-}
-
-export function markWatchdogAutoFollowPromptEvent<T extends object>(event: T): T {
-	Object.defineProperty(event, WATCHDOG_AUTO_FOLLOW_PROMPT_MARKER, { value: true });
-	return event;
 }

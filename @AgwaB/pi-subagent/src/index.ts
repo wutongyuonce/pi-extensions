@@ -31,6 +31,10 @@ import {
 	startAsyncSubagentRun,
 } from "./orchestrate/async.ts";
 import { interruptRun } from "./orchestrate/interrupt.ts";
+import {
+	formatPruneSubagentRunsSummary,
+	pruneSubagentRuns,
+} from "./orchestrate/prune.ts";
 import { reconcileSubagentRun } from "./orchestrate/reconcile.ts";
 import { resolveRunRef } from "./orchestrate/run-ref.ts";
 import {
@@ -288,9 +292,7 @@ function compactResult(result: ResultEnvelope, error?: string) {
 		sandbox: result.sandbox,
 		workspace: result.workspace,
 		...(result.tmux === undefined ? {} : { tmux: result.tmux }),
-		...(result.completion === undefined
-			? {}
-			: { completion: result.completion }),
+		...(result.completion === undefined ? {} : { completion: result.completion }),
 		metadata: result.metadata,
 		artifacts: artifactSummary(result.artifacts),
 	};
@@ -316,9 +318,7 @@ function subagentCallSummary(input: unknown): string {
 	if (action === "run") {
 		pieces.push(mode);
 		if (Array.isArray(args.tasks))
-			pieces.push(
-				`${args.tasks.length} run${args.tasks.length === 1 ? "" : "s"}`,
-			);
+			pieces.push(`${args.tasks.length} run${args.tasks.length === 1 ? "" : "s"}`);
 		const agent = displayText(args.agent, 24);
 		if (agent) pieces.push(agent);
 		const task = displayText(args.task, 48);
@@ -378,6 +378,42 @@ function optionalPositiveNumber(
 	return value;
 }
 
+function optionalBoolean(
+	value: unknown,
+	fieldName: string,
+): boolean | undefined {
+	if (value === undefined) return undefined;
+	if (typeof value !== "boolean")
+		throw new InputValidationError(
+			`${fieldName} must be a boolean when provided.`,
+		);
+	return value;
+}
+
+function optionalNonNegativeInteger(
+	value: unknown,
+	fieldName: string,
+): number | undefined {
+	if (value === undefined) return undefined;
+	if (typeof value !== "number" || !Number.isInteger(value) || value < 0)
+		throw new InputValidationError(
+			`${fieldName} must be a non-negative integer when provided.`,
+		);
+	return value;
+}
+
+function optionalNonNegativeNumber(
+	value: unknown,
+	fieldName: string,
+): number | undefined {
+	if (value === undefined) return undefined;
+	if (typeof value !== "number" || !Number.isFinite(value) || value < 0)
+		throw new InputValidationError(
+			`${fieldName} must be a non-negative finite number when provided.`,
+		);
+	return value;
+}
+
 async function lifecycleAction(
 	raw: Record<string, unknown>,
 	cwd: string,
@@ -390,10 +426,33 @@ async function lifecycleAction(
 		action !== "wait" &&
 		action !== "interrupt" &&
 		action !== "mark-background" &&
-		action !== "reconcile"
+		action !== "reconcile" &&
+		action !== "prune"
 	) {
 		throw new InputValidationError(
-			'action must be one of "run", "status", "logs", "wait", "interrupt", "mark-background", or "reconcile" when provided.',
+			'action must be one of "run", "status", "logs", "wait", "interrupt", "mark-background", "reconcile", or "prune" when provided.',
+		);
+	}
+
+	if (action === "prune") {
+		const requestedCwd = optionalString(raw.cwd, "cwd");
+		const summary = await pruneSubagentRuns({
+			cwd: requestedCwd === undefined ? cwd : resolve(cwd, requestedCwd),
+			runsDir: optionalString(raw.runsDir, "runsDir"),
+			keep: optionalNonNegativeInteger(raw.keep, "keep"),
+			olderThanDays: optionalNonNegativeNumber(raw.olderThanDays, "olderThanDays"),
+			yes: optionalBoolean(raw.yes, "yes"),
+		});
+		return textResult(
+			{
+				tool: TOOL_NAME,
+				action,
+				status: summary.status,
+				summary,
+				text: formatPruneSubagentRunsSummary(summary),
+			},
+			summary.deleteErrors.length > 0,
+			{ summary },
 		);
 	}
 
@@ -491,8 +550,7 @@ async function lifecycleAction(
 		});
 		const snapshot = await getRunStatus(ref);
 		const isError =
-			interrupted.status === "not-found" ||
-			interrupted.status === "unsupported";
+			interrupted.status === "not-found" || interrupted.status === "unsupported";
 		return textResult(
 			{
 				tool: TOOL_NAME,
@@ -517,8 +575,7 @@ async function lifecycleAction(
 				reconciled,
 				snapshot,
 			},
-			reconciled.status === "not-found" ||
-				reconciled.status === "cleanup-blocked",
+			reconciled.status === "not-found" || reconciled.status === "cleanup-blocked",
 			{ reconciled, snapshot },
 		);
 	}
@@ -526,10 +583,7 @@ async function lifecycleAction(
 	const waited = await waitForRun({
 		...ref,
 		timeoutMs: optionalPositiveNumber(raw.timeoutMs, "timeoutMs"),
-		pollIntervalMs: optionalPositiveNumber(
-			raw.pollIntervalMs,
-			"pollIntervalMs",
-		),
+		pollIntervalMs: optionalPositiveNumber(raw.pollIntervalMs, "pollIntervalMs"),
 	});
 	const isError =
 		waited.status !== "completed" || waited.snapshot?.status !== "completed";
@@ -558,9 +612,7 @@ function unsupportedPathError(
 	backend: ResolvedBackend,
 ): string | undefined {
 	const mode = executionMode(input);
-	const unknownKeys = Object.keys(raw).filter(
-		(key) => !SUPPORTED_KEYS.has(key),
-	);
+	const unknownKeys = Object.keys(raw).filter((key) => !SUPPORTED_KEYS.has(key));
 	if (unknownKeys.length > 0) {
 		return `unsupported subagent option(s): ${formatKeyList(unknownKeys)}.`;
 	}
@@ -642,17 +694,17 @@ interface AgentRequest {
 function agentRequests(input: ResolveInput): AgentRequest[] {
 	if (input.tasks !== undefined) {
 		return input.tasks
-			.filter(
-				(task): task is typeof task & { agent: string } =>
-					typeof task.agent === "string" && task.agent.length > 0,
-			)
 			.map((task) => ({
-				agent: task.agent,
+				agent: task.agent ?? input.agent,
 				cwd: task.cwd,
 				agentScope: task.agentScope ?? input.agentScope,
 				confirmProjectAgents:
 					task.confirmProjectAgents ?? input.confirmProjectAgents ?? false,
-			}));
+			}))
+			.filter(
+				(request): request is typeof request & { agent: string } =>
+					typeof request.agent === "string" && request.agent.length > 0,
+			);
 	}
 	return typeof input.agent === "string" && input.agent.length > 0
 		? [
@@ -673,10 +725,7 @@ async function maybeConfirmProjectAgents(
 ): Promise<void> {
 	const projectAgents: AgentDefinition[] = [];
 	for (const request of agentRequests(input)) {
-		if (
-			request.confirmProjectAgents === false ||
-			request.agentScope === "global"
-		)
+		if (request.confirmProjectAgents === false || request.agentScope === "global")
 			continue;
 		const requestCwd = resolve(cwd, request.cwd ?? ".");
 		const agent = await loadAgentByName(
@@ -686,9 +735,7 @@ async function maybeConfirmProjectAgents(
 		);
 		if (
 			agent?.source === "project" &&
-			!projectAgents.some(
-				(candidate) => candidate.sourcePath === agent.sourcePath,
-			)
+			!projectAgents.some((candidate) => candidate.sourcePath === agent.sourcePath)
 		) {
 			projectAgents.push(agent);
 		}
@@ -759,17 +806,56 @@ function notifyCompletion(
 	return updatesSent;
 }
 
+export function parsePruneCommandArgs(argText: string): {
+	keep?: number;
+	olderThanDays?: number;
+	yes?: boolean;
+} {
+	const tokens = argText.trim().length === 0 ? [] : argText.trim().split(/\s+/u);
+	const options: { keep?: number; olderThanDays?: number; yes?: boolean } = {};
+	for (let index = 0; index < tokens.length; index += 1) {
+		const token = tokens[index];
+		if (token === "--yes" || token === "-y") {
+			options.yes = true;
+			continue;
+		}
+		const [flag, inlineValue] = token.split("=", 2);
+		if (flag === "--keep" || flag === "--older-than") {
+			const rawValue = inlineValue ?? tokens[++index];
+			const value = Number(rawValue);
+			if (rawValue === undefined || !Number.isFinite(value) || value < 0)
+				throw new Error(`${flag} requires a non-negative number`);
+			if (flag === "--keep") {
+				if (!Number.isInteger(value))
+					throw new Error("--keep requires a non-negative integer");
+				options.keep = value;
+			} else options.olderThanDays = value;
+			continue;
+		}
+		throw new Error(
+			`unknown prune option ${token}; usage: /subagent prune [--yes] [--keep N] [--older-than DAYS]`,
+		);
+	}
+	return options;
+}
+
 export default function registerSubagentEngine(pi: ExtensionAPI) {
 	if (typeof pi.registerCommand === "function") {
 		pi.registerCommand("subagent", {
 			description:
-				"Subagent utilities. Use `/subagent panel` to open the live status panel.",
+				"Subagent utilities. `/subagent panel` opens the live status panel; `/subagent prune [--yes] [--keep N] [--older-than DAYS]` deletes old terminal runs (dry run without --yes).",
 			getArgumentCompletions(prefix) {
 				const items = [
 					{
 						value: "panel",
 						label: "panel",
 						description: "Open the live Subagents status panel",
+					},
+					{
+						value: "prune",
+						label: "prune",
+						description:
+							"Delete old terminal runs under the current cwd (dry run without --yes)",
 					},
 				];
 				const filtered = items.filter((item) =>
@@ -779,14 +865,33 @@ export default function registerSubagentEngine(pi: ExtensionAPI) {
 			},
 			async handler(args, ctx) {
 				const commandArgs = args.trim();
-				const normalizedArgs = commandArgs
-					.replace(/^\/?subagent\b\s*/, "")
-					.trim();
-				if (normalizedArgs !== "panel") {
-					ctx.ui.notify?.("Usage: /subagent panel", "warning");
+				const normalizedArgs = commandArgs.replace(/^\/?subagent\b\s*/, "").trim();
+				if (normalizedArgs === "panel") {
+					await showSubagentPanel(ctx);
 					return;
 				}
-				await showSubagentPanel(ctx);
+				if (/^prune(\s|$)/u.test(normalizedArgs)) {
+					try {
+						const options = parsePruneCommandArgs(
+							normalizedArgs.slice("prune".length),
+						);
+						const summary = await pruneSubagentRuns({ ...options, cwd: getCwd(ctx) });
+						ctx.ui.notify?.(
+							formatPruneSubagentRunsSummary(summary),
+							summary.deleteErrors.length > 0 ? "warning" : "info",
+						);
+					} catch (error) {
+						ctx.ui.notify?.(
+							error instanceof Error ? error.message : String(error),
+							"error",
+						);
+					}
+					return;
+				}
+				ctx.ui.notify?.(
+					"Usage: /subagent panel | /subagent prune [--yes] [--keep N] [--older-than DAYS]",
+					"warning",
+				);
 			},
 		});
 	}
@@ -941,13 +1046,34 @@ export default function registerSubagentEngine(pi: ExtensionAPI) {
 						Type.Literal("interrupt"),
 						Type.Literal("mark-background"),
 						Type.Literal("reconcile"),
+						Type.Literal("prune"),
 					],
 					{
 						default: "run",
 						description:
-							'What to do. Default "run" starts a new subagent. status/logs/wait/interrupt/mark-background/reconcile operate on an existing runId.',
+							'What to do. Default "run" starts a new subagent. status/logs/wait/interrupt/mark-background/reconcile operate on an existing runId. prune deletes old terminal runs under cwd (dry run unless yes is true).',
 					},
 				),
+			),
+			keep: Type.Optional(
+				Type.Integer({
+					minimum: 0,
+					description:
+						"prune: newest terminal runs to keep regardless of age (default 50).",
+				}),
+			),
+			olderThanDays: Type.Optional(
+				Type.Number({
+					minimum: 0,
+					description:
+						"prune: only delete terminal runs whose last update is older than this many days.",
+				}),
+			),
+			yes: Type.Optional(
+				Type.Boolean({
+					description:
+						"prune: actually delete. Without it the action only reports what would be deleted.",
+				}),
 			),
 			runId: Type.Optional(Type.String({ minLength: 1 })),
 			attemptId: Type.Optional(Type.String({ minLength: 1 })),
@@ -966,8 +1092,20 @@ export default function registerSubagentEngine(pi: ExtensionAPI) {
 					Type.Literal("SIGKILL"),
 				]),
 			),
-			escalateAfterMs: Type.Optional(Type.Number({ exclusiveMinimum: 0 })),
-			killAfterMs: Type.Optional(Type.Number({ exclusiveMinimum: 0 })),
+			escalateAfterMs: Type.Optional(
+				Type.Number({
+					exclusiveMinimum: 0,
+					description:
+						"interrupt: re-send SIGTERM after this many ms if the run is still active (default 1000).",
+				}),
+			),
+			killAfterMs: Type.Optional(
+				Type.Number({
+					exclusiveMinimum: 0,
+					description:
+						"interrupt: send SIGKILL after this many ms if the run is still active (default 3000).",
+				}),
+			),
 		}),
 		renderCall(args, theme) {
 			const title = theme.fg("toolTitle", theme.bold("subagent"));
@@ -978,8 +1116,7 @@ export default function registerSubagentEngine(pi: ExtensionAPI) {
 			return new SingleLineComponent(`${title} ${theme.fg("muted", rest)}`);
 		},
 		async execute(...executeArgs: unknown[]) {
-			const { params, signal, onUpdate, ctx } =
-				normalizeExecuteArgs(executeArgs);
+			const { params, signal, onUpdate, ctx } = normalizeExecuteArgs(executeArgs);
 			const cwd = getCwd(ctx);
 
 			try {
@@ -993,6 +1130,16 @@ export default function registerSubagentEngine(pi: ExtensionAPI) {
 				const parentSessionId = parentSessionIdFromCtx(ctx);
 				if (parentSessionId !== undefined)
 					validation.input.parentSessionId = parentSessionId;
+
+				// The effective cwd is the extension context's cwd, not the host
+				// process cwd. Pin it on the input before backend resolution so a
+				// foreign context cwd routes away from inline here, in prepared
+				// execution, and in the durable payload alike.
+				if (
+					validation.input.cwd === undefined &&
+					resolve(cwd) !== resolve(process.cwd())
+				)
+					validation.input.cwd = cwd;
 
 				const resolved = resolveBackend(validation.input);
 				if (resolved.status === "failed") return validationFailure(resolved);
@@ -1050,11 +1197,7 @@ export default function registerSubagentEngine(pi: ExtensionAPI) {
 						{
 							tool: TOOL_NAME,
 							mode: "parallel",
-							status: failed
-								? "failed"
-								: asyncRequested
-									? "running"
-									: "completed",
+							status: failed ? "failed" : asyncRequested ? "running" : "completed",
 							runIds: parallel.runIds,
 							concurrencyLimit: parallel.concurrency,
 							totalTasks: parallel.totalTasks,
@@ -1091,11 +1234,10 @@ export default function registerSubagentEngine(pi: ExtensionAPI) {
 					cwd: runCwd,
 					signal,
 				});
-				return textResult(
-					compactResult(result),
-					result.status !== "completed",
-					{ result, resolved },
-				);
+				return textResult(compactResult(result), result.status !== "completed", {
+					result,
+					resolved,
+				});
 			} catch (error) {
 				const message = error instanceof Error ? error.message : String(error);
 				const failureKind =
@@ -1104,8 +1246,7 @@ export default function registerSubagentEngine(pi: ExtensionAPI) {
 						? error.failureKind
 						: typeof error === "object" &&
 								error !== null &&
-								(error as { failureKind?: unknown }).failureKind ===
-									"validation"
+								(error as { failureKind?: unknown }).failureKind === "validation"
 							? "validation"
 							: "internal";
 				return textResult(

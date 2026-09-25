@@ -1,0 +1,20 @@
+{
+	"provenance": {
+		"runner": "spellcheck",
+		"tool": "typos",
+		"version": "1.49.0",
+		"command": "typos --format json notes.md",
+		"argv": [
+			"--format",
+			"json",
+			"notes.md"
+		],
+		"workspace": "tests/fixtures/tool-smoke/typos-aux",
+		"platform": "win32-x64",
+		"capturedAt": "2026-08-21"
+	},
+	"file": "notes.md",
+	"exitCode": 2,
+	"stdout": "{\"type\":\"typo\",\"path\":\"notes.md\",\"line_num\":3,\"byte_offset\":3,\"typo\":\"recieve\",\"corrections\":[\"receive\"]}\n{\"type\":\"typo\",\"path\":\"notes.md\",\"line_num\":3,\"byte_offset\":27,\"typo\":\"proccess\",\"corrections\":[\"process\"]}\n{\"type\":\"typo\",\"path\":\"notes.md\",\"line_num\":3,\"byte_offset\":50,\"typo\":\"responce\",\"corrections\":[\"response\"]}\n{\"type\":\"typo\",\"path\":\"notes.md\",\"line_num\":4,\"byte_offset\":5,\"typo\":\"sentance\",\"corrections\":[\"sentence\"]}\n{\"type\":\"typo\",\"path\":\"notes.md\",\"line_num\":4,\"byte_offset\":56,\"typo\":\"somthing\",\"corrections\":[\"something\"]}\n",
+	"stderr": ""
+}

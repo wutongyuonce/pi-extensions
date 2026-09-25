@@ -4,6 +4,8 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
+import { HOST_PEER_ALIASES, resolveHostPeerAliases } from "../../src/runs/background/runner-aliases.ts";
+import { resolveInstalledPiPackageRoot } from "../../src/runs/shared/pi-spawn.ts";
 import { resolveCompileFromPackageRoot, validateStructuredOutputValue } from "../../src/runs/shared/structured-output.ts";
 import type { JsonSchemaObject } from "../../src/shared/types.ts";
 
@@ -59,11 +61,12 @@ function resolveRelativeImport(fromFile: string, specifier: string): string | un
 	return candidates.find((candidate) => fs.existsSync(candidate) && fs.statSync(candidate).isFile());
 }
 
-test("detached async runner's runtime import graph never reaches a host peer package (issues #334, #526)", () => {
+test("every host peer package the detached async runner imports is aliased to the installed pi package (issues #334, #526)", () => {
 	const entryPoint = path.join(projectRoot, "src", "runs", "background", "subagent-runner.ts");
 	const visited = new Set<string>([entryPoint]);
 	const queue: string[] = [entryPoint];
 	const violations: string[] = [];
+	const aliased = new Set(HOST_PEER_ALIASES.map((entry) => entry.specifier));
 
 	while (queue.length > 0) {
 		const file = queue.shift()!;
@@ -71,7 +74,7 @@ test("detached async runner's runtime import graph never reaches a host peer pac
 		for (const specifier of extractStaticImportSpecifiers(source)) {
 			const hostPeerMatch = matchingHostPeerPackage(specifier);
 			if (hostPeerMatch) {
-				violations.push(`${path.relative(projectRoot, file)} has a runtime import of '${specifier}' (host peer package '${hostPeerMatch}')`);
+				if (!aliased.has(specifier)) violations.push(`${path.relative(projectRoot, file)} imports '${specifier}' (host peer package '${hostPeerMatch}'), which has no runner alias`);
 				continue;
 			}
 			if (!specifier.startsWith(".")) continue;
@@ -86,8 +89,39 @@ test("detached async runner's runtime import graph never reaches a host peer pac
 		}
 	}
 
-	assert.equal(violations.length, 0, `runtime import graph reached host peer package(s):\n${violations.join("\n")}`);
+	assert.equal(violations.length, 0, `runtime import graph reaches host peer package(s) the runner does not alias:\n${violations.join("\n")}`);
 	assert.ok(visited.size > 20, `expected a non-trivial reachable file set (a broken resolver could undercount it), got ${visited.size}`);
+	const packageRoot = resolveInstalledPiPackageRoot();
+	assert.ok(packageRoot, "expected the pi package (or its test shim) to be resolvable");
+	const resolved = resolveHostPeerAliases(packageRoot);
+	assert.deepEqual(resolved.missing, []);
+	for (const specifier of aliased) assert.ok(fs.existsSync(resolved.aliases[specifier]!), `alias target for ${specifier} exists`);
+});
+
+test("resolves pi-agent-core/node to its exact package export instead of appending to the root alias", () => {
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-agent-core-node-alias-"));
+	const packageDir = path.join(root, "node_modules", "@earendil-works", "pi-agent-core");
+	const distDir = path.join(packageDir, "dist");
+	try {
+		fs.mkdirSync(distDir, { recursive: true });
+		fs.writeFileSync(path.join(packageDir, "package.json"), JSON.stringify({
+			name: "@earendil-works/pi-agent-core",
+			version: "0.85.1-test",
+			exports: {
+				".": "./dist/index.js",
+				"./node": "./dist/node.js",
+			},
+		}), "utf-8");
+		fs.writeFileSync(path.join(distDir, "index.js"), "export {};\n", "utf-8");
+		fs.writeFileSync(path.join(distDir, "node.js"), "export {};\n", "utf-8");
+
+		const resolved = resolveHostPeerAliases(root);
+		assert.equal(resolved.aliases["@earendil-works/pi-agent-core"], fs.realpathSync(path.join(distDir, "index.js")));
+		assert.equal(resolved.aliases["@earendil-works/pi-agent-core/node"], fs.realpathSync(path.join(distDir, "node.js")));
+		assert.notEqual(resolved.aliases["@earendil-works/pi-agent-core/node"], path.join(distDir, "index.js", "node"));
+	} finally {
+		fs.rmSync(root, { recursive: true, force: true });
+	}
 });
 
 function writeFakeTypeboxPackage(typeboxDir: string): void {
@@ -154,4 +188,54 @@ test("validateStructuredOutputValue validates values against a JSON Schema", asy
 	const invalid = await validateStructuredOutputValue(schema, {});
 	assert.equal(invalid.status, "invalid");
 	assert.ok(invalid.status === "invalid" && invalid.message.length > 0);
+});
+
+test("chord is omitted before 0.85, but required host-first on chord-era and unknown hosts (#2026)", () => {
+	const root = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-chord-alias-"));
+	const host = path.join(root, "host");
+	const extension = path.join(root, "extension");
+	const chord = "@earendil-works/chord";
+	function writePackage(dir: string, name: string, version: string, exports: Record<string, string>) {
+		fs.mkdirSync(dir, { recursive: true });
+		fs.writeFileSync(path.join(dir, "package.json"), JSON.stringify({ name, version, exports }));
+		for (const target of Object.values(exports)) fs.writeFileSync(path.join(dir, target), "export {};\n");
+	}
+	const hostChord = path.join(host, "node_modules", chord);
+	try {
+		const packages = new Map<string, Record<string, string>>();
+		for (const { pkg, subpath } of HOST_PEER_ALIASES) {
+			const exports = packages.get(pkg) ?? {};
+			exports[subpath] = `./${subpath.replaceAll("/", "-")}.mjs`;
+			packages.set(pkg, exports);
+		}
+		for (const [pkg, exports] of packages) {
+			writePackage(pkg === "@earendil-works/pi-coding-agent" ? host : path.join(host, "node_modules", pkg), pkg, "0.84.3", exports);
+		}
+		const hostExports = packages.get("@earendil-works/pi-coding-agent")!;
+		const preChord = resolveHostPeerAliases(host);
+		assert.deepEqual(preChord.missing, []);
+		assert.equal(preChord.aliases[chord], undefined);
+		assert.equal(preChord.aliases[`${chord}/context`], undefined);
+		// An extension-local copy must never satisfy a missing host chord export.
+		writePackage(path.join(extension, "node_modules", chord), chord, "0.85.1", { ".": "./index.mjs", "./context": "./context.mjs" });
+		for (const version of ["0.85.0", "0.85.1", "1.0.0", "0.84.4-test", "unknown"]) {
+			writePackage(host, "@earendil-works/pi-coding-agent", version, hostExports);
+			const result = resolveHostPeerAliases(host);
+			for (const specifier of [chord, `${chord}/context`]) assert.ok(result.missing.includes(specifier), version);
+		}
+		writePackage(host, "@earendil-works/pi-coding-agent", "0.85.1", hostExports);
+		writePackage(hostChord, chord, "0.85.1", { ".": "./index.mjs", "./context": "./context.mjs" });
+		let result = resolveHostPeerAliases(host);
+		assert.deepEqual(result.missing, []);
+		assert.equal(result.aliases[chord], fs.realpathSync(path.join(hostChord, "index.mjs")));
+		assert.equal(result.aliases[`${chord}/context`], fs.realpathSync(path.join(hostChord, "context.mjs")));
+		fs.unlinkSync(path.join(hostChord, "context.mjs"));
+		assert.deepEqual(resolveHostPeerAliases(host).missing, [`${chord}/context`]);
+		writePackage(host, "@earendil-works/pi-coding-agent", "0.84.3", hostExports);
+		fs.rmSync(path.join(host, "node_modules", "@earendil-works/pi-tui"), { recursive: true });
+		result = resolveHostPeerAliases(host);
+		assert.deepEqual(result.missing, ["@earendil-works/pi-tui"], "pre-chord hosts still require TUI");
+	} finally {
+		fs.rmSync(root, { recursive: true, force: true });
+	}
 });

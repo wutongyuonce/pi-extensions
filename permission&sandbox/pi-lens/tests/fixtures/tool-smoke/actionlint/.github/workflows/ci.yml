@@ -1,0 +1,15 @@
+name: ci
+on: push
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "${{ github.event.issue.title }}"
+      - uses: actions/checkout@v4
+        with:
+          bogus-input: true
+  broken:
+    runs-on: ubuntu-latest
+    if: ${{ nonexistent.func() }}
+    steps:
+      - run: echo ok

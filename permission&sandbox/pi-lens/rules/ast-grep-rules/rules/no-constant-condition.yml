@@ -1,0 +1,18 @@
+id: no-constant-condition
+language: TypeScript
+message: "Unexpected constant condition"
+severity: error
+note: |
+  A literal `true`/`false` as an if-test or ternary condition is almost always a
+  leftover debug toggle or a typo — the branch is either dead or always taken.
+
+  BAD:  if (true) { ... }      false ? a : b
+  GOOD: if (flag) { ... }      cond ? a : b
+
+  Idiomatic infinite loops (`while (true)`) are intentionally not flagged.
+rule:
+  any:
+    - pattern: "if (true) $$$"
+    - pattern: "if (false) $$$"
+    - pattern: "true ? $A : $B"
+    - pattern: "false ? $A : $B"

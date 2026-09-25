@@ -1,8 +1,11 @@
 import { existsSync, readFileSync } from "node:fs";
 import { activityMonitor } from "./activity.ts";
+import { normalizeDomain } from "./domain-filter-normalization.ts";
 import { hasCredentialSource, redactCredential, resolveCredential } from "./credential-source.ts";
 import type { ExtractedContent, ExtractOptions } from "./extract.ts";
 import type { SearchOptions, SearchResponse } from "./perplexity.ts";
+import { formatSearchResultsAsAnswer } from "./search-answer-formatting.ts";
+import { normalizeSearchResultCount } from "./search-result-count-normalization.ts";
 import { getWebSearchConfigPath } from "./utils.ts";
 
 const QUERIT_SEARCH_URL = "https://api.querit.ai/v1/search";
@@ -123,26 +126,6 @@ function requestSignal(signal: AbortSignal | undefined, timeoutMs: number): Abor
 	return signal ? AbortSignal.any([signal, timeout]) : timeout;
 }
 
-function normalizeNumResults(value: number | undefined): number {
-	if (typeof value !== "number" || !Number.isFinite(value)) return 5;
-	return Math.max(1, Math.min(Math.floor(value), 20));
-}
-
-function normalizeDomain(value: string): string | null {
-	let input = value.trim().toLowerCase();
-	if (!input) return null;
-	if (input.startsWith("-")) input = input.slice(1).trim();
-	if (!input) return null;
-	try {
-		const parsed = input.includes("://") ? new URL(input) : new URL(`https://${input}`);
-		input = parsed.hostname;
-	} catch {
-		input = input.split("/")[0]?.split(":")[0] ?? "";
-	}
-	input = input.replace(/^\.+|\.+$/g, "");
-	return /^[a-z0-9][a-z0-9.-]*\.[a-z]{2,}$/i.test(input) ? input : null;
-}
-
 function mapDomainFilter(domainFilter: string[] | undefined): { include: string[]; exclude: string[] } {
 	const include: string[] = [];
 	const exclude: string[] = [];
@@ -176,7 +159,7 @@ function buildSearchBody(query: string, options: QueritSearchOptions): Record<st
 	if (date) filters.timeRange = { date };
 	return {
 		query,
-		count: normalizeNumResults(options.numResults),
+		count: normalizeSearchResultCount(options.numResults),
 		...(Object.keys(filters).length > 0 ? { filters } : {}),
 	};
 }
@@ -273,13 +256,6 @@ function mapSearchResults(data: QueritSearchResponse): SearchResponse["results"]
 	});
 }
 
-function buildAnswer(results: SearchResponse["results"]): string {
-	return results.map((result) => {
-		if (result.snippet) return `${result.snippet}\nSource: ${result.title} (${result.url})`;
-		return `Source: ${result.title} (${result.url})`;
-	}).join("\n\n");
-}
-
 function mapContentResult(result: QueritContentResult | undefined, requestedUrl: string): ExtractedContent | null {
 	if (!result || typeof result.content !== "string" || result.content.trim().length === 0) return null;
 	const metadata = result.extrasMeta;
@@ -365,7 +341,7 @@ export async function searchWithQuerit(
 		);
 		assertApiSuccess("Search", data);
 		const results = mapSearchResults(data);
-		const response: SearchResponse = { answer: buildAnswer(results), results };
+		const response: SearchResponse = { answer: formatSearchResultsAsAnswer(results), results };
 		if (options.includeContent && results.length > 0) {
 			const inlineContent = await fetchInlineContent(results.map((result) => result.url), apiKey, options.signal);
 			if (inlineContent.length > 0) response.inlineContent = inlineContent;

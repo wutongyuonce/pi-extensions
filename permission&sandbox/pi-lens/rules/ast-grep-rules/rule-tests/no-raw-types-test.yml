@@ -1,0 +1,30 @@
+id: no-raw-types
+valid:
+  - 'List<String> names = new ArrayList<String>();'
+  - 'Map<String, Integer> counts = new HashMap<>();'
+  # PR #2212 review F3: neither context has a valid parameterized form.
+  # `o instanceof List<String>` and `List<String>.class` are compile errors,
+  # so a finding here can never be acted on.
+  - |
+    class Probe {
+      void check(Object o) {
+        if (o instanceof List) { }
+      }
+    }
+  - |
+    class Probe {
+      Class<?> token() {
+        return List.class;
+      }
+    }
+  # The qualifier chain of a parameterized qualified type stays silent.
+  - 'java.util.List<String> queue = null;'
+  - 'Map.Entry<String, Integer> entry = null;'
+invalid:
+  - 'List names = new ArrayList();'
+  - 'Optional value = Optional.empty();'
+  # PR #2212 review F4: a raw type nested in a type argument. The pre-fix rule
+  # excluded it, because `not: inside: {kind: generic_type, stopBy: end}`
+  # walked every ancestor and found the enclosing `Map<...>`.
+  - 'Map<String, List> nested = null;'
+  - 'java.util.List raw = null;'

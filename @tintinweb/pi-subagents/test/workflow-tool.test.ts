@@ -1398,6 +1398,27 @@ describe("collisions with another extension", () => {
     expect(warnings(context).some(m => /other-ext/.test(m))).toBe(true);
   });
 
+  it("withdraws its tool when another extension provides a lowercase `workflow` tool", async () => {
+    // #283: `@quintinshaw/pi-dynamic-workflows` — the second orchestrator most
+    // likely to be installed alongside this one — registers its tool as
+    // lowercase `workflow`. The match is exact, so the name has to be listed by
+    // hand; without it neither orchestrator stands down and the model is
+    // offered both, with no warning that it happened.
+    const booted = bootAuto();
+    booted.pi.getAllTools.mockReturnValue([
+      foreign("workflow", "pi-dynamic-workflows"),
+      foreign("workflow_control", "pi-dynamic-workflows"),
+    ]);
+    const context = uiContext();
+
+    await booted.lifecycle.get("session_start")?.({}, context);
+
+    expect(booted.pi.getActiveTools()).not.toContain("SubagentWorkflow");
+    expect(booted.pi.getActiveTools()).toContain("Agent");
+    expect(warnings(context).some(m => /already provides a "workflow" tool/.test(m))).toBe(true);
+    expect(warnings(context).some(m => /pi-dynamic-workflows/.test(m))).toBe(true);
+  });
+
   it("names the setting that keeps both", async () => {
     const booted = bootAuto();
     booted.pi.getAllTools.mockReturnValue([foreign("Workflow")]);

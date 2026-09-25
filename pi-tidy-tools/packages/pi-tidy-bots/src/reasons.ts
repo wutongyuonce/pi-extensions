@@ -6,6 +6,7 @@ export type Reason =
   | "turn_in_flight"
   | "runtime_offline"
   | "delivery_timeout"
+  | "rpc_prompt_timeout"
   | "context_overflow"
   | "provider_quota_limit"
   | "provider_rate_limit"
@@ -29,6 +30,9 @@ const RULES: [Reason, string[]][] = [
   ],
   ["runtime_offline", ["offline", "not running", "closed", "exited", "dead"]],
   ["turn_in_flight", ["already processing"]],
+  // Issue 149: prompt-class timeout = UNKNOWN (accepted-and-running is
+  // possible under the accept-ack contract) — never a plain failure.
+  ["rpc_prompt_timeout", ["rpc_prompt_timeout"]],
 ];
 
 /** Failures where one retry can actually help. Everything else fails fast. */
@@ -47,6 +51,23 @@ export function classifyFailure(message: string): Reason {
     }
   }
   return "delivery_failed";
+}
+
+/**
+ * Issue 79: pi compact refusals are terminal no-ops, not delivery failures.
+ * classifyFailure("Already compacted") still falls through to delivery_failed
+ * — that misclass is what retried at every settled boundary (118+ spam).
+ * Compact paths MUST consult this first.
+ */
+export type CompactRefusal = "already_compacted" | "nothing_to_compact";
+
+export function classifyCompactRefusal(
+  message: string
+): CompactRefusal | undefined {
+  const lowered = message.toLowerCase();
+  if (lowered.includes("already compacted")) return "already_compacted";
+  if (lowered.includes("nothing to compact")) return "nothing_to_compact";
+  return undefined;
 }
 
 export function isRetryable(reason: string): boolean {

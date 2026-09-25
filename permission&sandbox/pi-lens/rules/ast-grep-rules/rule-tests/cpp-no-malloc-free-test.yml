@@ -1,0 +1,25 @@
+id: cpp-no-malloc-free
+valid:
+  - |
+    std::unique_ptr<int[]> make_buffer(int count) {
+        return std::make_unique<int[]>(count);
+    }
+invalid:
+  - |
+    int* make_buffer(int count) {
+        int* buf = static_cast<int*>(malloc(sizeof(int) * count));
+        return buf;
+    }
+  - |
+    void release(int* buf) {
+        free(buf);
+    }
+  - |
+    int* make_buffer(int count) {
+        int* buf = static_cast<int*>(std::malloc(sizeof(int) * count));
+        return buf;
+    }
+  - |
+    void release(int* buf) {
+        ::free(buf);
+    }

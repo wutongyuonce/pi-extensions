@@ -1,0 +1,6 @@
+[workspace]
+members = [
+    "crates/kept",
+    # "crates/commented-out",
+]
+resolver = "2"

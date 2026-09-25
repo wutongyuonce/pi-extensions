@@ -41,7 +41,18 @@ function readPromptFiles(cwd: string): string[] {
 			continue;
 		}
 		for (const entry of entries) {
-			if (entry.isFile() && entry.name.endsWith(".md")) files.push(path.join(dir, entry.name));
+			if (!entry.name.endsWith(".md")) continue;
+			const filePath = path.join(dir, entry.name);
+			let isFile = entry.isFile();
+			if (entry.isSymbolicLink()) {
+				try {
+					isFile = fs.statSync(filePath).isFile();
+				} catch (error) {
+					if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+					isFile = false;
+				}
+			}
+			if (isFile) files.push(filePath);
 		}
 	}
 	return files;

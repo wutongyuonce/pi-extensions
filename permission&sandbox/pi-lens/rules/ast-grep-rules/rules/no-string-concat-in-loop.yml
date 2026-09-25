@@ -1,0 +1,90 @@
+id: no-string-concat-in-loop
+language: java
+severity: warning
+message: Use StringBuilder instead of string concatenation in loops.
+note: Ported from VTCode (https://github.com/vinhnx/VTCode), refs #2195. Loop allocation and readability context make this detection-only. The accumulator must be a String, established either by a direct string-literal operand or by the declaration that binds the same name in scope.
+rule:
+  all:
+    # An accumulating assignment: `s += x` or `s = s + x`.
+    - any:
+        - pattern: $VAR += $EXPR
+        - pattern: $VAR = $VAR + $EXPR
+    # ... inside a loop body.
+    - any:
+        - inside:
+            kind: for_statement
+            stopBy: end
+        - inside:
+            kind: enhanced_for_statement
+            stopBy: end
+        - inside:
+            kind: while_statement
+            stopBy: end
+        - inside:
+            kind: do_statement
+            stopBy: end
+    # ... where the accumulator is a String. Without this arm the rule fires on
+    # `total += counts.get("label")`, because a `stopBy: end` search for a
+    # string_literal accepts one anywhere in the subtree, including inside a
+    # call argument. Each branch below binds String-ness to $VAR itself.
+    - any:
+        # The right-hand side is, or directly contains, a string literal. The
+        # inner `has` carries no `stopBy`, so it only inspects direct operands
+        # of the `+` and never descends into a call's arguments.
+        - has:
+            field: right
+            any:
+              - kind: string_literal
+              - all:
+                  - kind: binary_expression
+                  - has:
+                      kind: string_literal
+        # $VAR is declared String in the enclosing method or constructor,
+        # either as a local or as a parameter. $VAR is the same metavariable
+        # the pattern above bound, so the names must match.
+        - inside:
+            stopBy: end
+            any:
+              - kind: method_declaration
+              - kind: constructor_declaration
+            has:
+              stopBy: end
+              any:
+                - all:
+                    - kind: local_variable_declaration
+                    - has:
+                        field: type
+                        regex: ^String$
+                    - has:
+                        kind: variable_declarator
+                        has:
+                          field: name
+                          pattern: $VAR
+                - all:
+                    - kind: formal_parameter
+                    - has:
+                        field: type
+                        regex: ^String$
+                    - has:
+                        field: name
+                        pattern: $VAR
+        # $VAR is a String field of the enclosing class.
+        - inside:
+            stopBy: end
+            kind: class_body
+            has:
+              stopBy: end
+              all:
+                - kind: field_declaration
+                - has:
+                    field: type
+                    regex: ^String$
+                - has:
+                    kind: variable_declarator
+                    has:
+                      field: name
+                      pattern: $VAR
+files:
+  - "**/*.java"
+ignores:
+  - "**/test/**"

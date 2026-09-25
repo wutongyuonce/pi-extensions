@@ -1,0 +1,709 @@
+import * as os from "node:os";
+import { defineConfig } from "vitest/config";
+import {
+	formatTestWorkerBudget,
+	resolveTestWorkerBudget,
+} from "./scripts/lib/worker-budget.mjs";
+
+// Applies to globalSetup as well as workers: ordinary tests never install tools.
+process.env.PI_LENS_DISABLE_TOOL_INSTALL ??= "1";
+process.env.PI_LENS_TMP_HYGIENE_RUN_ID ??= `${Date.now()}-${process.pid}`;
+
+// Background coding agents get worktrees under .claude/worktrees/ — vitest's
+// default exclude covers node_modules/.git/dist but NOT those, so a "full
+// suite" run in the main tree silently swept every agent's IN-PROGRESS
+// worktree tests too (seen 2026-07-11: 40+ phantom failures, all from
+// half-finished branches in sibling worktrees).
+const sharedExclude = [
+	"**/node_modules/**",
+	"**/dist/**",
+	"**/.{git,cache,output,temp}/**",
+	// Stryker keeps in-place backups and sandboxes under the project (#2758).
+	"**/.stryker-tmp/**",
+	"**/.stryker/**",
+	"**/.claude/**",
+	// Fixture projects carry *.test.ts files that belong to the FIXTURE's own
+	// toolchain (e.g. the native-TS7/Vitest fixture the live integration suite
+	// copies out and type-checks) — they are inputs, not repo tests, and fail
+	// when collected here (#1412 PR #1433 CI).
+	"tests/fixtures/**",
+	// The live suite's copied-out temp projects (gitignored, cleaned in
+	// afterAll, but a mid-run collection race must not pick them up).
+	"tests/native-ts7-live-*/**",
+];
+
+// The two slow real-process files `npm run test:integration` runs on their own.
+// `npm run test:unit` is the complement, and the switch has to live here: every
+// project below sets its own `exclude`, which REPLACES the root/CLI value
+// outright, so a `vitest run --exclude <file>` on the command line is silently
+// ignored (it was, from #1101 until 2026-08-06). npm exports the script name it
+// is running, and that survives the with-test-lock wrapper identically on every
+// OS — unlike an inline `FOO=1 …` prefix, which cmd.exe cannot parse.
+// `test:integration` names these same two files positionally in package.json
+// (a positional filter DOES survive) — keep the two lists in step.
+const integrationInclude = [
+	"tests/clients/lsp/integration.test.ts",
+	"tests/index-integration.test.ts",
+];
+const unitOnlyExclude =
+	process.env.npm_lifecycle_event === "test:unit" ? integrationInclude : [];
+
+/**
+ * The run-level setup arms. EXPORTED (#3104 review F2) so
+ * tests/support/tests-tree-write-guard.test.ts can assert membership: every
+ * arm here is a guard whose absence is silent — delete a row and the guard's
+ * own unit tests stay green while the guard stops running for the whole suite.
+ */
+export const sharedGlobalSetup = [
+	"./tests/support/check-build-freshness.ts",
+	"./tests/support/prewarm-grammars.ts",
+	// After check-build-freshness: the seed analyze runs the in-place build.
+	"./tests/support/prewarm-tool-home.ts",
+	"./tests/support/git-config-guard-setup.ts",
+	// Last: every earlier step (the in-place build, the grammar prewarm, the
+	// tool-home seed) has finished, so the baseline this guard snapshots is the
+	// tree the test files will actually walk (#3082).
+	"./tests/support/tests-tree-write-guard-setup.ts",
+];
+
+const sharedSetupFiles = ["./tests/support/vitest-setup.ts"];
+
+// Fork concurrency and per-fork heap ceiling both come from ONE resolver
+// (scripts/lib/worker-budget.mjs), which sizes them against the host's
+// real memory. Before #2042 they were two constants tuned on a 32-core / 68 GB
+// dev host and applied verbatim to CI, where `maxWorkers` fell back to
+// vitest's `availableParallelism() - 1` and bounded worker COUNT while per-fork
+// peak RSS — the axis that actually grows, and native rather than V8 heap — was
+// bounded by nothing. That is how the Unit-tests job got SIGKILLed (exit 137)
+// with no failing assertion. Local runs keep the measured 2026-07-29 posture
+// (8 forks ≈ 40s / 9-11 GB peak RSS; 6 forks ≈ 44s / 8 GB); memory-constrained
+// local runs still use PI_LENS_TEST_MAX_WORKERS=6.
+const testHost = {
+	totalMemMb: Math.round(os.totalmem() / (1024 * 1024)),
+	cpus: os.availableParallelism?.() ?? os.cpus().length,
+	ci: Boolean(process.env.CI),
+	workerOverride: Number(process.env.PI_LENS_TEST_MAX_WORKERS) || undefined,
+	heapOverride: Number(process.env.PI_LENS_TEST_WORKER_HEAP_MB) || undefined,
+};
+const testBudget = resolveTestWorkerBudget(testHost);
+if (testHost.ci) {
+	// One line naming the host and the decision. Without it an exit 137 says
+	// nothing about what the run was allowed to use.
+	console.log(formatTestWorkerBudget(testHost, testBudget));
+}
+
+const sharedMaxWorkers = testBudget.maxWorkers;
+
+// Worker heap headroom (#2042 note first: this ceiling is now DERIVED from the
+// host by the budget resolver above, not the flat 4096 that the paragraph below
+// describes — on a 68 GB dev host it still resolves to 4096, so the reasoning
+// stands unchanged there; on a small CI runner it shrinks, and a fork that
+// blows the smaller ceiling dies with Node's own heap-limit report naming the
+// FILE, which is a far better failure than the OS killing the whole run).
+//
+// The full suite occasionally died with a "Worker
+// exited unexpectedly" + a `node::GetNodeReport` dump. That report is emitted
+// by Node's OWN fatal-error handler (V8 heap-limit reached) — an external OS
+// OOM-kill SIGKILLs with no dump — so the crash is a single long-lived worker
+// hitting its own V8 heap ceiling, not system memory exhaustion (32-core /
+// 68 GB host). With `isolate: true` (vitest's default) each worker's module
+// registry is reset per file, so the native addons (the many tree-sitter
+// grammars + @ast-grep/napi) are re-loaded and re-compiled file after file.
+// CORRECTION (#2042, measured 2026-08-25): this paragraph used to say those
+// buffers "accumulate in the reused worker". They do not — Vitest 4's forks
+// pool with `isolate: true` spawns a FRESH child process per test file (20
+// files at `maxWorkers: 1` produced 20 distinct pids), so a fork's peak is its
+// own file's peak and nothing carries over. The cost is per-file, not
+// cumulative; it is simply large for the tail (p99 1405 MB, max 2267 MB).
+// `execArgv` passes --max-old-space-size to every spawned worker.
+// Tune via PI_LENS_TEST_WORKER_HEAP_MB. NOTE: Vitest 4
+// flattened the config — `execArgv` is a direct `test` field (the v3
+// `poolOptions.forks.execArgv` nesting no longer exists and is silently
+// ignored).
+const sharedExecArgv = [`--max-old-space-size=${testBudget.heapMb}`];
+
+// Tier 1 fix (#902): these files all transitively drive real tree-sitter
+// grammar parses (via clients/review-graph/builder.js or the project-diagnostics
+// scanner), and `isolate: true` (required — see above, and removing it
+// reintroduces the V8 heap-ceiling crash) means each test FILE gets a fresh
+// module registry, so the native grammar addons get re-loaded/re-compiled
+// per file rather than once per worker. Grammar prewarm
+// (tests/support/prewarm-grammars.ts) only pre-fetches the wasm BYTES to
+// disk — it does nothing to stop several of these files re-compiling their
+// grammars concurrently once spread across forks under the default
+// `maxWorkers: "50%"`. That contention was intermittently blowing past the
+// fork teardown deadline ("Timeout terminating forks worker") even though
+// every test in the file had already passed. Carving this glob into its own
+// project with a small capped `maxWorkers` bounds how many of these heavy
+// files compile grammars at once, without reducing parallelism for the rest
+// of the suite (which keeps its existing `maxWorkers: "50%"` in the
+// "default" project below).
+const grammarHeavyInclude = [
+	"tests/clients/module-report-call-graph.test.ts",
+	"tests/clients/project-diagnostics/scanner.test.ts",
+	"tests/clients/review-graph/extract-symbols.test.ts",
+	"tests/clients/review-graph/rebuild-cost.test.ts",
+	"tests/clients/review-graph/shared-extraction-ir.test.ts",
+	"tests/clients/review-graph/tsconfig-paths.test.ts",
+	// #1089: these two co-load most of the grammar set (incl. the heavy
+	// swift/cpp/kotlin/csharp four) for the call-graph fixture matrices —
+	// the exact #255/#902 contention shape this project exists to bound.
+	"tests/clients/tree-sitter-call-graph.test.ts",
+	// #2074: builds several synthetic TypeScript projects end-to-end through the
+	// review-graph extractor. Measured peak RSS 1,417 MB — the same class as its
+	// review-graph siblings above (1,394-1,396 MB) — and the CI unit job was
+	// killed at exit 137 the first time this file ran as a default-project
+	// co-resident.
+];
+
+// Tier 2 fix (#902): event-loop *occupancy* guards (measureMaxSyncBlockMs —
+// see tests/support/perf-harness.ts) measure the longest synchronous stretch
+// the code under test holds the loop, via an independent setImmediate
+// sampler. That sampler is a real event-loop citizen: it only gets scheduled
+// when the OS actually gives this process a turn. Under the "default"
+// project's `maxWorkers: "50%"` — dozens of sibling forks doing grammar
+// compiles, `ast-grep`/biome child-process spawns, and LSP server smoke
+// tests all competing for cores — the sampler itself can be descheduled for
+// a while, which the guard cannot tell apart from the code under test
+// actually blocking. That's a scheduling-jitter false positive, not the
+// regression the guard exists to catch (confirmed 2026-07-31: both files
+// pass cleanly and repeatedly run solo; they only fail mid-"default"-project
+// full-suite runs, alongside grammar/CLI-heavy sibling files). Widening the
+// ms threshold can't absorb this without also hiding the real ~800ms+
+// non-yielding-walk regression the tests guard against (#188/#191/#192) —
+// so, same fix shape as the grammar-heavy project above: reduce how much
+// sibling-fork noise coincides with the *measurement window* itself, not
+// how tolerant the measurement is. A capped, phased-last project means by
+// the time these run, the default project's fork storm (and grammar-heavy's
+// smaller one) has already fully drained, so the sampler only ever
+// contends with (at most) one other file in this group.
+const timingSensitiveInclude = [
+	// Real node child-process barrier race for #2173; process scheduling makes
+	// this unsuitable for the default fork storm.
+	"tests/clients/cascade-graph-occupancy.test.ts",
+	"tests/clients/cooperative-budget.test.ts",
+	"tests/clients/instance-registry-lock.test.ts",
+	"tests/clients/instance-registry-race.test.ts",
+	"tests/clients/loop-block-stall-discrimination.test.ts",
+	// Workspace-edit planning also uses the independent occupancy sampler; keep
+	// its measurement window out of the default fork storm while the guard still
+	// catches a genuinely non-yielding planner. #1081 additionally showed the
+	// sampler gap alone could not tell a descheduled worker apart from a real
+	// block, so the test now asserts a CPU-time budget as well — but CPU time is
+	// NOT contention-proof here either: on Windows this payload is ~400
+	// realpathSync.native calls (clients/path-utils.ts normalizeFilePath) whose
+	// SYSTEM time is charged to this process and does inflate under load. Both
+	// numbers therefore need this project's quiet measurement window.
+	// Same measureMaxSyncBlockMs sampler + same contention-starvation flake
+	// (observed 2026-07-31: cold buildOrUpdateGraph blew the 300ms budget at
+	// ~82s under a full-suite fork storm, exhausting its retry:2). Its
+	// existing retry isn't enough on its own; phasing it here removes the
+	// sibling-fork noise the sampler was actually measuring.
+	"tests/clients/lsp/edits.test.ts",
+	// 2026-08-12 (#1230): the remaining measureMaxSyncBlockMs users. The list
+	// above had drifted — these files run the SAME independent setImmediate
+	// sampler under the SAME default-project fork storm, so they carry the same
+	// scheduling-jitter false-positive risk and belong in the same quiet phase;
+	// they were simply never added. tests/config/timing-sensitive-coverage.test.ts
+	// now derives the expected membership from the sampler import itself and
+	// fails if a new sampler test lands outside this list (or an entry here goes
+	// stale), so the drift cannot silently recur. Each entry below was verified
+	// to import measureMaxSyncBlockMs from tests/support/perf-harness.ts:
+	//   - lens-diagnostics-occupancy: diagnostics-run loop occupancy.
+	//   - workspace-diagnostics-occupancy: workspace-wide diagnostics fan-out.
+	//   - pipeline-snapshot-occupancy: snapshot assembly walks.
+	//   (performance-report-occupancy sat here until #2886 round 2; its
+	//   occupancy row is a real-clock sampler assertion, so it now runs in
+	//   the fully serialized wall-clock-budget lane instead, beside its
+	//   deterministic yield-count row.)
+	//   - word-index-async-build: the async word-index build's yield behaviour.
+	//   - ruby-drive-dirs: not named "-occupancy", but runs two sampler-based
+	//     fail-then-pass screens over the Ruby drive-dir walk (#902 pattern).
+	//   - review-graph-superseded-persist: holds a worker generation in a 400ms
+	//     test-only suspension window while admitting its replacement. Two #1318
+	//     CI flakes under the default fork storm showed that deterministic
+	//     admission alone (#1329) does not make that window contention-proof.
+	"tests/clients/lsp/ruby-drive-dirs.test.ts",
+	"tests/clients/lsp/workspace-diagnostics-occupancy.test.ts",
+	"tests/clients/pipeline-snapshot-occupancy.test.ts",
+	"tests/clients/review-graph-retention.test.ts",
+	"tests/clients/review-graph-superseded-persist.test.ts",
+	"tests/clients/source-filter-async.test.ts",
+	"tests/clients/source-walk-occupancy.test.ts",
+	"tests/clients/source-walker-io-occupancy.test.ts",
+	"tests/clients/word-index-async-build.test.ts",
+	"tests/clients/word-index-cooperative-occupancy.test.ts",
+	// #1137: the shared walk engine's directory-read occupancy screen. Same
+	// sampler, and its fail-then-pass pair injects a busy-wait stall, so it
+	// must not compete with a fork storm for CPU turns.
+	"tests/clients/word-index-persist-occupancy.test.ts",
+	// #1980: blocks the real event loop twice (a parked-thread futex wait, then
+	// a busy spin of the same length) and asserts the two classify differently
+	// on the CPU axis, reading process.cpuUsage through getEventLoopStats.
+	// Under the default fork storm a busy spin gets descheduled and burns less
+	// CPU than the wall time it held, which would make the compute case read as
+	// a stall — contention, not a regression, so the cure is a quiet host, not
+	// a looser assertion. timing-sensitive-coverage.test.ts derives this
+	// membership from the process.cpuUsage marker and fails if it is absent.
+	//
+	// Read the `maxWorkers: 2` note below together with this entry. That note
+	// rests the cap on the remaining members' own measurements; this file is a NEW one — three
+	// cases that busy-spin a core for ~4.8s in total, which is exactly the
+	// shape that starved a sibling's sampler at cap 2 before. Measured rather
+	// than assumed when this landed: the full lane ran clean 4/4 at cap 2 with
+	// this file in it (19 files, 118 tests, ~49s). If a sampler-based sibling
+	// starts flaking here, this file is the first suspect and the cap is the
+	// first lever.
+	"tests/tools/lens-diagnostics-occupancy.test.ts",
+];
+
+// #1022 fix: the "workspace LSP winner" case in this file spawns a REAL
+// ast-grep LSP child process and waits on its `initialize` handshake plus
+// its first-document diagnostics — both bounded by ast-grep's own
+// deliberately-generous initializeTimeoutMs (~15s, see clients/lsp/server.ts)
+// because the first scan of a session compiles the full rule set (~350
+// files incl. the CodeRabbit catalog). `client.waitForDiagnostics`
+// (clients/lsp/client.ts) resolves SILENTLY on timeout rather than throwing,
+// so under the "default" project's `maxWorkers: "50%"` fork storm — dozens
+// of sibling forks doing grammar compiles and their own process spawns —
+// CPU contention can starve this real spawn past its budget, and that
+// starvation surfaces not as a timeout but as a false "diagnostic not
+// found" assertion failure (confirmed via 2026-08-01 repro: solo run green
+// every time, full-suite run intermittently red on exactly this case).
+// Same fix shape as grammar-heavy/timing-sensitive above: phase this file
+// into its own low-concurrency, last-running project so its real-LSP-spawn
+// budget window never has to compete with the rest of the suite's fork
+// storm for CPU turns. This removes the CONTENTION rather than just
+// widening the timeout (see the companion budget-alignment fix in the test
+// file itself, which corrects the timeout values to match ast-grep's own
+// declared budget instead of a shorter invented constant — belt-and-braces,
+// not a substitute for phasing).
+// Membership is enforced, not conventional (#2344): tests/config/
+// lsp-spawn-heavy-coverage.test.ts derives candidates from the real spawn
+// seams (a bare `launchLSP(` call, a `getServerById(` registry spawn, or an
+// import of the fake-LSP fixture) and fails when a spawning test lands
+// outside this list without a documented exemption — or a member here
+// silently goes stale.
+const lspSpawnHeavyInclude = [
+	"tests/clients/ast-grep-rule-precedence-followups.test.ts",
+	"tests/clients/dispatch/runners/lsp-real-runner.test.ts",
+	// #3405: its last describe spawns two real fake-server children through
+	// `spawnFakeLspServer` and waits on a real initialize handshake before
+	// asserting which notifications reached the server — the same #1022/#2332
+	// contention class as its lane siblings.
+	"tests/clients/lsp/did-save-notification.test.ts",
+	"tests/clients/lsp/fake-lsp-server-parent-watchdog.test.ts",
+	"tests/clients/lsp/integration.test.ts",
+	"tests/clients/lsp/workspace-diagnostics-language-neutral.test.ts",
+	// #2776: the real fake-server wire is the only way to reproduce the
+	// custom-primary handler verdict after pull diagnostics are ignored and a
+	// server-authored diagnostic is pushed; keep that handshake in this lane.
+	// #2344: npm test leaves this real-child integration suite in the default
+	// project unless it is explicitly phased here. `test:integration` still
+	// selects the same file positionally, while `test:unit` excludes it below.
+	"tests/clients/lsp/workspace-diagnostics-sweep-attribution.integration.test.ts",
+	"tests/support/fake-lsp-server.test.ts",
+	// #873/#448: the dispatch LSP runner against a real stdio JSON-RPC server
+	// — a real child spawn through the production LSPService plus a
+	// `.pi-lens/lsp.json` custom server, waiting on real first-document
+	// diagnostics. Same #1022/#2332 contention class as its lane siblings.
+	// #2436: spawns a real fake-lsp-server.mjs child (through a parent shim
+	// process) and asserts it self-terminates within a 2s ceiling after the
+	// shim is SIGKILLed — a process-death-timing budget across two nested
+	// spawns, same #1022/#2332 contention class as its lane siblings.
+	// #2436 review round 2: pins spawnFakeLspServer's onTestFinished backstop
+	// by spawning a real fixture child via the shared helper and asserting,
+	// in a later test, that it died within a 2s ceiling with no explicit
+	// kill — same process-death-timing budget and contention class as the
+	// watchdog test above.
+	"tests/tools/lsp-diagnostics-2776.test.ts",
+	// #3310: launches the fake server THROUGH the production `PHPServer` entry
+	// (an executable node_modules/.bin/intelephense shim) and waits on a real
+	// initialize handshake plus a two-publish diagnostics sequence per case —
+	// the same #1022/#2332 contention class as its lane siblings.
+	"tests/tools/lsp-diagnostics-empty-first-publish-3310.test.ts",
+];
+
+// Real pi RPC sessions execute the built extension and a real host tool. Keep
+// this admission outside the default fork storm: each scenario has a 60 s
+// wall budget, and a child owns its fixture project unless the test supplied
+// one (`withRealPi({ project })`, #2154) — the two-live-sessions case, where
+// two children deliberately share one project root and one PI_LENS_HOME and
+// the TEST owns the tree's lifetime.
+export const realHarnessInclude = [
+	"tests/real-harness/fixture-shape.test.ts",
+	"tests/real-harness/scenario-1.test.ts",
+	"tests/real-harness/scenario-3.test.ts",
+	"tests/real-harness/negative.test.ts",
+	"tests/real-harness/child-exit.test.ts",
+	"tests/real-harness/tools-enabled.test.ts",
+	"tests/real-harness/diagnostic-provenance.test.ts",
+];
+
+// #1920: files that assert REAL wall-clock elapsed-time budgets (Date.now()
+// deltas around awaited work, or a self-reported span whose window contains
+// deschedulable real work). Unlike the timing-sensitive list above, these do
+// not use the occupancy sampler — the timing-sensitive project's charter
+// deliberately excludes plain wall-clock budgets (see
+// tests/config/timing-sensitive-coverage.test.ts) — but they fail the same
+// way under the default project's fork storm: the budget ends up measuring
+// scheduler contention, not code speed (startup-overhead measured 659–2321ms
+// against a 500ms budget under load, green solo every time). Same cure, one
+// phase later: fully serial, dead last, so each budget window gets a quiet
+// host. Sweep coverage for other members lives in this list; new entries must
+// carry a wall-clock budget assertion, not just slowness.
+export const wallClockBudgetInclude = [
+	"tests/clients/biome-config-decorator-metadata.test.ts",
+	"tests/clients/build-identity.test.ts",
+	"tests/clients/cascade-turn-merge.test.ts",
+	"tests/clients/config-diagnostic-codes.test.ts",
+	"tests/clients/dispatch/runners/ast-grep-playground-verify.test.ts",
+	"tests/clients/dispatch/runners/ast-grep-rule-ignores.test.ts",
+	"tests/clients/git-tracked-ignore.test.ts",
+	// #2557 review round 3: a real 30s deadline margin is the subject of an abort-vs-deadline precedence assertion (flake-shape admission).
+	"tests/clients/hook-await-fold-bounds.test.ts",
+	"tests/clients/installer/pip-pep668.test.ts",
+	"tests/clients/installer/posix-group-kill.test.ts",
+	"tests/clients/installer/verify-binary-semantics.test.ts",
+	// #2507: a real headless child whose own exit decision is the subject — it
+	// must not drain mid `lsp_diagnostics`, and must still exit by itself
+	// afterwards. Real child spawn (flake-shape admission), and it also spawns a
+	// real LSP child inside itself, so it wants the same quiet, serialized phase
+	// its lsp-spawn-heavy siblings get.
+	"tests/clients/lsp/headless-tool-call-keepalive.test.ts",
+	// #2042/#3091 F2: a real, live direct child is the only pid whose /proc PPid
+	// is this process, so the Linux ownership arm of the kill-by-pid predicate
+	// cannot be observed through any double (flake-shape admission).
+	"tests/clients/lsp/kill-process-tree-real-child.test.ts",
+	// #2703 review r1: the push-wait settle guard drains one real setImmediate tick so Node can deliver `unhandledRejection` (flake-shape admission).
+	"tests/clients/lsp/push-wait-settle-rejection.test.ts",
+	// #2765 round 3: fake timers exercise the live hook remainder after delayed
+	// pre-snapshot work; keep the admission beside the timer-based regression.
+	"tests/clients/lsp/service-inconclusive-per-server.test.ts",
+	// #2358: the flat-server discriminator asserts the real outstanding wedge
+	// window. Keep child-process CPU sampling and this wall-clock lower bound in
+	// the fully serialized, dead-last phase.
+	"tests/clients/lsp/service-notify-cpu-liveness.test.ts",
+	"tests/clients/metrics-history-stderr.test.ts",
+	// #2886 round 2: the /lens-perf occupancy row keeps its real-clock
+	// sampler assertion (a yield count is O(input) and cannot see per-chunk
+	// block growth), so the file runs here, fully serialized (flake-shape
+	// admission).
+	"tests/clients/performance-report-occupancy.test.ts",
+	"tests/clients/persistent-reverify.test.ts",
+	"tests/clients/pipeline-lsp-sync.test.ts",
+	"tests/clients/project-data-dir-slug.test.ts",
+	"tests/clients/read-expansion-enrichment.test.ts",
+	// #2622: adjacent read-guard stars previously produced exponential regex
+	// backtracking against a long non-matching path; the test measures the real
+	// synchronous matcher cost and belongs in the quiet serialized phase.
+	"tests/clients/read-guard-glob-nonbacktracking.test.ts",
+	"tests/clients/runtime-session-scan-cache.test.ts",
+	// #2528: the bounded batch helper tests race a real wall-clock budget against settle latency (flake-shape admission).
+	"tests/clients/runtime-turn-test-runner-bounds.test.ts",
+	"tests/clients/safe-spawn-ambient-signal.test.ts",
+	"tests/clients/safe-spawn-failure-taxonomy.test.ts",
+	"tests/clients/safe-spawn-input.test.ts",
+	"tests/clients/safe-spawn-resource-usage.test.ts",
+	"tests/clients/safe-spawn-timeout-teardown.test.ts",
+	"tests/clients/safe-spawn-windows-command.test.ts",
+	// #3403: real scratch-tree rotation performs cold-disk filesystem work;
+	// measured p95 is 3.63s under six workers and eight CPU hogs, so the 10s
+	// assertion/budget leaves bounded CI scheduling headroom.
+	"tests/clients/sgconfig-scratch-bound.test.ts",
+	"tests/clients/shared-checkout-guard.test.ts",
+	"tests/clients/startup-overhead.test.ts",
+	// #2603 (was #2591 review round 2, F1): the workspace-member matcher's
+	// budget asserts a real elapsed-time bound through detectPythonEnvironment;
+	// the defect it pins is wall-clock (2^N regex backtracking on an interleaved
+	// `**` chain), so a fake clock measures nothing.
+	"tests/clients/workspace-glob-nonbacktracking-budget.test.ts",
+	"tests/config/gitignore-tracked-shadow.test.ts",
+	// #3244: the advisory floor must observe the real oxlint --print-config and
+	// counter process; an in-process double would only restate the expected rule map.
+	"tests/config/oxlint-advisory-rule-floor-gate.test.ts",
+	// #2697: the strictness ratchet spawns two real tsc processes and waits for
+	// their wall-clock completion; keep its 120s budget in the quiet phase.
+	"tests/config/strictness-ratchet.test.ts",
+	"tests/config/tracked-control-bytes.test.ts",
+	"tests/mcp/session-end.smoke.test.ts",
+	// published-manifest guard runs the real `npm pack` (flake-shape admission).
+	"tests/packaging-pack-manifest.test.ts",
+	// #2807 review F1/F4: the checker must be exercised through its real local
+	// CLI and a real shallow clone, not an in-process substitute.
+	"tests/scripts/check-pr-body.test.ts",
+	// #2668 review F2: two real `node --import <fetch-stub>` child-process
+	// spawns of scripts/classify-ci-failure.mjs, asserting exit code and argv
+	// wiring the library-level suite (in-process) cannot see.
+	"tests/scripts/classify-ci-failure-cli.test.ts",
+	"tests/scripts/git-fixture-env.test.ts",
+	// #2699: the subject is the guard's own stdin/exit-code/stderr contract --
+	// what Claude Code actually invokes for a PreToolUse hook. No in-process
+	// call to the exported classify functions can see a drift in that
+	// contract (flake-shape admission).
+	"tests/scripts/guard-bash-hook.test.ts",
+	// #2698: real `git init`/`add`/`commit`/`ls-files` calls against a
+	// throwaway fixture repo — gitignore/tracked-vs-untracked resolution is
+	// the exact mechanism under test, which no mock reproduces faithfully.
+	// No wall-clock budget assertion (a handful of `git` calls on a
+	// two-file fixture has none worth pinning); membership here is solely
+	// to satisfy flake-shape-ratchet.test.ts's real-process-spawn admission
+	// gate, which requires it for any newly admitted real spawn regardless
+	// of this list's own "carries a budget assertion" charter above.
+	"tests/scripts/knip-sibling-purge.test.ts",
+	// #2700: the gating/advisory subset test resolves oxlint's real
+	// --print-config for both npm scripts (real child process, flake-shape
+	// admission).
+	"tests/scripts/lint-js.test.ts",
+	"tests/scripts/lockfile-completeness.test.ts",
+	// #2613 review S2/T3: the drift-notifier CLI's --dry-run env-reading and
+	// report-building wiring is the subject; no in-process double is faithful.
+	"tests/scripts/notify-install-smoke-drift.test.ts",
+	// #2723: mirrors notify-install-smoke-drift.test.ts's own admission --
+	// this second, independent drift-notifier CLI's --dry-run env-reading and
+	// real (stubbed) `gh` wiring are the subject; no in-process double is
+	// faithful to the real subcommands it invokes.
+	"tests/scripts/notify-tool-smoke-red.test.ts",
+	// #2613 review S3a: the retry wrapper's real exit code and distinct
+	// `::error::infra:` label on exhaustion are the subject under test.
+	"tests/scripts/npm-retry.test.ts",
+	"tests/scripts/prune-agent-worktrees.test.ts",
+	// #2619 review F1: the release-QA hermeticity canary spawns a REAL child
+	// under scratchEnv() and reads back what that child resolved. The defect it
+	// pins is a child inheriting the ambient environment, which an in-process
+	// assertion on the env object cannot see (it passed while npm() ignored the
+	// env entirely).
+	"tests/scripts/release-qa.test.ts",
+	// #2613: the resolver CLI's real exit code (2 vs. 4) and GITHUB_OUTPUT
+	// write are the subject under test; no in-process double is faithful.
+	"tests/scripts/resolve-newest-in-range-host.test.ts",
+	// #2369: the fixture-ordering defect lives in the CLI's own module-load
+	// order; only a real child process is the script under test.
+	"tests/scripts/smoke-tools-lsp-fixture-registration.test.ts",
+	// #3322: the Sonar gate CLI's exit codes and rendered stdout/stderr are the
+	// process-boundary contract; keep its real child out of the fork storm.
+	"tests/scripts/sonar-master-gate.test.ts",
+	// #2586 review F1: proves the ACTUAL stdout bytes supply-host-provided-deps.mjs
+	// prints (real child process, flake-shape admission).
+	"tests/scripts/supply-host-provided-deps.test.ts",
+	// #2628: the warm-loader's install-log home resolution spawns a real child
+	// under a fully pinned env; the child's own os.homedir() fallback decides
+	// where the record lands and is unobservable in-process (flake-shape
+	// admission).
+	"tests/scripts/warm-loader-cache.test.ts",
+	// #2042 2026-09-15: the sample-tail wiring is proven by spawning the real
+	// wrapper (its own real setInterval sampling loop cannot be faked from the
+	// test process) and, in one case, killing the wrapper's real process mid-run
+	// -- the exact "wrapper is the kill's victim" shape the diagnosis found on
+	// master 1701d01. A poll loop (real setTimeout) waits for the file's first
+	// write rather than a fixed sleep (flake-shape admission).
+	"tests/scripts/with-memory-watch.test.ts",
+	"tests/support/fault-injection.test.ts",
+	"tests/support/git-config-guard.test.ts",
+	"tests/support/git-fixture-env.test.ts",
+	// #3179: the guard's #3179 fix's one real, cross-process reproduction. A
+	// separately spawned process races node's own recursive-watch readdirSync
+	// against a directory removal — the same race PR #3178 hit in CI — which
+	// no in-process stand-in can occupy the other side of (flake-shape
+	// admission).
+	"tests/support/tests-tree-write-guard-race.test.ts",
+	// #3082: the tests-tree write guard's one real-watcher case. A recursive
+	// `fs.watch` delivers on the kernel's schedule, so the case retries the
+	// create/remove and polls the guard's own report (real setTimeout, bounded)
+	// rather than sleeping a guessed settle time (flake-shape admission).
+	"tests/support/tests-tree-write-guard.test.ts",
+];
+
+// #2912: the tmp-fixture governance sweep compares the real process-wide
+// namespace before and after one file. Run it after every other project drains
+// so another worker cannot be mistaken for this file's owner.
+export const tmpFixtureHygieneInclude = [
+	"tests/config/tmp-fixture-hygiene.test.ts",
+];
+// #2512 round 2: runtime-turn-session.test.ts's "retires a deleted failed
+// target through the real client and records real telemetry" spawns a REAL
+// child process, and was seen timing out at vitest's 5000ms default under a
+// 47-file parallel batch (5153/5013ms) — but it asserts no elapsed-time
+// budget at all, only that the spawn completes and its telemetry lands. That
+// fails this list's own charter (above: "carry a wall-clock budget assertion,
+// not just slowness"), so it does not belong here. An explicit per-test
+// timeout (20_000ms, 4× the observed 5013ms worst case) absorbs the same
+// contention without pulling 49 unrelated synthetic/mocked tests in the same
+// file into the serialized, dead-last phase — see the timeout at that test's
+// call site in runtime-turn-session.test.ts.
+
+export default defineConfig({
+	test: {
+		exclude: sharedExclude,
+		// Root-config-only in Vitest 4 (see the grammar-heavy project's comment
+		// below) — applies to every project's fork teardown, not just the
+		// grammar-heavy one, which is strictly more forgiving everywhere else.
+		teardownTimeout: 30_000,
+		projects: [
+			{
+				test: {
+					name: "default",
+					exclude: [
+						...sharedExclude,
+						...unitOnlyExclude,
+						...realHarnessInclude,
+						...grammarHeavyInclude,
+						...timingSensitiveInclude,
+						...lspSpawnHeavyInclude,
+						...wallClockBudgetInclude,
+						...tmpFixtureHygieneInclude,
+					],
+					globalSetup: sharedGlobalSetup,
+					setupFiles: sharedSetupFiles,
+					maxWorkers: sharedMaxWorkers,
+					execArgv: sharedExecArgv,
+					// Vitest 4 requires distinct groupOrder whenever projects have
+					// different `maxWorkers` — see the "grammar-heavy" project below
+					// for why that's actually desirable here, not just a workaround.
+					sequence: { groupOrder: 0 },
+				},
+			},
+			{
+				test: {
+					name: "grammar-heavy",
+					include: grammarHeavyInclude,
+					exclude: sharedExclude,
+					globalSetup: sharedGlobalSetup,
+					setupFiles: sharedSetupFiles,
+					execArgv: sharedExecArgv,
+					// Cap, don't serialize: bounds concurrent grammar re-compiles to
+					// 2-at-a-time instead of whatever `maxWorkers: "50%"` would give
+					// them (the root cause above), without going fully sequential.
+					// NOTE: Vitest 4 removed `poolOptions.forks.maxForks` — pool
+					// concurrency knobs were unified into the top-level
+					// `maxWorkers` (applies to whichever pool is active; this repo
+					// uses the default `forks` pool everywhere).
+					// #2042: 2 locally, but derived on CI — these files carry the
+					// suite's largest native footprints (measured 3345 MB and 3853 MB
+					// peak RSS), so two at once is a bigger bite than a small runner
+					// has to give.
+					maxWorkers: testBudget.heavyMaxWorkers,
+					// Distinct groupOrder is required whenever projects have
+					// different `maxWorkers` (Vitest 4 throws otherwise). Side
+					// effect: scheduling groups run as sequential PHASES (group 0
+					// fully drains, then group 1 starts) rather than interleaved —
+					// a feature here, not a cost: it guarantees these 4
+					// grammar-heavy files never share fork-scheduling time with the
+					// rest of the suite, so they can never race a batch of OTHER
+					// files' concurrent grammar compiles either.
+					sequence: { groupOrder: 1 },
+					// Supplement, not a substitute for the maxForks cap above: give
+					// fork teardown more headroom in case a heavy grammar compile is
+					// still finishing when a test file's hooks wrap up.
+					// NOTE: Vitest 4's per-project `ProjectConfig` type excludes
+					// `teardownTimeout` (it moved to root-config-only), so the 30s
+					// bump lives on the top-level `test` block below instead —
+					// applies to both projects, which only makes the default
+					// project's teardown MORE forgiving, never less.
+					hookTimeout: 60_000,
+				},
+			},
+			{
+				test: {
+					name: "timing-sensitive",
+					include: timingSensitiveInclude,
+					exclude: sharedExclude,
+					globalSetup: sharedGlobalSetup,
+					setupFiles: sharedSetupFiles,
+					execArgv: sharedExecArgv,
+					// At most two at a time so the event-loop-occupancy sampler in each
+					// (measureMaxSyncBlockMs, see perf-harness.ts) contends with at most
+					// one sibling fork for CPU turns while it's mid-measurement, not the
+					// full-suite fork storm. This lane briefly ran at 1 while
+					// word-index-per-edit lived here: that file rebuilt a 401-document
+					// index (~1.2s, retry: 2) and at cap 2 starved
+					// performance-report-occupancy's sampler on a loaded runner (107ms
+					// against a 75ms budget, 3/3 retries). #2254 converted that guard to
+					// a load-invariant clock-read count and moved it out of this lane;
+					// #2886 round 2 moved performance-report-occupancy's re-admitted
+					// sampler row to the fully serialized wall-clock-budget lane, so
+					// the cap rests on the remaining members' own measurements (see
+					// the lens-diagnostics-occupancy note at this list's tail).
+					maxWorkers: 2,
+					// Its own phase, after both "default" and "grammar-heavy" drain
+					// (required anyway once maxWorkers differs from "default" — see
+					// the grammar-heavy project above). By running last and alone,
+					// these occupancy guards get a (near-)quiet host for their
+					// measurement window instead of racing the full-suite fork storm
+					// that was intermittently starving their sampler and tripping the
+					// budget on ambient scheduling delay, not a real regression.
+					sequence: { groupOrder: 2 },
+					hookTimeout: 60_000,
+				},
+			},
+			{
+				test: {
+					name: "lsp-spawn-heavy",
+					include: lspSpawnHeavyInclude,
+					exclude: [...sharedExclude, ...unitOnlyExclude],
+					globalSetup: sharedGlobalSetup,
+					setupFiles: sharedSetupFiles,
+					execArgv: sharedExecArgv,
+					// Full serialization, not just a cap: five files, but the point
+					// is to guarantee zero overlap with the "default" project's
+					// fork storm (the actual contention source, see #1022/#2332
+					// above), not to bound intra-project concurrency.
+					maxWorkers: 1,
+					// Last phase: by the time this runs, "default", "grammar-heavy",
+					// and "timing-sensitive" have all fully drained, so the real
+					// ast-grep LSP spawn's initialize/diagnostics budget window gets
+					// a quiet host instead of racing the rest of the suite.
+					sequence: { groupOrder: 3 },
+					// Real LSP process spawn + rule-set compile can legitimately use
+					// most of its declared ~15s budget twice over (initialize, then
+					// first-document diagnostics) before shutdown; give teardown the
+					// same headroom as the other heavy projects.
+					hookTimeout: 60_000,
+				},
+			},
+			{
+				test: {
+					name: "real-harness",
+					include: realHarnessInclude,
+					exclude: sharedExclude,
+					globalSetup: sharedGlobalSetup,
+					setupFiles: sharedSetupFiles,
+					execArgv: sharedExecArgv,
+					maxWorkers: 1,
+					sequence: { groupOrder: 5 },
+					hookTimeout: 60_000,
+				},
+			},
+			{
+				test: {
+					name: "wall-clock-budget",
+					include: wallClockBudgetInclude,
+					exclude: sharedExclude,
+					globalSetup: sharedGlobalSetup,
+					setupFiles: sharedSetupFiles,
+					execArgv: sharedExecArgv,
+					// Fully serialized (#1920): these files' budgets measure real
+					// elapsed time around awaited work, so even ONE concurrent
+					// sibling can inflate them. One at a time, after every other
+					// project has drained.
+					maxWorkers: 1,
+					sequence: { groupOrder: 4 },
+					hookTimeout: 60_000,
+				},
+			},
+			{
+				test: {
+					name: "tmp-fixture-hygiene",
+					include: tmpFixtureHygieneInclude,
+					exclude: sharedExclude,
+					globalSetup: sharedGlobalSetup,
+					setupFiles: sharedSetupFiles,
+					execArgv: sharedExecArgv,
+					maxWorkers: 1,
+					sequence: { groupOrder: 6 },
+					hookTimeout: 60_000,
+				},
+			},
+		],
+	},
+});

@@ -1,0 +1,28 @@
+# Kotlin No unsafe cast
+# Detects the unsafe `as` cast (as opposed to the safe `as?` cast).
+# Ported from vinhnx/VTCode rules/kotlin/no-unsafe-cast.yml (#2198, refs #2195).
+id: kotlin-no-unsafe-cast
+language: kotlin
+severity: warning
+message: "Unsafe cast (as) throws ClassCastException on a mismatch; consider as?"
+note: |
+  `as` throws ClassCastException immediately when the value isn't the target
+  type. `as?` returns null instead, which is usually safer when the caller
+  can handle a missing value.
+  Detection-only: `as?` changes a thrown failure into a silent null, which
+  is a real behavior change a caller must handle explicitly. Whether the
+  unsafe throw is actually the intended contract (a precondition the caller
+  already established) is a call this rule cannot make.
+rule:
+  pattern: $VALUE as $TYPE
+files:
+  - "**/*.kt"
+tags:
+  - kotlin
+  - idiom
+  - null-safety
+examples:
+  bad: |
+    val name = value as String
+  good: |
+    val name = value as? String ?: return

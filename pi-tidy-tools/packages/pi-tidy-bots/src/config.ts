@@ -1,7 +1,7 @@
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
-import { parse } from "smol-toml";
+import { parse, stringify } from "smol-toml";
 
 export interface BotRoutine {
   name: string;
@@ -12,11 +12,37 @@ export interface BotRoutine {
 export interface BotConfig {
   name: string;
   dir: string;
+  /** Registered, pinned plugin identity; interpreted only in gateway mode. */
+  backend?: string;
+  backendConfig?: Record<string, unknown>;
   model?: string;
   thinking?: string;
+  /** Role label (legacy identity), kept for back-compat disclosure. */
   title?: string;
+  /** Issue 62: recommendation-shaped disclosure, skills-style. Optional; falls back to title. */
+  description?: string;
   avatar: string;
   routes?: string[];
+  /** Issue 92: bot-scoped pi packages — installed project-local and loaded
+   * via project trust at spawn. Omitted/invalid = current behavior. */
+  packages?: string[];
+  /** Issue 132: image provider override (fleet [image_provider] default). */
+  imageProvider?: string;
+  /** Per-bot extra pi extensions loaded after the fleet's own (absolute or
+   * fleet-dir-relative paths). Composes with noExtensions: explicit -e flags
+   * still load. */
+  extensions?: string[];
+  /** Tool allowlist passed to pi as --tools (exact registered tool names,
+   * across built-in, extension, and custom tools). Omitted = no allowlist. */
+  tools?: string[];
+  /** Pass --no-builtin-tools: built-ins (bash/read/edit/...) off; extension
+   * and custom tools stay unless also excluded via `tools`. */
+  noBuiltinTools?: boolean;
+  /** Pass --no-extensions: no extension/package discovery — inherited
+   * global integrations stay out; the fleet's own -e flags still load. */
+  noExtensions?: boolean;
+  /** Pass --no-skills: no skill discovery for this bot. */
+  noSkills?: boolean;
   approve: boolean;
   routines: BotRoutine[];
 }
@@ -26,9 +52,118 @@ export interface FleetConfig {
   port: number;
   host: string;
   bots: BotConfig[];
+  gateway?: {
+    registry: string;
+    environment: string[];
+    policy: {
+      workspace: "none" | "read" | "read-write";
+      nativeProfile: boolean;
+      network: boolean;
+      gatewayTools: string[];
+    };
+  };
+  /**
+   * Issue 43 amendment: fallback summarizer model ("provider/id") used when
+   * the context exceeds the SESSION model's window — the summary is prose;
+   * any compliant model can write it. Optional; sane default applied by the
+   * daemon.
+   */
+  compactFallbackModel?: string;
+  /** Issue 80: consecutive empty-success turns before the roster flags the
+   * bot degraded (health probes/wedge detection). Default 2. */
+  emptyTurnAlertAfter?: number;
+  /** Issue 132: default image provider id for the generate_image tool. */
+  imageProvider?: string;
 }
 
 export class ConfigError extends Error {}
+
+/**
+ * Convert a legacy bot-only manifest by retaining every parsed value and
+ * adding only the explicitly selected gateway bindings. This is a pure
+ * preparation step; it does not enable or start a backend.
+ */
+export function convertLegacyManifest(
+  source: string,
+  options: {
+    registry: string;
+    backend: string | Record<string, string>;
+    environment?: string[];
+    workspaceAccess?: "none" | "read" | "read-write";
+    nativeProfile?: boolean;
+    network?: boolean;
+    gatewayTools?: string[];
+  }
+): string {
+  let doc: Record<string, unknown>;
+  try {
+    doc = parse(source) as Record<string, unknown>;
+  } catch (error) {
+    throw new ConfigError(
+      `legacy manifest parse error: ${(error as Error).message}`
+    );
+  }
+  if (doc.gateway !== undefined)
+    throw new ConfigError("manifest is already in gateway mode");
+  if (!Array.isArray(doc.bot) || doc.bot.length === 0)
+    throw new ConfigError("legacy manifest must contain [[bot]] entries");
+  if (typeof options.registry !== "string" || !options.registry.trim())
+    throw new ConfigError("migration registry is required");
+  const names = new Set<string>();
+  for (const [index, raw] of doc.bot.entries()) {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw))
+      throw new ConfigError(`legacy bot #${index + 1} is not a table`);
+    const name = (raw as Record<string, unknown>).name;
+    if (typeof name !== "string" || !NAME_PATTERN.test(name) || names.has(name))
+      throw new ConfigError(
+        `legacy bot #${index + 1} has an invalid or duplicate name`
+      );
+    names.add(name);
+  }
+  const bindings =
+    typeof options.backend === "string"
+      ? Object.fromEntries([...names].map((name) => [name, options.backend]))
+      : options.backend;
+  if (!bindings || Object.keys(bindings).some((name) => !names.has(name)))
+    throw new ConfigError("backend map contains an unknown bot");
+  const bots = doc.bot.map((raw, index) => {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw))
+      throw new ConfigError(`legacy bot #${index + 1} is not a table`);
+    const bot = { ...(raw as Record<string, unknown>) };
+    const name = typeof bot.name === "string" ? bot.name : "";
+    const backend = bindings[name];
+    if (bot.backend !== undefined || bot.backend_config !== undefined)
+      throw new ConfigError(
+        `legacy bot ${name || `#${index + 1}`} already selects a backend`
+      );
+    if (typeof backend !== "string" || !backend.trim())
+      throw new ConfigError(
+        `missing explicit backend for legacy bot ${name || `#${index + 1}`}`
+      );
+    bot.backend = backend;
+    return bot;
+  });
+  const gateway = {
+    registry: options.registry,
+    environment: options.environment ?? [],
+    workspace_access: options.workspaceAccess ?? "none",
+    native_profile: options.nativeProfile === true,
+    network: options.network === true,
+    gateway_tools: options.gatewayTools ?? [],
+  };
+  return stringify({ ...doc, gateway, bot: bots });
+}
+
+/**
+ * Issue 62: disclosure text for a bot — description when present (it IS the
+ * recommendation, skills-style), otherwise the legacy title. Never a config
+ * error: missing description is valid, just less discoverable.
+ */
+export function botDisclosure(
+  bot: Pick<BotConfig, "description" | "title">
+): string {
+  return bot.description ?? bot.title ?? "";
+}
 
 export const NAME_PATTERN = /^[a-z][a-z0-9-]{1,31}$/;
 
@@ -77,6 +212,72 @@ export function loadFleetConfig(
     throw new ConfigError(`bots.toml parse error: ${(error as Error).message}`);
   }
 
+  let gateway: FleetConfig["gateway"];
+  if (doc.gateway !== undefined) {
+    const value = doc.gateway;
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      throw new ConfigError("[gateway] must be a table");
+    }
+    const table = value as Record<string, unknown>;
+    const allowed = [
+      "registry",
+      "environment",
+      "workspace_access",
+      "native_profile",
+      "network",
+      "gateway_tools",
+    ];
+    if (Object.keys(table).some((key) => !allowed.includes(key))) {
+      throw new ConfigError("[gateway] has an unknown configuration key");
+    }
+    if (typeof table.registry !== "string" || !table.registry.trim()) {
+      throw new ConfigError(
+        "[gateway].registry must name an explicit installation registry"
+      );
+    }
+    const strings = (key: string): string[] => {
+      const field = table[key] ?? [];
+      if (
+        !Array.isArray(field) ||
+        !field.every((entry) => typeof entry === "string" && entry.length > 0)
+      ) {
+        throw new ConfigError(`[gateway].${key} must be a string array`);
+      }
+      return field as string[];
+    };
+    const environment = strings("environment");
+    if (environment.some((key) => !/^[A-Za-z_][A-Za-z_0-9]*$/.test(key))) {
+      throw new ConfigError(
+        "[gateway].environment contains an invalid variable name"
+      );
+    }
+    const workspace = table.workspace_access ?? "none";
+    if (
+      workspace !== "none" &&
+      workspace !== "read" &&
+      workspace !== "read-write"
+    ) {
+      throw new ConfigError(
+        "[gateway].workspace_access must be none, read, or read-write"
+      );
+    }
+    for (const key of ["native_profile", "network"]) {
+      if (table[key] !== undefined && typeof table[key] !== "boolean") {
+        throw new ConfigError(`[gateway].${key} must be a boolean`);
+      }
+    }
+    gateway = {
+      registry: resolve(dir, table.registry),
+      environment,
+      policy: {
+        workspace,
+        nativeProfile: table.native_profile === true,
+        network: table.network === true,
+        gatewayTools: strings("gateway_tools"),
+      },
+    };
+  }
+
   const botsRaw = doc.bot;
   if (!Array.isArray(botsRaw) || botsRaw.length === 0) {
     throw new ConfigError("bots.toml must define at least one [[bot]] table");
@@ -120,9 +321,90 @@ export function loadFleetConfig(
       botDirOverride = scoped;
     }
     const botDir = botDirOverride;
+    if (
+      !gateway &&
+      (table.backend !== undefined || table.backend_config !== undefined)
+    ) {
+      throw new ConfigError(
+        `${where} (${name}): backend selection requires [gateway].registry; it cannot fall through to the legacy runtime`
+      );
+    }
+    const backend = gateway ? (table.backend ?? "tidy.pi") : undefined;
+    if (
+      backend !== undefined &&
+      (typeof backend !== "string" ||
+        !/^[a-z0-9]+(?:[.-][a-z0-9]+)+$/.test(backend))
+    ) {
+      throw new ConfigError(
+        `${where} (${name}): backend must be a registered plugin ID`
+      );
+    }
+    let backendConfig: Record<string, unknown> | undefined;
+    if (gateway) {
+      const supplied = table.backend_config ?? {};
+      if (
+        !supplied ||
+        typeof supplied !== "object" ||
+        Array.isArray(supplied)
+      ) {
+        throw new ConfigError(
+          `${where} (${name}): backend_config must be a table`
+        );
+      }
+      backendConfig = { ...(supplied as Record<string, unknown>) };
+      const piKeys = [
+        "model",
+        "thinking",
+        "packages",
+        "extensions",
+        "tools",
+        "no_builtin_tools",
+        "no_extensions",
+        "no_skills",
+        "image_provider",
+      ];
+      for (const key of piKeys) {
+        if (table[key] === undefined) continue;
+        if (backend !== "tidy.pi")
+          throw new ConfigError(
+            `${where} (${name}): ${key} is a legacy Pi key; use this backend's backend_config schema`
+          );
+        if (
+          backendConfig[key] !== undefined &&
+          JSON.stringify(backendConfig[key]) !== JSON.stringify(table[key])
+        ) {
+          throw new ConfigError(
+            `${where} (${name}): conflicting ${key} and backend_config.${key}; remove the legacy key`
+          );
+        }
+        backendConfig[key] = table[key];
+      }
+    }
     const routes = Array.isArray(table.routes)
       ? table.routes.map((value) => String(value))
       : undefined;
+    const packages = Array.isArray(table.packages)
+      ? table.packages.map((value) => String(value))
+      : undefined;
+    const imageProvider =
+      typeof table.image_provider === "string" &&
+      table.image_provider.length > 0
+        ? table.image_provider
+        : undefined;
+    const tools = Array.isArray(table.tools)
+      ? table.tools.map((value) => String(value))
+      : undefined;
+    const extensions = Array.isArray(table.extensions)
+      ? table.extensions.map((value) => String(value))
+      : undefined;
+    if (tools && tools.some((tool) => tool.trim().length === 0)) {
+      throw new ConfigError(
+        `${where} (${name}): tools entries must be non-empty strings`
+      );
+    }
+    const noBuiltinTools = table.no_builtin_tools === true;
+    const noExtensions = table.no_extensions === true;
+    const noSkills = table.no_skills === true;
     // Action pills are removed (issue 15); a manifest still carrying the row is
     // stale config — fail fast instead of silently ignoring it.
     if (table.actions !== undefined) {
@@ -145,17 +427,39 @@ export function loadFleetConfig(
     bots.push({
       name,
       dir: botDir,
+      ...(backend ? { backend: backend as string, backendConfig } : {}),
       model: table.model === undefined ? undefined : String(table.model),
       thinking,
       title: table.title === undefined ? undefined : String(table.title),
+      description:
+        table.description === undefined ? undefined : String(table.description),
       avatar: table.avatar === undefined ? "" : String(table.avatar),
       routes,
+      packages,
+      ...(imageProvider ? { imageProvider } : {}),
+      ...(extensions ? { extensions } : {}),
+      ...(tools ? { tools } : {}),
+      ...(noBuiltinTools ? { noBuiltinTools } : {}),
+      ...(noExtensions ? { noExtensions } : {}),
+      ...(noSkills ? { noSkills } : {}),
       approve: table.approve === undefined ? true : table.approve === true,
       routines,
     });
   }
 
   const fleet = (doc.fleet ?? {}) as Record<string, unknown>;
+  const emptyTurnAlertAfter =
+    fleet.empty_turn_alert_after === undefined
+      ? undefined
+      : Number(fleet.empty_turn_alert_after);
+  if (
+    emptyTurnAlertAfter !== undefined &&
+    (!Number.isInteger(emptyTurnAlertAfter) || emptyTurnAlertAfter < 1)
+  ) {
+    throw new ConfigError(
+      `[fleet]: empty_turn_alert_after must be an integer >= 1`
+    );
+  }
   return {
     dir,
     port:
@@ -165,6 +469,16 @@ export function loadFleetConfig(
       overrides.host ??
       (typeof fleet.host === "string" ? fleet.host : "127.0.0.1"),
     bots,
+    ...(gateway ? { gateway } : {}),
+    ...(emptyTurnAlertAfter !== undefined ? { emptyTurnAlertAfter } : {}),
+    ...(typeof fleet.compactFallbackModel === "string" &&
+    fleet.compactFallbackModel.length > 0
+      ? { compactFallbackModel: fleet.compactFallbackModel }
+      : {}),
+    ...(typeof fleet.image_provider === "string" &&
+    fleet.image_provider.length > 0
+      ? { imageProvider: fleet.image_provider }
+      : {}),
   };
 }
 
@@ -191,10 +505,28 @@ export function diffFleet(
     }
     const same = (a: unknown, b: unknown) =>
       JSON.stringify(a ?? null) === JSON.stringify(b ?? null);
+    // Issue 157: ANY config change counts — routines, packages, approve,
+    // thinking, title, imageProvider… The old dir/model/routes-only diff
+    // silently ignored manifest edits on existing bots (a routine added to
+    // a live bot never registered; toggle 404'd; no log).
     const differs =
       existing.dir !== bot.dir ||
+      !same(existing.backend, bot.backend) ||
+      !same(existing.backendConfig, bot.backendConfig) ||
       !same(existing.model, bot.model) ||
-      !same(existing.routes, bot.routes);
+      !same(existing.routes, bot.routes) ||
+      !same(existing.routines, bot.routines) ||
+      !same(existing.packages, bot.packages) ||
+      !same(existing.approve, bot.approve) ||
+      !same(existing.title, bot.title) ||
+      !same(existing.avatar, bot.avatar) ||
+      !same(existing.description, bot.description) ||
+      !same(existing.imageProvider, bot.imageProvider) ||
+      !same(existing.extensions, bot.extensions) ||
+      !same(existing.tools, bot.tools) ||
+      existing.noBuiltinTools !== bot.noBuiltinTools ||
+      existing.noExtensions !== bot.noExtensions ||
+      existing.noSkills !== bot.noSkills;
     (differs ? changed : untouched).push(bot);
   }
   const removed = current.filter((bot) => !nextByName.has(bot.name));

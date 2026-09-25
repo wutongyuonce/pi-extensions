@@ -1,0 +1,90 @@
+{
+  // Minimal ruleset tuned to this repo's existing docs style (#1844). The
+  // goal is a mechanical dogfooding CI job, not a mass reformat -- rules
+  // that would force rewriting the current tree are disabled below, each
+  // with the reason. Structural rules (broken headings, duplicate content,
+  // bad links) stay enabled because those catch real authoring mistakes.
+  "config": {
+    "default": true,
+    // Docs mix prose paragraphs with long code samples and tables; a hard
+    // wrap would force reformatting every existing file for no reader benefit.
+    "MD013": false,
+    // Several docs (AGENTS.md, CLAUDE.md) use inline HTML for callouts.
+    "MD033": false,
+    // Repo convention mixes bare issue/PR URLs into prose (e.g. "#1844",
+    // full GitHub URLs) without always wrapping them as links.
+    "MD034": false,
+    // Docs use both "-" and "*" bullets depending on the author/section.
+    "MD004": false,
+    // First line doesn't always have to be a top-level heading (e.g.
+    // .changelog/README.md leads with a heading but some docs use a badge
+    // or short intro line first).
+    "MD041": false,
+    // Duplicate headings occur across sibling sections (e.g. "Overview"
+    // repeated per subsystem) -- acceptable given the doc structure.
+    "MD024": false,
+    // Docs tables use compact "| a | b |" style without markdownlint's
+    // stricter pipe-alignment rules; rewriting every table for this
+    // brand-new rule (MD060) is exactly the mass reformat we're avoiding.
+    "MD060": false,
+    // Skill docs use bare ``` fences for illustrative snippets that are not
+    // a single language (shell + output mixed, or pseudo-code).
+    "MD040": false,
+    // Design-doc style throughout docs/ nests lists and headings tight
+    // against surrounding prose without a blank-line buffer.
+    "MD032": false,
+    "MD022": false,
+    // docs/features.md intentionally skips an h2 in one section; not worth
+    // renumbering headings repo-wide for a brand-new lint pass.
+    "MD001": false,
+    // Repo mixes `_underscore_` and `*asterisk*` single-marker emphasis
+    // across docs written by different authors over time.
+    "MD049": false,
+    // Same author-style mix as MD049, for `__underscore__`/`**asterisk**`
+    // bold (docs/tree-sitter_rules_catalog.md uses underscore bold
+    // throughout its rule descriptions).
+    "MD050": false,
+    // A handful of long-form design docs (lsp-latency-benchmark.md) quote
+    // multi-paragraph benchmark output inside blockquotes with blank lines.
+    "MD028": false,
+    // docs/servercapabilities.md has a genuine double-blank-line gap
+    // between sections; not worth a one-line docs edit for a brand-new
+    // lint pass.
+    "MD012": false,
+    // docs/servercapabilities.md has emphasis markers with a leading space
+    // (", _ text_") in prose describing punctuation-adjacent terms; a false
+    // positive for how the sentence reads, not a formatting mistake.
+    "MD037": false,
+    // "#NNN" issue references routinely land at the start of a wrapped
+    // line in prose (e.g. "structured options,\n#771)") -- these are never
+    // intended as ATX headings, and CommonMark itself does not render them
+    // as headings (no space after '#'). False-positive-prone for this repo.
+    "MD018": false,
+    // AGENTS.md and docs/api-ports-inventory.md use tab-indented tables/data
+    // blocks (copy-pasted from tool output).
+    "MD010": false,
+    // docs/ast-grep_rules_catalog.md is a generated rule catalog; its table
+    // cells embed raw rule-message text (e.g. a trailing "`" before a
+    // space) that trips this rule as a side effect of the content, not the
+    // markdown structure.
+    "MD038": false,
+    // Same generated catalog: a table cell containing literal code like
+    // "split(sep)[n]" parses as reversed-link syntax by coincidence.
+    "MD011": false,
+    // docs/audit1.md has fenced code blocks immediately followed by a list
+    // item with no blank line -- a deliberate compact layout, not a
+    // formatting slip.
+    "MD031": false
+  },
+  "globs": ["**/*.md"],
+  "ignores": [
+    "node_modules/**",
+    "dist/**",
+    "grammars/**",
+    ".changelog/*.md",
+    "CHANGELOG.md",
+    // Deliberately malformed fixtures that exercise the markdown
+    // format/autofix tools under test -- linting them defeats their purpose.
+    "tests/fixtures/**"
+  ]
+}

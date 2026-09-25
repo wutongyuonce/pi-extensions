@@ -81,6 +81,12 @@ function registerResumeTool(runtime: ReturnType<typeof createResumeRuntime>) {
 }
 
 describe("context-exhausted resume guard", () => {
+	it("rejects a resume without a session file before checking child state", async () => {
+		const tool = registerResumeTool(createResumeRuntime());
+
+		await assert.rejects(() => tool.execute("call-missing", {}, undefined), /Session file is required/);
+	});
+
 	it("refuses an agent-initiated resume and never starts the child", async () => {
 		const dir = createTestDir();
 		const spawnMarker = join(dir, "child-started.txt");
@@ -145,7 +151,7 @@ describe("context-exhausted resume guard", () => {
 			// Without an explicit mode this session has no launch metadata, so the
 			// resume falls back to interactive and would open a real mux pane.
 			const result = await withoutAmbientSpawnGrant(() =>
-				tool.execute("call-2", { sessionFile, mode: "background" }, undefined),
+				tool.execute("call-2", { sessionFile, mode: "background" }, undefined, undefined, { hasUI: true }),
 			);
 
 			assert.equal(result.details.status, "started");

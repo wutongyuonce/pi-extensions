@@ -87,6 +87,8 @@
   - 用于保护尚未发送新 prompt 的手动修改
 
 - 基于 `/tree` 的工作区恢复
+  - 当前与目标快照均可用、当前纳管文件没有未快照修改，且两份快照的纳管内容一致时，省略模式选择，保留文件并锚定到新分支。工作区干净本身不代表旧快照的文件与当前相同。
+  - 其他情况仍保留选择；普通交互式树导航会说明目标文件不同、当前有未快照修改或无法完成比较。分支摘要和待恢复状态沿用现有流程。
   - 选定历史节点后，可选择是否恢复对应的工作区状态
   - 同时覆盖 `/tree` 和 Pi 的双击 `Esc` 历史树入口
   - 支持在不同历史分支之间来回切换
@@ -106,19 +108,24 @@
 
 插件内部使用独立的 shadow git 来保存快照，而不是依赖用户项目本身的 `.git` 历史。
 
+同一套文件历史流程可用于 Git 仓库、Jujutsu 仓库以及 Git/Jujutsu colocated 仓库。仓库元数据（`.git/` 和 `.jj/`）不会进入快照，也不会被恢复。因此，工作区撤销只恢复文件内容，不会回退 Git 的 commit、branch 或 index，也不会回退 Jujutsu 的 commit、bookmark 或 operation。撤销后，`git status` 或 `jj status` 可能会把恢复的文件显示为工作区修改；如需回退仓库历史，请使用对应 VCS 自身的恢复命令。
+
+即使工作区只使用 Jujutsu，扩展仍需要 Git 可执行文件来维护私有 shadow 仓库。
+
 一个撤销单元从原始 prompt 开始，直到 Pi 报告 Agent 已 settled 为止。中间工具轮次各自拥有 `/tree` 锚点，但排队输入不会替换该操作最初的 prompt 或 `before` 快照。因此，一次 `/undo` 会完整撤销多轮工具调用的全部结果，`/redo` 也会把它作为整体恢复。
 
 只回退对话且不生成分支摘要时，插件会先处理此前中断恢复留下的待恢复工作；如果中断恢复后文件又被修改，这些后续修改会自动保留。随后插件快照当前文件，并将其作为后续历史分支的起点。继续对话后，分支中正常可见的消息节点即可通过 `/tree` 恢复这份保留的工作区状态。取消选择时，对话和工作区都不改变；非交互模式继续沿用原来的“对话和工作区一起恢复”行为。
 
 默认快照范围：
 
-- Git tracked 文件
-- 未被 ignore 的 untracked 文件
+- 已由内部 shadow 仓库纳管的文件
+- 未被 ignore 的新文件
 - 命中工作区 `.gitignore` 的路径会被过滤掉，即使它们此前已经进入过快照范围
 
 默认排除：
 
 - `.git/`
+- `.jj/`
 - `.pi/workspace-history/`
 - `node_modules/`
 - `dist/`
@@ -136,7 +143,7 @@
 
 在 Windows 上，恢复操作会重试短暂锁定的纳管文件。如果文件持续被占用，导航会取消而不会跳过该文件，并在提示中指出失败的 Git 文件操作。待恢复状态可跨会话或扩展重载保留；恢复失败后产生的新编辑不会被自动覆盖，可先用 `/checkpoint` 保留。
 
-插件会在使用前校验当前 session 的 shadow repo。如果当前 session repo 或工作区 reusable repo 无效，插件会先将其原样保留为同级的 `repo.git.invalid-<timestamp>-<uuid>`，再自动重建可用仓库，后续快照可继续正常工作；但仅存在于无效仓库中的旧快照可能不可用。其他 session 的无效仓库只会被跳过，不会被修改。
+插件会在使用前校验当前 session 的 shadow repo。如果已校验的仓库在 session 运行期间消失，插件会检测并自动重建。如果当前 session repo 或工作区 reusable repo 无效，插件会先将其原样保留为同级的 `repo.git.invalid-<timestamp>-<uuid>`，再自动重建可用仓库。后续快照可继续正常工作，但仅存在于丢失或无效仓库中的旧快照可能不可用。其他 session 的无效仓库只会被跳过，不会被修改。
 
 ## 配置
 
@@ -164,24 +171,30 @@
   - 默认：`~/.pi/agent/state/workspace-history`
   - 必须位于工作区之外。如果它等于工作区或位于工作区内部，即使 `enabled` 为 `true`，插件也会禁用，且不会在其中创建历史目录。
 - `workspaceHistory.maxSessionsPerWorkspace`
-  - 每个工作区最多保留最近使用的 session 数
+  - 通过清理最久未使用的非活跃 session，使每个工作区的 session 总数尽量保持在上限内
+  - 活跃 session 永远不会被清理，因此总数可能暂时超过此上限
   - 默认：`3`
 - `workspaceHistory.maxWorkspaces`
-  - 全局最多保留最近使用的工作区数
+  - 通过清理最久未使用的非活跃工作区，使全局工作区总数尽量保持在上限内
+  - 包含活跃 session 的工作区永远不会被清理，因此总数可能暂时超过此上限
   - 默认：`10`
 - `workspaceHistory.enabled`
   - `auto`（默认）在当前目录或祖先目录存在已声明项目标记时启用
-  - `true` 强制启用
+  - 自动模式且要求项目标记时，如果当前目录自身没有 `.git` 或 `.jj`，但至少两个直属非隐藏子目录是仓库，则插件会跳过该多仓库容器目录
+  - 多仓库容器检查是浅层且有界的；无法可靠完成判断时，workspace-history 继续启用
+  - `true` 强制启用，包括多仓库容器目录
   - `false` 完全禁用
 - `workspaceHistory.allowHomeDirectory`
   - 是否允许在用户 home 目录启用
   - 默认：`false`
 - `workspaceHistory.requireProjectMarker`
-  - 是否要求当前目录或祖先目录存在 `.git`、`package.json`、`Cargo.toml`、`go.mod`、`pyproject.toml` 等项目标记
+  - 是否要求当前目录或祖先目录存在 `.git`、`.jj`、`package.json`、`Cargo.toml`、`go.mod`、`pyproject.toml` 等项目标记
   - 默认：`true`
-  - 设为 `false` 时，自动模式允许文件系统根目录和用户 home 目录以外的任意目录（home 目录仍需同时启用 `allowHomeDirectory`）
-- `workspaceHistory.maxScanFiles` / `workspaceHistory.maxScanDirs` / `workspaceHistory.maxScanMs`
-  - 工作区扫描的安全预算
+  - 设为 `false` 时，自动模式允许文件系统根目录和用户 home 目录以外的任意目录（home 目录仍需同时启用 `allowHomeDirectory`），并跳过多仓库容器判断
+- `workspaceHistory.maxScanFiles`
+- `workspaceHistory.maxScanDirs`
+- `workspaceHistory.maxScanMs`
+  - 恢复时扫描工作区的安全限制
 - `workspaceHistory.gitTimeoutMs`
   - 插件内部 git 操作超时时间
 
@@ -235,10 +248,12 @@ npm run typecheck
 
 ## 最近更新
 
+- Git、Jujutsu 和 colocated 仓库共用同一套文件历史流程，同时保持各自的 VCS 元数据不变
 - 完整的多轮 Agent 操作现在作为一个 undo / redo 单元
 - 即使 `.gitignore` 使用反向规则，硬排除路径也不会重新被纳管
 - Git、Rust、Go、Python 等项目标记可从祖先目录识别
 - 无效 shadow repo 会自动隔离并重建
+- 并发运行的活跃 session 不会被保留清理误删
 
 ## 存储目录
 
@@ -251,6 +266,7 @@ npm run typecheck
       meta.json
       sessions/
         <sessionId>/
+          active-session.json
           repo.git/
           redo.json
           meta.json
@@ -263,6 +279,7 @@ npm run typecheck
 - shadow git 与用户项目自身的 `.git` 历史隔离
 - 自动恢复时，无效的 shadow repo 会保留为 `repo.git.invalid-<timestamp>-<uuid>`
 - 旧的工作区内 `.pi/workspace-history/` 状态不会自动迁移
-- 清理策略基于最近使用时间（LRU 风格）
-- 保留清理只删除元数据有效且不是当前对象的目录；元数据损坏的目录会保留，便于人工恢复
+- 非活跃 session 按最近使用时间清理（LRU 风格）
+- 进程租约会保护活跃 session 及其工作区。租约对应进程已不存在时通常按非活跃处理；PID 被复用的极少数情况下只会保守地多保留旧历史，不会导致活跃历史被删除
+- 保留清理只删除元数据有效的非活跃目录；元数据损坏的目录会保留，便于人工恢复
 - 在 `auto` 模式下，插件会在像用户 home 目录这样的宽泛目录里自动禁用，避免启动扫描过大导致卡顿

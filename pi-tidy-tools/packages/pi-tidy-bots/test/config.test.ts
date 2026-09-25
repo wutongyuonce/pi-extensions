@@ -5,7 +5,11 @@ import {
   diffFleet,
   loadFleetConfig,
   ConfigError,
+  botDisclosure,
+  convertLegacyManifest,
 } from "../src/config.ts";
+import { parse } from "smol-toml";
+import { scaffoldBot, restartSpawnArgs } from "../src/cli.ts";
 import {
   stripActionMarkers,
   attributionPrefix,
@@ -17,11 +21,65 @@ import {
   mkdirSync,
   writeFileSync,
   rmSync,
+  readFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 const fixtureFleet = new URL("./fixtures/fleet/", import.meta.url).pathname;
+
+test("legacy manifest conversion preserves bot values and adds only explicit bindings", () => {
+  const source = `title = "Fleet"\n[[bot]]\nname = "one"\ndir = "."\ntitle = "Primary"\napprove = true\nroutes = ["two"]\nmodel = "fixture/model"\nthinking = "high"\n[[bot.routines]]\nname = "daily"\nschedule = "0 9 * * *"\nprompt = "status"\n[[bot]]\nname = "two"\ndir = "."\nno_skills = true\n`;
+  const converted = convertLegacyManifest(source, {
+    registry: "registry.json",
+    backend: { one: "org.example.one", two: "org.example.two" },
+    environment: ["PATH"],
+  });
+  const before = parse(source) as Record<string, unknown>;
+  const after = parse(converted) as Record<string, unknown>;
+  assert.deepEqual(after.title, before.title);
+  assert.deepEqual(
+    (after.bot as Record<string, unknown>[]).map(
+      ({ backend: _backend, ...bot }) => bot
+    ),
+    before.bot
+  );
+  assert.deepEqual(after.gateway, {
+    registry: "registry.json",
+    environment: ["PATH"],
+    workspace_access: "none",
+    native_profile: false,
+    network: false,
+    gateway_tools: [],
+  });
+});
+
+test("legacy conversion rejects already migrated or ambiguously bound manifests", () => {
+  assert.throws(
+    () =>
+      convertLegacyManifest('[gateway]\nregistry="x"\n[[bot]]\nname="one"\n', {
+        registry: "registry.json",
+        backend: "org.example.backend",
+      }),
+    /already in gateway mode/
+  );
+  assert.throws(
+    () =>
+      convertLegacyManifest('[[bot]]\nname="one"\n', {
+        registry: "registry.json",
+        backend: { two: "org.example.backend" },
+      }),
+    /unknown bot/
+  );
+  assert.throws(
+    () =>
+      convertLegacyManifest('[[bot]]\nname="one"\n', {
+        registry: "registry.json",
+        backend: { one: "org.example.backend", typo: "org.example.other" },
+      }),
+    /unknown bot/
+  );
+});
 
 test("loadFleetConfig parses the fixture fleet with defaults", () => {
   const fleet = loadFleetConfig(fixtureFleet, { port: 4599 });
@@ -98,6 +156,121 @@ test("checkRoute enforces routing table with typed reasons", () => {
     ok: false,
     reason: "route_forbidden",
   });
+});
+
+test("loadFleetConfig parses optional description; botDisclosure falls back to title", () => {
+  const dir = mkdtempSync(join(tmpdir(), "ptb-desc-"));
+  try {
+    const botDir = join(dir, "atlas");
+    mkdirSync(botDir, { recursive: true });
+    writeFileSync(join(botDir, "AGENTS.md"), "# atlas\n");
+    writeFileSync(
+      join(dir, "bots.toml"),
+      `[[bot]]\nname = "atlas"\ndir = "atlas"\ndescription = "Use when work needs routing."\n`
+    );
+    const withDesc = loadFleetConfig(dir).bots[0];
+    assert.equal(withDesc.description, "Use when work needs routing.");
+    assert.equal(botDisclosure(withDesc), withDesc.description);
+    // Missing description is NOT a config error; disclosure falls back to title.
+    writeFileSync(
+      join(dir, "bots.toml"),
+      `[[bot]]\nname = "atlas"\ndir = "atlas"\ntitle = "Triage lead"\n`
+    );
+    const noDesc = loadFleetConfig(dir).bots[0];
+    assert.equal(noDesc.description, undefined);
+    assert.equal(botDisclosure(noDesc), "Triage lead");
+    writeFileSync(
+      join(dir, "bots.toml"),
+      `[[bot]]\nname = "atlas"\ndir = "atlas"\n`
+    );
+    assert.equal(botDisclosure(loadFleetConfig(dir).bots[0]), "");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("scaffoldBot writes --description (escaped) and omits it when absent", () => {
+  const dir = mkdtempSync(join(tmpdir(), "ptb-scaffold-desc-"));
+  try {
+    writeFileSync(join(dir, "bots.toml"), `port = 4317\n`);
+    scaffoldBot(dir, "forge", {
+      title: 'Fleet "Worker"',
+      description: 'Use for "code" work\\nnow',
+    });
+    const manifest = readFileSync(join(dir, "bots.toml"), "utf8");
+    assert.ok(
+      manifest.includes('description = "Use for \\"code\\" work\\\\nnow"'),
+      "row escapes quotes and backslashes: " + manifest
+    );
+    // Round-trips through the parser without loss.
+    const bots = loadFleetConfig(dir).bots;
+    assert.equal(bots.length, 1);
+    assert.equal(bots[0].title, 'Fleet "Worker"');
+    assert.equal(bots[0].description, 'Use for "code" work\\nnow');
+    // Absent description: row omits the key; parses with undefined.
+    scaffoldBot(dir, "scribe", { title: "Docs" });
+    const scribe = loadFleetConfig(dir).bots.find(
+      (bot) => bot.name === "scribe"
+    );
+    assert.equal(scribe?.description, undefined);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("image_provider parses at fleet and bot scope (issue 132)", () => {
+  const dir = mkdtempSync(join(tmpdir(), "ptb-imgprov-"));
+  try {
+    const botDir = join(dir, "atlas");
+    mkdirSync(botDir, { recursive: true });
+    writeFileSync(join(botDir, "AGENTS.md"), "# atlas\n");
+    writeFileSync(
+      join(dir, "bots.toml"),
+      `[fleet]\nimage_provider = "fleet-default"\n[[bot]]\nname = "atlas"\ndir = "atlas"\n[[bot]]\nname = "scoped"\ndir = "atlas"\nimage_provider = "grok-build"\n`
+    );
+    const fleet = loadFleetConfig(dir);
+    assert.equal(fleet.imageProvider, "fleet-default", "fleet scope");
+    assert.equal(fleet.bots[0].imageProvider, undefined, "bot inherits");
+    assert.equal(fleet.bots[1].imageProvider, "grok-build", "bot overrides");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("tool-isolation controls parse and validate", () => {
+  const dir = mkdtempSync(join(tmpdir(), "ptb-isolate-"));
+  try {
+    const botDir = join(dir, "atlas");
+    mkdirSync(botDir, { recursive: true });
+    writeFileSync(join(botDir, "AGENTS.md"), "# atlas\n");
+    writeFileSync(
+      join(dir, "bots.toml"),
+      `[[bot]]\nname = "plain"\ndir = "atlas"\n[[bot]]\nname = "locked"\ndir = "atlas"\nextensions = ["finance/digest-ext.mjs"]\ntools = ["tiller_digest"]\nno_builtin_tools = true\nno_extensions = true\nno_skills = true\n`
+    );
+    const fleet = loadFleetConfig(dir);
+    const [plain, locked] = fleet.bots;
+    assert.equal(plain.tools, undefined, "no allowlist by default");
+    assert.deepEqual(locked.extensions, ["finance/digest-ext.mjs"]);
+    assert.equal(plain.noBuiltinTools, undefined);
+    assert.equal(plain.noExtensions, undefined);
+    assert.equal(plain.noSkills, undefined);
+    assert.deepEqual(locked.tools, ["tiller_digest"]);
+    assert.equal(plain.extensions, undefined, "no extra extensions by default");
+    assert.equal(locked.noBuiltinTools, true);
+    assert.equal(locked.noExtensions, true);
+    assert.equal(locked.noSkills, true);
+    // Empty tool names fail fast, not silently.
+    writeFileSync(
+      join(dir, "bots.toml"),
+      `[[bot]]\nname = "bad"\ndir = "atlas"\ntools = [""]\n`
+    );
+    assert.throws(
+      () => loadFleetConfig(dir),
+      /tools entries must be non-empty strings/
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("stripActionMarkers removes [[action:]] lines from transcript text", () => {
@@ -270,4 +443,14 @@ test("thinking rows validate against pi's level set and reach the config", () =>
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test("restartSpawnArgs replays a persisted host and omits it when absent", () => {
+  const dir = "/tmp/fleet-x";
+  const plain = restartSpawnArgs(dir, 4317);
+  assert.ok(!plain.includes("--host"), "no host flag when absent");
+  assert.equal(plain[plain.indexOf("--port") + 1], "4317");
+  const withHost = restartSpawnArgs(dir, 4317, undefined, "0.0.0.0");
+  assert.ok(withHost.includes("--host"));
+  assert.equal(withHost[withHost.indexOf("--host") + 1], "0.0.0.0");
 });

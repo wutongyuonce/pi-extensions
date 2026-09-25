@@ -177,7 +177,7 @@ function statusStepForTask(task: RunnerSubagentStep): StatusStep {
 		model: task.model,
 		...(task.contextLimit !== undefined ? { contextLimit: task.contextLimit } : {}),
 		thinking: task.thinking,
-		attemptedModels: task.modelCandidates && task.modelCandidates.length > 0 ? task.modelCandidates : task.model ? [task.model] : undefined,
+		requestedModel: task.requestedModel,
 		recentTools: [],
 		recentOutput: [],
 	};

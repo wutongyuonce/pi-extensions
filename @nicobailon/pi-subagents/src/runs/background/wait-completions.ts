@@ -2,7 +2,7 @@ import * as fs from "node:fs";
 import type { ArtifactPaths, SubagentState, Usage, WaitCompletion, WaitCompletionChild } from "../../shared/types.ts";
 import type { AsyncRunSummary } from "./async-status.ts";
 import { readCompletionReplay, writeCompletionReplay } from "./completion-replay.ts";
-import { fallbackResultPayloadPathForSessionRun, resultFilePath, resultPayloadPathForSessionRun } from "./result-files.ts";
+import { fallbackResultPayloadPathForSessionRun, resultFilePath, resultPayloadMatchesSessionRun, resultPayloadPathForSessionRun } from "./result-files.ts";
 import { parseWorkflowChildSummary } from "../../workflows/workflow-child-summary.ts";
 import { projectTimeoutRecovery } from "../shared/mutation-evidence.ts";
 
@@ -43,6 +43,27 @@ function errorMessage(error: unknown): string {
 }
 
 const STRUCTURED_OUTPUT_INLINE_LIMIT_BYTES = 4 * 1024;
+
+function waitResultPayloadCandidate(resultsDir: string, run: AsyncRunSummary): string {
+	const publicPath = resultFilePath(resultsDir, run.id);
+	if (!run.sessionId) return publicPath;
+	try {
+		const indexedPath = resultPayloadPathForSessionRun(resultsDir, run.sessionId, run.id);
+		return indexedPath ?? publicPath;
+	} catch (error) {
+		if (!isAccessDenied(error)) throw error;
+		const pendingPath = fallbackResultPayloadPathForSessionRun(resultsDir, run.sessionId, run.id);
+		return pendingPath ?? publicPath;
+	}
+}
+
+function readWaitResultPayload(candidatePath: string, run: AsyncRunSummary): Record<string, unknown> | undefined {
+	// A terminal run without session ownership cannot safely claim a payload.
+	if (!run.sessionId) return undefined;
+	const payload: unknown = JSON.parse(fs.readFileSync(candidatePath, "utf-8"));
+	if (!resultPayloadMatchesSessionRun(payload, run.sessionId, run.id)) return undefined;
+	return payload as Record<string, unknown>;
+}
 
 export function projectStructuredOutput(value: unknown): unknown {
 	if (value === undefined) return undefined;
@@ -96,6 +117,9 @@ export function toWaitCompletion(data: Record<string, unknown>, runId: string): 
 		})
 		: undefined;
 	const agent = asNonEmptyString(data.agent);
+	const receipt = data.workflowReceipt;
+	const workflowReceiptPath = receipt && typeof receipt === "object" && !Array.isArray(receipt)
+		? asNonEmptyString((receipt as Record<string, unknown>).path) : undefined;
 	const mode = asNonEmptyString(data.mode);
 	const state = asNonEmptyString(data.state);
 	const workflowChildren = parseWorkflowChildSummary(data.workflowChildren);
@@ -104,6 +128,7 @@ export function toWaitCompletion(data: Record<string, unknown>, runId: string): 
 		runId,
 		...(agent ? { agent } : {}),
 		...(mode ? { mode } : {}),
+		...(workflowReceiptPath ? { workflowReceiptPath } : {}),
 		...(state ? { state } : {}),
 		...(typeof data.success === "boolean" ? { success: data.success } : {}),
 		...(results && results.length > 0 ? { results } : {}),
@@ -114,8 +139,9 @@ export function toWaitCompletion(data: Record<string, unknown>, runId: string): 
 /**
  * Record a consumed terminal payload for later surfacing by bg_wait, pruning
  * stale entries with the same TTL that dedupes completion notifications. The result
- * file is deleted after delivery, so this record is the only in-process source once
- * the watcher has consumed it.
+ * file is deleted after durable replay succeeds, so this record is the in-process
+ * source once the watcher has consumed it. Payload ownership must be explicit and
+ * agree with persistence ownership. Returns whether that replay is durable.
  */
 export function recordWaitCompletion(
 	state: SubagentState,
@@ -124,7 +150,10 @@ export function recordWaitCompletion(
 	now: number,
 	ttlMs: number,
 	persistence?: { resultsDir: string; sessionId: string },
-): void {
+): boolean {
+	const sessionId = asNonEmptyString(data.sessionId);
+	if (!sessionId || !resultPayloadMatchesSessionRun(data, sessionId, runId)) return false;
+	if (persistence && persistence.sessionId !== sessionId) return false;
 	const store = state.completedResults ??= new Map();
 	for (const [key, entry] of store) {
 		if (now - entry.seenAt > ttlMs) store.delete(key);
@@ -144,7 +173,8 @@ export function recordWaitCompletion(
 			console.error(`Failed to persist completion replay for '${runId}':`, error);
 		}
 	}
-	store.set(runId, { seenAt: now, completion });
+	store.set(runId, { sessionId, seenAt: now, completion });
+	return completion.archivePath !== undefined;
 }
 
 /**
@@ -153,37 +183,59 @@ export function recordWaitCompletion(
  * so a direct read never observes a torn write; the read is deliberately read-only —
  * the watcher owns notification and cleanup.
  */
-export function collectWaitCompletions(terminal: AsyncRunSummary[], state: SubagentState, resultsDir: string): WaitCompletion[] | undefined {
+export function collectWaitCompletions(terminal: AsyncRunSummary[], state: SubagentState, resultsDir: string, onReference?: (text: string) => void): WaitCompletion[] | undefined {
 	if (terminal.length === 0) return undefined;
 	const completions: WaitCompletion[] = [];
+	const add = (completion: WaitCompletion, resultPath?: string): void => {
+		completions.push(completion);
+		// Tool details are not model context. Publish the evidence address in content
+		// without copying potentially unbounded reviewer output into every wait.
+		const reference = completion.archivePath ?? resultPath;
+		if (reference) onReference?.(`Result [${completion.runId}]: ${reference}`);
+	};
 	for (const run of terminal) {
 		const recorded = state.completedResults?.get(run.id);
-		if (recorded) {
-			completions.push(recorded.completion);
+		if (recorded && recorded.sessionId === run.sessionId) {
+			if (recorded.completion.archivePath) {
+				add(recorded.completion);
+				continue;
+			}
+			try {
+				const candidatePath = waitResultPayloadCandidate(resultsDir, run);
+				if (!readWaitResultPayload(candidatePath, run)) {
+					const replay = readCompletionReplay(resultsDir, run.id, { sessionId: run.sessionId });
+					add(replay?.completion ?? recorded.completion);
+					continue;
+				}
+				add(recorded.completion, candidatePath);
+				continue;
+			} catch (error) {
+				if (errorCode(error) !== "ENOENT") throw error;
+			}
+			const replay = readCompletionReplay(resultsDir, run.id, { sessionId: run.sessionId });
+			add(replay?.completion ?? recorded.completion);
 			continue;
 		}
-		const publicResultPath = resultFilePath(resultsDir, run.id);
-		let resultPath = publicResultPath;
+		let candidatePath: string;
 		try {
-			resultPath = run.sessionId
-				? resultPayloadPathForSessionRun(resultsDir, run.sessionId, run.id) ?? publicResultPath
-				: publicResultPath;
+			candidatePath = waitResultPayloadCandidate(resultsDir, run);
 		} catch (error) {
-			if (!isAccessDenied(error) || !run.sessionId) throw error;
-			try {
-				resultPath = fallbackResultPayloadPathForSessionRun(resultsDir, run.sessionId, run.id) ?? publicResultPath;
-			} catch (fallbackError) {
-				throw new Error(`Failed to read subagent result '${publicResultPath}': ${errorMessage(fallbackError)}`, {
-					cause: fallbackError instanceof Error ? fallbackError : undefined,
-				});
-			}
+			const publicResultPath = resultFilePath(resultsDir, run.id);
+			throw new Error(`Failed to read subagent result '${publicResultPath}': ${errorMessage(error)}`, {
+				cause: error instanceof Error ? error : undefined,
+			});
 		}
 		try {
-			const raw = JSON.parse(fs.readFileSync(resultPath, "utf-8")) as Record<string, unknown>;
-			completions.push(toWaitCompletion(raw, run.id));
+			const payload = readWaitResultPayload(candidatePath, run);
+			if (!payload) {
+				const replay = readCompletionReplay(resultsDir, run.id, { sessionId: run.sessionId });
+				if (replay) add(replay.completion);
+				continue;
+			}
+			add(toWaitCompletion(payload, run.id), candidatePath);
 		} catch (error) {
 			if (errorCode(error) !== "ENOENT") {
-				throw new Error(`Failed to read subagent result '${resultPath}': ${errorMessage(error)}`, {
+				throw new Error(`Failed to read subagent result '${candidatePath}': ${errorMessage(error)}`, {
 					cause: error instanceof Error ? error : undefined,
 				});
 			}
@@ -191,13 +243,13 @@ export function collectWaitCompletions(terminal: AsyncRunSummary[], state: Subag
 			// read. Prefer its in-memory record, then the durable replay written before
 			// result cleanup so watcher reloads do not lose completion details.
 			const late = state.completedResults?.get(run.id);
-			if (late) {
-				completions.push(late.completion);
+			if (late && late.sessionId === run.sessionId) {
+				add(late.completion);
 				continue;
 			}
 			try {
 				const replay = readCompletionReplay(resultsDir, run.id, { sessionId: run.sessionId });
-				if (replay) completions.push(replay.completion);
+				if (replay) add(replay.completion);
 			} catch (replayError) {
 				throw new Error(`Failed to read completion replay for '${run.id}': ${errorMessage(replayError)}`, {
 					cause: replayError instanceof Error ? replayError : undefined,

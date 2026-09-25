@@ -1,0 +1,35 @@
+{
+  "success": true,
+  "scannedAt": "2026-08-18T07:00:00.000Z",
+  "analyzed": true,
+  "summary": "1 CVE, 1 secret, 1 license",
+  "findings": [
+    {
+      "vulnerabilityId": "CVE-2026-0001",
+      "pkgName": "left-pad",
+      "installedVersion": "1.0.0",
+      "fixedVersion": "1.0.1",
+      "severity": "CRITICAL",
+      "title": "Prototype pollution in left-pad",
+      "primaryUrl": "https://example.invalid/CVE-2026-0001",
+      "target": "package-lock.json"
+    }
+  ],
+  "secrets": [
+    {
+      "ruleId": "aws-access-key-id",
+      "file": "__PROJECT_ROOT__/src/config.ts",
+      "line": 234,
+      "title": "AWS Access Key ID"
+    }
+  ],
+  "licenses": [
+    {
+      "license": "AGPL-3.0",
+      "pkgName": "copyleft-dep",
+      "severity": "HIGH",
+      "category": "restricted",
+      "filePath": "package.json"
+    }
+  ]
+}

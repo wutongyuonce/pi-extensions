@@ -1,0 +1,96 @@
+<svg width="1100" height="310" viewBox="0 0 1100 310" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#0d1117"/>
+      <stop offset="100%" stop-color="#161b22"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#2f81f7"/>
+      <stop offset="100%" stop-color="#58a6ff"/>
+    </linearGradient>
+    <linearGradient id="accentFade" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#2f81f7"/>
+      <stop offset="100%" stop-color="#2f81f700"/>
+    </linearGradient>
+    <clipPath id="bounds">
+      <rect width="1100" height="310" rx="12"/>
+    </clipPath>
+  </defs>
+
+  <!-- Background -->
+  <rect width="1100" height="310" fill="url(#bg)" rx="12"/>
+
+  <!-- Top accent line -->
+  <rect x="0" y="0" width="1100" height="3" fill="url(#accent)" rx="1.5" clip-path="url(#bounds)"/>
+
+  <!-- Decorative aperture rings (right side) -->
+  <g opacity="0.06" clip-path="url(#bounds)">
+    <circle cx="980" cy="100" r="170" fill="none" stroke="#2f81f7" stroke-width="1.5"/>
+    <circle cx="980" cy="100" r="132" fill="none" stroke="#2f81f7" stroke-width="1"/>
+    <circle cx="980" cy="100" r="94"  fill="none" stroke="#2f81f7" stroke-width="1"/>
+    <circle cx="980" cy="100" r="56"  fill="none" stroke="#2f81f7" stroke-width="1"/>
+    <line x1="810" y1="100" x2="1100" y2="100" stroke="#2f81f7" stroke-width="0.8"/>
+    <line x1="980" y1="-70" x2="980"  y2="270"  stroke="#2f81f7" stroke-width="0.8"/>
+  </g>
+
+  <!-- Lens icon -->
+  <circle cx="118" cy="88" r="56" fill="#2f81f708"/>
+  <circle cx="118" cy="88" r="50" fill="#2f81f710" stroke="url(#accent)" stroke-width="4"/>
+  <circle cx="118" cy="88" r="37" fill="none" stroke="#2f81f740" stroke-width="1.4"/>
+  <line x1="156" y1="126" x2="182" y2="155" stroke="url(#accent)" stroke-width="7" stroke-linecap="round"/>
+  <text x="93" y="98" font-family="'Courier New', Courier, monospace" font-size="27" font-weight="700" fill="#58a6ff">&lt;/&gt;</text>
+
+  <!-- pi-lens wordmark -->
+  <text x="208" y="82" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, sans-serif" font-size="58" font-weight="700" fill="#e6edf3" letter-spacing="-2">pi-lens</text>
+
+  <!-- Languages badge (header) -->
+  <rect x="446" y="44" width="132" height="28" rx="14" fill="#2f81f718" stroke="#2f81f755" stroke-width="1"/>
+  <text x="512" y="63" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, sans-serif" font-size="13" font-weight="600" fill="#58a6ff" text-anchor="middle">36+ languages</text>
+
+  <!-- Tagline -->
+  <text x="210" y="116" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, sans-serif" font-size="19" font-weight="400" fill="#8b949e" letter-spacing="0.3">Real-time code intelligence for AI agents</text>
+
+  <!-- Divider under header -->
+  <rect x="40" y="146" width="1020" height="1" fill="#2f81f730"/>
+
+  <!-- Column dividers -->
+  <g fill="#2f81f722">
+    <rect x="294" y="170" width="1" height="108"/>
+    <rect x="550" y="170" width="1" height="108"/>
+    <rect x="806" y="170" width="1" height="108"/>
+  </g>
+
+  <g font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, sans-serif">
+    <!-- ANALYZE -->
+    <rect x="56" y="176" width="7" height="7" rx="1.5" fill="url(#accent)"/>
+    <text x="72" y="183" font-size="13.5" font-weight="700" fill="#58a6ff" letter-spacing="2">ANALYZE</text>
+    <text x="56" y="200" font-size="11" font-weight="400" fill="#6e7681" letter-spacing="0.2">inline feedback, every write/edit</text>
+    <text x="56" y="225" font-size="14.5" font-weight="400" fill="#c9d1d9">LSP diagnostics</text>
+    <text x="56" y="248" font-size="14.5" font-weight="400" fill="#c9d1d9">Linters &amp; type-checks</text>
+    <text x="56" y="271" font-size="14.5" font-weight="400" fill="#c9d1d9">ast-grep &#183; tree-sitter</text>
+
+    <!-- FIX & GUARD -->
+    <rect x="312" y="176" width="7" height="7" rx="1.5" fill="url(#accent)"/>
+    <text x="328" y="183" font-size="13.5" font-weight="700" fill="#58a6ff" letter-spacing="2">FIX &amp; GUARD</text>
+    <text x="312" y="200" font-size="11" font-weight="400" fill="#6e7681" letter-spacing="0.2">automatic</text>
+    <text x="312" y="225" font-size="14.5" font-weight="400" fill="#c9d1d9">Formatters &amp; auto-fix</text>
+    <text x="312" y="248" font-size="14.5" font-weight="400" fill="#c9d1d9">Read-guard</text>
+    <text x="312" y="271" font-size="14.5" font-weight="400" fill="#c9d1d9">Edit autopatch</text>
+
+    <!-- UNDERSTAND -->
+    <rect x="568" y="176" width="7" height="7" rx="1.5" fill="url(#accent)"/>
+    <text x="584" y="183" font-size="13.5" font-weight="700" fill="#58a6ff" letter-spacing="2">UNDERSTAND</text>
+    <text x="568" y="200" font-size="11" font-weight="400" fill="#6e7681" letter-spacing="0.2">review-graph engine</text>
+    <text x="568" y="225" font-size="14.5" font-weight="400" fill="#c9d1d9">Review graph</text>
+    <text x="568" y="248" font-size="14.5" font-weight="400" fill="#c9d1d9">Impact cascade</text>
+    <text x="568" y="271" font-size="14.5" font-weight="400" fill="#c9d1d9">Centrality ranking</text>
+
+    <!-- AGENT TOOLS -->
+    <rect x="824" y="176" width="7" height="7" rx="1.5" fill="url(#accent)"/>
+    <text x="840" y="183" font-size="13.5" font-weight="700" fill="#58a6ff" letter-spacing="2">AGENT TOOLS</text>
+    <text x="824" y="200" font-size="11" font-weight="400" fill="#6e7681" letter-spacing="0.2">on demand</text>
+    <text x="824" y="225" font-size="14.5" font-weight="400" fill="#c9d1d9">Symbol search</text>
+    <text x="824" y="248" font-size="14.5" font-weight="400" fill="#c9d1d9">Module reports</text>
+    <text x="824" y="271" font-size="14.5" font-weight="400" fill="#c9d1d9">AST search &amp; replace</text>
+  </g>
+</svg>

@@ -1,0 +1,9 @@
+[workspace]
+members = [
+    "crates/autofix-smoke",
+    "crates/toolsmoke",
+    "crates/normal-with-deps",
+    "crates/bin-before-package",
+    "crates/metadata-before-package",
+]
+resolver = "2"

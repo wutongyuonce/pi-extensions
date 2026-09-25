@@ -1,6 +1,8 @@
+import { randomUUID } from "node:crypto";
 import { existsSync, readFileSync } from "node:fs";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { activityMonitor } from "./activity.ts";
+import { normalizeDomain } from "./domain-filter-normalization.ts";
 import type { SearchOptions, SearchResponse, SearchResult } from "./perplexity.ts";
 import { hasCredentialSource, redactCredential, resolveCredential } from "./credential-source.ts";
 import { getWebSearchConfigPath } from "./utils.ts";
@@ -35,11 +37,17 @@ function pickSearchModel<T extends { id: string }>(models: readonly T[]): T | un
 interface WebSearchConfig {
 	openaiApiKey?: unknown;
 	openaiResponsesUrl?: unknown;
+	openaiUseProviderBaseUrl?: unknown;
+	openaiUseAlphaSearch?: unknown;
 	openaiSearchModel?: unknown;
 	openaiSearchProviders?: unknown;
 }
 
 type ProviderHeaders = Record<string, string | null>;
+
+class CustomOpenAIBaseUrlError extends Error {}
+
+export class OpenAIAlphaSearchUnsupportedError extends Error {}
 
 interface OpenAIAuth {
 	provider: string;
@@ -48,6 +56,7 @@ interface OpenAIAuth {
 	headers: ProviderHeaders;
 	responsesUrl: string;
 	useCodexEndpoint?: boolean;
+	useProviderBaseUrl?: boolean;
 }
 
 type CurrentModel = NonNullable<ExtensionContext["model"]>;
@@ -114,21 +123,6 @@ function loadConfig(): WebSearchConfig {
 	}
 }
 
-function normalizeDomain(value: string): string | null {
-	let input = value.trim().toLowerCase();
-	if (!input) return null;
-	if (input.startsWith("-")) input = input.slice(1).trim();
-	if (!input) return null;
-	try {
-		const parsed = input.includes("://") ? new URL(input) : new URL(`https://${input}`);
-		input = parsed.hostname;
-	} catch {
-		input = input.split("/")[0]?.split(":")[0] ?? "";
-	}
-	input = input.replace(/^\.+|\.+$/g, "");
-	return /^[a-z0-9][a-z0-9.-]*\.[a-z]{2,}$/i.test(input) ? input : null;
-}
-
 function normalizeDomainFilters(domainFilter: string[] | undefined): NormalizedDomainFilters | null {
 	if (!domainFilter?.length) return null;
 
@@ -191,6 +185,36 @@ function resolveConfiguredResponsesUrl(value: unknown): string {
 	return url.toString();
 }
 
+function resolveUseProviderBaseUrl(config: WebSearchConfig): boolean {
+	if (config.openaiResponsesUrl !== undefined) return false;
+	const value = config.openaiUseProviderBaseUrl;
+	if (value === undefined) return false;
+	if (typeof value !== "boolean") {
+		throw new Error(`openaiUseProviderBaseUrl in ${CONFIG_PATH} must be a boolean`);
+	}
+	return value;
+}
+
+function resolveProviderResponsesUrl(baseUrl: unknown, useCodexEndpoint: boolean): string {
+	let url: URL;
+	try {
+		if (typeof baseUrl !== "string" || !baseUrl.trim()) throw new Error();
+		url = new URL(baseUrl.trim());
+		if (url.protocol !== "https:" && url.protocol !== "http:") throw new Error();
+	} catch {
+		throw new CustomOpenAIBaseUrlError("OpenAI search configuration: openaiUseProviderBaseUrl requires an absolute http(s) provider baseUrl");
+	}
+	const path = url.pathname.replace(/\/+$/u, "");
+	if (path.endsWith("/responses")) {
+		url.pathname = path;
+	} else if (useCodexEndpoint && url.hostname.toLowerCase() === "chatgpt.com" && path === "/backend-api") {
+		url.pathname = "/backend-api/codex/responses";
+	} else {
+		url.pathname = `${path || "/v1"}/responses`;
+	}
+	return url.toString();
+}
+
 function resolveConfiguredSearchProviders(value: unknown): readonly string[] {
 	if (value === undefined) return DEFAULT_SEARCH_PROVIDERS;
 	if (!Array.isArray(value) || value.some((entry) => typeof entry !== "string" || entry.trim().length === 0)) {
@@ -215,8 +239,9 @@ function toRequestHeaders(headers: ProviderHeaders): Record<string, string> {
 	return requestHeaders;
 }
 
-async function resolvePiAuth(ctx: ExtensionContext, responsesUrl: string, providers: readonly string[], modelOverride?: string): Promise<OpenAIAuth | undefined> {
+async function resolvePiAuth(ctx: ExtensionContext, responsesUrl: string, providers: readonly string[], modelOverride?: string, hasExplicitResponsesUrl = false, useProviderBaseUrl = false): Promise<OpenAIAuth | undefined> {
 	let models: ReturnType<typeof ctx.modelRegistry.getAll>;
+	let invalidProviderUrlError: CustomOpenAIBaseUrlError | undefined;
 	try {
 		models = ctx.modelRegistry.getAll();
 	} catch {
@@ -225,31 +250,62 @@ async function resolvePiAuth(ctx: ExtensionContext, responsesUrl: string, provid
 	for (const provider of providers) {
 		const preferred = pickSearchModel(models.filter((model) => model.provider === provider));
 		if (!preferred) continue;
+		let resolved: Awaited<ReturnType<typeof ctx.modelRegistry.getApiKeyAndHeaders>>;
 		try {
-			const resolved = await ctx.modelRegistry.getApiKeyAndHeaders(preferred);
-			if (resolved.ok && resolved.apiKey) {
-				return {
-					provider,
-					apiKey: resolved.apiKey,
-					model: modelOverride ?? preferred.id,
-					headers: resolved.headers ?? {},
-					responsesUrl,
-				};
-			}
+			resolved = await ctx.modelRegistry.getApiKeyAndHeaders(preferred);
 		} catch {
+			continue;
 		}
+		if (!resolved.ok || !resolved.apiKey) continue;
+		// Auth can override the model's base URL. Do not guess Responses/web_search
+		// support from a gateway URL, or pair its credential with the official API.
+		const baseUrl = resolved.baseUrl ?? preferred.baseUrl;
+		const useCodexEndpoint = provider === "openai-codex" || isCodexJwt(resolved.apiKey);
+		if (!hasExplicitResponsesUrl && !useProviderBaseUrl && !useCodexEndpoint && baseUrl !== undefined) {
+			let isOfficial = false;
+			try {
+				isOfficial = new URL(baseUrl).toString().replace(/\/+$/u, "") === "https://api.openai.com/v1";
+			} catch {
+			}
+			if (!isOfficial) {
+				throw new CustomOpenAIBaseUrlError(`OpenAI web search cannot reuse Pi credentials with a custom baseUrl by default. Set openaiResponsesUrl in ${CONFIG_PATH} to the full Responses endpoint for this credential.`);
+			}
+		}
+		let providerResponsesUrl = responsesUrl;
+		if (useProviderBaseUrl) {
+			try {
+				providerResponsesUrl = resolveProviderResponsesUrl(baseUrl, useCodexEndpoint);
+			} catch (err) {
+				if (!(err instanceof CustomOpenAIBaseUrlError)) throw err;
+				invalidProviderUrlError ??= err;
+				continue;
+			}
+		}
+		return {
+			provider,
+			apiKey: resolved.apiKey,
+			model: modelOverride ?? preferred.id,
+			headers: resolved.headers ?? {},
+			responsesUrl: providerResponsesUrl,
+			...(useProviderBaseUrl ? { useProviderBaseUrl: true } : {}),
+		};
 	}
+	if (invalidProviderUrlError) throw invalidProviderUrlError;
 	return undefined;
 }
 
 export async function resolveOpenAIAuth(ctx?: ExtensionContext, signal?: AbortSignal): Promise<OpenAIAuth | undefined> {
 	const config = loadConfig();
 	const responsesUrl = resolveConfiguredResponsesUrl(config.openaiResponsesUrl);
+	const useProviderBaseUrl = resolveUseProviderBaseUrl(config);
 	const modelOverride = resolveConfiguredSearchModel(config.openaiSearchModel);
 	const providers = resolveConfiguredSearchProviders(config.openaiSearchProviders);
 	if (ctx) {
-		const auth = await resolvePiAuth(ctx, responsesUrl, providers, modelOverride);
+		const auth = await resolvePiAuth(ctx, responsesUrl, providers, modelOverride, config.openaiResponsesUrl !== undefined, useProviderBaseUrl);
 		if (auth) return auth;
+	}
+	if (useProviderBaseUrl) {
+		throw new CustomOpenAIBaseUrlError("OpenAI search configuration: openaiUseProviderBaseUrl requires selected Pi provider credentials and a baseUrl; set openaiResponsesUrl for standalone API keys");
 	}
 
 	const hasSource = hasCredentialSource({
@@ -272,8 +328,15 @@ export async function resolveOpenAIAuth(ctx?: ExtensionContext, signal?: AbortSi
 export async function isOpenAISearchAvailable(ctx?: ExtensionContext): Promise<boolean> {
 	const config = loadConfig();
 	const responsesUrl = resolveConfiguredResponsesUrl(config.openaiResponsesUrl);
+	const useProviderBaseUrl = resolveUseProviderBaseUrl(config);
 	const providers = resolveConfiguredSearchProviders(config.openaiSearchProviders);
-	if (ctx && await resolvePiAuth(ctx, responsesUrl, providers)) return true;
+	try {
+		if (ctx && await resolvePiAuth(ctx, responsesUrl, providers, undefined, config.openaiResponsesUrl !== undefined, useProviderBaseUrl)) return true;
+	} catch (err) {
+		if (err instanceof CustomOpenAIBaseUrlError) return false;
+		throw err;
+	}
+	if (useProviderBaseUrl) return false;
 	return hasCredentialSource({
 		provider: "OpenAI",
 		configuredValue: config.openaiApiKey,
@@ -490,26 +553,103 @@ function extractAnswer(output: unknown[]): string {
 	return parts.join("\n").trim();
 }
 
+function isAlphaSearchEnabled(): boolean {
+	const value = loadConfig().openaiUseAlphaSearch;
+	if (value === undefined) return false;
+	if (typeof value !== "boolean") {
+		throw new Error(`openaiUseAlphaSearch in ${CONFIG_PATH} must be a boolean`);
+	}
+	return value;
+}
+
+function resolveAlphaSearchUrl(responsesUrl: string): string {
+	const url = new URL(responsesUrl);
+	const pathname = url.pathname.replace(/\/+$/u, "");
+	if (!pathname.endsWith("/responses")) {
+		throw new Error("OpenAI alpha/search configuration: endpoint path must end with /responses");
+	}
+	url.pathname = `${pathname.slice(0, -"/responses".length)}/alpha/search`;
+	return url.toString();
+}
+
+function buildAlphaSearchBody(query: string, options: SearchOptions, model: string): Record<string, unknown> {
+	const filters = normalizeDomainFilters(options.domainFilter);
+	if (filters?.blockedDomains?.length) {
+		throw new OpenAIAlphaSearchUnsupportedError("OpenAI alpha/search: unsupported excluded domains; use another search provider or disable openaiUseAlphaSearch");
+	}
+	const recencyDays = { day: 1, week: 7, month: 30, year: 365 };
+	return {
+		id: randomUUID(),
+		model,
+		commands: {
+			search_query: [{
+				q: query,
+				...(options.recencyFilter ? { recency: recencyDays[options.recencyFilter] } : {}),
+				...(filters?.allowedDomains ? { domains: filters.allowedDomains } : {}),
+			}],
+		},
+	};
+}
+
+function buildAlphaSearchHeaders(headers: Record<string, string>, apiKey: string): Headers {
+	const result = new Headers(headers);
+	for (const name of ["OpenAI-Beta", "Session_ID", "Conversation_ID", "X-Codex-Beta-Features", "X-Codex-Turn-State", "x-openai-internal-codex-responses-lite"]) {
+		result.delete(name);
+	}
+	result.set("Authorization", `Bearer ${apiKey}`);
+	result.set("Content-Type", "application/json");
+	result.set("Accept", "application/json");
+	result.set("Originator", "codex_cli_rs");
+	return result;
+}
+
+async function parseAlphaSearchResponse(response: Response, numResults = 5): Promise<SearchResponse> {
+	const text = await response.text();
+	let payload: unknown;
+	try {
+		payload = JSON.parse(text);
+	} catch {
+		throw new Error("OpenAI alpha/search returned invalid JSON");
+	}
+	if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+		throw new Error("OpenAI alpha/search returned an invalid response");
+	}
+	const record = payload as Record<string, unknown>;
+	const answer = typeof record.output === "string" ? record.output.trim() : "";
+	const results: SearchResult[] = [];
+	const seen = new Set<string>();
+	for (const item of Array.isArray(record.results) ? record.results : []) {
+		if (!item || typeof item !== "object" || item.type !== "text_result" || typeof item.url !== "string") continue;
+		try {
+			const url = new URL(item.url);
+			if (url.protocol !== "http:" && url.protocol !== "https:") continue;
+		} catch {
+			continue;
+		}
+		addResult(results, seen, item.url, item.title, typeof item.snippet === "string" ? item.snippet : "");
+	}
+	if (!answer && results.length === 0) {
+		throw new Error("OpenAI alpha/search returned no parseable results or plaintext output");
+	}
+	return {
+		answer,
+		results: typeof numResults === "number" && Number.isFinite(numResults) && numResults > 0
+			? results.slice(0, Math.min(Math.floor(numResults), 20))
+			: results,
+	};
+}
+
 async function runOpenAISearch(
 	query: string,
 	options: SearchOptions,
 	auth: OpenAIAuth,
 ): Promise<SearchResponse> {
-	const activityId = activityMonitor.logStart({ type: "api", query });
-	const headers: Record<string, string> = {
-		...toRequestHeaders(auth.headers),
-		Authorization: `Bearer ${auth.apiKey}`,
-		"Content-Type": "application/json",
-		"OpenAI-Beta": "responses=experimental",
-	};
+	const useAlphaSearch = isAlphaSearchEnabled();
+	if (useAlphaSearch) options.signal?.throwIfAborted();
 	const useCodexEndpoint = auth.useCodexEndpoint ?? (auth.provider === "openai-codex" || isCodexJwt(auth.apiKey));
-	if (useCodexEndpoint) {
-		const accountId = extractAccountId(auth.apiKey);
-		if (accountId) headers["chatgpt-account-id"] = accountId;
-		headers.originator = "pi";
-	}
-
-	const body = {
+	const responsesUrl = useCodexEndpoint && !auth.useProviderBaseUrl ? CODEX_RESPONSES_URL : auth.responsesUrl;
+	const requestUrl = useAlphaSearch ? resolveAlphaSearchUrl(responsesUrl) : responsesUrl;
+	const body = useAlphaSearch ? buildAlphaSearchBody(query, options, auth.model) : {
 		model: auth.model,
 		instructions: buildInstructions(options),
 		input: [{ role: "user", content: [{ type: "input_text", text: query }] }],
@@ -520,11 +660,23 @@ async function runOpenAISearch(
 		tool_choice: "required" as const,
 		parallel_tool_calls: true,
 	};
+	const activityId = activityMonitor.logStart({ type: "api", query });
+	const headers: Record<string, string> = {
+		...toRequestHeaders(auth.headers),
+		Authorization: `Bearer ${auth.apiKey}`,
+		"Content-Type": "application/json",
+		"OpenAI-Beta": "responses=experimental",
+	};
+	if (useCodexEndpoint) {
+		const accountId = extractAccountId(auth.apiKey);
+		if (accountId) headers["chatgpt-account-id"] = accountId;
+		headers.originator = "pi";
+	}
 
 	try {
-		const response = await fetch(useCodexEndpoint ? CODEX_RESPONSES_URL : auth.responsesUrl, {
+		const response = await fetch(requestUrl, {
 			method: "POST",
-			headers,
+			headers: useAlphaSearch ? buildAlphaSearchHeaders(headers, auth.apiKey) : headers,
 			body: JSON.stringify(body),
 			signal: options.signal
 				? AbortSignal.any([AbortSignal.timeout(SEARCH_TIMEOUT_MS), options.signal])
@@ -534,9 +686,17 @@ async function runOpenAISearch(
 		if (!response.ok) {
 			activityMonitor.logError(activityId, `HTTP ${response.status}`);
 			const errorText = redactCredential(await response.text(), auth.apiKey);
-			throw new Error(`OpenAI API error ${response.status}: ${errorText.slice(0, 300)}`);
+			const ErrorType = useAlphaSearch && [404, 405, 501].includes(response.status)
+				? OpenAIAlphaSearchUnsupportedError
+				: Error;
+			throw new ErrorType(`OpenAI ${useAlphaSearch ? "alpha/search " : ""}API error ${response.status}: ${errorText.slice(0, 300)}`);
 		}
 
+		if (useAlphaSearch) {
+			const result = await parseAlphaSearchResponse(response, options.numResults);
+			activityMonitor.logComplete(activityId, response.status);
+			return result;
+		}
 		const parsed = await parseOpenAIResponse(response);
 		const output = Array.isArray(parsed.payload.output) ? parsed.payload.output : [];
 		if (!parsed.webSearchCallSeen) throw new Error("OpenAI web_search returned no web_search_call");

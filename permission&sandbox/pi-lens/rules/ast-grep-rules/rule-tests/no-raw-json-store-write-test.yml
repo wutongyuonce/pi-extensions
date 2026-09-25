@@ -1,0 +1,17 @@
+id: no-raw-json-store-write
+valid:
+  - "writeFileAtomic(file, JSON.stringify(data))"
+  - "writeFileSync(file, text)"
+invalid:
+  # #1349 review: encoding/replacer/indent variants are the same raw write.
+  - "writeFileSync(file, JSON.stringify(data), 'utf8')"
+  - "writeFileSync(file, JSON.stringify(data, null, 2))"
+  - "fs.writeFileSync(file, JSON.stringify(data, replacer), { encoding: 'utf8' })"
+  - "writeFileSync(file, JSON.stringify(data))"
+  - "fs.writeFileSync(file, JSON.stringify(data))"
+  - |
+    const payload = JSON.stringify(data)
+    writeFileSync(file, payload)
+  - |
+    const payload = JSON.stringify(data)
+    fs.writeFileSync(file, payload)

@@ -1,0 +1,3 @@
+apiVersion: v2
+name: pi-lens-smoke
+version: 0.1.0

@@ -1,11 +1,13 @@
 import { existsSync, readFileSync } from "node:fs";
-import net from "node:net";
 import { activityMonitor } from "./activity.ts";
+import { normalizeDomain } from "./domain-filter-normalization.ts";
 import { redactCredential, resolveCredential } from "./credential-source.ts";
 import type { ExtractedContent, ExtractOptions } from "./extract.ts";
 import type { SearchOptions, SearchResponse } from "./perplexity.ts";
+import { formatSearchResultsAsAnswer } from "./search-answer-formatting.ts";
+import { normalizeSearchResultCount } from "./search-result-count-normalization.ts";
 import { loadSsrfConfig, validateRemoteUrl, type Lookup } from "./ssrf-protection.ts";
-import { getWebSearchConfigPath } from "./utils.ts";
+import { getWebSearchConfigPath, isLoopbackHostname } from "./utils.ts";
 
 const CONFIG_PATH = getWebSearchConfigPath();
 const DEFAULT_API_VERSION = "v2";
@@ -185,13 +187,6 @@ function ssrfOptions(options?: FirecrawlExtractOptions | FirecrawlSearchOptions)
 	};
 }
 
-function isLoopbackApiUrl(url: URL): boolean {
-	const hostname = url.hostname.toLowerCase().replace(/^\[|\]$/g, "").replace(/\.$/, "");
-	if (hostname === "localhost" || hostname === "::1") return true;
-	if (net.isIP(hostname) !== 4) return false;
-	return hostname.split(".")[0] === "127";
-}
-
 function firecrawlApiSsrfOptions(
 	options: FirecrawlExtractOptions | FirecrawlSearchOptions | undefined,
 	allowLoopback: boolean,
@@ -215,7 +210,7 @@ async function fetchFirecrawlApi(
 	init: { method: string; headers: Record<string, string>; body: string; signal: AbortSignal },
 	options: FirecrawlExtractOptions | FirecrawlSearchOptions | undefined,
 ): Promise<Response> {
-	const allowLoopback = isLoopbackApiUrl(new URL(url));
+	const allowLoopback = isLoopbackHostname(new URL(url).hostname);
 	let current = await validateRemoteUrl(url, firecrawlApiSsrfOptions(options, allowLoopback));
 	let headers = init.headers;
 	for (let redirects = 0; redirects <= DEFAULT_MAX_REDIRECTS; redirects++) {
@@ -240,26 +235,6 @@ function scrapeBody(url: string): Record<string, unknown> {
 		onlyMainContent: true,
 		...(allowFreshScrape() ? {} : { lockdown: true }),
 	};
-}
-
-function normalizeCount(value: number | undefined): number {
-	if (typeof value !== "number" || !Number.isFinite(value)) return 5;
-	return Math.max(1, Math.min(Math.floor(value), 20));
-}
-
-function normalizeDomain(value: string): string | null {
-	let input = value.trim().toLowerCase();
-	if (!input) return null;
-	if (input.startsWith("-")) input = input.slice(1).trim();
-	if (!input) return null;
-	try {
-		const parsed = input.includes("://") ? new URL(input) : new URL(`https://${input}`);
-		input = parsed.hostname;
-	} catch {
-		input = input.split("/")[0]?.split(":")[0] ?? "";
-	}
-	input = input.replace(/^\.+|\.+$/g, "");
-	return /^[a-z0-9][a-z0-9.-]*\.[a-z]{2,}$/i.test(input) ? input : null;
 }
 
 function parseDomainFilter(domainFilter: string[] | undefined): DomainFilters {
@@ -319,13 +294,6 @@ function firstString(...values: unknown[]): string | null {
 		if (typeof value === "string" && value.trim()) return value.trim();
 	}
 	return null;
-}
-
-function buildAnswer(results: SearchResponse["results"]): string {
-	return results.map((result) => {
-		if (result.snippet) return `${result.snippet}\nSource: ${result.title} (${result.url})`;
-		return `Source: ${result.title} (${result.url})`;
-	}).join("\n\n");
 }
 
 function mapSearchResults(data: unknown, numResults: number, filters: DomainFilters): {
@@ -413,7 +381,7 @@ export function isFirecrawlAvailable(): boolean {
 
 export async function searchWithFirecrawl(query: string, options: FirecrawlSearchOptions = {}): Promise<SearchResponse> {
 	requireBaseUrl();
-	const numResults = normalizeCount(options.numResults);
+	const numResults = normalizeSearchResultCount(options.numResults);
 	const filters = parseDomainFilter(options.domainFilter);
 	const envelope = await firecrawlFetch(
 		"search",
@@ -424,7 +392,7 @@ export async function searchWithFirecrawl(query: string, options: FirecrawlSearc
 		{ type: "api", query },
 	);
 	const mapped = mapSearchResults(envelope.data, numResults, filters);
-	const response: SearchResponse = { answer: buildAnswer(mapped.results), results: mapped.results };
+	const response: SearchResponse = { answer: formatSearchResultsAsAnswer(mapped.results), results: mapped.results };
 	if (options.includeContent && mapped.inlineContent.length > 0) response.inlineContent = mapped.inlineContent;
 	return response;
 }

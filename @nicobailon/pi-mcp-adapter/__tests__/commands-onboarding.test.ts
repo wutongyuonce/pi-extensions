@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { mkdtempSync, mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -49,10 +49,12 @@ describe("commands onboarding", () => {
   });
 
   function createUi() {
+    const theme = { name: "active-test-theme" };
     return {
       notify: vi.fn(),
       setStatus: vi.fn(),
-      custom: vi.fn((renderer: any) => renderer({ requestRender: vi.fn() }, {}, {}, vi.fn())),
+      theme,
+      custom: vi.fn((renderer: any) => renderer({ requestRender: vi.fn() }, theme, {}, vi.fn())),
     };
   }
 
@@ -85,6 +87,7 @@ describe("commands onboarding", () => {
     });
 
     const ui = createUi();
+    const { theme } = ui;
     const { loadMcpConfig } = await import("../config.ts");
     const { openMcpPanel } = await import("../commands.ts");
     const { loadOnboardingState } = await import("../onboarding-state.ts");
@@ -99,7 +102,121 @@ describe("commands onboarding", () => {
     expect(mocks.createMcpPanel).toHaveBeenCalled();
     const options = mocks.createMcpPanel.mock.calls[0]?.[6];
     expect(options.noticeLines[0]).toContain("Using standard MCP config");
+    expect(options.theme).toBe(theme);
     expect(loadOnboardingState().sharedConfigHintShown).toBe(true);
+  });
+
+  it("passes the active theme into the setup MCP panel", async () => {
+    process.env.HOME = mkdtempSync(join(tmpdir(), "pi-mcp-commands-setup-theme-home-"));
+    const ui = createUi();
+    const { openMcpSetup } = await import("../commands.ts");
+
+    await openMcpSetup(
+      { config: { mcpServers: {} } } as any,
+      {} as any,
+      { hasUI: true, mode: "tui", cwd: process.cwd(), ui } as any,
+    );
+
+    const options = mocks.createMcpSetupPanel.mock.calls.at(-1)?.[2];
+    expect(options.theme).toBe(ui.theme);
+  });
+
+  it("passes the active theme into the OAuth MCP panel", async () => {
+    const ui = createUi();
+    const { openMcpAuthPanel } = await import("../commands.ts");
+
+    await openMcpAuthPanel({
+      programmaticConfig: false,
+      config: { mcpServers: { sentry: { url: "https://mcp.sentry.dev/mcp", auth: "oauth" } } },
+      manager: { getConnection: () => null },
+      failureTracker: new Map(),
+    } as any, { getFlag: () => undefined } as any, {
+      hasUI: true,
+      mode: "tui",
+      cwd: process.cwd(),
+      ui,
+    } as any);
+
+    const options = mocks.createMcpPanel.mock.calls.at(-1)?.[6];
+    expect(options.theme).toBe(ui.theme);
+  });
+
+  it("does not present an .agents-only config as canonical shared MCP config", async () => {
+    const home = mkdtempSync(join(tmpdir(), "pi-mcp-commands-agents-home-"));
+    const project = mkdtempSync(join(tmpdir(), "pi-mcp-commands-agents-project-"));
+    process.env.HOME = home;
+    process.chdir(project);
+
+    writeJson(join(home, ".agents", "mcp.json"), {
+      mcpServers: {
+        compatibilityServer: { command: "compatibility" },
+      },
+    });
+
+    const ui = createUi();
+    const { loadMcpConfig } = await import("../config.ts");
+    const { openMcpPanel } = await import("../commands.ts");
+
+    await openMcpPanel({
+      config: loadMcpConfig(),
+      manager: { getConnection: () => null },
+      toolMetadata: new Map(),
+      failureTracker: new Map(),
+    } as any, { getFlag: () => undefined } as any, { hasUI: true, mode: "tui", ui, cwd: process.cwd() } as any);
+
+    expect(mocks.createMcpPanel).toHaveBeenCalled();
+    const options = mocks.createMcpPanel.mock.calls[0]?.[6];
+    expect(options.noticeLines).toEqual([]);
+  });
+
+  it("writes known-server setup choices to the selected global shared config", async () => {
+    const home = mkdtempSync(join(tmpdir(), "pi-mcp-commands-global-target-home-"));
+    const project = mkdtempSync(join(tmpdir(), "pi-mcp-commands-global-target-project-"));
+    process.env.HOME = home;
+    process.chdir(project);
+    mocks.createMcpSetupPanel.mockImplementationOnce((_discovery, callbacks, _options, _tui, done) => {
+      void callbacks.addKnownServer({ id: "demo", name: "Demo", summary: "Demo server", entry: { command: "demo" } }, "global")
+        .then(() => done());
+      return { dispose() {} };
+    });
+
+    const ui = createUi();
+    const { openMcpSetup } = await import("../commands.ts");
+
+    const result = await openMcpSetup({ config: { mcpServers: {} } } as any, {} as any, { hasUI: true, mode: "tui", ui, cwd: process.cwd() } as any);
+
+    expect(result.configChanged).toBe(true);
+    expect(JSON.parse(readFileSync(join(home, ".config", "mcp", "mcp.json"), "utf-8"))).toEqual({
+      mcpServers: {
+        demo: { command: "demo" },
+      },
+    });
+  });
+
+  it("writes RepoPrompt setup choices to the selected global shared config", async () => {
+    const home = mkdtempSync(join(tmpdir(), "pi-mcp-commands-repoprompt-global-home-"));
+    const project = mkdtempSync(join(tmpdir(), "pi-mcp-commands-repoprompt-global-project-"));
+    process.env.HOME = home;
+    process.chdir(project);
+    writeFileSync(join(project, "package.json"), "{}\n", "utf-8");
+    writeJson(join(home, "RepoPrompt", "repoprompt_cli"), {});
+    mocks.createMcpSetupPanel.mockImplementationOnce((_discovery, callbacks, _options, _tui, done) => {
+      void callbacks.addRepoPrompt("global").then(() => done());
+      return { dispose() {} };
+    });
+
+    const ui = createUi();
+    const { openMcpSetup } = await import("../commands.ts");
+
+    const result = await openMcpSetup({ config: { mcpServers: {} } } as any, {} as any, { hasUI: true, mode: "tui", ui, cwd: process.cwd() } as any);
+
+    expect(result.configChanged).toBe(true);
+    expect(existsSync(join(project, ".mcp.json"))).toBe(false);
+    expect(JSON.parse(readFileSync(join(home, ".config", "mcp", "mcp.json"), "utf-8"))).toEqual({
+      mcpServers: {
+        repoprompt: { command: join(home, "RepoPrompt", "repoprompt_cli"), args: [], lifecycle: "lazy" },
+      },
+    });
   });
 
   it("does not inspect host-specific configs when opening the MCP panel", async () => {
@@ -221,7 +338,9 @@ describe("commands onboarding", () => {
     const close = vi.fn(async () => {
       currentConnection = null;
     });
-    const connect = vi.fn(async () => {
+    const connect = vi.fn(async () => currentConnection);
+    const reconnect = vi.fn(async (_name, _definition, staleConnection) => {
+      expect(staleConnection).toBe(currentConnection);
       currentConnection = {
         status: "connected",
         tools: [{ name: "search", description: "Search" }],
@@ -234,6 +353,7 @@ describe("commands onboarding", () => {
       manager: {
         close,
         connect,
+        reconnect,
         getConnection: vi.fn(() => currentConnection),
         getAllConnections: vi.fn(() => new Map(currentConnection?.status === "connected" ? [["notion", currentConnection]] : [])),
       },
@@ -249,8 +369,9 @@ describe("commands onboarding", () => {
     const callbacks = mocks.createMcpPanel.mock.calls[0]?.[3];
     await expect(callbacks.reconnect("notion")).resolves.toBe(true);
 
-    expect(close).toHaveBeenCalledWith("notion");
-    expect(connect).toHaveBeenCalledWith("notion", state.config.mcpServers.notion);
+    expect(close).not.toHaveBeenCalled();
+    expect(connect).not.toHaveBeenCalled();
+    expect(reconnect).toHaveBeenCalledWith("notion", state.config.mcpServers.notion, expect.any(Object), undefined);
     expect(state.failureTracker.has("notion")).toBe(false);
     expect(state.toolMetadata.get("notion")?.[0]?.name).toBe("notion_search");
     expect(callbacks.getConnectionStatus("notion")).toBe("connected");

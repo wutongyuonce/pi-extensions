@@ -1,8 +1,11 @@
 import { randomUUID } from "node:crypto";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { activityMonitor } from "./activity.ts";
+import { normalizeDomain } from "./domain-filter-normalization.ts";
 import { redactCredential } from "./credential-source.ts";
 import type { SearchOptions, SearchResponse, SearchResult } from "./perplexity.ts";
+import { formatSearchResultsAsAnswer } from "./search-answer-formatting.ts";
+import { normalizeSearchResultCount } from "./search-result-count-normalization.ts";
 
 const KIMI_SEARCH_URL = "https://api.kimi.com/coding/v1/search";
 const KIMI_PROVIDERS = ["kimi-coding", "kimi-code"] as const;
@@ -66,26 +69,6 @@ async function resolveKimiAuth(ctx?: ExtensionContext): Promise<KimiAuth | undef
 	return undefined;
 }
 
-function normalizeCount(value: number | undefined): number {
-	if (typeof value !== "number" || !Number.isFinite(value)) return 5;
-	return Math.max(1, Math.min(Math.floor(value), 20));
-}
-
-function normalizeDomain(value: string): string | null {
-	let input = value.trim().toLowerCase();
-	if (!input) return null;
-	if (input.startsWith("-")) input = input.slice(1).trim();
-	if (!input) return null;
-	try {
-		const parsed = input.includes("://") ? new URL(input) : new URL(`https://${input}`);
-		input = parsed.hostname;
-	} catch {
-		input = input.split("/")[0]?.split(":")[0] ?? "";
-	}
-	input = input.replace(/^\.+|\.+$/g, "");
-	return /^[a-z0-9][a-z0-9.-]*\.[a-z]{2,}$/i.test(input) ? input : null;
-}
-
 function normalizeDomainFilters(domainFilter: string[] | undefined): NormalizedDomainFilters {
 	const filters: NormalizedDomainFilters = { allowed: [], blocked: [] };
 	if (!domainFilter?.length) return filters;
@@ -137,7 +120,7 @@ function parseResults(value: unknown, options: SearchOptions): SearchResult[] {
 	}
 
 	const filters = normalizeDomainFilters(options.domainFilter);
-	const numResults = normalizeCount(options.numResults);
+	const numResults = normalizeSearchResultCount(options.numResults);
 	const results: SearchResult[] = [];
 	for (const item of (value as { search_results: unknown[] }).search_results) {
 		if (!item || typeof item !== "object") continue;
@@ -152,14 +135,6 @@ function parseResults(value: unknown, options: SearchOptions): SearchResult[] {
 		if (results.length >= numResults) break;
 	}
 	return results;
-}
-
-function formatAnswer(results: SearchResult[]): string {
-	return results
-		.map((result) => result.snippet
-			? `${result.snippet}\nSource: ${result.title} (${result.url})`
-			: `Source: ${result.title} (${result.url})`)
-		.join("\n\n");
 }
 
 export async function isKimiSearchAvailable(ctx?: ExtensionContext): Promise<boolean> {
@@ -212,7 +187,7 @@ export async function searchWithKimi(
 		}
 
 		activityMonitor.logComplete(activityId, response.status);
-		return { answer: formatAnswer(results), results };
+		return { answer: formatSearchResultsAsAnswer(results), results };
 	} catch (err) {
 		const message = err instanceof Error ? err.message : String(err);
 		const redactedMessage = redactCredential(message, auth.apiKey);

@@ -1,7 +1,8 @@
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { abortable } from "./abort.ts";
 import { combineAbortSignals } from "./runtime-owner.ts";
 import type { McpExtensionState } from "./state.ts";
+import { getServerApprovalIdentity, getToolApprovalIdentity, rememberToolApproval } from "./session-approvals.ts";
 import {
   getToolNameCandidates,
   matchesToolPattern,
@@ -19,18 +20,6 @@ import { sanitizeTerminalText } from "./utils.ts";
 export type ToolCallApprovalResult =
   | { ok: true }
   | { ok: false; reason: "denied" | "approval_required_headless" };
-
-function stableStringify(value: unknown): string {
-  if (value === null || value === undefined || typeof value !== "object") {
-    const serialized = JSON.stringify(value);
-    return serialized === undefined ? "undefined" : serialized;
-  }
-  if (Array.isArray(value)) {
-    return `[${value.map(item => stableStringify(item)).join(",")}]`;
-  }
-  const object = value as Record<string, unknown>;
-  return `{${Object.keys(object).sort().map(key => `${JSON.stringify(key)}:${stableStringify(object[key])}`).join(",")}}`;
-}
 
 export function isToolCallApprovalRequired(
   config: McpConfig,
@@ -148,20 +137,31 @@ export async function ensureToolCallApproved(
   origin: McpToolApprovalOrigin = toolMeta.resourceUri ? "resource" : "proxy",
   approvalMetadata?: ReadonlyMap<string, readonly ToolMetadata[]>,
 ): Promise<ToolCallApprovalResult> {
-  const argsHash = createHash("sha256").update(stableStringify(args ?? {})).digest("hex");
-  const cacheKey = `${serverName}\u0000${toolMeta.originalName}\u0000${argsHash}`;
+  const ownedSignal = combineAbortSignals(state.owner?.signal, signal);
+  const approvedServers = state.approvedServers ??= new Map();
+  const serverIdentity = getServerApprovalIdentity(state, serverName);
+  const brokerDecision = await requestBrokerApproval(state, serverName, toolMeta, args, origin, signal);
+  if (brokerDecision === "allow_once") return { ok: true };
+  if (brokerDecision === "allow_for_session") {
+    rememberToolApproval(state, serverName, toolMeta, args);
+    return { ok: true };
+  }
+  if (brokerDecision === "deny") return { ok: false, reason: "denied" };
+
+  const serverGrant = approvedServers.get(serverName);
+  const liveServerIdentity = getServerApprovalIdentity(state, serverName);
+  if (serverGrant && state.approvedServers === approvedServers
+    && serverGrant.definition === liveServerIdentity?.definition && serverGrant.hash === liveServerIdentity?.hash) {
+    ownedSignal?.throwIfAborted();
+    return { ok: true };
+  }
+  approvedServers.delete(serverName);
+
+  const { cacheKey } = getToolApprovalIdentity(serverName, toolMeta, args);
   const approvedToolCalls = state.approvedToolCalls ??= new Map<string, true>();
   if (approvedToolCalls.has(cacheKey)) {
     return { ok: true };
   }
-
-  const brokerDecision = await requestBrokerApproval(state, serverName, toolMeta, args, origin, signal);
-  if (brokerDecision === "allow_once") return { ok: true };
-  if (brokerDecision === "allow_for_session") {
-    approvedToolCalls.set(cacheKey, true);
-    return { ok: true };
-  }
-  if (brokerDecision === "deny") return { ok: false, reason: "denied" };
 
   if (!isToolCallApprovalRequired(state.config, serverName, toolMeta, approvalMetadata ?? state.toolMetadata)) {
     return { ok: true };
@@ -175,20 +175,30 @@ export async function ensureToolCallApproved(
   const sanitized = sanitizeTerminalText(json);
   const preview = sanitized.length > 500 ? `${sanitized.slice(0, 500)}...` : sanitized;
   const title = `MCP: ${sanitizeTerminalText(serverName)} wants to run ${sanitizeTerminalText(toolMeta.originalName)}`;
-  const ownedSignal = combineAbortSignals(state.owner?.signal, signal);
+  const serverScope = "Allow server for this session permits all tools and arguments on this server until reload or session/branch change. Other security and UI consent checks still apply.";
   const decision = await abortable(
     state.ui.select(
-      `${title}\n\nArguments:\n${preview}`,
-      ["Allow once", "Allow for session", "Deny"],
+      `${title}\n\nArguments:\n${preview}\n\n${serverScope}`,
+      ["Allow once", "Allow for session", "Allow server for this session", "Deny"],
     ),
     ownedSignal,
   );
 
+  if (decision === "Allow server for this session") {
+    ownedSignal?.throwIfAborted();
+    const currentIdentity = getServerApprovalIdentity(state, serverName);
+    if (!serverIdentity || state.approvedServers !== approvedServers
+      || currentIdentity?.definition !== serverIdentity.definition || currentIdentity.hash !== serverIdentity.hash) {
+      return { ok: false, reason: "denied" };
+    }
+    approvedServers.set(serverName, serverIdentity);
+    return { ok: true };
+  }
   if (decision === "Allow once") {
     return { ok: true };
   }
   if (decision === "Allow for session") {
-    approvedToolCalls.set(cacheKey, true);
+    rememberToolApproval(state, serverName, toolMeta, args);
     return { ok: true };
   }
   return { ok: false, reason: "denied" };

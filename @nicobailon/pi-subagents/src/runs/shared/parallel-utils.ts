@@ -10,6 +10,10 @@ export interface RunnerSubagentStep {
 	sessionName?: string;
 	task: string;
 	runner?: ResolvedRunnerConfig;
+	/** Herdr saved machine this external-cli step runs on; `cwd` is then the directory on that machine. */
+	machine?: import("../../shared/types.ts").HerdrMachineReference;
+	remoteReads?: string[] | false;
+	machineEnv?: Record<string, string>;
 	externalJobFollowUp?: {
 		sourceRunId: string;
 		sourceStepIndex: number;
@@ -37,20 +41,22 @@ export interface RunnerSubagentStep {
 	fast?: boolean;
 	thinking?: string;
 	thinkingCeiling?: import("../../shared/model-info.ts").ThinkingLevel;
-	modelCandidates?: string[];
+	requestedModel?: string;
 	/** The primary model is inherited from the parent session and should not be verified against the child-reported active registry model. */
 	skipPrimaryModelVerification?: boolean;
 	modelVerificationRegistry?: Array<{ provider: string; id: string; fullId: string; contextWindow?: number }>;
+	modelResponseAliases?: Record<string, string[]>;
 	tools?: string[];
 	excludeTools?: string[];
 	allowNestedSubagents?: boolean;
+	/** Resolved selected-agent policy for launches made by this child. */
+	allowedAgents?: string[];
 	extensions?: string[];
 	subagentOnlyExtensions?: string[];
+	/** Private immutable host policy snapshot serialized to the native runner. */
+	requiredExtensions?: import("../../shared/required-child-extensions.ts").RequiredChildExtensionSnapshot;
 	mcpDirectTools?: string[];
-	mcpConfig?: import("./mcp-direct-tool-allowlist.ts").McpConfig;
-	runtimeServerNames?: string[];
 	mutationTools?: string[];
-	completionGuard?: boolean;
 	systemPrompt?: string | null;
 	systemPromptMode?: "append" | "replace";
 	inheritProjectContext: boolean;
@@ -76,8 +82,8 @@ export interface RunnerSubagentStep {
 	launchBindingTask?: string;
 	launchContractDigest?: string;
 	extensionBindings?: import("./extension-bindings.ts").ExtensionBindings;
-	launchResolvedExtensions?: import("../../shared/types.ts").LaunchResolvedChildExtensionsV1;
-	runtimeAcknowledgedExtensions?: import("../../shared/types.ts").RuntimeAcknowledgedChildExtensionsV1;
+	launchResolvedExtensions?: import("../../shared/types.ts").LaunchResolvedChildExtensions;
+	runtimeAcknowledgedExtensions?: import("../../shared/types.ts").RuntimeAcknowledgedChildExtensions;
 	effectiveAcceptance?: import("../../shared/types.ts").ResolvedAcceptanceConfig;
 	acceptanceInput?: import("../../shared/types.ts").AcceptanceInput;
 	acceptanceRole?: import("../../shared/types.ts").AcceptanceRole;
@@ -238,7 +244,6 @@ export interface ParallelTaskResult {
 	error?: string;
 	timedOut?: boolean;
 	model?: string;
-	attemptedModels?: string[];
 	outputTargetPath?: string;
 	outputTargetExists?: boolean;
 }

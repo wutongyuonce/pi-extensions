@@ -1,0 +1,42 @@
+# Kotlin No println
+# Detects bare `println`/`print` calls.
+# Ported from vinhnx/VTCode rules/kotlin/no-println.yml (#2198, refs #2195).
+id: kotlin-no-println
+language: kotlin
+severity: warning
+message: "Avoid println/print; use a structured logger"
+note: |
+  Direct console output via println/print is not configurable and cannot be
+  routed to log aggregators or filtered by level. Use a structured logging
+  library (kotlin-logging, SLF4J, android.util.Log) for production code.
+  Detection-only: which logger to use, and whether a given call site is a
+  CLI entry point or a test where println is acceptable, is a project
+  policy call this rule cannot make.
+  Scoped to the unqualified call. A fully-qualified spelling
+  (`kotlin.io.println(...)`) is missed on purpose: syntactically it is the
+  same navigation-call shape as `anyReceiver.println(...)`, a member call on
+  an arbitrary type (a Writer, a PrintStream) that this rule must not flag,
+  and there is no type information here to tell the two apart.
+rule:
+  any:
+    - pattern: println($$$ARGS)
+    - pattern: print($$$ARGS)
+files:
+  - "**/*.kt"
+ignores:
+  - "**/*Test.kt"
+  - "**/test/**"
+tags:
+  - kotlin
+  - idiom
+  - logging
+examples:
+  bad: |
+    fun main() {
+        println("starting up")
+    }
+  good: |
+    private val logger = KotlinLogging.logger {}
+    fun main() {
+        logger.info { "starting up" }
+    }

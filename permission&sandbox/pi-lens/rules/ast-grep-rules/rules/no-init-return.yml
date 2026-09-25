@@ -1,0 +1,33 @@
+id: no-init-return
+language: Python
+message: "__init__ should not return a value"
+severity: error
+note: |
+  Port of SonarCloud python:S2734 ("__init__ should not return a value").
+
+  `__init__` is a constructor and is implicitly expected to return
+  None. Returning a value from `__init__` is a bug — the caller never
+  sees the returned value, and `__init__` returning non-None raises
+  TypeError at runtime.
+
+  The rule matches `return $VALUE` inside a `function_definition` whose
+  NAME is `__init__` (via `has: field: name`). Matching the name field — not
+  a `regex: 'def __init__'` over the function's *text* — is what avoids the
+  #439 false positive: a factory function that returns a class with an
+  `__init__` has `def __init__` in its body text, but its own name is not
+  `__init__`, so its `return` is correctly left alone. The `stopBy: end` on
+  the inside ancestor is required — without it, `inside` only checks the
+  *immediate* parent, which is `block` (not `function_definition`).
+
+  A bare `return` (no value) is allowed and intentionally not flagged.
+metadata:
+  sonar: S2734
+rule:
+  all:
+    - pattern: return $VALUE
+    - inside:
+        kind: function_definition
+        has:
+          field: name
+          regex: '^__init__$'
+        stopBy: end

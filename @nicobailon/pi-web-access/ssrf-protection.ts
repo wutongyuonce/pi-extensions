@@ -232,6 +232,7 @@ export async function fetchRemoteUrl(
 	const fetchImpl = options.fetch ?? fetch;
 	const maxRedirects = options.maxRedirects ?? DEFAULT_MAX_REDIRECTS;
 	let current = await validateRemoteUrl(url, options);
+	const configuredOrigin = current.origin;
 	let requestInit = init;
 
 	for (let redirects = 0; redirects <= maxRedirects; redirects++) {
@@ -243,7 +244,10 @@ export async function fetchRemoteUrl(
 		if (redirects === maxRedirects) throw new Error(`Too many redirects fetching ${current.toString()}`);
 
 		const from = current;
-		current = await validateRemoteUrl(new URL(location, current), options);
+		const next = new URL(location, current);
+		// allowLoopback exempts an explicitly configured endpoint, never a redirect target: a loopback
+		// base must not be able to pivot the request onto a different loopback origin.
+		current = await validateRemoteUrl(next, next.origin === configuredOrigin ? options : { ...options, allowLoopback: false });
 		if (response.status === 303 || ((response.status === 301 || response.status === 302) && requestInit.method?.toUpperCase() === "POST")) {
 			const { body: _body, ...nextInit } = requestInit;
 			requestInit = { ...nextInit, method: "GET" };

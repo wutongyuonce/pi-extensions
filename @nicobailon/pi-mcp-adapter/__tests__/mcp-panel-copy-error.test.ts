@@ -2,9 +2,19 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 const mocks = vi.hoisted(() => ({
   copyToClipboard: vi.fn(async (_text: string) => undefined),
+  DynamicBorder: class {
+    render(width: number): string[] {
+      return ["─".repeat(Math.max(1, width))];
+    }
+
+    invalidate(): void {}
+  },
 }));
 
-vi.mock("@earendil-works/pi-coding-agent", () => ({ copyToClipboard: mocks.copyToClipboard }));
+vi.mock("@earendil-works/pi-coding-agent", () => ({
+  copyToClipboard: mocks.copyToClipboard,
+  DynamicBorder: mocks.DynamicBorder,
+}));
 
 function stripAnsi(input: string): string {
   return input.replace(/\x1b\[[0-9;]*m/g, "");

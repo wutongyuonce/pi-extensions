@@ -1,0 +1,37 @@
+{
+	"global": null,
+	"lsp": {
+		"disabledServers": [
+			"typos"
+		],
+		"serverOverrides": {
+			"rust": {
+				"initializationOptions": {
+					"check": true
+				}
+			}
+		},
+		"servers": {
+			"custom": {
+				"args": [
+					"--stdio"
+				],
+				"command": "custom-lsp",
+				"extensions": [
+					".custom"
+				],
+				"name": "Custom",
+				"rootMarkers": [
+					"package.json"
+				]
+			}
+		},
+		"warmFiles": [
+			"src/main.rs"
+		]
+	},
+	"project": {
+		"ignore": [],
+		"rules": {}
+	}
+}

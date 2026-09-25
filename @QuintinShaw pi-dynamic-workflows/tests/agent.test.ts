@@ -1,0 +1,1889 @@
+import assert from "node:assert/strict";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
+import test from "node:test";
+import { createFauxCore, fauxAssistantMessage, fauxToolCall } from "@earendil-works/pi-ai";
+import { ModelRegistry, ModelRuntime, SessionManager } from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
+import type { AgentRunOptions, AgentUsage } from "../src/agent.js";
+import {
+  DEFAULT_EXCLUDED_SUBAGENT_TOOLS,
+  listAvailableModelSpecs,
+  resolveAgentModelSpec,
+  runtimeOf,
+  subagentExcludedTools,
+  usageFromStats,
+  WorkflowAgent,
+} from "../src/agent.js";
+import { WorkflowError, WorkflowErrorCode } from "../src/errors.js";
+import { resolveModelSpecWithThinking } from "../src/model-spec.js";
+import {
+  getModelTierConfigPath,
+  getProjectModelTierConfigPath,
+  type ModelTierConfig,
+} from "../src/model-tier-config.js";
+import { type JournalEntry, runWorkflow } from "../src/workflow.js";
+import { withFakeHome, withFakeHomeAsync } from "./helpers/fake-home.js";
+
+// Private methods used for testing - cast to this type to access them without `any`
+type WorkflowAgentPrivates = {
+  buildPrompt(prompt: string, options: AgentRunOptions<any>, structured: boolean): string;
+  lastAssistantText(messages: unknown[]): string;
+  finalAssistantText(messages: unknown[]): string;
+  createSessionManager(thread?: string): {
+    isPersisted(): boolean;
+    getCwd(): string;
+    getSessionId(): string;
+    getSessionDir(): string;
+    getSessionFile(): string | undefined;
+    getLeafId(): string | null;
+    appendSessionInfo(name: string): string;
+  };
+  restoreThreadLeaf(manager: ReturnType<WorkflowAgentPrivates["createSessionManager"]>, leafId: string | null): void;
+  getRegistry(perRunRegistry?: ModelRegistry): Promise<ModelRegistry>;
+};
+
+// ═══════════════════════════════════════════════════════════════════════
+// persistAgentSessions — in-memory by default, file-backed keyed by project cwd
+// ═══════════════════════════════════════════════════════════════════════
+
+test("WorkflowAgent uses an in-memory session manager by default", () => {
+  const agent = new WorkflowAgent({ cwd: "/tmp" });
+  const manager = (agent as unknown as WorkflowAgentPrivates).createSessionManager();
+  assert.equal(manager.isPersisted(), false, "default must stay in-memory (back-compat)");
+});
+
+test("WorkflowAgent with persistAgentSessions=false explicitly stays in-memory", () => {
+  const agent = new WorkflowAgent({ cwd: "/tmp", persistAgentSessions: false });
+  const manager = (agent as unknown as WorkflowAgentPrivates).createSessionManager();
+  assert.equal(manager.isPersisted(), false);
+});
+
+test("WorkflowAgent with persistAgentSessions=true creates a file-backed manager keyed by the project cwd", () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-dynamic-workflows-persist-agent-"));
+  const projectCwd = join(dir, "project");
+  const fakeHome = join(dir, "home");
+  try {
+    withFakeHome(fakeHome, () => {
+      const agent = new WorkflowAgent({ cwd: projectCwd, persistAgentSessions: true });
+      const manager = (agent as unknown as WorkflowAgentPrivates).createSessionManager();
+      assert.equal(manager.isPersisted(), true, "flag must yield a file-backed session manager");
+      // Sessions must be keyed by the runner's project cwd — never a per-call
+      // worktree cwd — so transcripts group under the project's session dir.
+      // createSessionManager() takes no per-call cwd by design; assert the
+      // manager saw the project cwd.
+      assert.equal(manager.getCwd(), projectCwd);
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("agentIdFor mints a unique id per unthreaded createAgentSession call (concurrent/retry-safe)", () => {
+  const agent = new WorkflowAgent({ cwd: "/tmp" }) as unknown as WorkflowAgentPrivates;
+  const id1 = agent.agentIdFor({}, "/worktree-a");
+  const id2 = agent.agentIdFor({}, "/worktree-b");
+  const id3 = agent.agentIdFor({}, "/worktree-a");
+  assert.notEqual(id1, id2, "distinct worktrees must never share an id");
+  assert.notEqual(id1, id3, "a retried call on the same worktree must not reuse the id");
+  // Each id embeds the pid + a monotonic per-process sequence, so ids from
+  // concurrent runs in this process can never collide either.
+  assert.match(id1, /^workflow:\/worktree-a:\d+:\d+$/);
+});
+
+test("agentIdFor keeps one stable id per named thread (a thread is one continuing session)", () => {
+  const agent = new WorkflowAgent({ cwd: "/tmp" }) as unknown as WorkflowAgentPrivates;
+  const first = agent.agentIdFor({ thread: "implementer" }, "/worktree");
+  const again = agent.agentIdFor({ thread: "implementer" }, "/worktree");
+  const other = agent.agentIdFor({ thread: "reviewer" }, "/worktree");
+  assert.equal(again, first, "thread turns continue one session, so the id must be stable");
+  assert.notEqual(other, first, "distinct threads must not share an id");
+});
+
+test("agentIdFor ids never collide across separate WorkflowAgent instances", () => {
+  const first = new WorkflowAgent({ cwd: "/tmp" }) as unknown as WorkflowAgentPrivates;
+  const second = new WorkflowAgent({ cwd: "/tmp" }) as unknown as WorkflowAgentPrivates;
+  // Unthreaded one-shot calls: every invocation gets a fresh id, across instances too.
+  assert.notEqual(
+    first.agentIdFor({}, "/worktree"),
+    second.agentIdFor({}, "/worktree"),
+    "unthreaded ids from separate instances must not collide",
+  );
+  // Named threads: stable within one instance, but the same thread name on a
+  // separate instance must not reuse the id (process-global AgentRegistry).
+  assert.notEqual(
+    first.agentIdFor({ thread: "implementer" }, "/worktree"),
+    second.agentIdFor({ thread: "implementer" }, "/worktree"),
+    "the same thread name on separate instances must not share an AgentRegistry id",
+  );
+});
+
+test("WorkflowAgent retains one session manager per named thread", () => {
+  const agent = new WorkflowAgent({ cwd: "/tmp" }) as unknown as WorkflowAgentPrivates;
+  const first = agent.createSessionManager("implementer");
+  const again = agent.createSessionManager("implementer");
+  const reviewer = agent.createSessionManager("reviewer");
+
+  assert.equal(again, first);
+  assert.equal(again.getSessionId(), first.getSessionId());
+  assert.notEqual(reviewer.getSessionId(), first.getSessionId());
+  const nextInvocation = new WorkflowAgent({ cwd: "/tmp" }) as unknown as WorkflowAgentPrivates;
+  assert.notEqual(nextInvocation.createSessionManager("implementer").getSessionId(), first.getSessionId());
+  assert.notEqual(agent.createSessionManager(), agent.createSessionManager(), "unthreaded calls remain one-shot");
+});
+
+test("WorkflowAgent restores a failed named turn to its previous leaf", () => {
+  const agent = new WorkflowAgent({ cwd: "/tmp" }) as unknown as WorkflowAgentPrivates;
+  const manager = agent.createSessionManager("implementer");
+  const acceptedLeaf = manager.appendSessionInfo("accepted");
+  manager.appendSessionInfo("failed-attempt");
+
+  agent.restoreThreadLeaf(manager, acceptedLeaf);
+  assert.equal(manager.getLeafId(), acceptedLeaf);
+});
+
+test("persistAgentSessions uses one file per named thread", () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-dynamic-workflows-thread-files-"));
+  const projectCwd = join(dir, "project");
+  const fakeHome = join(dir, "home");
+  try {
+    withFakeHome(fakeHome, () => {
+      const agent = new WorkflowAgent({
+        cwd: projectCwd,
+        persistAgentSessions: true,
+      }) as unknown as WorkflowAgentPrivates;
+      const implementer = agent.createSessionManager("implementer");
+      implementer.appendSessionInfo("first turn");
+      agent.createSessionManager("implementer").appendSessionInfo("second turn");
+      agent.createSessionManager("reviewer").appendSessionInfo("review");
+
+      const sessionFiles = new Set([
+        implementer.getSessionFile(),
+        agent.createSessionManager("implementer").getSessionFile(),
+        agent.createSessionManager("reviewer").getSessionFile(),
+      ]);
+      assert.equal(sessionFiles.size, 2);
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("WorkflowAgent degrades to in-memory when the session directory can't be created", () => {
+  const dir = mkdtempSync(join(tmpdir(), "pi-dynamic-workflows-persist-agent-fail-"));
+  const projectCwd = join(dir, "project");
+  const fakeHome = join(dir, "home");
+  try {
+    withFakeHome(fakeHome, () => {
+      // Pre-occupy the sessions directory with a plain file so the SDK's
+      // mkdirSync(recursive) inside SessionManager.create() throws ENOTDIR —
+      // simulating a permissions/disk-full failure at session-creation time.
+      const sessionsPath = join(fakeHome, ".pi", "agent", "sessions");
+      mkdirSync(dirname(sessionsPath), { recursive: true });
+      writeFileSync(sessionsPath, "not a directory");
+
+      const originalWarn = console.warn;
+      const warnings: unknown[][] = [];
+      console.warn = (...args: unknown[]) => warnings.push(args);
+      try {
+        const agent = new WorkflowAgent({ cwd: projectCwd, persistAgentSessions: true });
+        const manager = (agent as unknown as WorkflowAgentPrivates).createSessionManager();
+        assert.equal(manager.isPersisted(), false, "must degrade to in-memory rather than throw");
+        assert.ok(
+          warnings.some((args) => String(args[0]).includes("persistAgentSessions")),
+          "should log a warning about the degradation",
+        );
+      } finally {
+        console.warn = originalWarn;
+      }
+    });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("listAvailableModelSpecs returns an array (empty when no auth configured)", () => {
+  const result = listAvailableModelSpecs();
+  assert.ok(Array.isArray(result), "should always return an array");
+  // On CI or fresh installs there may be no models configured
+  // The important thing is it doesn't throw
+});
+
+test("listAvailableModelSpecs entries have provider/model format when non-empty", () => {
+  const result = listAvailableModelSpecs();
+  for (const spec of result) {
+    assert.ok(spec.includes("/"), `model spec "${spec}" should use provider/id format`);
+    const [provider, id] = spec.split("/");
+    assert.ok(provider.length > 0, "provider should not be empty");
+    assert.ok(id.length > 0, "model id should not be empty");
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// resolveAgentModelSpec — model precedence: explicit model > tier > main model
+// ═══════════════════════════════════════════════════════════════════════════
+
+const tierConfig: ModelTierConfig = {
+  tiers: { small: "vendor/small", medium: "vendor/medium", big: "vendor/big" },
+};
+const loadCfg = () => tierConfig;
+const noCfg = () => null;
+
+test("resolveAgentModelSpec: explicit model wins over tier (the precedence bug fix)", () => {
+  // Even with a tier set AND a config that resolves it, an explicit model wins.
+  assert.equal(
+    resolveAgentModelSpec({ model: "explicit/model", tier: "small" }, "main/model", loadCfg),
+    "explicit/model",
+  );
+});
+
+test("resolveAgentModelSpec: explicit model wins even when no config exists", () => {
+  assert.equal(
+    resolveAgentModelSpec({ model: "explicit/model", tier: "small" }, "main/model", noCfg),
+    "explicit/model",
+  );
+});
+
+test("resolveAgentModelSpec: tier resolves from config when no explicit model", () => {
+  assert.equal(resolveAgentModelSpec({ tier: "big" }, "main/model", loadCfg), "vendor/big");
+});
+
+test("resolveAgentModelSpec: unconfigured tier falls back to the main model", () => {
+  assert.equal(resolveAgentModelSpec({ tier: "small" }, "main/model", noCfg), "main/model");
+  assert.equal(resolveAgentModelSpec({ tier: "unknown-tier" }, "main/model", loadCfg), "main/model");
+});
+
+test("resolveAgentModelSpec: no model-tiers.json — after mainModel refresh, tier:medium uses the NEW mainModel", () => {
+  // #148: /model then /code-review with no model-tiers.json. Agents tagged
+  // { tier: "medium" } fall through to mainModel, which must be the post-/model
+  // value — not a session-start snapshot.
+  assert.equal(resolveAgentModelSpec({ tier: "medium" }, "start-prov/model-a", noCfg), "start-prov/model-a");
+  assert.equal(resolveAgentModelSpec({ tier: "medium" }, "live-prov/model-b", noCfg), "live-prov/model-b");
+});
+
+test("resolveAgentModelSpec: untagged agent defaults to the configured medium tier", () => {
+  // The "set tier but nothing changed" fix: an agent with no model and no tier
+  // falls back to the user's medium tier when a config exists.
+  assert.equal(resolveAgentModelSpec({}, "main/model", loadCfg), "vendor/medium");
+});
+
+test("resolveAgentModelSpec: untagged agent with NO config falls through to session default", () => {
+  assert.equal(resolveAgentModelSpec({}, "main/model", noCfg), undefined);
+});
+
+test("resolveAgentModelSpec: untagged agent with a config lacking a medium tier => session default", () => {
+  const noMedium = () => ({ tiers: { small: "vendor/small" } });
+  assert.equal(resolveAgentModelSpec({}, "main/model", noMedium), undefined);
+});
+
+test("resolveAgentModelSpec: tier with no main model and no config yields undefined", () => {
+  assert.equal(resolveAgentModelSpec({ tier: "small" }, undefined, noCfg), undefined);
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// WorkflowAgent#loadTierConfig — memoize model-tiers.json once per instance
+// (perf fix: resolveAgentModelSpec's loadConfig previously re-read+parsed the
+// file from disk on every run() call for any agent without an explicit
+// options.model, which is a sync fs read on the hot per-agent path)
+// ═══════════════════════════════════════════════════════════════════════════
+
+type WorkflowAgentTierPrivates = {
+  loadTierConfig(loader?: () => ModelTierConfig | null): ModelTierConfig | null;
+};
+
+test("WorkflowAgent#loadTierConfig: the loader is invoked at most once across repeated calls", () => {
+  const agent = new WorkflowAgent({ cwd: "/tmp" }) as unknown as WorkflowAgentTierPrivates;
+  let calls = 0;
+  const loader = () => {
+    calls++;
+    return tierConfig;
+  };
+
+  const first = agent.loadTierConfig(loader);
+  const second = agent.loadTierConfig(loader);
+  // Even a loader that would blow up if called proves the memoized branch
+  // never reaches the loader again.
+  const third = agent.loadTierConfig(() => {
+    throw new Error("loader must not be invoked again once memoized");
+  });
+
+  assert.equal(calls, 1, "the real loader should only run once");
+  assert.deepEqual(first, tierConfig);
+  assert.equal(second, first, "repeated calls must return the memoized value");
+  assert.equal(third, first);
+});
+
+test("WorkflowAgent#loadTierConfig: a legitimately-null config (no file) is memoized too, not re-checked", () => {
+  const agent = new WorkflowAgent({ cwd: "/tmp" }) as unknown as WorkflowAgentTierPrivates;
+  let calls = 0;
+  const loader = () => {
+    calls++;
+    return null;
+  };
+
+  assert.equal(agent.loadTierConfig(loader), null);
+  assert.equal(agent.loadTierConfig(loader), null);
+  assert.equal(calls, 1, "null is a valid memoized result, not a 'try again' signal");
+});
+
+test("WorkflowAgent#loadTierConfig: memoization is per-instance (two agents, two runs, don't leak into each other)", () => {
+  const a = new WorkflowAgent({ cwd: "/tmp" }) as unknown as WorkflowAgentTierPrivates;
+  const b = new WorkflowAgent({ cwd: "/tmp" }) as unknown as WorkflowAgentTierPrivates;
+  const cfgA: ModelTierConfig = { tiers: { medium: "vendor-a/model" } };
+  const cfgB: ModelTierConfig = { tiers: { medium: "vendor-b/model" } };
+
+  assert.equal(
+    a.loadTierConfig(() => cfgA),
+    cfgA,
+  );
+  assert.equal(
+    b.loadTierConfig(() => cfgB),
+    cfgB,
+  );
+  // `a` stays pinned to cfgA even when handed a different loader later — a
+  // fresh WorkflowAgent per run (the production lifetime; see workflow.ts's
+  // `new WorkflowAgent(options)` per runWorkflow() call) means two runs with
+  // different on-disk configs still each see their own correct snapshot,
+  // without a process-global cache leaking state across them.
+  assert.equal(
+    a.loadTierConfig(() => cfgB),
+    cfgA,
+  );
+});
+
+test("WorkflowAgent#loadTierConfig: default loader overlays project tiers over global", () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-dw-tier-overlay-home-"));
+  const cwd = mkdtempSync(join(tmpdir(), "pi-dw-tier-overlay-cwd-"));
+  try {
+    withFakeHome(home, () => {
+      const globalPath = getModelTierConfigPath();
+      const projectPath = getProjectModelTierConfigPath(cwd);
+      mkdirSync(join(globalPath, ".."), { recursive: true });
+      mkdirSync(join(projectPath, ".."), { recursive: true });
+      writeFileSync(globalPath, JSON.stringify({ tiers: { small: "global/small", medium: "global/medium" } }));
+      writeFileSync(projectPath, JSON.stringify({ tiers: { small: "project/small" } }));
+
+      const agent = new WorkflowAgent({ cwd }) as unknown as WorkflowAgentTierPrivates;
+      const loaded = agent.loadTierConfig();
+      assert.deepEqual(loaded, { tiers: { small: "project/small", medium: "global/medium" } });
+    });
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("WorkflowAgent.run(): tier routing resolves correctly through the real (non-injected) disk loader, read only once across two run() calls", async () => {
+  // End-to-end proof that memoization doesn't break the real wiring: writes an
+  // actual model-tiers.json to a fake home, runs two real subagents against a
+  // faux (no-network) provider, and confirms both resolve the tier-configured
+  // model AND that the underlying config object is reused (same reference)
+  // across both run() calls rather than re-read/re-parsed.
+  const home = mkdtempSync(join(tmpdir(), "pi-dw-tier-memo-home-"));
+  const cwd = mkdtempSync(join(tmpdir(), "pi-dw-tier-memo-cwd-"));
+  const core = createFauxCore({
+    provider: "fauxtest",
+    models: [{ id: "faux-model", name: "Faux Model", contextWindow: 128000, maxTokens: 4096 }],
+  });
+  try {
+    await withFakeHomeAsync(home, async () => {
+      const tiersDir = join(home, ".pi", "workflows");
+      mkdirSync(tiersDir, { recursive: true });
+      writeFileSync(join(tiersDir, "model-tiers.json"), JSON.stringify({ tiers: { medium: "fauxtest/faux-model" } }));
+
+      const runtime = await ModelRuntime.create({ authPath: join(home, "auth.json"), modelsPath: null });
+      runtime.registerProvider("fauxtest", {
+        name: "Faux Test",
+        baseUrl: "http://127.0.0.1:9/faux",
+        apiKey: "faux-dummy-key-not-used",
+        api: core.api,
+        streamSimple: core.streamSimple as never,
+        models: core.models.map((m) => ({
+          id: m.id,
+          name: m.name ?? m.id,
+          reasoning: false,
+          input: ["text"] as ("text" | "image")[],
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+          contextWindow: m.contextWindow ?? 128000,
+          maxTokens: m.maxTokens ?? 4096,
+        })),
+      });
+      const registry = new ModelRegistry(runtime);
+      core.setResponses([
+        fauxAssistantMessage("tier-routed-first", { stopReason: "stop" }),
+        fauxAssistantMessage("tier-routed-second", { stopReason: "stop" }),
+      ]);
+
+      const agent = new WorkflowAgent({ cwd, modelRegistry: registry });
+      const spy = test.mock.method(agent as unknown as WorkflowAgentTierPrivates, "loadTierConfig");
+
+      const first = await agent.run("task one", { label: "a", tier: "medium" });
+      const second = await agent.run("task two", { label: "b", tier: "medium" });
+
+      assert.ok(first.includes("tier-routed-first"), "first agent should route through the tiered faux model");
+      assert.ok(second.includes("tier-routed-second"), "second agent should route through the tiered faux model");
+
+      assert.equal(spy.mock.callCount(), 2, "loadTierConfig() is called once per run(), as expected");
+      const [firstResult, secondResult] = spy.mock.calls.map((c) => c.result);
+      assert.equal(
+        firstResult,
+        secondResult,
+        "the SAME config object must be reused across run() calls — the file was read/parsed only once",
+      );
+    });
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("WorkflowAgent.run() reports per-turn in-flight usage for a named thread", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-dw-live-usage-home-"));
+  const cwd = mkdtempSync(join(tmpdir(), "pi-dw-live-usage-cwd-"));
+  const core = createFauxCore({
+    provider: "fauxtest-live-usage",
+    models: [{ id: "faux-model", name: "Faux Model", contextWindow: 128000, maxTokens: 4096 }],
+    tokenSize: { min: 1, max: 1 },
+    tokensPerSecond: 200,
+  });
+  try {
+    await withFakeHomeAsync(home, async () => {
+      const runtime = await ModelRuntime.create({ authPath: join(home, "auth.json"), modelsPath: null });
+      runtime.registerProvider("fauxtest-live-usage", {
+        name: "Faux Test Live Usage",
+        baseUrl: "http://127.0.0.1:9/faux",
+        apiKey: "faux-dummy-key-not-used",
+        api: core.api,
+        streamSimple: core.streamSimple,
+        models: core.models.map((model) => ({
+          id: model.id,
+          name: model.name ?? model.id,
+          reasoning: false,
+          input: ["text" as const],
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+          contextWindow: model.contextWindow ?? 128000,
+          maxTokens: model.maxTokens ?? 4096,
+        })),
+      });
+      core.setResponses([
+        fauxAssistantMessage("streaming output proves this agent is active", { stopReason: "stop" }),
+        fauxAssistantMessage("the second threaded turn has independent usage", { stopReason: "stop" }),
+      ]);
+
+      const registry = new ModelRegistry(runtime);
+      const agent = new WorkflowAgent({
+        cwd,
+        modelRegistry: registry,
+        mainModel: "fauxtest-live-usage/faux-model",
+      });
+      let settled = false;
+      let terminalCalls = 0;
+      let resolveFirstProgress: (usage: AgentUsage) => void = () => {};
+      const firstProgress = new Promise<AgentUsage>((resolve) => {
+        resolveFirstProgress = resolve;
+      });
+
+      const thread = "live-usage-thread";
+      const run = agent
+        .run("respond slowly", {
+          thread,
+          model: "fauxtest-live-usage/faux-model",
+          onUsageProgress: (usage) => {
+            if (usage.total > 0) {
+              resolveFirstProgress(usage);
+            }
+          },
+          onUsage: () => {
+            terminalCalls++;
+          },
+        })
+        .finally(() => {
+          settled = true;
+        });
+      let progressTimeout: ReturnType<typeof setTimeout> | undefined;
+      const missingProgress = new Promise<never>((resolve, reject) => {
+        void resolve;
+        progressTimeout = setTimeout(() => reject(new Error("No in-flight usage was reported")), 30_000);
+      });
+      const progress = await Promise.race([firstProgress, missingProgress]);
+      if (progressTimeout) {
+        clearTimeout(progressTimeout);
+      }
+
+      assert.equal(settled, false, "progress must arrive before the subagent settles");
+      assert.ok(progress.output > 0, "streaming text should produce a positive output estimate");
+      await run;
+      assert.equal(terminalCalls, 1, "onUsage remains a once-only terminal callback");
+
+      const secondProgress: AgentUsage[] = [];
+      let secondTerminal: AgentUsage | undefined;
+      await agent.run("continue in the same thread", {
+        thread,
+        model: "fauxtest-live-usage/faux-model",
+        onUsageProgress: (usage) => secondProgress.push(usage),
+        onUsage: (usage) => {
+          secondTerminal = usage;
+        },
+      });
+
+      assert.ok(secondProgress.length > 0, "the second turn should stream usage");
+      assert.deepEqual(
+        secondProgress.at(-1),
+        secondTerminal,
+        "the last live update must describe this turn only, matching its terminal usage",
+      );
+    });
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// WorkflowAgent.run(): opts.schema must be a top-level JSON object schema
+// (#330 audit) — a non-object schema (e.g. array/primitive) would otherwise
+// reach a strict OpenAI-compatible provider (DeepSeek) as an invalid tool
+// parameters schema and fail with an opaque transport-level 400.
+// ═══════════════════════════════════════════════════════════════════════════
+
+test("failed or empty named turns restore the active transcript before the next call", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-dw-thread-rollback-home-"));
+  const cwd = mkdtempSync(join(tmpdir(), "pi-dw-thread-rollback-cwd-"));
+  const core = createFauxCore({
+    provider: "fauxtest-thread",
+    models: [{ id: "faux-model", name: "Faux Model", contextWindow: 128000, maxTokens: 4096 }],
+  });
+  try {
+    await withFakeHomeAsync(home, async () => {
+      const runtime = await ModelRuntime.create({ authPath: join(home, "auth.json"), modelsPath: null });
+      runtime.registerProvider("fauxtest-thread", {
+        name: "Faux Thread",
+        baseUrl: "http://127.0.0.1:9/faux",
+        apiKey: "faux-dummy-key-not-used",
+        api: core.api,
+        streamSimple: core.streamSimple as never,
+        models: core.models.map((model) => ({
+          ...model,
+          input: ["text"] as ("text" | "image")[],
+        })),
+      });
+      const contexts: unknown[] = [];
+      core.setResponses([
+        () => {
+          throw new Error("attempt failed");
+        },
+        fauxAssistantMessage("accepted", { stopReason: "stop" }),
+        fauxAssistantMessage("", { stopReason: "stop" }),
+        (context) => {
+          contexts.push(context);
+          return fauxAssistantMessage("followed up", { stopReason: "stop" });
+        },
+      ]);
+      const injectedManager = SessionManager.inMemory();
+      const agent = new WorkflowAgent({
+        cwd,
+        modelRegistry: new ModelRegistry(runtime),
+        session: { sessionManager: injectedManager },
+      });
+      const runOptions = { thread: "implementer", model: "fauxtest-thread/faux-model" } as const;
+
+      await assert.rejects(agent.run("FAILED_TURN_MARKER", runOptions));
+      await agent.run("ACCEPTED_TURN_MARKER", runOptions);
+      await assert.rejects(agent.run("EMPTY_TURN_MARKER", runOptions), (error: unknown) => {
+        assert.ok(error instanceof WorkflowError);
+        assert.equal(error.code, WorkflowErrorCode.AGENT_EMPTY_OUTPUT);
+        return true;
+      });
+      await agent.run("FOLLOWUP_TURN_MARKER", runOptions);
+
+      const contextText = JSON.stringify(contexts[0]);
+      assert.doesNotMatch(contextText, /FAILED_TURN_MARKER|EMPTY_TURN_MARKER/);
+      assert.match(contextText, /ACCEPTED_TURN_MARKER/);
+      assert.match(contextText, /FOLLOWUP_TURN_MARKER/);
+      assert.equal(injectedManager.getLeafId(), null, "a named thread must not use the injected one-shot manager");
+    });
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// Turn isolation must survive auto-compaction. Pi compaction (on by default)
+// can rewrite session.messages inside prompt() — the array is rebuilt shorter
+// (summary + kept tail) — so isolating a threaded turn by a pre-prompt()
+// length snapshot slices an empty window and misclassifies a successful turn
+// as AGENT_EMPTY_OUTPUT. These tests trigger REAL auto-compaction (tiny
+// reserve threshold + a huge reply) and assert the turn's output survives.
+// ═══════════════════════════════════════════════════════════════════════
+
+/** Compaction settings that trip auto-compaction on a ~50k-token reply
+ * (threshold = contextWindow 128k - reserveTokens 98k = 30k) while leaving
+ * the small pad turns alone. keepRecentTokens: 1 forces the cut right at the
+ * huge reply, exercising the split-turn path (history + prefix summaries). */
+function writeCompactionSettings(home: string): void {
+  mkdirSync(join(home, ".pi", "agent"), { recursive: true });
+  writeFileSync(
+    join(home, ".pi", "agent", "settings.json"),
+    JSON.stringify({ compaction: { enabled: true, reserveTokens: 98000, keepRecentTokens: 1 } }),
+  );
+}
+
+test("a threaded turn whose prompt() triggers auto-compaction still returns its output", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-dw-thread-compaction-home-"));
+  const cwd = mkdtempSync(join(tmpdir(), "pi-dw-thread-compaction-cwd-"));
+  const core = createFauxCore({
+    provider: "fauxtest-compaction",
+    models: [{ id: "faux-model", name: "Faux Model", contextWindow: 128000, maxTokens: 16384 }],
+    tokenSize: { min: 8000, max: 8000 },
+  });
+  try {
+    await withFakeHomeAsync(home, async () => {
+      writeCompactionSettings(home);
+      const runtime = await ModelRuntime.create({ authPath: join(home, "auth.json"), modelsPath: null });
+      runtime.registerProvider("fauxtest-compaction", {
+        name: "Faux Compaction",
+        baseUrl: "http://127.0.0.1:9/faux",
+        apiKey: "faux-dummy-key-not-used",
+        api: core.api,
+        streamSimple: core.streamSimple as never,
+        models: core.models.map((model) => ({
+          ...model,
+          input: ["text"] as ("text" | "image")[],
+        })),
+      });
+      // ~216k chars ≈ 54k estimated tokens: over the 30k compaction threshold,
+      // under the 128k context window (threshold path, not overflow).
+      const hugeAnswer = `COMPACTED_TURN_ANSWER ${"lorem ipsum dolor ".repeat(12000)}`;
+      core.setResponses([
+        fauxAssistantMessage("first pad answer", { stopReason: "stop" }),
+        fauxAssistantMessage("second pad answer", { stopReason: "stop" }),
+        fauxAssistantMessage(hugeAnswer, { stopReason: "stop" }),
+        // Consumed by auto-compaction inside the third prompt(): history summary,
+        // then the split-turn prefix summary.
+        fauxAssistantMessage("history summary", { stopReason: "stop" }),
+        fauxAssistantMessage("turn prefix summary", { stopReason: "stop" }),
+      ]);
+      const agent = new WorkflowAgent({ cwd, modelRegistry: new ModelRegistry(runtime) });
+      const runOptions = { thread: "implementer", model: "fauxtest-compaction/faux-model" } as const;
+
+      await agent.run("pad turn one", runOptions);
+      await agent.run("pad turn two", runOptions);
+      const text = await agent.run("big turn", runOptions);
+
+      assert.match(String(text), /^COMPACTED_TURN_ANSWER /, "the compacted turn's real answer must survive");
+      assert.equal(core.getPendingResponseCount(), 0, "auto-compaction must have run (both summaries consumed)");
+    });
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("a threaded structured turn recovers its prose payload across auto-compaction", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-dw-thread-compaction-schema-home-"));
+  const cwd = mkdtempSync(join(tmpdir(), "pi-dw-thread-compaction-schema-cwd-"));
+  const core = createFauxCore({
+    provider: "fauxtest-compaction-schema",
+    models: [{ id: "faux-model", name: "Faux Model", contextWindow: 128000, maxTokens: 16384 }],
+    tokenSize: { min: 8000, max: 8000 },
+  });
+  try {
+    await withFakeHomeAsync(home, async () => {
+      writeCompactionSettings(home);
+      const runtime = await ModelRuntime.create({ authPath: join(home, "auth.json"), modelsPath: null });
+      runtime.registerProvider("fauxtest-compaction-schema", {
+        name: "Faux Compaction Schema",
+        baseUrl: "http://127.0.0.1:9/faux",
+        apiKey: "faux-dummy-key-not-used",
+        api: core.api,
+        streamSimple: core.streamSimple as never,
+        models: core.models.map((model) => ({
+          ...model,
+          input: ["text"] as ("text" | "image")[],
+        })),
+      });
+      // Prose JSON (the model never calls structured_output) big enough to trip
+      // compaction; the prose-extraction fallback must still see this turn's text.
+      const structuredValue = { finding: `STRUCTURED_ANSWER ${"pad ".repeat(54000)}` };
+      core.setResponses([
+        fauxAssistantMessage("first pad answer", { stopReason: "stop" }),
+        fauxAssistantMessage("second pad answer", { stopReason: "stop" }),
+        fauxAssistantMessage(JSON.stringify(structuredValue), { stopReason: "stop" }),
+        fauxAssistantMessage("history summary", { stopReason: "stop" }),
+        fauxAssistantMessage("turn prefix summary", { stopReason: "stop" }),
+      ]);
+      const agent = new WorkflowAgent({ cwd, modelRegistry: new ModelRegistry(runtime) });
+      const runOptions = { thread: "implementer", model: "fauxtest-compaction-schema/faux-model" } as const;
+
+      await agent.run("pad turn one", runOptions);
+      await agent.run("pad turn two", runOptions);
+      const result = await agent.run("big structured turn", {
+        ...runOptions,
+        schema: Type.Object({ finding: Type.String() }),
+        maxSchemaRetries: 0,
+      });
+
+      assert.deepEqual(result, structuredValue, "the compacted turn's structured payload must survive");
+      assert.equal(core.getPendingResponseCount(), 0, "auto-compaction must have run (both summaries consumed)");
+    });
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("WorkflowAgent.run() rejects a non-object top-level schema before touching the model registry", async () => {
+  const agent = new WorkflowAgent({ cwd: "/tmp" });
+  await assert.rejects(
+    agent.run("task", { schema: Type.Array(Type.Object({ finding: Type.String() })) }),
+    (error: unknown) => {
+      assert.ok(error instanceof WorkflowError);
+      assert.equal(error.code, WorkflowErrorCode.SCRIPT_VALIDATION_ERROR);
+      assert.match(error.message, /opts\.schema must be a top-level JSON object schema/);
+      assert.match(error.message, /got type: array/);
+      return true;
+    },
+  );
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// WorkflowAgent.run(): an unresolvable `model` spec must fail loud (#131) — no
+// more silent fallback to the session default with only a console.warn.
+// ═══════════════════════════════════════════════════════════════════════════
+
+test("WorkflowAgent.run() throws MODEL_NOT_FOUND for an unresolvable model spec instead of silently using the session default", async () => {
+  const registry = {
+    getAll: () => [{ provider: "openrouter", id: "anthropic/claude-opus-4-8", name: "Claude" } as any],
+    getAvailable: () => [],
+    find: () => undefined,
+  } as any;
+
+  const agent = new WorkflowAgent({ cwd: "/tmp", modelRegistry: registry });
+  await assert.rejects(
+    agent.run("task", { model: "totally-unknown/does-not-exist", label: "pin" }),
+    (error: unknown) => {
+      assert.ok(error instanceof WorkflowError);
+      assert.equal(error.code, WorkflowErrorCode.MODEL_NOT_FOUND);
+      assert.equal(error.recoverable, false, "a bad pin is deterministic — retrying it is pointless");
+      assert.match(error.message, /totally-unknown\/does-not-exist/);
+      assert.equal(error.agentLabel, "pin");
+      return true;
+    },
+  );
+});
+
+test("WorkflowAgent.run() still resolves a known model spec normally (no regression)", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-dw-model-pin-ok-home-"));
+  const cwd = mkdtempSync(join(tmpdir(), "pi-dw-model-pin-ok-cwd-"));
+  const core = createFauxCore({
+    provider: "fauxtest-pin",
+    models: [{ id: "faux-model", name: "Faux Model", contextWindow: 128000, maxTokens: 4096 }],
+  });
+  try {
+    await withFakeHomeAsync(home, async () => {
+      const runtime = await ModelRuntime.create({ authPath: join(home, "auth.json"), modelsPath: null });
+      runtime.registerProvider("fauxtest-pin", {
+        name: "Faux Test Pin",
+        baseUrl: "http://127.0.0.1:9/faux",
+        apiKey: "faux-dummy-key-not-used",
+        api: core.api,
+        streamSimple: core.streamSimple as never,
+        models: core.models.map((m) => ({
+          id: m.id,
+          name: m.name ?? m.id,
+          reasoning: false,
+          input: ["text"] as ("text" | "image")[],
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+          contextWindow: m.contextWindow ?? 128000,
+          maxTokens: m.maxTokens ?? 4096,
+        })),
+      });
+      const registry = new ModelRegistry(runtime);
+      core.setResponses([fauxAssistantMessage("pinned-model-answer", { stopReason: "stop" })]);
+
+      const agent = new WorkflowAgent({ cwd, modelRegistry: registry });
+      const text = await agent.run("task", { model: "fauxtest-pin/faux-model", label: "pin-ok" });
+      assert.ok(text.includes("pinned-model-answer"));
+    });
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// WorkflowAgent.run(): asymmetric fail-loud behavior for a tier that resolves
+// to an unavailable model (#131 follow-up) —
+//   - an EXPLICIT tier (script wrote `tier: "x"`) is just as loud as an
+//     explicit model pin: MODEL_NOT_FOUND, naming the tier and what it
+//     resolved to.
+//   - the IMPLICIT default "medium" tier an UNTAGGED agent (no model, no
+//     tier) gets routed through never asked for that model, so it degrades
+//     to the session default instead — but only after firing onModelFallback
+//     so the degrade is still visible in the run's own log stream, not a
+//     silent continuation.
+// ═══════════════════════════════════════════════════════════════════════════
+
+test("WorkflowAgent.run() throws MODEL_NOT_FOUND naming the tier when an EXPLICIT tier resolves to an unavailable model", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-dw-tier-dead-explicit-home-"));
+  const cwd = mkdtempSync(join(tmpdir(), "pi-dw-tier-dead-explicit-cwd-"));
+  try {
+    await withFakeHomeAsync(home, async () => {
+      const tiersDir = join(home, ".pi", "workflows");
+      mkdirSync(tiersDir, { recursive: true });
+      writeFileSync(join(tiersDir, "model-tiers.json"), JSON.stringify({ tiers: { big: "deadprov/ghost-model" } }));
+
+      const registry = {
+        getAll: () => [{ provider: "fauxtest", id: "faux-model", name: "faux-model" } as any],
+      } as any;
+
+      const agent = new WorkflowAgent({ cwd, modelRegistry: registry });
+      await assert.rejects(agent.run("task", { tier: "big", label: "explicit-tier" }), (error: unknown) => {
+        assert.ok(error instanceof WorkflowError);
+        assert.equal(error.code, WorkflowErrorCode.MODEL_NOT_FOUND);
+        assert.equal(error.recoverable, false);
+        assert.match(error.message, /tier "big"/);
+        assert.match(error.message, /model-tiers\.json/);
+        assert.match(error.message, /deadprov\/ghost-model/);
+        assert.equal(error.agentLabel, "explicit-tier");
+        return true;
+      });
+    });
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("WorkflowAgent.run(): an untagged agent's IMPLICIT default medium tier degrades to the session default (not a throw) when it resolves to an unavailable model, and fires onModelFallback at most once per instance", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-dw-tier-dead-implicit-home-"));
+  const cwd = mkdtempSync(join(tmpdir(), "pi-dw-tier-dead-implicit-cwd-"));
+  const core = createFauxCore({
+    provider: "fauxtest-implicit",
+    models: [{ id: "faux-model", name: "Faux Model", contextWindow: 128000, maxTokens: 4096 }],
+  });
+  try {
+    await withFakeHomeAsync(home, async () => {
+      const tiersDir = join(home, ".pi", "workflows");
+      mkdirSync(tiersDir, { recursive: true });
+      const agentDir = join(home, ".pi", "agent");
+      mkdirSync(agentDir, { recursive: true });
+      // "medium" (the implicit default) resolves to a dead spec; the run must
+      // still complete by falling back to the configured session default.
+      // Pin it explicitly so provider credentials inherited from the test
+      // process cannot change which available model Pi selects by default.
+      writeFileSync(join(tiersDir, "model-tiers.json"), JSON.stringify({ tiers: { medium: "deadprov/ghost-model" } }));
+      writeFileSync(
+        join(agentDir, "settings.json"),
+        JSON.stringify({ defaultProvider: "fauxtest-implicit", defaultModel: "faux-model" }),
+      );
+
+      const runtime = await ModelRuntime.create({ authPath: join(home, "auth.json"), modelsPath: null });
+      runtime.registerProvider("fauxtest-implicit", {
+        name: "Faux Test Implicit",
+        baseUrl: "http://127.0.0.1:9/faux",
+        apiKey: "faux-dummy-key-not-used",
+        api: core.api,
+        streamSimple: core.streamSimple as never,
+        models: core.models.map((m) => ({
+          id: m.id,
+          name: m.name ?? m.id,
+          reasoning: false,
+          input: ["text"] as ("text" | "image")[],
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+          contextWindow: m.contextWindow ?? 128000,
+          maxTokens: m.maxTokens ?? 4096,
+        })),
+      });
+      const registry = new ModelRegistry(runtime);
+      core.setResponses([
+        fauxAssistantMessage("untagged-first", { stopReason: "stop" }),
+        fauxAssistantMessage("untagged-second", { stopReason: "stop" }),
+      ]);
+
+      const fallbacks: Array<{ tier: string; requestedSpec: string }> = [];
+      const agent = new WorkflowAgent({ cwd, modelRegistry: registry });
+      const onModelFallback = (info: { tier: string; requestedSpec: string }) => fallbacks.push(info);
+
+      const first = await agent.run("task one", { label: "untagged-1", onModelFallback });
+      const second = await agent.run("task two", { label: "untagged-2", onModelFallback });
+
+      assert.ok(first.includes("untagged-first"), "first untagged agent should still complete via session default");
+      assert.ok(second.includes("untagged-second"), "second untagged agent should still complete via session default");
+      assert.deepEqual(
+        fallbacks,
+        [{ tier: "medium", requestedSpec: "deadprov/ghost-model" }],
+        "onModelFallback fires exactly once across both run() calls on the same instance",
+      );
+    });
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("WorkflowAgent.run() still completes with a normal object schema (no regression)", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-dw-schema-ok-home-"));
+  const cwd = mkdtempSync(join(tmpdir(), "pi-dw-schema-ok-cwd-"));
+  const core = createFauxCore({
+    provider: "fauxtest-schema",
+    models: [{ id: "faux-model", name: "Faux Model", contextWindow: 128000, maxTokens: 4096 }],
+  });
+  try {
+    await withFakeHomeAsync(home, async () => {
+      const runtime = await ModelRuntime.create({ authPath: join(home, "auth.json"), modelsPath: null });
+      runtime.registerProvider("fauxtest-schema", {
+        name: "Faux Test Schema",
+        baseUrl: "http://127.0.0.1:9/faux",
+        apiKey: "faux-dummy-key-not-used",
+        api: core.api,
+        streamSimple: core.streamSimple as never,
+        models: core.models.map((m) => ({
+          id: m.id,
+          name: m.name ?? m.id,
+          reasoning: false,
+          input: ["text"] as ("text" | "image")[],
+          cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+          contextWindow: m.contextWindow ?? 128000,
+          maxTokens: m.maxTokens ?? 4096,
+        })),
+      });
+      const registry = new ModelRegistry(runtime);
+      core.setResponses([
+        fauxAssistantMessage(fauxToolCall("structured_output", { verdict: "ok" }), { stopReason: "toolUse" }),
+        fauxAssistantMessage("", { stopReason: "stop" }),
+      ]);
+
+      const agent = new WorkflowAgent({ cwd, modelRegistry: registry });
+      const runOptions = {
+        model: "fauxtest-schema/faux-model",
+        schema: Type.Object({ verdict: Type.String() }),
+        thread: "structured",
+      } as const;
+      const result = await agent.run("task", runOptions);
+
+      assert.deepEqual(result, { verdict: "ok" });
+      await assert.rejects(agent.run("empty follow-up", { ...runOptions, maxSchemaRetries: 0 }), (error: unknown) => {
+        assert.ok(error instanceof WorkflowError);
+        assert.equal(error.code, WorkflowErrorCode.SCHEMA_NONCOMPLIANCE);
+        return true;
+      });
+    });
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+    rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test("WorkflowAgent constructor accepts all option shapes without throwing", () => {
+  const optionSets = [
+    undefined,
+    { cwd: "/tmp" },
+    { cwd: "/tmp", instructions: "custom instruction" },
+    { cwd: "/tmp", tools: [], session: {}, instructions: "test" },
+    { cwd: "/tmp", excludeTools: ["pi-subagents"] },
+    { cwd: "/tmp", mainModel: "openai/gpt-4.1" },
+    { cwd: "/tmp", tools: [], session: {}, instructions: "test", mainModel: "openai/gpt-4.1" },
+    {
+      cwd: "/tmp",
+      modelRegistry: {
+        getAvailable: () => [{ provider: "mock", id: "model" }],
+        find: () => undefined,
+        getAll: () => [],
+      } as any,
+    },
+  ];
+  for (const opts of optionSets) {
+    const agent = opts ? new WorkflowAgent(opts) : new WorkflowAgent();
+    assert.ok(agent instanceof WorkflowAgent, `agent should be constructed for options: ${JSON.stringify(opts)}`);
+  }
+});
+
+test("DEFAULT_EXCLUDED_SUBAGENT_TOOLS denies the recursive orchestration tools (#107)", () => {
+  // Subagents must never see the globally-registered orchestration tools, or they
+  // could start independent nested workflows that bypass the parent run's caps.
+  // This is the always-on denylist folded into every subagent session; the guard
+  // is a regression fence so it can't be silently narrowed.
+  assert.deepEqual(DEFAULT_EXCLUDED_SUBAGENT_TOOLS, ["workflow", "workflow_control"]);
+});
+
+test("subagentExcludedTools always includes the defaults, plus caller/session names (#107)", () => {
+  // This is what run() passes to createAgentSession as excludeTools. Fencing the
+  // merge here catches a spread-order regression that drops the defaults — which
+  // a deepEqual on the constant alone would miss.
+  assert.deepEqual(subagentExcludedTools(), ["workflow", "workflow_control"]);
+  assert.deepEqual(subagentExcludedTools(["pi-subagents"]), ["workflow", "workflow_control", "pi-subagents"]);
+  const merged = subagentExcludedTools(["extra"], ["session-denied"]);
+  assert.ok(merged.includes("workflow") && merged.includes("workflow_control"), "defaults are never dropped");
+  assert.ok(merged.includes("session-denied") && merged.includes("extra"), "both caller lists are folded in");
+});
+
+test("the subagent resource loader is built once per run and shared across subagents (#109)", () => {
+  // The #109 mitigation: one no-extensions loader per run, reused by every
+  // subagent, instead of createAgentSession re-running every extension factory
+  // (and rooting each disposed session) per subagent. Memoization is the invariant.
+  const agent = new WorkflowAgent({ cwd: "/tmp" });
+  type Priv = { getSharedResourceLoader(agentDir: string): Promise<unknown> };
+  const a = agent as unknown as Priv;
+  const first = a.getSharedResourceLoader("/tmp/agentdir");
+  const second = a.getSharedResourceLoader("/tmp/agentdir");
+  assert.equal(first, second, "same promise — the loader is built once and shared, not rebuilt per subagent");
+  // reload() may reject in a bare temp dir; we only assert memoization here.
+  first.catch(() => {});
+  second.catch(() => {});
+});
+
+// ═══════════════════════════════════════════════════════════════════════
+// finalAssistantText — the unstructured result must come AFTER the last tool
+// result, so stale progress text can't be reported as a completed answer (#111)
+// ═══════════════════════════════════════════════════════════════════════
+
+const progressThenToolResult = [
+  { role: "assistant", content: [{ type: "text", text: "I'll inspect the repository now." }] },
+  { role: "assistant", content: [{ type: "toolCall", name: "bash", arguments: {} }] },
+  { role: "toolResult", toolName: "bash", content: [{ type: "text", text: "command output" }] },
+];
+
+test("finalAssistantText rejects progress text before a terminal tool result (#111)", () => {
+  const agent = new WorkflowAgent({ cwd: "/tmp" });
+  const text = (agent as unknown as WorkflowAgentPrivates).finalAssistantText(progressThenToolResult);
+  assert.equal(text, "", "text emitted before the final tool result is not a final answer");
+});
+
+test("finalAssistantText accepts a real assistant answer AFTER tools (#111)", () => {
+  const agent = new WorkflowAgent({ cwd: "/tmp" });
+  const messages = [
+    { role: "assistant", content: [{ type: "text", text: "Let me check." }] },
+    { role: "assistant", content: [{ type: "toolCall", name: "bash", arguments: {} }] },
+    { role: "toolResult", toolName: "bash", content: [{ type: "text", text: "output" }] },
+    { role: "assistant", content: [{ type: "text", text: "The answer is 42." }] },
+  ];
+  const text = (agent as unknown as WorkflowAgentPrivates).finalAssistantText(messages);
+  assert.equal(text, "The answer is 42.", "a genuine post-tool answer still counts");
+});
+
+test("finalAssistantText returns a plain answer when no tools were used (#111)", () => {
+  const agent = new WorkflowAgent({ cwd: "/tmp" });
+  const messages = [{ role: "assistant", content: [{ type: "text", text: "Direct answer." }] }];
+  const text = (agent as unknown as WorkflowAgentPrivates).finalAssistantText(messages);
+  assert.equal(text, "Direct answer.");
+});
+
+test("lastAssistantText stays lenient for schema prose extraction (unchanged by #111)", () => {
+  // The schema path's JSON recovery may read the payload from any assistant
+  // message, so lastAssistantText must NOT adopt finalAssistantText's stricter
+  // "after the last tool result" rule.
+  const agent = new WorkflowAgent({ cwd: "/tmp" });
+  const text = (agent as unknown as WorkflowAgentPrivates).lastAssistantText(progressThenToolResult);
+  assert.equal(text, "I'll inspect the repository now.", "lastAssistantText still finds earlier assistant text");
+});
+
+test("WorkflowAgent reuses an injected ModelRegistry instead of building its own", async () => {
+  const mockModel = { provider: "mock", id: "shared" } as any;
+  const registry = {
+    find: (provider: string, id: string) => (provider === "mock" && id === "shared" ? mockModel : undefined),
+    getAvailable: () => [mockModel],
+    getAll: () => [mockModel],
+  } as any;
+
+  const agent = new WorkflowAgent({ cwd: "/tmp", modelRegistry: registry });
+  const resolvedRegistry = await (agent as any).getRegistry();
+  assert.equal(resolvedRegistry, registry, "should hand back the injected registry");
+  const resolved = resolveModelSpecWithThinking("mock/shared", resolvedRegistry);
+  assert.equal(resolved.model, mockModel, "should resolve via the injected registry");
+});
+
+test("WorkflowAgent falls back to building a disk registry when no registry is injected", async () => {
+  const agent = new WorkflowAgent({ cwd: "/tmp" });
+  // Should not reject; getRegistry() lazily builds a ModelRegistry from disk
+  // (async since pi 0.80.8: registries wrap an async-created ModelRuntime).
+  await assert.doesNotReject(() => (agent as any).getRegistry());
+});
+
+test("WorkflowAgent.resolveModel resolves via a per-run registry when the constructor got none", async () => {
+  // Regression test for the per-run `modelRegistry` AgentRunOptions field: a
+  // model present only in a registry passed to run() (not the constructor)
+  // must still resolve.
+  const perRunModel = { provider: "router", id: "per-run-only" } as any;
+  const perRunRegistry = {
+    find: (provider: string, id: string) => (provider === "router" && id === "per-run-only" ? perRunModel : undefined),
+    getAvailable: () => [perRunModel],
+    getAll: () => [perRunModel],
+  } as any;
+
+  const agent = new WorkflowAgent({ cwd: "/tmp" });
+  const resolved = resolveModelSpecWithThinking(
+    "router/per-run-only",
+    await (agent as any).getRegistry(perRunRegistry),
+  );
+  assert.equal(resolved.model, perRunModel, "should resolve via the per-run registry, not a disk registry");
+});
+
+test("WorkflowAgent.resolveModel: per-run registry takes precedence over the constructor's shared registry", async () => {
+  const constructorModel = { provider: "ctor", id: "shared" } as any;
+  const constructorRegistry = {
+    find: (provider: string, id: string) => (provider === "ctor" && id === "shared" ? constructorModel : undefined),
+    getAvailable: () => [constructorModel],
+    getAll: () => [constructorModel],
+  } as any;
+
+  const perRunModel = { provider: "run", id: "override" } as any;
+  const perRunRegistry = {
+    find: (provider: string, id: string) => (provider === "run" && id === "override" ? perRunModel : undefined),
+    getAvailable: () => [perRunModel],
+    getAll: () => [perRunModel],
+  } as any;
+
+  const agent = new WorkflowAgent({ cwd: "/tmp", modelRegistry: constructorRegistry });
+  // The per-run registry, not the constructor's, is consulted when both are set.
+  const resolved = resolveModelSpecWithThinking("run/override", await (agent as any).getRegistry(perRunRegistry));
+  assert.equal(resolved.model, perRunModel, "per-run registry should win over the constructor's shared registry");
+  // And the constructor registry is still used when no per-run registry is given.
+  const fallback = resolveModelSpecWithThinking("ctor/shared", await (agent as any).getRegistry());
+  assert.equal(fallback.model, constructorModel, "constructor registry should still apply without a per-run override");
+});
+
+test("WorkflowAgent.getRegistry: per-run registry wins, then constructor's shared registry, then disk", async () => {
+  const constructorRegistry = { getAvailable: () => [], find: () => undefined, getAll: () => [] } as any;
+  const perRunRegistry = { getAvailable: () => [], find: () => undefined, getAll: () => [] } as any;
+
+  const agent = new WorkflowAgent({ cwd: "/tmp", modelRegistry: constructorRegistry });
+  assert.equal(await (agent as any).getRegistry(perRunRegistry), perRunRegistry);
+  assert.equal(await (agent as any).getRegistry(), constructorRegistry);
+
+  const bareAgent = new WorkflowAgent({ cwd: "/tmp" });
+  await assert.doesNotReject(() => (bareAgent as any).getRegistry());
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// buildPrompt — verifies that the agent's internal prompt assembly is correct
+// ═══════════════════════════════════════════════════════════════════════════
+
+test("buildPrompt includes base instructions, task label, and user prompt", () => {
+  const agent = new WorkflowAgent({ cwd: "/tmp", instructions: "You are a helper." });
+  const built: string = (agent as unknown as WorkflowAgentPrivates).buildPrompt(
+    "analyze this",
+    { label: "analyzer" },
+    false,
+  );
+  assert.ok(built.includes("You are a helper."), "should include base instructions");
+  assert.ok(built.includes("Task label: analyzer"), "should include task label");
+  assert.ok(built.includes("analyze this"), "should include user prompt");
+});
+
+test("buildPrompt includes per-call instructions when provided", () => {
+  const agent = new WorkflowAgent({ cwd: "/tmp", instructions: "Base." });
+  const built: string = (agent as unknown as WorkflowAgentPrivates).buildPrompt(
+    "do it",
+    { label: "x", instructions: "Extra." },
+    false,
+  );
+  assert.ok(built.includes("Base."), "base instructions");
+  assert.ok(built.includes("Extra."), "per-call instructions");
+  assert.ok(built.includes("do it"), "user prompt");
+});
+
+test("buildPrompt injects structured output contract when schema is used", () => {
+  const agent = new WorkflowAgent({ cwd: "/tmp" });
+  const built: string = (agent as unknown as WorkflowAgentPrivates).buildPrompt("return result", { label: "t" }, true);
+  assert.ok(built.includes("structured_output"), "should mention structured_output");
+  assert.ok(built.includes("Final output contract:"), "should include contract header");
+  assert.ok(built.includes("Do not emit a prose final answer"), "should discourage prose");
+  assert.ok(built.includes("call structured_output exactly once"), "should enforce single call");
+});
+
+test("buildPrompt works without base instructions", () => {
+  const agent = new WorkflowAgent({ cwd: "/tmp" });
+  const built: string = (agent as unknown as WorkflowAgentPrivates).buildPrompt("hello", { label: "greeter" }, false);
+  assert.ok(built.includes("Task label: greeter"), "should contain Task label: greeter");
+  assert.ok(built.includes("hello"), "should contain hello");
+});
+
+test("buildPrompt works without label", () => {
+  const agent = new WorkflowAgent({ cwd: "/tmp", instructions: "Help." });
+  const built: string = (agent as unknown as WorkflowAgentPrivates).buildPrompt("hello", {}, false);
+  assert.ok(built.includes("Help."), "should contain Help.");
+  assert.ok(built.includes("hello"), "should contain hello");
+  assert.ok(!built.includes("Task label:"), "no label when omitted");
+});
+
+test("buildPrompt includes both instructions when both base and per-call are set", () => {
+  const agent = new WorkflowAgent({ cwd: "/tmp", instructions: "You are a code reviewer." });
+  const built: string = (agent as unknown as WorkflowAgentPrivates).buildPrompt(
+    "check this file",
+    { label: "reviewer", instructions: "Focus on security." },
+    true,
+  );
+  // Order: base instructions, per-call instructions, label, prompt, structured contract
+  assert.ok(built.indexOf("You are a code reviewer.") < built.indexOf("Focus on security."), "base before per-call");
+  assert.ok(built.indexOf("Focus on security.") < built.indexOf("Task label: reviewer"), "per-call before label");
+  assert.ok(built.indexOf("Task label: reviewer") < built.indexOf("check this file"), "label before prompt");
+  assert.ok(
+    built.indexOf("check this file") < built.indexOf("Final output contract:"),
+    "prompt before structured contract",
+  );
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// lastAssistantText — verifies text extraction from session messages
+// ═══════════════════════════════════════════════════════════════════════════
+
+test("lastAssistantText extracts last assistant text content", () => {
+  const agent = new WorkflowAgent({ cwd: "/tmp" });
+  const messages = [
+    { role: "user", content: [{ type: "text", text: "hello" }] },
+    { role: "assistant", content: [{ type: "text", text: "hi there" }] },
+  ];
+  const text: string = (agent as unknown as WorkflowAgentPrivates).lastAssistantText(messages);
+  assert.equal(text, "hi there");
+});
+
+test("lastAssistantText joins multiple text parts", () => {
+  const agent = new WorkflowAgent({ cwd: "/tmp" });
+  const messages = [
+    {
+      role: "assistant",
+      content: [
+        { type: "text", text: "part1" },
+        { type: "text", text: "part2" },
+      ],
+    },
+  ];
+  const text: string = (agent as unknown as WorkflowAgentPrivates).lastAssistantText(messages);
+  assert.equal(text, "part1part2");
+});
+
+test("lastAssistantText skips non-text content parts", () => {
+  const agent = new WorkflowAgent({ cwd: "/tmp" });
+  const messages = [
+    {
+      role: "assistant",
+      content: [
+        { type: "tool_use", id: "t1" },
+        { type: "text", text: "result" },
+      ],
+    },
+  ];
+  const text: string = (agent as unknown as WorkflowAgentPrivates).lastAssistantText(messages);
+  assert.equal(text, "result");
+});
+
+test("lastAssistantText returns empty string when no assistant text", () => {
+  const agent = new WorkflowAgent({ cwd: "/tmp" });
+  const text: string = (agent as unknown as WorkflowAgentPrivates).lastAssistantText([]);
+  assert.equal(text, "");
+});
+
+test("lastAssistantText returns empty for non-assistant messages", () => {
+  const agent = new WorkflowAgent({ cwd: "/tmp" });
+  const messages = [{ role: "user", content: [{ type: "text", text: "hello" }] }];
+  const text: string = (agent as unknown as WorkflowAgentPrivates).lastAssistantText(messages);
+  assert.equal(text, "");
+});
+
+test("lastAssistantText picks the last assistant message, not first", () => {
+  const agent = new WorkflowAgent({ cwd: "/tmp" });
+  const messages = [
+    { role: "assistant", content: [{ type: "text", text: "first" }] },
+    { role: "user", content: [{ type: "text", text: "more" }] },
+    { role: "assistant", content: [{ type: "text", text: "final" }] },
+  ];
+  const text: string = (agent as unknown as WorkflowAgentPrivates).lastAssistantText(messages);
+  assert.equal(text, "final");
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Full agent() pipeline inside runWorkflow — verifies the agent() function
+// in workflow.ts correctly invokes the runner with all options.
+// ═══════════════════════════════════════════════════════════════════════════
+
+/** A smart mock agent runner that records every call and validates options shape. */
+class CallRecordingAgent {
+  calls: Array<{
+    prompt: string;
+    options: Record<string, unknown>;
+  }> = [];
+
+  result: unknown = "mock-result";
+
+  async run(prompt: string, options: any) {
+    this.calls.push({ prompt, options: { ...options } });
+    // Fire callbacks with synthetic data to test the full pipeline
+    options.onUsage?.({
+      input: 20,
+      output: 10,
+      cacheRead: 0,
+      cacheWrite: 0,
+      total: 30,
+      cost: 0.001,
+    } satisfies AgentUsage);
+    options.onModelResolved?.("openai/gpt-4.1-mini");
+    return this.result;
+  }
+}
+
+test("agent() in workflow passes prompt and label to runner", async () => {
+  const rec = new CallRecordingAgent();
+  await runWorkflow(
+    `export const meta = { name: 'test', description: 't' }
+     const r = await agent('analyze this', { label: 'analyzer' })
+     return r`,
+    { agent: rec, persistLogs: false },
+  );
+  assert.equal(rec.calls.length, 1);
+  assert.equal(rec.calls[0].prompt, "analyze this");
+});
+
+test("agent() in workflow forwards modelRegistry to the runner", async () => {
+  const rec = new CallRecordingAgent();
+  const fakeRegistry = { getAvailable: () => [], find: () => undefined, getAll: () => [] } as any;
+  await runWorkflow(
+    `export const meta = { name: 'test', description: 't' }
+     const r = await agent('task', { label: 't' })
+     return r`,
+    { agent: rec, persistLogs: false, modelRegistry: fakeRegistry },
+  );
+  assert.equal(rec.calls.length, 1);
+  assert.equal((rec.calls[0].options as { modelRegistry?: any }).modelRegistry, fakeRegistry);
+});
+
+test("agent() in workflow passes model spec to runner", async () => {
+  const rec = new CallRecordingAgent();
+  await runWorkflow(
+    `export const meta = { name: 'test', description: 't' }
+     const r = await agent('task', { label: 't', model: 'fast-llm/model' })
+     return r`,
+    { agent: rec, persistLogs: false },
+  );
+  assert.equal(rec.calls.length, 1);
+  assert.equal((rec.calls[0].options as { model?: string }).model, "fast-llm/model");
+});
+
+test("agent() in workflow forwards modelRegistry for CLI-style model parsing", async () => {
+  const rec = new CallRecordingAgent();
+  const modelRegistry = { getAll: () => [] };
+  await runWorkflow(
+    `export const meta = { name: 'test', description: 't' }
+     const r = await agent('task', { label: 't', model: 'fast-llm/model:xhigh' })
+     return r`,
+    { agent: rec, modelRegistry: modelRegistry as never, persistLogs: false },
+  );
+  assert.equal(rec.calls.length, 1);
+  assert.equal((rec.calls[0].options as { modelRegistry?: unknown }).modelRegistry, modelRegistry);
+  assert.equal((rec.calls[0].options as { model?: string }).model, "fast-llm/model:xhigh");
+});
+
+test("agent() in workflow fires onAgentStart and onAgentEnd callbacks", async () => {
+  const rec = new CallRecordingAgent();
+  const events: string[] = [];
+  await runWorkflow(
+    `export const meta = { name: 'test', description: 't' }
+     await agent('hello', { label: 'greeter' })
+     return 1`,
+    {
+      agent: rec,
+      persistLogs: false,
+      onAgentStart: (e) => events.push(`start:${e.label}`),
+      onAgentEnd: (e) => events.push(`end:${e.label}`),
+    },
+  );
+  assert.deepEqual(events, ["start:greeter", "end:greeter"]);
+});
+
+test("agent() in workflow forwards compact subagent history snapshots", async () => {
+  const historyRunner = {
+    async run(_prompt: string, options: any) {
+      options.onHistory?.([{ role: "assistant", kind: "text", text: "working" }]);
+      return "done";
+    },
+  };
+  const histories: Array<{ label: string; history: Array<{ text: string }> }> = [];
+
+  await runWorkflow(
+    `export const meta = { name: 'test', description: 't' }
+     await agent('hello', { label: 'greeter' })
+     return 1`,
+    {
+      agent: historyRunner,
+      persistLogs: false,
+      onAgentHistory: (event) => histories.push(event),
+    },
+  );
+
+  assert.equal(histories.length, 1);
+  assert.equal(histories[0].label, "greeter");
+  assert.equal(histories[0].history[0].text, "working");
+});
+
+test("agent() in workflow fires onAgentStart with phase info", async () => {
+  const rec = new CallRecordingAgent();
+  const starts: Array<{ label: string; phase?: string }> = [];
+  await runWorkflow(
+    `export const meta = { name: 'test', description: 't', phases: [{ title: 'Phase1' }] }
+     phase('Phase1')
+     await agent('work', { label: 'w' })
+     return 1`,
+    {
+      agent: rec,
+      persistLogs: false,
+      onAgentStart: (e) => starts.push({ label: e.label, phase: e.phase }),
+    },
+  );
+  assert.equal(starts.length, 1);
+  assert.equal(starts[0].phase, "Phase1");
+});
+
+test("agent() in workflow returns runner result", async () => {
+  const rec = new CallRecordingAgent();
+  rec.result = { findings: ["issue1"] };
+  const result = await runWorkflow<{ findings: string[] }>(
+    `export const meta = { name: 'test', description: 't' }
+     const r = await agent('analyze', { label: 'a' })
+     return r`,
+    { agent: rec, persistLogs: false },
+  );
+  assert.deepEqual(result.result, { findings: ["issue1"] });
+});
+
+test("agent() in workflow returns null for recoverable errors", async () => {
+  const failer = {
+    async run() {
+      throw new Error("recoverable agent error");
+    },
+  };
+  let end:
+    | {
+        result: unknown;
+        error?: string;
+        errorCode?: WorkflowErrorCode;
+        recoverable?: boolean;
+      }
+    | undefined;
+  const result = await runWorkflow<unknown>(
+    `export const meta = { name: 'test', description: 't' }
+     const r = await agent('failing task', { label: 'f' })
+     return r`,
+    { agent: failer, persistLogs: false, onAgentEnd: (e) => (end = e) },
+  );
+  assert.equal(result.result, null);
+  assert.equal(end?.result, null);
+  assert.equal(end?.error, "recoverable agent error");
+  assert.equal(end?.errorCode, WorkflowErrorCode.AGENT_EXECUTION_ERROR);
+  assert.equal(end?.recoverable, true);
+});
+
+test("agent() in workflow treats empty text output as a recoverable failure", async () => {
+  const rec = new CallRecordingAgent();
+  rec.result = "   ";
+  let end:
+    | {
+        result: unknown;
+        error?: string;
+        errorCode?: WorkflowErrorCode;
+        recoverable?: boolean;
+      }
+    | undefined;
+  const result = await runWorkflow<unknown>(
+    `export const meta = { name: 'test', description: 't' }
+     const r = await agent('empty task', { label: 'empty' })
+     return r`,
+    { agent: rec, persistLogs: false, onAgentEnd: (e) => (end = e) },
+  );
+
+  assert.equal(result.result, null);
+  assert.equal(end?.result, null);
+  assert.equal(end?.error, "Subagent produced no assistant output");
+  assert.equal(end?.errorCode, WorkflowErrorCode.AGENT_EMPTY_OUTPUT);
+  assert.equal(end?.recoverable, true);
+});
+
+test("agent() in workflow reports non-recoverable errors before throwing", async () => {
+  const failer = {
+    async run() {
+      throw new WorkflowError("schema failed", WorkflowErrorCode.SCHEMA_NONCOMPLIANCE, { recoverable: false });
+    },
+  };
+  let end:
+    | {
+        result: unknown;
+        error?: string;
+        errorCode?: WorkflowErrorCode;
+        recoverable?: boolean;
+      }
+    | undefined;
+
+  await assert.rejects(
+    () =>
+      runWorkflow<unknown>(
+        `export const meta = { name: 'test', description: 't' }
+         await agent('schema task', { label: 'schema' })
+         return 1`,
+        { agent: failer, persistLogs: false, onAgentEnd: (e) => (end = e) },
+      ),
+    (err) => err instanceof WorkflowError && err.code === WorkflowErrorCode.SCHEMA_NONCOMPLIANCE,
+  );
+
+  assert.equal(end?.result, null);
+  assert.equal(end?.error, "schema failed");
+  assert.equal(end?.errorCode, WorkflowErrorCode.SCHEMA_NONCOMPLIANCE);
+  assert.equal(end?.recoverable, false);
+});
+
+test("agent() in workflow fires onTokenUsage after run", async () => {
+  const rec = new CallRecordingAgent();
+  const usageEvents: Array<{ input: number; output: number; total: number }> = [];
+  await runWorkflow(
+    `export const meta = { name: 'test', description: 't' }
+     await agent('task', { label: 't' })
+     return 1`,
+    {
+      agent: rec,
+      persistLogs: false,
+      onTokenUsage: (u) => usageEvents.push({ input: u.input, output: u.output, total: u.total }),
+    },
+  );
+  assert.equal(usageEvents.length, 1, "should fire onTokenUsage once");
+  assert.equal(usageEvents[0].total, 30, "should accumulate from agent usage");
+});
+
+test("agent() passes onModelResolved callback for display model updates", async () => {
+  const rec = new CallRecordingAgent();
+  await runWorkflow(
+    `export const meta = { name: 'test', description: 't' }
+     await agent('task', { label: 't', model: 'some/model' })
+     return 1`,
+    {
+      agent: rec,
+      persistLogs: false,
+      onAgentEnd: (e) => {
+        assert.equal(e.model, "openai/gpt-4.1-mini");
+      },
+    },
+  );
+  assert.ok(rec.calls.length > 0, "rec.calls should not be empty");
+});
+
+test("onAgentModel corrects a RUNNING agent's model, not just the finished one", async () => {
+  const rec = new CallRecordingAgent();
+  const order: string[] = [];
+  let startEvent: { id: string; model?: string } | undefined;
+  let modelEvent: { id: string; model: string } | undefined;
+  let endModel: string | undefined;
+  await runWorkflow(
+    `export const meta = { name: 'test', description: 't' }
+     await agent('task', { label: 't' })
+     return 1`,
+    {
+      agent: rec,
+      persistLogs: false,
+      mainModel: "main-prov/main-model",
+      onAgentStart: (e) => {
+        order.push("start");
+        startEvent = { id: e.id, model: e.model };
+      },
+      onAgentModel: (e) => {
+        order.push("model");
+        modelEvent = { id: e.id, model: e.model };
+      },
+      onAgentEnd: (e) => {
+        order.push("end");
+        endModel = e.model;
+      },
+    },
+  );
+  assert.equal(startEvent?.model, "main-prov/main-model", "onAgentStart can only carry the pre-resolution guess");
+  assert.equal(modelEvent?.model, "openai/gpt-4.1-mini", "onAgentModel carries the id the agent actually runs on");
+  assert.equal(modelEvent?.id, startEvent?.id, "same per-call id, so the host can match it to the started row");
+  assert.deepEqual(order, ["start", "model", "end"], "the correction must land BEFORE the agent finishes");
+  assert.equal(endModel, "openai/gpt-4.1-mini", "onAgentEnd still carries the resolved model");
+});
+
+test("onAgentModel fires for a tier-tagged agent, whose start event cannot know the tier's model", async () => {
+  const rec = new CallRecordingAgent();
+  const models: string[] = [];
+  let startModel: string | undefined;
+  await runWorkflow(
+    `export const meta = { name: 'test', description: 't' }
+     await agent('task', { label: 't', tier: 'big' })
+     return 1`,
+    {
+      agent: rec,
+      persistLogs: false,
+      mainModel: "main-prov/main-model",
+      onAgentStart: (e) => {
+        startModel = e.model;
+      },
+      onAgentModel: (e) => models.push(e.model),
+    },
+  );
+  // A tier defers the choice to the agent layer, so agent() deliberately passes
+  // model: undefined and the start event falls back to the session's main model.
+  assert.equal(rec.calls[0].options.model, undefined, "a tier must not be pre-resolved into an explicit model");
+  assert.equal(rec.calls[0].options.tier, "big");
+  assert.equal(startModel, "main-prov/main-model");
+  assert.deepEqual(models, ["openai/gpt-4.1-mini"], "the tier's real model is pushed while the agent runs");
+});
+
+test("a replayed (cache-hit) agent reports the model it actually ran on, not the main model", async () => {
+  const rec = new CallRecordingAgent();
+  const journal: JournalEntry[] = [];
+  const script = `export const meta = { name: 'test', description: 't' }
+     await agent('task', { label: 't' })
+     return 1`;
+  await runWorkflow(script, {
+    agent: rec,
+    persistLogs: false,
+    runId: "replay-model-run",
+    mainModel: "main-prov/main-model",
+    onAgentJournal: (e) => journal.push(e),
+  });
+  assert.equal(journal.length, 1);
+  assert.equal(journal[0].model, "openai/gpt-4.1-mini", "the resolved model is journaled with the result");
+
+  const replayed: Array<string | undefined> = [];
+  const secondRec = new CallRecordingAgent();
+  await runWorkflow(script, {
+    agent: secondRec,
+    persistLogs: false,
+    runId: "replay-model-run",
+    mainModel: "main-prov/main-model",
+    resumeJournal: new Map(journal.map((e) => [`${e.runId}:${e.index}`, e] as const)),
+    onAgentStart: (e) => replayed.push(e.model),
+    onAgentEnd: (e) => replayed.push(e.model),
+  });
+  assert.equal(secondRec.calls.length, 0, "the call must cache-hit, so nothing re-resolves the model");
+  assert.deepEqual(
+    replayed,
+    ["openai/gpt-4.1-mini", "openai/gpt-4.1-mini"],
+    "resume must not regress a replayed row back to the main model",
+  );
+});
+
+test("a legacy journal entry with no model degrades to the pre-resolution guess", async () => {
+  const rec = new CallRecordingAgent();
+  const journal: JournalEntry[] = [];
+  const script = `export const meta = { name: 'test', description: 't' }
+     await agent('task', { label: 't' })
+     return 1`;
+  await runWorkflow(script, {
+    agent: rec,
+    persistLogs: false,
+    runId: "legacy-model-run",
+    mainModel: "main-prov/main-model",
+    onAgentJournal: (e) => journal.push(e),
+  });
+  const legacy = journal.map(({ model: _dropped, ...rest }) => rest as JournalEntry);
+  const replayed: Array<string | undefined> = [];
+  await runWorkflow(script, {
+    agent: new CallRecordingAgent(),
+    persistLogs: false,
+    runId: "legacy-model-run",
+    mainModel: "main-prov/main-model",
+    resumeJournal: new Map(legacy.map((e) => [`${e.runId}:${e.index}`, e] as const)),
+    onAgentStart: (e) => replayed.push(e.model),
+  });
+  assert.deepEqual(
+    replayed,
+    ["main-prov/main-model"],
+    "no journaled model => same behavior as before the field existed",
+  );
+});
+
+test("agent() accumulates usage across multiple agents", async () => {
+  const rec = new CallRecordingAgent();
+  const usageEvents: Array<{ total: number }> = [];
+  await runWorkflow(
+    `export const meta = { name: 'test', description: 't' }
+     await agent('first', { label: 'a' })
+     await agent('second', { label: 'b' })
+     return 1`,
+    {
+      agent: rec,
+      persistLogs: false,
+      onTokenUsage: (u) => usageEvents.push({ total: u.total }),
+    },
+  );
+  assert.equal(usageEvents.length, 1, "one final usage event");
+  assert.equal(usageEvents[0].total, 60, "two agents × 30 tokens each");
+});
+
+test("agent() with timeout should handle gracefully (timeout returns null)", async () => {
+  const slow = {
+    async run() {
+      await new Promise((r) => setTimeout(r, 50));
+      return "slow";
+    },
+  };
+  let errorMessage = "";
+  const result = await runWorkflow<unknown>(
+    `export const meta = { name: 'test', description: 't' }
+     let val = null
+     try { val = await agent('slow', { label: 's', timeoutMs: 5 }) } catch (e) { val = 'error:' + (e && e.message || e) }
+     return { val }`,
+    {
+      agent: slow,
+      persistLogs: false,
+      onAgentEnd: (event) => {
+        if (event.error) errorMessage = event.error;
+      },
+    },
+  );
+  const r = result.result as { val: unknown };
+  // agent() catches timeout internally (recoverable) and returns null
+  assert.equal(r.val, null, "timeout agent should return null (recoverable)");
+  assert.match(errorMessage, /timed out after 5ms/);
+  assert.match(errorMessage, /raise or omit timeoutMs\/agentTimeoutMs/);
+});
+
+test("agent() default timeout is unbounded", async () => {
+  const slow = {
+    async run() {
+      await new Promise((r) => setTimeout(r, 25));
+      return "slow";
+    },
+  };
+  const result = await runWorkflow<{ val: string }>(
+    `export const meta = { name: 'test', description: 't' }
+     const val = await agent('slow', { label: 's' })
+     return { val }`,
+    { agent: slow, persistLogs: false },
+  );
+
+  assert.equal(result.result.val, "slow");
+});
+
+test("agent() timeoutMs null overrides a run-level timeout", async () => {
+  const slow = {
+    async run() {
+      await new Promise((r) => setTimeout(r, 25));
+      return "slow";
+    },
+  };
+  const result = await runWorkflow<{ val: string }>(
+    `export const meta = { name: 'test', description: 't' }
+     const val = await agent('slow', { label: 's', timeoutMs: null })
+     return { val }`,
+    { agent: slow, agentTimeoutMs: 5, persistLogs: false },
+  );
+
+  assert.equal(result.result.val, "slow");
+});
+
+test("agent() with parallel invokes all agents", async () => {
+  const rec = new CallRecordingAgent();
+  await runWorkflow(
+    `export const meta = { name: 'test', description: 't' }
+     const rs = await parallel(['a','b','c'].map(p => () => agent(p, { label: p })))
+     return rs`,
+    { agent: rec, persistLogs: false },
+  );
+  assert.equal(rec.calls.length, 3);
+  const prompts = rec.calls.map((c) => c.prompt).sort();
+  assert.deepEqual(prompts, ["a", "b", "c"]);
+});
+
+test("agent() with pipeline invokes agent per stage per item", async () => {
+  const rec = new CallRecordingAgent();
+  await runWorkflow(
+    `export const meta = { name: 'test', description: 't' }
+     const rs = await pipeline(['x','y'],
+       item => agent('stage1 ' + item, { label: 's1-' + item }),
+       result => agent('stage2 ' + result, { label: 's2-' + result }),
+     )
+     return rs`,
+    { agent: rec, persistLogs: false },
+  );
+  assert.equal(rec.calls.length, 4); // 2 items × 2 stages
+});
+
+test("agent() monitors agent count and calls onAgentStart/End for each", async () => {
+  const rec = new CallRecordingAgent();
+  const counts: number[] = [];
+  await runWorkflow(
+    `export const meta = { name: 'test', description: 't' }
+     await agent('a', { label: 'a' })
+     await agent('b', { label: 'b' })
+     return 1`,
+    {
+      agent: rec,
+      persistLogs: false,
+      onAgentStart: () => {},
+      onAgentEnd: (e) => counts.push(e.tokens ?? 0),
+    },
+  );
+  assert.equal(counts.length, 2);
+  assert.ok(counts[0] > 0, "first agent tokens");
+  assert.ok(counts[1] > 0, "second agent tokens");
+});
+
+// ═══════════════════════════════════════════════════════════════════════════
+// usageFromStats — the guard between session stats and the onUsage callback.
+// ═══════════════════════════════════════════════════════════════════════════
+
+test("usageFromStats maps real stats to an AgentUsage", () => {
+  const usage = usageFromStats({
+    tokens: { input: 100, output: 50, cacheRead: 900, cacheWrite: 30, total: 1080 },
+    cost: 0.42,
+  });
+  assert.deepEqual(usage, { input: 100, output: 50, cacheRead: 900, cacheWrite: 30, total: 1080, cost: 0.42 });
+});
+
+test("usageFromStats returns undefined for all-zero stats (provider reported nothing)", () => {
+  const usage = usageFromStats({
+    tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    cost: 0,
+  });
+  assert.equal(usage, undefined);
+});
+
+test("usageFromStats keeps cost-only stats (billed but tokens unreported)", () => {
+  const usage = usageFromStats({
+    tokens: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    cost: 0.01,
+  });
+  assert.equal(usage?.cost, 0.01);
+});
+// ═══════════════════════════════════════════════════════════════════════
+// runtimeOf + 3-way fallback registry construction (omp / legacy / stock pi)
+// ═══════════════════════════════════════════════════════════════════════
+
+test("runtimeOf returns the backing ModelRuntime on stock pi and undefined on a fork-style registry", async () => {
+  const authDir = mkdtempSync(join(tmpdir(), "pi-dw-runtime-of-"));
+  try {
+    const runtime = await ModelRuntime.create({ authPath: join(authDir, "auth.json"), modelsPath: null });
+    const registry = new ModelRegistry(runtime);
+    assert.equal(runtimeOf(registry), runtime, "stock pi ModelRegistry must expose its runtime for subagent handoff");
+    // omp's auth-storage-backed registry carries no own `.runtime`; the seam
+    // must report undefined there so callers pass the registry itself instead.
+    const forkRegistry: ModelRegistry = Object.create(Object.getPrototypeOf(registry));
+    assert.equal(runtimeOf(forkRegistry), undefined);
+  } finally {
+    rmSync(authDir, { recursive: true, force: true });
+  }
+});
+
+test("stock pi exposes neither omp's discoverAuthStorage nor a legacy static ModelRegistry.create (fallback must use ModelRuntime.create)", async () => {
+  assert.equal(typeof ModelRuntime.create, "function", "runtime-split construction path must exist on stock pi");
+  const mod = await import("@earendil-works/pi-coding-agent");
+  assert.equal("discoverAuthStorage" in mod, false, "omp-only discovery export must not exist on stock pi");
+  assert.equal("create" in ModelRegistry, false, "legacy static create must not exist on stock pi");
+});
+
+test("fallback registry resolves to a real ModelRegistry on stock pi and is cached across agents (never undefined)", async () => {
+  const home = mkdtempSync(join(tmpdir(), "pi-dw-fallback-home-"));
+  try {
+    await withFakeHomeAsync(home, async () => {
+      const agent1 = new WorkflowAgent({ cwd: "/tmp" }) as unknown as WorkflowAgentPrivates;
+      const agent2 = new WorkflowAgent({ cwd: "/tmp" }) as unknown as WorkflowAgentPrivates;
+      const first = await agent1.getRegistry();
+      assert.ok(first instanceof ModelRegistry, "fallback must resolve to a real registry, never undefined");
+      assert.ok(runtimeOf(first), "stock-pi fallback registry must carry a runtime for subagent handoff");
+      assert.equal(await agent1.getRegistry(), first, "per-agent fallback must be reused");
+      assert.equal(await agent2.getRegistry(), first, "module-level fallback registry must be shared across agents");
+    });
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});

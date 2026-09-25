@@ -1,0 +1,48 @@
+id: no-return-value-in-generator
+language: Python
+message: "'return' with a value should not be used in a generator function"
+severity: error
+note: |
+  Port of SonarCloud python:S2712.
+
+  A generator function should only use bare `return` (to stop iteration).
+  Returning a value from a generator is meaningless — the value is
+  silently discarded because generators wrap their return value in a
+  StopIteration exception. Use `yield` instead, or split the function.
+
+  The rule matches a `function_definition` that contains BOTH a
+  `yield` node AND a `return_statement` with a value (`return\s+\S`).
+  Each `has:` uses `stopBy: {kind: function_definition}` (not the
+  plain `stopBy: end` this rule shipped with originally) — it needs
+  to search past the `block` wrapper (the function body isn't a
+  direct child of `function_definition`), but must NOT cross into a
+  nested `function_definition`. A bare `stopBy: end` searches every
+  descendant regardless of depth, so a `yield` in an outer
+  `async def lifespan(app):` and an unrelated `return 42` inside a
+  nested `def handler():` got conflated into one false positive
+  (#1806 audit: 3 FP hits, none were actual generators — the yield
+  and the value-return belonged to different functions).
+
+  A nested function that is itself a real generator (has its own
+  `yield` AND its own value-`return`) is still flagged: the scanner
+  visits every `function_definition` node independently, including
+  nested ones, and `stopBy: {kind: function_definition}` only blocks
+  the OUTER function's search from reaching into the inner one — it
+  doesn't stop the inner function from being checked on its own.
+
+  Bare `return` (no value) is allowed and intentionally not flagged.
+metadata:
+  sonar: S2712
+rule:
+  all:
+    - kind: function_definition
+    - has:
+        kind: yield
+        stopBy:
+          kind: function_definition
+    - has:
+        kind: return_statement
+        regex: 'return\s+\S'
+        stopBy:
+          kind: function_definition
+

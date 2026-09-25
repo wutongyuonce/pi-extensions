@@ -203,7 +203,11 @@ function signalOwnedProcess(
 	try {
 		process.kill(target, signal);
 	} catch (error) {
-		if (processErrorCode(error) !== "ESRCH") throw error;
+		// ESRCH: already gone. EPERM (macOS, zombie-only group): not proof the
+		// process survived; the liveness checks that follow decide whether
+		// cleanup is drained or blocked.
+		const code = processErrorCode(error);
+		if (code !== "ESRCH" && code !== "EPERM") throw error;
 	}
 }
 
@@ -264,7 +268,10 @@ async function terminateOwnedProcesses(
 			try {
 				process.kill(-processGroupId, signal);
 			} catch (error) {
-				if (processErrorCode(error) !== "ESRCH") throw error;
+				// EPERM (macOS, zombie-only group) is not proof the group survived;
+				// the liveness loop that follows decides whether cleanup is blocked.
+				const code = processErrorCode(error);
+				if (code !== "ESRCH" && code !== "EPERM") throw error;
 			}
 		}
 	}

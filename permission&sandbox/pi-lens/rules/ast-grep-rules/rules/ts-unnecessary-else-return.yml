@@ -1,0 +1,19 @@
+id: ts-unnecessary-else-return
+language: typescript
+severity: warning
+message: else after return - the else block is redundant
+metadata:
+  weight: 2
+  category: slop
+rule:
+  kind: if_statement
+  all:
+  # has defaults to direct-child (neighbour): the if's own consequent block must
+  # itself contain a return statement directly — a return nested in an inner
+  # conditional doesn't count (the else wouldn't be redundant then).
+  - has:
+      kind: statement_block
+      has:
+        kind: return_statement
+  - has:
+      kind: else_clause

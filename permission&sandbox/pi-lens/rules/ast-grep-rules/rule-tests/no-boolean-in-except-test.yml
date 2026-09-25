@@ -1,0 +1,54 @@
+id: no-boolean-in-except
+valid:
+  - |
+    try:
+        x()
+    except (ValueError, KeyError):
+        pass
+  - |
+    try:
+        x()
+    except ValueError as e:
+        pass
+  - |
+    try:
+        x()
+    except:
+        pass
+  - |
+    # #3211: body-only `or` must not be flagged — the handler condition
+    # itself is a plain exception type, only the return value uses `or`.
+    try:
+        x()
+    except Exception:
+        return 2 or 3
+  - |
+    # #3211: same shape one level deeper (an `if` inside the handler
+    # body) — still not a boolean-in-except-clause target.
+    try:
+        x()
+    except Exception:
+        if cond:
+            x = a or b
+invalid:
+  - |
+    try:
+        x()
+    except (ValueError or KeyError):
+        pass
+  - |
+    try:
+        x()
+    except ValueError and KeyError:
+        pass
+  - |
+    # #3211: a nested try whose OWN except clause has the boolean
+    # condition must still be flagged, even though it sits inside an
+    # outer handler whose body also contains an `or`.
+    try:
+        outer()
+    except Exception:
+        try:
+            inner()
+        except (A or B):
+            return 3 or 4

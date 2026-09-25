@@ -39,7 +39,6 @@ import type {
 	WorkflowTaskRunRecord,
 } from "./types.js";
 import type { WorkflowSourceManifestSource } from "./workflow-artifact-tool.js";
-import { readSimpleJsonPath } from "./workflow-runtime.js";
 
 export async function runDynamicDecisionPersistCall(input: {
 	cwd: string;
@@ -74,6 +73,8 @@ export async function runDynamicDecisionPersistCall(input: {
 		rawDecision: input.rawDecision,
 		validation,
 		stateIndexDigest,
+		attemptId: hashDynamicRequest({ opId: input.opId, requestHash }),
+		expectedRound: typeof context.expectedRound === "number" ? context.expectedRound : undefined,
 	});
 	if (!alreadyRecorded)
 		await recordDynamicEventAndUpdateState(input.cwd, input.run.runId, {
@@ -476,6 +477,14 @@ export function normalizeDynamicFanoutPlanRequest(
 			agentRequest: { ...agentRequest, branchId },
 		};
 	});
+	const requestIds = new Set<string>();
+	const branchIds = new Set<string>();
+	for (const branch of branches) {
+		if (requestIds.has(branch.requestId) || branchIds.has(branch.branchId))
+			throw new Error(`ctx.fanout.plan() duplicate generated request or branch id: ${branch.requestId}`);
+		requestIds.add(branch.requestId);
+		branchIds.add(branch.branchId);
+	}
 	return { round, decisionHash, branches };
 }
 
@@ -911,24 +920,6 @@ function requiredDynamicNonNegativeInteger(
 	return value;
 }
 
-function requiredDynamicPositiveInteger(
-	value: unknown,
-	field: string,
-	api: string,
-): number {
-	if (typeof value !== "number" || !Number.isInteger(value) || value <= 0) {
-		throw new Error(`${api} ${field} must be a positive integer`);
-	}
-	return value;
-}
-
 function optionalDynamicStringField(value: unknown): string | undefined {
 	return typeof value === "string" && value.trim() ? value.trim() : undefined;
-}
-
-function optionalDynamicOutputProfile(
-	value: unknown,
-): DynamicOutputProfile | undefined {
-	if (value === undefined) return undefined;
-	return requiredDynamicOutputProfile(value, "outputProfile", "ctx.agent()");
 }

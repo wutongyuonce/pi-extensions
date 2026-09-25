@@ -1,0 +1,11 @@
+[[bin]]
+name = "wrong-bin-name"
+path = "src/main.rs"
+
+[package]
+name = "bin-before-package"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = "1.0"

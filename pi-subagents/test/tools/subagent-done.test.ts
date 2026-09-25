@@ -237,6 +237,10 @@ describe("subagent-done.ts", () => {
 
 			const originalSession = process.env.PI_SUBAGENT_SESSION;
 			const originalName = process.env.PI_SUBAGENT_NAME;
+			// caller_ping now arms a hard-exit backstop; keep it mocked so the
+			// test runner survives the armed timer.
+			mock.timers.enable({ apis: ["setTimeout"] });
+			const exitMock = mock.method(process, "exit", (() => {}) as never);
 			try {
 				process.env.PI_SUBAGENT_SESSION = sessionFile;
 				process.env.PI_SUBAGENT_NAME = "Ping Child";
@@ -249,7 +253,7 @@ describe("subagent-done.ts", () => {
 						shutdowns += 1;
 					},
 				});
-				await sleep(0);
+				mock.timers.tick(0);
 
 				assert.equal(shutdowns, 1);
 				assert.deepEqual(JSON.parse(readFileSync(`${sessionFile}.exit`, "utf8")), {
@@ -259,6 +263,8 @@ describe("subagent-done.ts", () => {
 					outputTokens: 11,
 				});
 			} finally {
+				exitMock.mock.restore();
+				mock.timers.reset();
 				if (originalSession == null) delete process.env.PI_SUBAGENT_SESSION;
 				else process.env.PI_SUBAGENT_SESSION = originalSession;
 				if (originalName == null) delete process.env.PI_SUBAGENT_NAME;

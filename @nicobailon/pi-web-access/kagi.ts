@@ -2,6 +2,8 @@ import { existsSync, readFileSync } from "node:fs";
 import { activityMonitor } from "./activity.ts";
 import type { ExtractedContent, ExtractOptions } from "./extract.ts";
 import type { SearchOptions, SearchResponse } from "./perplexity.ts";
+import { formatSearchResultsAsAnswer } from "./search-answer-formatting.ts";
+import { normalizeSearchResultCount } from "./search-result-count-normalization.ts";
 import { hasCredentialSource, redactCredential, resolveCredential } from "./credential-source.ts";
 import { fetchRemoteUrl, loadFetchContentDomainPolicy, loadSsrfConfig, validateRemoteUrl, type SsrfConfig } from "./ssrf-protection.ts";
 import { getWebSearchConfigPath } from "./utils.ts";
@@ -66,11 +68,6 @@ async function requireApiKey(signal?: AbortSignal): Promise<string> {
 		);
 	}
 	return apiKey;
-}
-
-function normalizeCount(value: number | undefined): number {
-	if (typeof value !== "number" || !Number.isFinite(value)) return 5;
-	return Math.max(1, Math.min(Math.floor(value), 20));
 }
 
 function errorMessage(err: unknown): string {
@@ -153,19 +150,13 @@ function parseExtractResponse(value: unknown, requestedUrl: string): ExtractedCo
 	return null;
 }
 
-function buildAnswer(results: SearchResponse["results"]): string {
-	return results.map((result) => result.snippet
-		? `${result.snippet}\nSource: ${result.title} (${result.url})`
-		: `Source: ${result.title} (${result.url})`).join("\n\n");
-}
-
 export function isKagiAvailable(): boolean {
 	return hasCredentialSource({ provider: "Kagi", configuredValue: loadConfig().kagiApiKey, environmentValue: process.env.KAGI_API_KEY });
 }
 
 export async function searchWithKagi(query: string, options: KagiSearchOptions = {}): Promise<SearchResponse> {
 	const apiKey = await requireApiKey(options.signal);
-	const numResults = normalizeCount(options.numResults);
+	const numResults = normalizeSearchResultCount(options.numResults);
 	const activityId = activityMonitor.logStart({ type: "api", query });
 	let response: Response;
 	try {
@@ -200,7 +191,7 @@ export async function searchWithKagi(query: string, options: KagiSearchOptions =
 	const parsed = parseSearchResponse(rawData);
 	activityMonitor.logComplete(activityId, response.status);
 	const results = parsed.results.slice(0, numResults);
-	const mapped: SearchResponse = { answer: buildAnswer(results), results };
+	const mapped: SearchResponse = { answer: formatSearchResultsAsAnswer(results), results };
 	if (options.includeContent) {
 		const urls = new Set(results.map(result => result.url));
 		const inlineContent = parsed.inlineContent.filter(content => urls.has(content.url));

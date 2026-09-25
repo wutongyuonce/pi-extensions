@@ -1,3 +1,5 @@
+import type { IntercomBridgeConfig } from "../shared/types.ts";
+
 // This is the established extension-to-extension transport. The structured
 // delegation API intentionally reuses it instead of adding a second event
 // protocol. Unstructured legacy direct payloads are rejected.
@@ -35,6 +37,8 @@ export interface SubagentDelegationRequest {
 	toolBudget?: SubagentDelegationToolBudget;
 	skill?: string | string[] | boolean;
 	artifacts?: boolean;
+	/** Per-launch bridge config; replaces the global `intercomBridge` config. Pass the same value to preflight to compare digests. */
+	intercomBridge?: IntercomBridgeConfig;
 	result: SubagentDelegationResultRequest;
 }
 
@@ -42,6 +46,20 @@ export interface SubagentDelegationStarted {
 	requestId: string;
 	ownerRunId: string;
 	nodeId: string;
+}
+
+/**
+ * Cumulative usage for one attempt at one observation time. This snapshot is
+ * emitted only when every counter is known, finite, and non-negative. It does
+ * not combine retries or replace authoritative terminal usage; absence means
+ * unavailable, not zero. UPDATE `tokens` keeps its input-plus-output meaning.
+ */
+export interface SubagentDelegationUpdateUsage {
+	input: number;
+	output: number;
+	cacheRead: number;
+	cacheWrite: number;
+	turns: number;
 }
 
 export interface SubagentDelegationUpdate extends SubagentDelegationStarted {
@@ -55,6 +73,7 @@ export interface SubagentDelegationUpdate extends SubagentDelegationStarted {
 	toolCount?: number;
 	durationMs?: number;
 	tokens?: number;
+	usage?: SubagentDelegationUpdateUsage;
 }
 
 export type SubagentDelegationStatus =

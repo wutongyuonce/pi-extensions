@@ -1,0 +1,27 @@
+{
+	"global": null,
+	"lsp": {
+		"servers": {
+			"custom": {
+				"args": [
+					"--stdio"
+				],
+				"command": "custom-lsp",
+				"extensions": [
+					".custom"
+				],
+				"name": "Custom",
+				"rootMarkers": [
+					"package.json"
+				]
+			}
+		},
+		"warmFiles": [
+			"src/lib.rs"
+		]
+	},
+	"project": {
+		"ignore": [],
+		"rules": {}
+	}
+}

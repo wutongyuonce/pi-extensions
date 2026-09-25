@@ -28,11 +28,42 @@ export type {
 	DuplicateRunTarget,
 	WorkflowDurationEstimate,
 } from "./run-estimates.js";
-export { listWorkflows, resolveWorkflowRef } from "./workflow-specs.js";
+export {
+	listWorkflows,
+	listWorkflowRoutingSpecs,
+	resolveWorkflowRef,
+	WORKFLOW_ROUTING_CATALOG_BOUNDS,
+} from "./workflow-specs.js";
 export type {
 	ResolvedWorkflowSpecRef,
+	WorkflowRoutingCatalog,
+	WorkflowRoutingScope,
+	WorkflowRoutingSpecRecord,
 	WorkflowSpecRecord,
 } from "./workflow-specs.js";
+export {
+	formatWorkflowAutoRecommendation,
+	parseWorkflowAutoComparisonOutput,
+	recommendWorkflowAuto,
+	workflowAutoDirectDraft,
+	WORKFLOW_AUTO_COMPARE_CORRELATION_ID,
+	WORKFLOW_AUTO_COMPARE_TIMEOUT_MS,
+	WORKFLOW_AUTO_MAX_CANDIDATE_CARDS,
+	WORKFLOW_AUTO_MAX_MODEL_INPUT_BYTES,
+	WORKFLOW_AUTO_MAX_TASK_BYTES,
+} from "./workflow-router.js";
+export type {
+	WorkflowAutoAssessment,
+	WorkflowAutoCandidate,
+	WorkflowAutoCandidateFacts,
+	WorkflowAutoCandidateKind,
+	WorkflowAutoComparison,
+	WorkflowAutoComparisonStatus,
+	WorkflowAutoReadiness,
+	WorkflowAutoRecommendation,
+	WorkflowAutoRequest,
+	WorkflowAutoResult,
+} from "./workflow-router.js";
 export { compileRole, extractMarkdownSections } from "./roles.js";
 export { loadWorkflow, loadWorkflowSpec, parseWorkflow } from "./schema.js";
 export { parseArtifactGraphWorkflowSpec } from "./artifact-graph-schema.js";
@@ -47,11 +78,22 @@ export type {
 	ExecutionProfileStageOverride,
 	FastMode,
 	WorkflowDefaults,
+	WorkflowRoutingHints,
+	WorkflowCapturedExecutionProfile,
+	WorkflowExecutionProfileSelection,
+	WorkflowProfileRole,
+	WorkflowRunExecutionProfile,
+	WorkflowRunAutoSelectionMetadata,
 	WorkflowRunLaunchCapture,
+	WorkflowRunLaunchCaptureV1,
+	WorkflowRunLaunchCaptureV2,
 	WorkflowRunLaunchCommandMetadata,
 	WorkflowRunLaunchMetadata,
+	WorkflowRunLaunchMetadataV1,
+	WorkflowRunLaunchMetadataV2,
 	WorkflowRunLaunchProfile,
 	WorkflowRunLaunchSource,
+	WorkflowAutoRoute,
 	WorkflowRunProvenance,
 	ArtifactGraphWorkflowSpec,
 	ArtifactGraphStageSpec,
@@ -62,7 +104,7 @@ export type {
 	ThinkingLevel,
 	WorktreePolicy,
 } from "./types.js";
-export { WorkflowValidationError } from "./types.js";
+export { WORKFLOW_PROFILE_ROLES, WorkflowValidationError } from "./types.js";
 export { runDynamicDecisionLoop } from "./dynamic-decision-loop.js";
 export type {
 	DynamicDecisionLoopControllerContext,
@@ -143,14 +185,20 @@ Usage:
   /workflow roles <workflow-name-or-path>
   /workflow agents
   /workflow list
-  /workflow run [--no-route] [--model MODEL] [--thinking LEVEL] [--profile NAME] <workflow-name-or-path> "<task>" [--detach] [--force-new]
-  /workflow dynamic [--route] [--model MODEL] [--thinking LEVEL] "<task>" [--detach] [--force-new]
+  /workflow profile [workflow-name-or-path]
+  /workflow auto "<task>"
+  /workflow run [--model MODEL] [--thinking LEVEL] [--profile NAME] <workflow-name-or-path> "<task>" [--detach] [--force-new]
+  /workflow dynamic [--model MODEL] [--thinking LEVEL] "<task>" [--detach] [--force-new]
   /workflow status [run-id]
   /workflow show [--raw] <run-id-or-workflow-name>
   /workflow logs <run-id> [task-id-or-spec-id] [lines]
   /workflow wait <run-id> [timeout-ms]
   /workflow resume <run-id>
   /workflow stop <run-id>
+  /workflow prune [--keep N] [--older-than DAYS] [--yes] [--json]
+  /workflow notices list [--json]
+  /workflow notices acknowledge <exact-run-id> --state <sha256> --reason <text>
+  /workflow notices clear <exact-run-id> [--json]
 
 /workflow opens the read-only workflow board TUI.
 /workflow <run-id> opens the board focused on that run.
@@ -164,19 +212,27 @@ Interactive run/dynamic starts skip launching when an active run with the
 same workflow and identical task started within the last 10 minutes;
 --force-new starts another run anyway.
 
-/workflow run routes by default: a low-cost router pass first decides direct
-answer vs dynamic vs the requested workflow (with quick/standard/max depth).
-On low confidence or router failure it escalates to the requested path at
-standard depth; the decision is recorded on the run record (or
-routing-log.jsonl for direct). Use --no-route to skip the router and start
-the requested workflow directly. /workflow dynamic still requires an
-explicit --route to enable the router pass.
+/workflow run starts exactly the named workflow and /workflow dynamic starts
+exactly the direct dynamic runtime. Neither command classifies or replaces your
+selection. /workflow auto discovers bounded existing candidates, may ask one
+read-only classifier for a recommendation, then requires an interactive choice
+and separate final confirmation before any workflow starts. In print/RPC/headless
+mode auto is recommendation-only and prints explicit follow-up commands.
+
+--route and --no-route are no longer accepted; use /workflow auto "<task>" to
+request a recommendation.
+
+/workflow profile opens the native Pi picker for Codex, Codex High, Claude,
+Mixed, or one per-workflow Custom model/thinking setup. It saves a private user
+preference for the exact workflow definition; Custom may capture the current Pi
+model/thinking when a new run starts. The picker never starts a workflow or
+provider call.
 
 With --profile NAME, /workflow run applies a custom-named executionProfiles
-entry declared by the workflow spec and records it on the run. When omitted,
-interactive runs offer the declared profiles plus the base spec. Headless/print
-runs use defaultExecutionProfile when declared, otherwise the base spec.
-Explicit --profile bypasses the prompt. Routing asks only when the named
-workflow path is selected. Unknown names fail closed and list the declared
-profiles.
+entry declared by the workflow spec and records it on the run. Launch precedence
+is explicit --profile, then a saved user workflow profile, then the existing
+omitted behavior. Without a saved preference, interactive runs offer declared
+profiles plus Base; headless/print runs use defaultExecutionProfile when
+present, otherwise Base. Unknown names and unavailable saved model/thinking
+pairs fail closed without substitution or silent clamp.
 `;

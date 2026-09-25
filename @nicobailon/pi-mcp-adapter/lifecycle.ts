@@ -1,6 +1,11 @@
 import { SdkError, SdkErrorCode } from "@modelcontextprotocol/client";
 import { isServerDisabled, type ServerDefinition } from "./types.ts";
-import { isTransientHttpConnectError, type McpServerManager, type ServerConnection } from "./server-manager.ts";
+import {
+  isTransientHttpConnectError,
+  isUnauthorizedHttpError,
+  type McpServerManager,
+  type ServerConnection,
+} from "./server-manager.ts";
 import { hasPendingAuth } from "./mcp-auth-flow.ts";
 import { logger } from "./logger.ts";
 import { formatTerminalError, parallelLimit, sanitizeTerminalText } from "./utils.ts";
@@ -223,7 +228,7 @@ export class McpLifecycleManager {
         await this.handleSupersededConnection(name, definition, connection, signal, retrySuperseded);
         return;
       }
-      if (!shouldReconnectAfterRefresh(error, hadSessionId)) {
+      if (!shouldReconnectAfterRefresh(error, hadSessionId, definition)) {
         this.reportConnectionFailure(name, definition, error, "refresh", connection);
         return;
       }
@@ -439,8 +444,14 @@ export class McpLifecycleManager {
   }
 }
 
-function shouldReconnectAfterRefresh(error: unknown, hadSessionId: boolean): boolean {
+function shouldReconnectAfterRefresh(
+  error: unknown,
+  hadSessionId: boolean,
+  definition: ServerDefinition,
+): boolean {
   if (isTerminatedSession(error, hadSessionId)) return true;
+  // Reconnect baked bearer sources so connect-time resolution runs again.
+  if (definition.auth === "bearer" && isUnauthorizedHttpError(error)) return true;
   return error instanceof SdkError
     && (error.code === SdkErrorCode.NotConnected || error.code === SdkErrorCode.ConnectionClosed);
 }

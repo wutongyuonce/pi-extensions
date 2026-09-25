@@ -4,6 +4,19 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [1.8.1] - 2026-09-08
+
+### Fixed
+
+- `/autoresearch <goal>` without a `.auto/prompt.md` sent the literal text `/skill:autoresearch-create …` to the model instead of the skill's contents, because `pi.sendUserMessage()` does not expand skill commands by default. Models would reply with things like `Unknown command: /skill:autoresearch-create` (#93). The kickoff is now sent with `expandPromptTemplates: true` (pi ≥ 0.84.2).
+
+## [1.8.0] - 2026-09-08
+
+### Added
+- After every logged experiment, `log_experiment` now asks the agent to check whether the latest result invalidates a previous discard's rollback reason before choosing the next experiment. Ideas discarded because "X was the bottleneck" get a second look once X stops being the bottleneck.
+- Intentional retries can be annotated with `asi.revisits_run: <run number>`; the transcript then shows a `↻ Revisiting #N` line under the logged result so a retry is distinguishable from the agent forgetting a failure.
+- The `.auto/prompt.md` template's "What's Been Tried" section now asks for the conditions that would justify revisiting a discarded idea, so that knowledge survives compaction.
+
 ## [1.7.0] - 2026-08-31
 
 ### Changed

@@ -70,6 +70,7 @@ type ResultFileChild = {
 	sessionName?: string;
 	output?: string;
 	structuredOutput?: unknown;
+	structuredOutputPath?: string;
 	outputState?: SubagentOutputState;
 	error?: string;
 	success?: boolean;
@@ -81,6 +82,8 @@ type ResultFileChild = {
 	processSignal?: string | null;
 	sessionFile?: string;
 	artifactPaths?: { outputPath?: string };
+	outputSaveError?: string;
+	artifactOutputSaveFailed?: true;
 	intercomTarget?: string;
 	children?: unknown;
 };
@@ -408,7 +411,9 @@ export function createResultWatcher(
 			if (typeof data.sessionId !== "string" || !data.sessionId) return;
 			const sessionId = data.sessionId;
 			const completionOwnerId = data.completionOwnerId;
-			const runId = data.runId ?? data.id ?? file.replace(/\.json$/i, "");
+			const runId = typeof data.runId === "string" && data.runId
+				? data.runId
+				: typeof data.id === "string" && data.id ? data.id : file.replace(/\.json$/i, "");
 			const toolCallId = typeof data.toolCallId === "string" ? data.toolCallId : undefined;
 			let observerSucceeded = true;
 			try {
@@ -428,7 +433,7 @@ export function createResultWatcher(
 			if (!ownsCompletion(sessionId, completionOwnerId, epoch)) return;
 			// Recorded before dedupe and before the unlink below so bg_wait can
 			// use the in-memory record or its bounded durable replay after cleanup.
-			recordWaitCompletion(state, runId, data, Date.now(), completionTtlMs, {
+			const completionPersisted = recordWaitCompletion(state, runId, data, Date.now(), completionTtlMs, {
 				resultsDir,
 				sessionId,
 			});
@@ -456,6 +461,10 @@ export function createResultWatcher(
 				}
 				if (!ownsCompletion(sessionId, completionOwnerId, epoch)) return;
 				if (markReplacedPayload()) return;
+				if (!completionPersisted) {
+					scheduleResult(file, triggerTurn, RETRY_DELAY_MS);
+					return;
+				}
 				if (!removeDeliveredResult(file, sessionId, runId, toolCallId)) scheduleResult(file, triggerTurn, RETRY_DELAY_MS);
 				return;
 			}
@@ -474,7 +483,7 @@ export function createResultWatcher(
 					: output;
 				const sessionPath = result.sessionFile ?? (resultChildren.length === 1 ? data.sessionFile : undefined);
 				const childNestedChildren = sanitizeNestedResultChildren(result.children, resultPath, `results[${index}].children`);
-				const childState = result.state === "paused" || result.state === "stopped"
+				const childState = result.state === "running" || result.state === "queued" || result.state === "paused" || result.state === "stopped"
 					? result.state
 					: result.stopped === true
 						? "stopped"
@@ -513,6 +522,10 @@ export function createResultWatcher(
 				}
 				if (!ownsCompletion(sessionId, completionOwnerId, epoch)) return;
 				if (markReplacedPayload()) return;
+				if (!completionPersisted) {
+					scheduleResult(file, triggerTurn, RETRY_DELAY_MS);
+					return;
+				}
 				if (!removeDeliveredResult(file, sessionId, runId, toolCallId)) scheduleResult(file, triggerTurn, RETRY_DELAY_MS);
 				return;
 			}
@@ -600,6 +613,10 @@ export function createResultWatcher(
 				return;
 			}
 			if (!ownsCompletion(sessionId, completionOwnerId, epoch)) return;
+			if (!completionPersisted) {
+				scheduleResult(file, triggerTurn, RETRY_DELAY_MS);
+				return;
+			}
 			if (!removeDeliveredResult(file, sessionId, runId, toolCallId)) scheduleResult(file, triggerTurn, RETRY_DELAY_MS);
 		} catch (error) {
 			if (isAccessDenied(error)) {

@@ -59,6 +59,7 @@ function fakePrepared(agentDefs: PreparedSubagentLaunch["agentDefs"]): PreparedS
 		runtimePaths: {} as PreparedSubagentLaunch["runtimePaths"],
 		subagentSessionFile: "child.jsonl",
 		sessionFile: "parent.jsonl",
+		skillLaunchPlan: { visibilitySpec: "" },
 		identity: "",
 		identityInSystemPrompt: false,
 	}) as PreparedSubagentLaunch;

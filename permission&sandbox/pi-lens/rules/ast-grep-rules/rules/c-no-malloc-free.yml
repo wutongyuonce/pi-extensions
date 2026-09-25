@@ -1,0 +1,39 @@
+# C No malloc/free
+# Detects manual heap allocation via malloc/calloc/realloc/free.
+# Ported from vinhnx/VTCode rules/c/no-malloc-free.yml (#2201, refs #2195).
+id: c-no-malloc-free
+language: c
+severity: warning
+message: "Manual malloc/calloc/realloc/free; verify ownership and error handling"
+note: |
+  Manual heap management is routine and often correct in C, but every call
+  site needs a matching free on every path (including error returns) and a
+  NULL check on the allocation itself. This rule surfaces the call sites for
+  review; it does not imply the allocation is wrong.
+  Detection-only: whether an allocation is intentional, already
+  correctly paired and error-checked, or a leak/double-free candidate
+  requires tracing ownership across the function, which this syntactic rule
+  cannot verify.
+  Expect volume in an unmanaged-memory C codebase: this fires once per
+  malloc/calloc/realloc/free call site, so a file with routine heap use can
+  report many findings that are individually fine. Treat a high count as a
+  prompt to skim for the unpaired or unchecked exceptions, not as a signal
+  every call site needs a change.
+rule:
+  kind: call_expression
+  has:
+    field: function
+    kind: identifier
+    regex: "^(malloc|calloc|realloc|free)$"
+tags:
+  - c
+  - idiom
+  - memory-safety
+examples:
+  bad: |
+    int *buf = malloc(sizeof(int) * count);
+    /* ... */
+    free(buf);
+  good: |
+    /* Same call sites, reviewed for a matching free on every path and a
+       NULL check on the allocation. */

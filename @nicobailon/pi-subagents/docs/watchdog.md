@@ -1,145 +1,171 @@
 # Watchdog and child permissions
 
-The watchdog is an opt-in adversarial reviewer for repo edits. This page covers what it reviews, how to pick its model, scope monitoring, LSP diagnostics, and the native child tool permission gate that uses the child watchdog as its arbiter.
+The watchdog is an opt-in second model that reviews what the agent just did and pushes findings back into the transcript. It looks for missed constraints, correctness risks, test gaps, unsafe changes, loop risks, and scope drift, and says nothing when the turn is clean. It is not the `reviewer` subagent; `subagents.defaultModel` and `agentOverrides.reviewer` do not configure it.
 
-## What the watchdog reviews
+## When it runs
 
-The watchdog is not the `reviewer` subagent. `subagents.defaultModel` and `subagents.agentOverrides.reviewer` do not configure it.
+| Timing | Trigger | Gate | Delivery |
+|---|---|---|---|
+| Boundary review | `agent_end` of every main or child turn | Repo changed | Routed by finding importance; high is steered to the model, low/medium are persisted for the user only |
+| Main activity review | `agent_end`, with `clarification: true` | New delivered orchestration evidence; at most one additional review per user prompt | Same warning/clarification path, even without local edits |
+| Cadence review | Every `cadence.everyNTools` tool results, minimum 5 | Opt-in | Steered after the current tool, before the next step |
+| LSP pre-pass | Before boundary review | Changed TypeScript/JavaScript files | Diagnostics become watchdog findings without a model call |
 
-It reviews repo edits, not ordinary conversation:
+Boundary reviews coalesce a turn's edits into one final-state review. Unchanged or reverted diffs are skipped unless the main-only activity opt-in below admits new evidence; `.pi/subagents/` and `tmp/` artifacts remain excluded. In orchestrated runs, each writing child reviews its own worktree and the parent reviews the aggregate diff after child changes land. There are no idle timer reviews. Cadence monitoring is inspired by [Scopey](https://github.com/ArchAstro/scopey).
 
-- It runs at the safe `agent_end` boundary, only when the current agent or child writer changed the final repo state since the start of that turn.
-- Multiple edits in one turn are coalesced into one review of the final changed state.
-- Unchanged/reverted diffs are skipped.
-- Generated `.pi/subagents/` or `tmp/` artifacts do not trigger review.
-- In orchestrated runs, each writing child can review its own edited worktree, and the parent can still review the aggregate repo diff after child changes are applied.
+Children get the same boundary, cadence, and LSP behavior. Child cadence resolves from `children.overrides.<agent>.cadence`, then `children.cadence`, then top-level `cadence`:
+
+```json
+{
+  "subagents": {
+    "watchdog": {
+      "enabled": true,
+      "cadence": { "everyNTools": 10 },
+      "children": {
+        "enabled": true,
+        "cadence": { "everyNTools": 20 },
+        "overrides": {
+          "worker": { "cadence": { "everyNTools": 5 } },
+          "reviewer": { "enabled": false }
+        }
+      }
+    }
+  }
+}
+```
+
+That means: main every 10 tools, worker every 5, other children every 20, reviewer never.
+
+## What you see
+
+Every finding requires `importance: low | medium | high`. Low and medium are persisted for the user but excluded from model context and continuations. High findings retain model-visible delivery. Severity independently controls thresholds and acceptance, so a low-importance blocker still blocks acceptance. Clean reviews show nothing.
+
+```
+you ─▶ agent turn ─▶ edits repo ─▶ agent_end ─▶ watchdog review
+                                             ├─ clean: turn ends
+                                             └─ warning: low/medium user entry, or high steered message
+```
+
+Collapsed warnings show the title and evidence line. Expanded warnings show evidence, recommended action, importance, category, and source:
+
+```
+● Subagent watchdog Blocker (displayed): Claims tests passed without running them
+  Evidence: The transcript claims `npm test` passed but no test command appears in the tool log.
+  Recommended action: Run the focused test before finishing.
+  Importance: High · Category: Test Gap · Source: main
+```
+
+When consecutive boundary reviews raise the same warning, the agent is not making progress. After `stalemateRepeats` identical warnings in a row (default 3), the warning is shown as `stalemate`, no continuation is triggered, and the turn ends. Your next prompt resets the count.
+
+Child watchdog findings are lifted into the parent in three ways:
+
+- Internal/user inspection retains the last 20 findings, including importance and full details. Parent model results may include only high-importance findings.
+- The acceptance runtime check `watchdog-blocker` fails on blockers that are unaddressed or stalemate.
+- Completion notices may include high-importance concerns and blockers; low/medium finding text is omitted.
+
+`/subagents-watchdog status` shows setting sources, enabled state, runtime state, review trigger, scope, cadence, LSP status, selected model/thinking, child overrides, timeout, stalemate count, launch-rule count, review backend, last warning, changed paths, and config errors when present.
+
+## What the reviewer is given
+
+- **Turn delta** with changed repo paths. Over-long input keeps the first 6,000 characters and the tail.
+- **Current scope** (`scope.enabled`, default on): bounded real user prompts. Side questions are additive; only explicit changes supersede older requirements. Scope survives compaction within the current session.
+- **`watchdog_diff`** when inside git: diff since the session-start commit, including later commits, plus untracked paths to inspect with `read`; accepts `path` and `stat:true`.
+- **`WATCHDOG.md`** standing instructions, read fresh on every review: `<project>/.pi/WATCHDOG.md` first, then `~/.pi/agent/WATCHDOG.md`, capped at 8,000 characters. Set `guidance.watchdogMd: false` to ignore them.
+- **LSP diagnostics** from `typescript-language-server`, auto-detected in `node_modules/.bin` or `PATH`; it is never installed and never run over the whole workspace. Errors become blockers, warnings concerns, and info/hints stay in status.
 
 ## Choosing a model
 
-Because the watchdog is an adversarial change reviewer, it should usually use a strong complementary model rather than a cheap/light one.
-
-Ask pi-subagents for the current strong pairing:
+One model setting serves both boundary and cadence reviews per endpoint. Use a strong complementary model for rare adversarial boundary reviews, or a cheap one for frequent cadence monitoring.
 
 ```text
 /subagents-watchdog recommend-model
 /subagents-watchdog session model recommended
 /subagents-watchdog model recommended
-```
-
-The current recommendation policy is Opus 4.8 with thinking high or GPT 5.5 with thinking high. If your main session is using one, the watchdog should use the other when that model is authenticated.
-
-- `session model recommended` changes only the current Pi session.
-- `model recommended` saves the recommendation to `~/.pi/agent/settings.json`. It does not turn the watchdog on; enable it separately with `/subagents-watchdog on`.
-
-Or set the model explicitly:
-
-```text
 /subagents-watchdog model anthropic/claude-opus-4-8:high
 /subagents-watchdog model openai-codex/gpt-5.5:high
 /subagents-watchdog model inherit
 /subagents-watchdog check
+/subagents-watchdog on
 ```
 
-In settings files, use `subagents.watchdog.main.model` and `subagents.watchdog.main.thinking` for the main watchdog:
+When a main watchdog model is configured (including a session override), recommendations keep that model and its effective thinking level rather than judging its strength or independence. An unavailable or unauthenticated configured model is reported, not replaced. Without a configured main model, the recommendation remains Opus 4.8 or GPT 5.5 at thinking high, whichever your main session is not using and is authenticated.
 
-- If `main.model` is omitted, the main watchdog uses the current session model and thinking level.
-- If `main.model` is set without a thinking suffix or `main.thinking`, it runs with thinking off. Prefer `:high` or `"thinking": "high"` for the strong-watchdog pairing.
-
-Default strong-reviewer profile:
+`session model recommended` changes only this session. `model recommended` explicitly saves the recommendation to **user settings**, affecting other projects without overrides; it does not change project settings. Project and session overrides still take precedence. Use an explicit model to replace a configured choice. Saving a model does not enable the watchdog; use `on` separately.
 
 ```json
 {
   "subagents": {
     "watchdog": {
       "enabled": true,
-      "main": {
-        "model": "anthropic/claude-opus-4-8",
-        "thinking": "high"
-      }
-    }
-  }
-}
-```
-
-## Scope monitoring
-
-When enabled, the watchdog keeps a bounded in-memory current-scope artifact from real user prompts and prepends it to review input by default (`subagents.watchdog.scope.enabled`). Newer prompts supersede and mutate older prompts, so the reviewer can flag work that no longer serves the current scope as `scope-drift`. Watchdog auto-follow prompts are not recorded as scope.
-
-You can opt into Scopey-style scope monitoring, inspired by [Scopey](https://github.com/ArchAstro/scopey), by setting `subagents.watchdog.cadence.everyNTools` to run additional non-blocking reviews every N tool results. Cadence warnings are transcript-visible and delivered with Pi's `steer` mode after the current tool boundary; they are never hidden. The same configured watchdog model is used for all checks, so choose a cheap model for frequent monitoring or a strong model for rarer adversarial review.
-
-Scopey-style profile:
-
-```json
-{
-  "subagents": {
-    "watchdog": {
-      "enabled": true,
-      "main": {
-        "model": "anthropic/claude-haiku-4-5",
-        "thinking": "medium"
-      },
+      "main": { "model": "anthropic/claude-opus-4-8", "thinking": "high" },
       "scope": { "enabled": true },
       "cadence": { "everyNTools": 10 },
-      "autoFollow": {
-        "blockers": true,
-        "maxAttempts": 3,
-        "stalemateRepeats": 3
-      }
+      "stalemateRepeats": 3
     }
   }
 }
 ```
 
-## Auto-follow
+Omit `main.model` to inherit the session model and thinking level. A `main.model` without a thinking suffix or `main.thinking` runs with thinking off, so prefer `:high` for the strong pairing.
 
-When the watchdog displays a blocker at `agent_end`, the `subagents.watchdog.autoFollow` policy can queue a visible follow-up user message asking the agent to address it. Auto-follow only runs while the watchdog is enabled, respects `maxAttempts`, and stops on repeated identical blockers using `stalemateRepeats`.
+The watchdog resolves one reviewer model and makes one review call. Unavailable models fail visibly; rate limits, quota, authentication, provider timeouts, findings, clarification, cancellation, and the overall watchdog deadline never switch models automatically. An inherited model keeps the current session model and thinking level.
 
-## LSP diagnostics
+Agents can call `subagent({ action: "watchdog.recommend-model" })` and `subagent({ action: "watchdog.configure", model: "recommended", scope: "session" | "user" | "project" })`. They should use `scope: "session"` unless you ask for a lasting default.
 
-When the watchdog is enabled, it also checks changed TypeScript and JavaScript files for fresh language-server diagnostics before the model review.
+## Optional main-session clarification
 
-- It auto-detects `typescript-language-server` from the project `node_modules/.bin` or `PATH`. It never installs tools or scans the whole workspace.
-- LSP errors surface as watchdog blockers, warnings as concerns, and info/hints stay in status details.
-- Slow or missing servers are reported in `/subagents-watchdog status` without blocking the turn or emitting late mid-turn warnings.
-- Configure the bounds with `subagents.watchdog.lsp.enabled`, `timeoutMs`, `maxFiles`, and `maxDiagnostics`.
+Use `watchdog_warn` directly for evidence-backed reminders of forgotten authorized work; a question is not a prerequisite. Distinguish forgotten work from dependencies still pending or explicit holds. Use clarification when task status or intent is genuinely unclear. The orchestrator remains owner of its task/lane board.
+
+With this opt-in, completed `turn_end` events retain a recent actual-activity tail: paired calls/results for `subagent` dispatch (no action), `subagent` actions `status`, `resume`, `interrupt`, `steer`, `stop`, `bg_wait`, and `subagent_supervisor` actions `pending`, `list`, `reply`. Pairing requires the same tool name and exact tool-call ID; raw results, unrelated tool names and watchdog management actions do not qualify. Each activity entry is bounded to 3,000 characters, with a 6,000-character recent tail retained across ordinary new prompts and skipped edit boundaries. Session replacement, compaction, shutdown or disabling clears it. This is observed text, not an inferred task board.
+
+New unreviewed activity permits at most one additional boundary review per user prompt even with no local edit. Side questions keep earlier authorized task evidence available; they do not themselves trigger a model call. Activity gathered after that prompt's extra review remains available for the next prompt. Warning continuations cannot supply fresh triggering activity. No polling, task scheduling, cross-worktree scans or idle calls are added.
+
+**Visibility limit:** external task/gate completions are visible when returned through those parent tool results. Standalone native completion notifications, arbitrary custom messages, direct shell/CI output, and events not delivered to the parent through these contracts are not ingested by this activity tail. Existing scope retains at most eight prompts (2,000 characters each); new streaming user input cancels an active review but is not added to scope unless `before_agent_start` fires. Reminders depend on retained evidence and model judgment, not an exhaustive view of running work.
+
+Set `subagents.watchdog.clarification: true` in Pi settings alongside `enabled: true`. It defaults to `false` and applies **only to the main watchdog**, not child watchdogs or child permission arbitration.
+
+```json
+{ "subagents": { "watchdog": { "enabled": true, "clarification": true } } }
+```
+
+At an eligible activity or repo-edit boundary, the reviewer may use `watchdog_ask` for one focused question when missing orchestrator context prevents a concrete judgment. It cannot ask during cadence reviews, after an accepted warning, or during stalemate. There is at most one question per real user prompt.
+
+The tool **yields and ends that review**. A visible question with concrete evidence steers the main session into Pi's native automatic continuation after the boundary hook returns. The orchestrator handles the context as needed and continues; no answer, receipt, deadline or follow-up review is required or tracked. Questions are **not approval, permission, or warnings**.
+
+Asking consumes the current review evidence, so an unchanged Git-backed boundary does not immediately review it again. Later reviews use the normal edit, cadence and bounded activity triggers, with the same read-only tools, warning thresholds, budgets and stalemate protections. Non-Git observed edits can also prompt a question: there is no cross-answer evidence guarantee to verify. Disabling watchdog or clarification, new user input, model changes and session lifecycle resets cancel applicable active reviews and suppress stale results; already delivered questions remain ordinary transcript messages.
+
+Reviews retain the existing `agentEndTimeoutMs`. Questions and evidence are capped at 1,000 and 2,000 characters; scope, activity and delta share the existing 24,000-character input limit. Enabled cost adds at most one activity boundary review and one question-triggered continuation per prompt, not a dedicated answer review. Disabled execution does not collect activity or add polling, model calls or reviewer prompt/tool content. Child warning messaging and permission decisions remain unchanged.
 
 ## Child watchdogs
 
-For child subagent watchdogs, use `subagents.watchdog.children.model` as the default child watchdog model, or `subagents.watchdog.children.overrides.<agent>.model` for a specific child role.
+Opt in under `subagents.watchdog.children`. `model` and `thinking` set the default child watchdog; `overrides.<agent>` can set `model`, `thinking`, `enabled`, or `cadence` per role.
 
-Child watchdogs are opt-in and follow the same edit-gated rule: read-only children do not trigger watchdog reviews, while writer children are reviewed at their own `agent_end` if their worktree changed.
+## Launch rules
 
-## Agent-driven configuration
-
-Agents can configure the same values through the tool when you ask them to set up the watchdog:
-
-```ts
-subagent({ action: "watchdog.recommend-model" })
-subagent({ action: "watchdog.configure", model: "recommended", scope: "session" })
-subagent({ action: "watchdog.configure", model: "recommended", scope: "project" })
-```
-
-Persistent scopes (`user` or `project`) should only be used when you ask for a lasting default. Otherwise the agent should use `scope: "session"`.
-
-## Native child tool permissions
-
-Native permissions are opt-in and apply only to Pi child runtimes. With no rules configured, every tool call passes through unchanged.
-
-Configure explicit non-bash rules globally in `~/.pi/agent/extensions/subagent/config.json`:
+`subagents.watchdog.rules` pins which models each role may run on. It runs before a child starts, needs no model call, and applies even when model review is off.
 
 ```json
 {
-  "permissions": {
-    "rules": {
-      "read": "allow",
-      "write": "ask",
-      "edit": "deny"
+  "subagents": {
+    "watchdog": {
+      "rules": {
+        "action": "warn",
+        "roleModels": {
+          "scout": { "allow": ["openai-codex/gpt-5.6-luna:max"] },
+          "oracle": { "deny": ["*"], "note": "oracle is for hard questions only; ask before launching" },
+          "worker": { "deny": ["openai-codex/gpt-5.6-sol:high"] }
+        }
+      }
     }
   }
 }
 ```
 
-Custom agents can override matching global rules with a `permission:` or `permissions:` frontmatter block:
+`action: "warn"` steers a concern into the orchestrator transcript and lets the launch proceed. `action: "block"` returns a tool error and starts nothing. `allow` and `deny` are anchored, case-sensitive globs (`*`, `?`) matched against `provider/id[:thinking]` and bare `provider/id`; `deny` wins. Rules apply to direct launches, workflow children, and chain/parallel steps using settings visible at the launch cwd.
+
+## Native child tool permissions
+
+Opt-in, Pi child runtimes only. With no rules, every tool call passes through. Global non-bash rules live in `~/.pi/agent/extensions/subagent/config.json`; agents override matching rules in `permission:` or `permissions:` frontmatter:
 
 ```yaml
 ---
@@ -150,27 +176,10 @@ permission:
 ---
 ```
 
-Rules support `allow`, `ask`, and `deny`:
+Values are `allow`, `ask`, and `deny`. Agent rules override global ones, omitted and unknown tools default to `allow`, an explicit `allow` removes an inherited restriction, and the gate is not registered when the resolved policy has no `ask` or `deny`.
 
-- Agent rules override matching global rules.
-- Omitted and unknown tools default to `allow`.
-- Explicit `allow` removes an inherited restriction.
-- The gate is not registered when the resolved policy has no `ask` or `deny` rules.
+`ask` pauses that exact tool call and sends a bounded, redacted preview to a one-call arbiter owned by the child watchdog, using the configured child-watchdog model. The arbiter returns only `approve` or `deny` and does not notify the parent. A disabled watchdog, missing model/auth, timeout, malformed response, or runtime error denies the call with a clear error. Requests and decisions are written to bounded audit JSONL. `contact_supervisor` and the optional `pi-intercom` extension are never permission-gated.
 
-### How `ask` works
+Bash is always passed through; bash rules are rejected. Use `pi-guard` for command-level policy. Children are pi sessions inside the parent process (foreground) or the detached runner process (background), not separate `pi` binaries, so there is no per-child command wrapper; load `pi-guard` into a child through the agent's `extensions` or `subagentOnlyExtensions`, and background children also pick it up as an ambient extension. External CLI profiles are opaque processes, so native permissions cannot intercept their tools; launches with effective `ask` or `deny` rules are rejected for external CLI agents.
 
-An explicit `ask` pauses that exact tool call and sends a bounded, redacted preview to a one-call permission arbiter owned by the built-in child watchdog. The arbiter uses the configured child-watchdog model and returns only `approve` or `deny`; it does not notify the parent agent.
-
-Enable and configure `subagents.watchdog.children` before using `ask` rules. A disabled watchdog, missing model/auth, timeout, malformed response, or runtime error denies the call with a clear error.
-
-Asked requests and decisions are written to bounded audit JSONL, including `decisionSource: "watchdog"` and bounded failure reasons. Ordinary direction and clarification through `contact_supervisor` or the optional `pi-intercom` extension remain separate and are never permission-gated.
-
-### Bash is out of scope
-
-`bash` is always passed through by pi-subagents. Bash rules are rejected rather than parsed, gated, denied, or audited. Install and configure `pi-guard` when command-level bash policy is needed.
-
-A pi-subagents child is headless, so a pi-guard rule that resolves to `ask` cannot request approval from the parent Pi UI. Native permissions do not forward pi-guard decisions; they only apply to the separate non-bash child permission gate. For child-specific policy, use `PI_GUARD` through a `PI_SUBAGENT_PI_BINARY` wrapper or an equivalent launch wrapper, and configure explicit `allow` or `deny` rules. An `allow` rule grants execution; it is not approval forwarding, so retain explicit denies for commands the child must not run.
-
-### External CLI profiles
-
-External CLI profiles are opaque processes, so native permissions cannot intercept their tools. A launch with effective `ask` or `deny` rules is rejected for an external CLI agent instead of claiming enforcement.
+Detached runners receive `PI_SUBAGENT_PARENT_SESSION` from their exact launch and retain it for that dedicated process. Root and in-process foreground hosts do not publish a global parent identity because multiple Pi sessions can share a host. Environment-only permission extensions therefore cannot safely forward foreground `ask` requests; that path remains unsupported until the extension accepts a session-scoped target. Native child permissions are unaffected.

@@ -1,0 +1,11 @@
+Turn this into a tiny TypeScript invoice utility project.
+
+Requirements:
+1. Keep package.json and tsconfig.json as-is.
+2. Work only inside src/.
+3. Create src/totals.ts exporting:
+   `sumInvoiceTotals(invoices: Array<{ id: string; totalCents: number }>): number`
+4. Update src/index.ts to import that function and export `demoTotal`, computed from two sample invoices.
+5. Fix any diagnostics pi-lens surfaces while you work.
+6. Do not add dependencies.
+7. End with a short summary of what you changed.

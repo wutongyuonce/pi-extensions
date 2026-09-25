@@ -31,6 +31,7 @@ export function resolveSubagentResultStatus(input: {
 	if (input.detached) return "detached";
 	if (input.stopped || input.state === "stopped") return "stopped";
 	if (input.interrupted || input.state === "paused") return "paused";
+	if (input.state === "running" || input.state === "queued") return "running";
 	if (input.success === true) return "completed";
 	if (isUnexplainedProcessSignal(input) && input.exitCode !== 0) return "stopped";
 	if (input.success === false) return "failed";
@@ -42,6 +43,7 @@ export function resolveSubagentResultStatus(input: {
 
 function countStatuses(children: SubagentResultIntercomChild[]): Record<SubagentResultStatus, number> {
 	const counts: Record<SubagentResultStatus, number> = {
+		running: 0,
 		completed: 0,
 		failed: 0,
 		paused: 0,
@@ -56,6 +58,7 @@ function countStatuses(children: SubagentResultIntercomChild[]): Record<Subagent
 
 function formatStatusCounts(counts: Record<SubagentResultStatus, number>): string {
 	const parts = [
+		counts.running ? `${counts.running} running` : undefined,
 		counts.completed ? `${counts.completed} completed` : undefined,
 		counts.failed ? `${counts.failed} failed` : undefined,
 		counts.stopped ? `${counts.stopped} stopped` : undefined,
@@ -85,6 +88,7 @@ function resolveGroupedStatus(children: SubagentResultIntercomChild[]): Subagent
 	if (counts.failed > 0) return "failed";
 	if (counts.stopped > 0) return "stopped";
 	if (counts.paused > 0) return "paused";
+	if (counts.running > 0) return "running";
 	if (counts.completed > 0) return "completed";
 	if (counts.detached > 0) return "detached";
 	return "failed";

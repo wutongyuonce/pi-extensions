@@ -12,11 +12,15 @@ import {
 import type { ResultWorkspace } from "../artifacts/result.ts";
 import {
 	THINKING_LEVELS,
+	abortFailureKind,
 	type AgentScope,
 	type FailureKind,
 	type ThinkingLevel,
 } from "../core/constants.ts";
-import { detectContextLengthExceeded } from "./headless-model.ts";
+import {
+	detectContextLengthExceeded,
+	sumUsageValues,
+} from "./headless-model.ts";
 import {
 	flushToolCallTelemetry,
 	ToolCallTelemetryCollector,
@@ -120,9 +124,7 @@ interface SdkModelContext {
 function normalizeTimeoutMs(timeoutMs: number | undefined): number | undefined {
 	if (timeoutMs === undefined) return undefined;
 	if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
-		throw new Error(
-			"timeoutMs must be a positive finite number when provided.",
-		);
+		throw new Error("timeoutMs must be a positive finite number when provided.");
 	}
 	return timeoutMs;
 }
@@ -152,7 +154,10 @@ function findPackageRoot(
 }
 
 function assertPiSdkModule(value: unknown): PiSdkModule {
-	if ((typeof value !== "object" || value === null) && typeof value !== "function")
+	if (
+		(typeof value !== "object" || value === null) &&
+		typeof value !== "function"
+	)
 		throw new Error("Pi SDK module did not export an object namespace.");
 	const candidate = value as Record<string, unknown>;
 	const modelRegistry = candidate.ModelRegistry as
@@ -211,16 +216,24 @@ async function createSdkModelContext(
 	};
 }
 
+let sdkImporterForTests: (() => Promise<SdkImportResult>) | undefined;
+
+/** Test seam: replace the Pi SDK import with a fake module for one check. */
+export function setInlineSdkImporterForTests(
+	importer: (() => Promise<SdkImportResult>) | undefined,
+): void {
+	sdkImporterForTests = importer;
+}
+
 async function importPiSdk(): Promise<SdkImportResult> {
+	if (sdkImporterForTests !== undefined) return await sdkImporterForTests();
 	try {
 		const require = createRequire(import.meta.url);
 		const packageJson = require.resolve(
 			"@earendil-works/pi-coding-agent/package.json",
 		);
 		return {
-			module: assertPiSdkModule(
-				await import("@earendil-works/pi-coding-agent"),
-			),
+			module: assertPiSdkModule(await import("@earendil-works/pi-coding-agent")),
 			source: dirname(packageJson),
 		};
 	} catch (projectError) {
@@ -229,9 +242,7 @@ async function importPiSdk(): Promise<SdkImportResult> {
 			piBin = execFileSync("which", ["pi"], { encoding: "utf8" }).trim();
 		} catch {
 			const message =
-				projectError instanceof Error
-					? projectError.message
-					: String(projectError);
+				projectError instanceof Error ? projectError.message : String(projectError);
 			throw new Error(
 				`Could not import @earendil-works/pi-coding-agent and could not find pi on PATH. Project import error: ${message}`,
 			);
@@ -291,6 +302,44 @@ function assistantTextFromMessages(messages: unknown): string {
 		}
 	}
 	return text;
+}
+
+/**
+ * Provider, model, summed usage, and the last stop reason from the session's
+ * assistant messages, mirroring what the headless runner derives from
+ * `message_end` events so inline results carry the same accounting metadata.
+ */
+export function assistantMetadataFromMessages(messages: unknown): {
+	provider?: string;
+	model?: string;
+	usage?: unknown;
+	stopReason?: string;
+	errorMessage?: string;
+} {
+	if (!Array.isArray(messages)) return {};
+	const metadata: {
+		provider?: string;
+		model?: string;
+		usage?: unknown;
+		stopReason?: string;
+		errorMessage?: string;
+	} = {};
+	for (const message of messages) {
+		if (typeof message !== "object" || message === null) continue;
+		const record = message as Record<string, unknown>;
+		if (record.role !== "assistant") continue;
+		if (typeof record.provider === "string") metadata.provider = record.provider;
+		if (typeof record.model === "string") metadata.model = record.model;
+		if (record.usage !== undefined)
+			metadata.usage = sumUsageValues(metadata.usage, record.usage);
+		delete metadata.errorMessage;
+		if (typeof record.stopReason === "string") {
+			metadata.stopReason = record.stopReason;
+			if (record.stopReason === "error" && typeof record.errorMessage === "string")
+				metadata.errorMessage = record.errorMessage;
+		}
+	}
+	return metadata;
 }
 
 function maybeAssistantTextFromAgentEnd(event: unknown): string {
@@ -433,32 +482,34 @@ async function promptWithStops(
 ): Promise<FailureKind | null> {
 	let timeoutTimer: ReturnType<typeof setTimeout> | undefined;
 	let settled = false;
+	let onAbort: (() => void) | undefined;
 
-	const promptPromise = session.prompt(prompt);
-	const stopPromise = new Promise<FailureKind | null>((resolveStop) => {
-		function stop(kind: FailureKind): void {
-			if (settled) return;
-			settled = true;
-			void session.abort?.();
-			resolveStop(kind);
-		}
+	try {
+		const promptPromise = session.prompt(prompt);
+		const stopPromise = new Promise<FailureKind | null>((resolveStop) => {
+			function stop(kind: FailureKind): void {
+				if (settled) return;
+				settled = true;
+				void session.abort?.();
+				resolveStop(kind);
+			}
 
-		if (timeoutMs !== undefined)
-			timeoutTimer = setTimeout(() => stop("timeout"), timeoutMs);
-		if (signal !== undefined) {
-			if (signal.aborted) stop("abort");
-			else
-				signal.addEventListener("abort", () => stop("abort"), { once: true });
-		}
-	});
+			if (timeoutMs !== undefined)
+				timeoutTimer = setTimeout(() => stop("timeout"), timeoutMs);
+			if (signal !== undefined) {
+				onAbort = () => stop("abort");
+				if (signal.aborted) onAbort();
+				else signal.addEventListener("abort", onAbort, { once: true });
+			}
+		});
 
-	const result = await Promise.race([
-		promptPromise.then(() => null),
-		stopPromise,
-	]);
-	settled = true;
-	if (timeoutTimer !== undefined) clearTimeout(timeoutTimer);
-	return result;
+		return await Promise.race([promptPromise.then(() => null), stopPromise]);
+	} finally {
+		settled = true;
+		if (timeoutTimer !== undefined) clearTimeout(timeoutTimer);
+		if (signal !== undefined && onAbort !== undefined)
+			signal.removeEventListener("abort", onAbort);
+	}
 }
 
 export async function runInlineModel(
@@ -486,6 +537,7 @@ export async function runInlineModel(
 	let stderrText = "";
 	let outputText = "";
 	let failureKind: FailureKind | null = null;
+	let assistantMetadata: ReturnType<typeof assistantMetadataFromMessages> = {};
 	let toolCallArtifactRefs: ArtifactRef[] = [];
 	const toolCallTelemetry =
 		options.captureToolCalls === true
@@ -494,8 +546,7 @@ export async function runInlineModel(
 
 	try {
 		const { module: piSdk, source } = await importPiSdk();
-		const { modelRegistry, sessionOptions } =
-			await createSdkModelContext(piSdk);
+		const { modelRegistry, sessionOptions } = await createSdkModelContext(piSdk);
 		const sessionManager = piSdk.SessionManager.inMemory(cwd);
 		const resourceLoader = createChildResourceLoader(piSdk, options, cwd);
 		await resourceLoader.reload();
@@ -544,8 +595,19 @@ export async function runInlineModel(
 				outputText = assistantTextFromMessages(session.messages);
 			if (outputText.length === 0) outputText = stdoutText;
 		} finally {
+			// Capture accounting metadata even when prompt() rejected after the
+			// model had already produced assistant messages.
+			assistantMetadata = assistantMetadataFromMessages(session.messages);
 			if (typeof unsubscribe === "function") unsubscribe();
 			session.dispose?.();
+		}
+
+		// The SDK can resolve prompt() after a provider error has been finalized
+		// as an assistant message. Only the final assistant stop reason decides
+		// the outcome: an earlier error may have been recovered by a retry.
+		if (failureKind === null && assistantMetadata.stopReason === "error") {
+			failureKind = "model";
+			stderrText += `${assistantMetadata.errorMessage ?? "Inline SDK session ended with a provider error."}\n`;
 		}
 
 		if (diagnostics.length > 0)
@@ -563,10 +625,12 @@ export async function runInlineModel(
 	toolCallArtifactRefs = await flushToolCallTelemetry(toolCallTelemetry, store);
 
 	const completedAt = new Date();
+	const cancelledByAbort = failureKind === "abort";
+	if (cancelledByAbort) failureKind = abortFailureKind(options.signal);
 	const status =
 		failureKind === null
 			? "completed"
-			: failureKind === "abort"
+			: cancelledByAbort
 				? "cancelled"
 				: "failed";
 	const artifacts: ArtifactRef[] = [
@@ -585,11 +649,12 @@ export async function runInlineModel(
 		workspace: options.workspace ?? { mode: "shared", cwd },
 		sandbox: { enabled: false },
 		exitCode: null,
-		signal: failureKind === "abort" ? "ABORT" : null,
+		signal: cancelledByAbort ? "ABORT" : null,
 		artifacts,
 		correlationId: options.correlationId,
 		metadata: {
 			contextLengthExceeded: detectContextLengthExceeded({ stderrText }),
+			...assistantMetadata,
 		},
 	});
 }

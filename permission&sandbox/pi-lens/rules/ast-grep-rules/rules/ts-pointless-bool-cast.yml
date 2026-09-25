@@ -1,0 +1,10 @@
+id: ts-pointless-bool-cast
+language: typescript
+severity: warning
+message: Wrapping a condition in Boolean() is redundant ceremony
+metadata:
+  weight: 3
+  category: slop
+rule:
+  kind: if_statement
+  pattern: "if (Boolean($COND)) { $$$ }"

@@ -1,0 +1,44 @@
+id: no-dupe-class-members
+valid:
+  - |
+    class A { foo() {} bar() {} }
+  - |
+    class A { get x() {} set x(v) {} }
+  - |
+    class A {
+      static async create() {
+        return new A();
+      }
+      create() {
+        return 1;
+      }
+    }
+  - |
+    class A {
+      static async open(id: string) {
+        return new A();
+      }
+      async open(id: string) {
+        return;
+      }
+    }
+invalid:
+  - |
+    class A { foo() {} foo() {} }
+  - |
+    class A { foo = 1; foo = 2; }
+  - |
+    class A {
+      static async build() {}
+      build() {}
+      build() {}
+    }
+  - |
+    class A { async foo() {} async foo() {} }
+  - |
+    class A { static foo() {} static foo() {} }
+  - |
+    class A {
+      static async build() {}
+      static async build() {}
+    }

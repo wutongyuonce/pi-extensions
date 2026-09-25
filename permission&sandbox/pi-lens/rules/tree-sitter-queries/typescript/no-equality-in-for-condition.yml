@@ -1,0 +1,41 @@
+# Loose equality in for-loop termination
+# Detects ==/!= used as a for-loop's exit test, which is fragile.
+id: no-equality-in-for-condition
+name: Loose equality in for-loop condition
+severity: warning
+category: bug
+defect_class: correctness
+inline_tier: warning
+language: typescript
+
+message: "for-loop uses ==/!= for termination — prefer </<=/>/>= so stepping past the bound still exits"
+
+description: |
+  Using == or != as a for-loop's termination test is fragile: if the counter
+  steps past the target value (e.g. i += 2, or it is mutated in the body), the
+  equality never holds and the loop runs forever. Use a relational operator
+  (<, <=, >, >=) so the loop still terminates when the counter overshoots.
+
+  ❌  for (let i = 0; i != n; i += 2)   // infinite if n is odd
+  ✅  for (let i = 0; i < n;  i += 2)
+
+query: |
+  (for_statement
+    (expression_statement
+      (binary_expression
+        ["==" "!="] @OP)))
+
+metavars:
+  - OP
+
+has_fix: false
+
+tags:
+  - bug
+  - loop
+
+examples:
+  bad: |
+    for (let i = 0; i != items.length; i += 2) { /* ... */ }
+  good: |
+    for (let i = 0; i < items.length; i += 2) { /* ... */ }

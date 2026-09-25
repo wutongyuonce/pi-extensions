@@ -1,0 +1,42 @@
+id: no-reflect-get
+language: TypeScript
+severity: error
+message: "Reflect.get(obj, key) — use a typed property access (obj.prop or obj[key]) instead"
+metadata:
+  category: pi-lens-self-scan
+note: |
+  Reflect.get reaches for reflection where a typed property access
+  already works. Prefer dot or bracket access.
+
+  2026-08-20 (refs #1856): PROMOTED from `warning` to `error`. The
+  standard receiver-forwarding call inside an inline `new Proxy` get
+  trap is excluded structurally. Both arities remain in scope elsewhere,
+  including a method merely named `get` outside a Proxy call. Only the
+  two-argument branch is fixable because a receiver changes access semantics.
+rule:
+  all:
+    - pattern: $CALL
+    - any:
+        - pattern: Reflect.get($OBJ, $KEY)
+        - pattern: Reflect.get($GET_TARGET, $PROP, $RECEIVER)
+    - not:
+        inside:
+          kind: method_definition
+          stopBy: end
+          has:
+            field: name
+            regex: "^get$"
+          inside:
+            pattern: new Proxy($TARGET, $HANDLER)
+            stopBy: end
+rewriters:
+  - id: rewrite-two-argument-reflect-get
+    rule:
+      pattern: Reflect.get($OBJ, $KEY)
+    fix: "$OBJ[$KEY]"
+transform:
+  REWRITTEN:
+    rewrite:
+      rewriters: [rewrite-two-argument-reflect-get]
+      source: $CALL
+fix: $REWRITTEN

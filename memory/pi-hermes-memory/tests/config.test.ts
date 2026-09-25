@@ -16,6 +16,7 @@ describe("loadConfig", () => {
   it("returns defaults when no config file exists", () => {
     const config = loadConfig(TEST_CONFIG_PATH);
     assert.strictEqual(config.memoryMode, "policy-only");
+    assert.strictEqual(config.lazyInitialization, false);
     assert.strictEqual(config.memoryPolicyStyle, "full");
     assert.strictEqual(config.memoryPolicyCustomText, undefined);
     assert.strictEqual(config.memoryCharLimit, 5000);
@@ -28,6 +29,7 @@ describe("loadConfig", () => {
     assert.strictEqual(config.flushOnShutdown, true);
     assert.strictEqual(config.flushMinTurns, 6);
     assert.strictEqual(config.flushRecentMessages, 0);
+    assert.strictEqual(config.flushCompactTimeoutMs, 60000);
     assert.strictEqual(config.memoryOverflowStrategy, "auto-consolidate");
     assert.strictEqual(config.autoConsolidate, true);
     assert.strictEqual(config.consolidationTimeoutMs, 180000);
@@ -41,6 +43,10 @@ describe("loadConfig", () => {
     assert.strictEqual(config.llmModelOverride, undefined);
     assert.strictEqual(config.llmThinkingOverride, undefined);
     assert.strictEqual(config.standingInstructionsEnabled, true);
+    // Retention is disabled by default so existing history is never silently
+    // deleted; a positive value opts in, 0/omitted disables.
+    assert.strictEqual(config.sessionRetentionDays, 0);
+    assert.strictEqual(config.quickCheckOnOpen, true);
   });
 
   it("honors a configured consolidationTimeoutMs, warning only when it is below the default", () => {
@@ -67,6 +73,56 @@ describe("loadConfig", () => {
     }
   });
 
+  it("honors a configured flushCompactTimeoutMs, warning only when it is below the default", () => {
+    fs.mkdirSync(path.dirname(TEST_CONFIG_PATH), { recursive: true });
+    const warnings: string[] = [];
+    const originalWarn = console.warn;
+    console.warn = (message?: unknown) => { warnings.push(String(message)); };
+
+    try {
+      fs.writeFileSync(TEST_CONFIG_PATH, JSON.stringify({ flushCompactTimeoutMs: 90000 }));
+      assert.strictEqual(loadConfig(TEST_CONFIG_PATH).flushCompactTimeoutMs, 90000);
+      assert.deepStrictEqual(warnings, [], "a value above the default should not warn");
+
+      fs.writeFileSync(TEST_CONFIG_PATH, JSON.stringify({ flushCompactTimeoutMs: 30000 }));
+      assert.strictEqual(
+        loadConfig(TEST_CONFIG_PATH).flushCompactTimeoutMs,
+        30000,
+        "a lower configured value must be honored, not clamped",
+      );
+      assert.strictEqual(warnings.length, 1, "a sub-default value should warn once");
+      assert.match(warnings[0], /30000ms.*below the 60000ms default/);
+
+      fs.writeFileSync(TEST_CONFIG_PATH, JSON.stringify({ flushCompactTimeoutMs: 0 }));
+      assert.strictEqual(
+        loadConfig(TEST_CONFIG_PATH).flushCompactTimeoutMs,
+        0,
+        "the disable sentinel must be honored",
+      );
+      assert.strictEqual(warnings.length, 1, "disabling the flush is not a too-low timeout");
+    } finally {
+      console.warn = originalWarn;
+    }
+  });
+
+  it("ignores non-finite flushCompactTimeoutMs values and keeps the default", () => {
+    fs.mkdirSync(path.dirname(TEST_CONFIG_PATH), { recursive: true });
+    const warnings: string[] = [];
+    const originalWarn = console.warn;
+    console.warn = (message?: unknown) => { warnings.push(String(message)); };
+
+    try {
+      // Written raw: JSON.stringify turns Infinity into null, so an object
+      // literal would test the string branch instead of the finite guard.
+      fs.writeFileSync(TEST_CONFIG_PATH, '{"flushCompactTimeoutMs": 1e999}');
+      assert.strictEqual(loadConfig(TEST_CONFIG_PATH).flushCompactTimeoutMs, 60000);
+      assert.deepStrictEqual(warnings, [], "a non-finite value is treated as absent, not warned");
+    } finally {
+      console.warn = originalWarn;
+    }
+  });
+
+
   it("overrides defaults when config file exists", () => {
     // Write a config file
     fs.mkdirSync(path.dirname(TEST_CONFIG_PATH), { recursive: true });
@@ -85,6 +141,7 @@ describe("loadConfig", () => {
       llmModelOverride: " openrouter/deepseek/deepseek-v4-flash ",
       llmThinkingOverride: "minimal",
       autoConsolidationWarnOnFailure: false,
+      quickCheckOnOpen: false,
     }));
     const config = loadConfig(TEST_CONFIG_PATH);
     assert.strictEqual(config.memoryMode, "legacy-inject");
@@ -101,9 +158,53 @@ describe("loadConfig", () => {
     assert.strictEqual(config.projectsMemoryDir, "my-memory");
     assert.strictEqual(config.llmModelOverride, "openrouter/deepseek/deepseek-v4-flash");
     assert.strictEqual(config.llmThinkingOverride, "minimal");
+    assert.strictEqual(config.quickCheckOnOpen, false);
     // Unset values use defaults
     assert.strictEqual(config.userCharLimit, 5000);
     assert.strictEqual(config.reviewEnabled, true);
+  });
+
+  it("only accepts boolean lazyInitialization overrides", () => {
+    for (const value of [true, false, "true", 1, null]) {
+      fs.writeFileSync(TEST_CONFIG_PATH, JSON.stringify({ lazyInitialization: value }));
+      assert.strictEqual(loadConfig(TEST_CONFIG_PATH).lazyInitialization, value === true);
+    }
+  });
+
+  it("only accepts boolean quickCheckOnOpen overrides", () => {
+    fs.mkdirSync(path.dirname(TEST_CONFIG_PATH), { recursive: true });
+    fs.writeFileSync(TEST_CONFIG_PATH, JSON.stringify({ quickCheckOnOpen: "false" }));
+    assert.strictEqual(loadConfig(TEST_CONFIG_PATH).quickCheckOnOpen, true);
+  });
+
+  it("merges array-form override tails with explicit llmFallbackModels", () => {
+    fs.mkdirSync(path.dirname(TEST_CONFIG_PATH), { recursive: true });
+    fs.writeFileSync(TEST_CONFIG_PATH, JSON.stringify({
+      llmModelOverride: ["p1/m1", "p2/m2"],
+      llmFallbackModels: ["p3/m3"],
+    }));
+    const config = loadConfig(TEST_CONFIG_PATH);
+    assert.strictEqual(config.llmModelOverride, "p1/m1");
+    assert.deepStrictEqual(config.llmFallbackModels, ["p2/m2", "p3/m3"]);
+  });
+
+
+  it("parses sessionRetentionDays as opt-in, accepting explicit 0 to disable", () => {
+    fs.mkdirSync(path.dirname(TEST_CONFIG_PATH), { recursive: true });
+
+    // Positive value opts in to retention pruning.
+    fs.writeFileSync(TEST_CONFIG_PATH, JSON.stringify({ sessionRetentionDays: 45 }));
+    assert.strictEqual(loadConfig(TEST_CONFIG_PATH).sessionRetentionDays, 45);
+
+    // Explicit 0 disables retention (even after a prior positive value).
+    fs.writeFileSync(TEST_CONFIG_PATH, JSON.stringify({ sessionRetentionDays: 0 }));
+    assert.strictEqual(loadConfig(TEST_CONFIG_PATH).sessionRetentionDays, 0);
+
+    // Negative / non-numeric values are ignored, keeping the (disabled) default.
+    fs.writeFileSync(TEST_CONFIG_PATH, JSON.stringify({ sessionRetentionDays: -5 }));
+    assert.strictEqual(loadConfig(TEST_CONFIG_PATH).sessionRetentionDays, 0);
+    fs.writeFileSync(TEST_CONFIG_PATH, JSON.stringify({ sessionRetentionDays: "30" }));
+    assert.strictEqual(loadConfig(TEST_CONFIG_PATH).sessionRetentionDays, 0);
   });
 
   it("handles partial config (missing keys use defaults)", () => {

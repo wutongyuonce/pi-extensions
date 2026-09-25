@@ -1,0 +1,11 @@
+id: reducible-list-comprehension
+valid:
+  - "total = sum(price for price in prices)"
+  - "items = [item for item in source]"
+  - "result = max([value for value in values])"
+  - "total = sum([price async for price in prices])"
+  - "found = any([await check(item) for item in items])"
+invalid:
+  - "total = sum([price for price in prices])"
+  - "found = any([item for item in items])"
+  - "complete = all([item.ready for item in items])"

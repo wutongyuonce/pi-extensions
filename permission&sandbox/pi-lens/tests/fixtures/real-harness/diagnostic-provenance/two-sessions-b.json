@@ -1,0 +1,10 @@
+[
+  [{"type":"toolCall","name":"lens_diagnostics","arguments":{"mode":"full","refreshRunners":"cached"}}],
+  [{"type":"text","text":"session B read the inherited cache"}],
+  [{"type":"toolCall","name":"lens_diagnostics","arguments":{"mode":"delta"}}],
+  [{"type":"text","text":"session B compared delta"}],
+  [{"type":"toolCall","name":"lens_diagnostics","arguments":{"mode":"full","refreshRunners":"all"}}],
+  [{"type":"text","text":"session B rescanned"}],
+  [{"type":"toolCall","name":"lens_diagnostics","arguments":{"mode":"all"}}],
+  [{"type":"text","text":"session B session view"}]
+]

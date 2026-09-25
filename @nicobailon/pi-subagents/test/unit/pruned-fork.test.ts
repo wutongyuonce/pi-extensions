@@ -3,8 +3,10 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { describe, it } from "node:test";
+import { createAssistantMessageEventStream, fauxAssistantMessage } from "@earendil-works/pi-ai";
+import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { createForkContextResolver } from "../../src/shared/fork-context.ts";
-import { pruneForkSessionFile, prunedForkRecoveryPath, type PrunedForkRecoveryPayload } from "../../src/shared/pruned-fork.ts";
+import { createPrunedForkSessionWriter, pruneForkSessionFile, prunedForkRecoveryPath, type PrunedForkRecoveryPayload } from "../../src/shared/pruned-fork.ts";
 
 function writeJsonl(filePath: string, entries: unknown[]): void {
 	fs.mkdirSync(path.dirname(filePath), { recursive: true });
@@ -33,6 +35,73 @@ function readRecovery(sessionFile: string): PrunedForkRecoveryPayload {
 }
 
 describe("pruned fork sessions", () => {
+	it("routes summaries through the Pi model registry with provider-neutral request options", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-pruned-registry-"));
+		try {
+			const parentSession = path.join(tempDir, "parent.jsonl");
+			const firstSession = path.join(tempDir, "first.jsonl");
+			const secondSession = path.join(tempDir, "second.jsonl");
+			writeJsonl(firstSession, largeForkEntries(parentSession));
+			writeJsonl(secondSession, largeForkEntries(parentSession));
+			type RegistryStreamArgs = Parameters<ExtensionContext["modelRegistry"]["streamSimple"]>;
+			type RegistryCall = { model: RegistryStreamArgs[0]; context: RegistryStreamArgs[1]; options: RegistryStreamArgs[2] };
+			const model: RegistryStreamArgs[0] = {
+				provider: "extension-provider",
+				id: "summary-model",
+				name: "Summary model",
+				api: "pi-registry-only",
+				baseUrl: "https://summary.invalid",
+				reasoning: false,
+				input: ["text"],
+				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+				contextWindow: 16_000,
+				maxTokens: 9_000,
+			};
+			const controller = new AbortController();
+			const calls: RegistryCall[] = [];
+			const modelRegistry = {
+				getAvailable: () => [model],
+				find: (provider: string, id: string) => provider === model.provider && id === model.id ? model : undefined,
+				streamSimple(streamModel: RegistryStreamArgs[0], context: RegistryStreamArgs[1], options?: RegistryStreamArgs[2]) {
+					calls.push({ model: streamModel, context, options });
+					const input = context.messages[0];
+					if (input?.role !== "user" || !Array.isArray(input.content) || input.content[0]?.type !== "text") throw new Error("expected summary payload");
+					const stream = createAssistantMessageEventStream();
+					queueMicrotask(() => stream.push({
+						type: "done",
+						reason: "stop",
+						message: fauxAssistantMessage(validSummaryResponse(input.content[0].text), { stopReason: "stop" }),
+					}));
+					return stream;
+				},
+			};
+			const writer = await createPrunedForkSessionWriter({ modelRegistry }, {
+				mode: "pruned",
+				model: "extension-provider/summary-model",
+			}, controller.signal);
+
+			await Promise.all([writer(firstSession), writer(secondSession)]);
+
+			assert.equal(calls.length, 1, "forks share one registry-routed summary request");
+			const call = calls[0];
+			assert.ok(call);
+			assert.equal(call.model, model);
+			assert.ok(call.options);
+			assert.deepEqual(Object.keys(call.options).sort(), ["maxTokens", "signal"]);
+			assert.equal(call.options.maxTokens, 4_096);
+			assert.equal(call.options.signal, controller.signal);
+			assert.match(call.context.systemPrompt ?? "", /Return strict JSON only/);
+			assert.equal(call.context.messages.length, 1);
+			const message = call.context.messages[0];
+			assert.ok(message);
+			assert.equal(message.role, "user");
+			assert.equal(readRecovery(firstSession).records.length, 1);
+			assert.equal(readRecovery(secondSession).records.length, 1);
+		} finally {
+			fs.rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
 	it("spills transcript overflow to private recovery with stable visible refs", async () => {
 		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-pruned-fork-"));
 		try {
@@ -90,6 +159,51 @@ describe("pruned fork sessions", () => {
 			assert.ok(text.includes("Recent exact decision."));
 			assert.ok(!text.includes(assistantBody));
 			assert.equal(readRecovery(childSession).records[0]?.kind, "assistant-text");
+		} finally {
+			fs.rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("summarizes context-edit replacement overflow", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-pruned-context-edit-"));
+		try {
+			const parentSession = path.join(tempDir, "parent.jsonl");
+			const childSession = path.join(tempDir, "child.jsonl");
+			const replacement = "replacement-overflow-".repeat(5_000);
+			writeJsonl(childSession, [
+				{ type: "session", version: 3, id: "child", cwd: "/tmp", parentSession },
+				{ type: "message", id: "user-1", parentId: null, message: { role: "user", content: "Original prompt." } },
+				{ type: "context_edit", id: "edit-1", parentId: "user-1", targetId: "user-1", replacement: { content: replacement } },
+			]);
+
+			await pruneForkSessionFile(childSession, async (payload) => validSummaryResponse(payload, "Replacement context summarized."));
+
+			const entries = fs.readFileSync(childSession, "utf-8").trim().split("\n").map((line) => JSON.parse(line));
+			assert.match(entries[2].replacement.content, /^Replacement context summarized\.\nRecovery ref:/);
+			assert.ok(!fs.readFileSync(childSession, "utf-8").includes(replacement));
+			assert.equal(readRecovery(childSession).records[0]?.sourceEntryId, "edit-1");
+		} finally {
+			fs.rmSync(tempDir, { recursive: true, force: true });
+		}
+	});
+
+	it("preserves null context-edit omissions while pruning their raw target", async () => {
+		const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-pruned-context-omission-"));
+		try {
+			const parentSession = path.join(tempDir, "parent.jsonl");
+			const childSession = path.join(tempDir, "child.jsonl");
+			const omitted = "omitted-overflow-".repeat(5_000);
+			writeJsonl(childSession, [
+				{ type: "session", version: 3, id: "child", cwd: "/tmp", parentSession },
+				{ type: "message", id: "user-1", parentId: null, message: { role: "user", content: omitted } },
+				{ type: "context_edit", id: "edit-1", parentId: "user-1", targetId: "user-1", replacement: null },
+			]);
+
+			await pruneForkSessionFile(childSession, async (payload) => validSummaryResponse(payload, "Omitted raw context summarized."));
+
+			const entries = fs.readFileSync(childSession, "utf-8").trim().split("\n").map((line) => JSON.parse(line));
+			assert.equal(entries[2].replacement, null);
+			assert.ok(!fs.readFileSync(childSession, "utf-8").includes(omitted));
 		} finally {
 			fs.rmSync(tempDir, { recursive: true, force: true });
 		}
@@ -185,9 +299,9 @@ describe("pruned fork sessions", () => {
 			assert.throws(() => resolver.sessionFileForIndex(0), /before pruning completed/);
 			await resolver.prepareSessionForIndex(0);
 			assert.equal(resolver.sessionFileForIndex(0), childSession);
-			assert.equal(resolver.thinkingOverrideForIndex(0), "off");
 			const text = fs.readFileSync(childSession, "utf-8");
 			assert.ok(!text.includes("thinkingSignature"));
+			assert.ok(!text.includes("thinking_level_change"));
 			assert.equal(JSON.parse(text.split("\n")[0]!).parentSession, parentSession);
 		} finally {
 			fs.rmSync(tempDir, { recursive: true, force: true });

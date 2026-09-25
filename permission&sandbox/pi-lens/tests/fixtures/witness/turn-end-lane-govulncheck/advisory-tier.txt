@@ -1,0 +1,17 @@
+=== context message the agent receives ===
+[pi-lens automated check — not a user request] Address 🔴 blockers before continuing; ℹ️ advisories are informational only.
+
+ℹ️ Advisory — no action required this turn:
+🛡️ Go CVEs reachable from this code (govulncheck) — upgrade where possible:
+  GO-2026-0101 (internal/live.go:12) — upgrade to v1.2.3 or later
+  GO-2026-0102 (internal/live.go:30) — no fix yet, track upstream
+  GO-2026-0103 (example.com/nofile) — upgrade to v0.9.1 or later
+  GO-2026-0105 (internal/edited.go [stale — re-run to confirm]) — upgrade to v3.1.0 or later
+  GO-2026-0106 (internal/gone.go [stale — re-run to confirm]) — upgrade to v4.0.0 or later
+  … and 1 more
+
+
+ℹ️ Advisory — no action required this turn:
+suppressed by disposition: 1 finding(s) dropped from this turn's gitleaks/govulncheck/trivy sections (govulncheck 1) (marked false-positive or won't-fix).
+
+keep working

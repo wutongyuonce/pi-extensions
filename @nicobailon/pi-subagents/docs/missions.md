@@ -95,6 +95,7 @@ subagent({
   id: "evening-review",
   name: "Evening review",
   at: "+30m",
+  baseRef: "refs/heads/release",
   workflowScript: `return runs.run("main", { agent: "reviewer", task: "Review the current diff." })`
 })
 ```
@@ -102,18 +103,27 @@ subagent({
 Create a fixed recurring workflow:
 
 ```ts
-subagent({ action: "schedule.create", id: "backlog", every: "6h", catchUp: "latest", workflowScript: "..." })
+subagent({ action: "schedule.create", id: "backlog", every: "6h", catchUp: "latest", workflowScript: "return runs.run('main', { agent: 'worker', task: args.task })", args: { task: "Maintain core" } })
 ```
 
-Fixed intervals support `m`, `h`, `d`, and `w` units and advance from the planned time without completion drift.
+Fixed intervals support `m`, `h`, `d`, and `w` units and advance from the planned time without completion drift. Schedule arguments are normalized and persisted for exact replay after reload; do not put secrets in them.
+
+Create a quiet recurring workflow whose successful completions stay visible but do not wake the parent session:
+
+```ts
+subagent({ action: "schedule.create", id: "nightly-sweep", every: "24h", quiet: true, workflowScript: "..." })
+```
 
 Manage schedules with `schedule.list`, `schedule.show`, `schedule.history`, `schedule.pause`, `schedule.resume`, `schedule.run`, `schedule.run-due`, and `schedule.delete`.
 
 Behavior:
 
 - Runs always launch async with fresh context and disable automatic mission creation; mission attachment is deferred from this first slice.
+- An optional top-level `baseRef` selects the safe Git ref used by managed worktrees (default `HEAD`); it is persisted with the schedule and forwarded on every fire. The source checkout must still be clean.
 - Definitions, bounded history, append-only events, and per-run receipts are stored with mode `0600`.
 - `overlap` is currently fixed to `skip`; `catchUp` supports `latest` (default) and `none`.
+- A successful `schedule.run` satisfies the next natural fire; a failed manual launch does not skip it.
+- `quiet` persists only on recurring (`every`) schedules. Successful automatic fires stay visible without a parent turn; failed, stopped, or paused outcomes still wake the session. One-shot `at` schedules and `schedule.run` stay noisy unless that launch passes `quiet: true`.
 - `schedule.run-due` lets an external launcher start due project work without making `pi-subagents` a daemon.
 - Calendar recurrence, cron, queue/replace overlap, and the schedule TUI inspector are intentionally deferred to the next slice.
 - The old `schedule`, `schedule-list`, `schedule-status`, and `schedule-cancel` actions were removed in a hard cutover.
