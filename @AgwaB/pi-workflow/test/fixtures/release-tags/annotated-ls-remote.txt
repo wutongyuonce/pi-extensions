@@ -1,2 +1,0 @@
-fedcba9876543210fedcba9876543210fedcba98	refs/tags/v0.12.0
-0123456789abcdef0123456789abcdef01234567	refs/tags/v0.12.0^{}

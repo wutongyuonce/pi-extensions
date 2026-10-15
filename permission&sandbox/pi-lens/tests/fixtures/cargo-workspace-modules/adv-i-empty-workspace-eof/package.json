@@ -1,5 +1,0 @@
-{
-	"name": "adv-i-root",
-	"private": true,
-	"workspaces": ["packages/*"]
-}

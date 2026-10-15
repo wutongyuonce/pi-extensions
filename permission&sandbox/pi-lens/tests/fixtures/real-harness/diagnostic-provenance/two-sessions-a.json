@@ -1,4 +1,0 @@
-[
-  [{"type":"toolCall","name":"lens_diagnostics","arguments":{"mode":"full","refreshRunners":"all"}}],
-  [{"type":"text","text":"session A recorded"}]
-]

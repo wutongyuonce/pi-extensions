@@ -1,8 +1,0 @@
-id: prefer-structured-clone
-valid:
-  - 'structuredClone(x)'
-  - 'JSON.parse(s)'
-  - 'JSON.stringify(x)'
-invalid:
-  - 'JSON.parse(JSON.stringify(x))'
-  - 'JSON.parse(JSON.stringify(obj, null, 2))'

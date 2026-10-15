@@ -1,8 +1,0 @@
-{
-  "version": "4.2.1",
-  "records": {
-    "gitleaks.json": ["analyzed", "findings", "scannedAt", "success", "summary"],
-    "govulncheck.json": ["analyzed", "findings", "scannedAt", "success", "summary"],
-    "trivy.json": ["analyzed", "findings", "licenses", "scannedAt", "secrets", "success", "summary"]
-  }
-}

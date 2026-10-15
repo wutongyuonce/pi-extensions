@@ -1,3 +1,0 @@
-class Caller {
-  Callee? value;
-}

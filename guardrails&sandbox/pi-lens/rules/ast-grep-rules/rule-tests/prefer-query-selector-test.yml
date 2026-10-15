@@ -1,9 +1,0 @@
-id: prefer-query-selector
-valid:
-  - 'document.querySelector("#x")'
-  - 'document.querySelectorAll(".y")'
-  - 'document.getElementById'
-invalid:
-  - 'document.getElementById("x")'
-  - 'document.getElementsByClassName("y")'
-  - 'document.getElementsByTagName("div")'

@@ -1,8 +1,0 @@
-id: prefer-date-now-js
-valid:
-  - 'Date.now()'
-  - 'new Date()'
-  - 'new Date().toISOString()'
-invalid:
-  - 'new Date().getTime()'
-  - 'new Date().valueOf()'

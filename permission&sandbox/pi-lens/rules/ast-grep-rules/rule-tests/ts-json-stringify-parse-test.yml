@@ -1,8 +1,0 @@
-id: ts-json-stringify-parse
-valid:
-  - 'JSON.parse(s)'
-  - 'JSON.stringify(x)'
-  - 'structuredClone(x)'
-invalid:
-  - 'JSON.parse(JSON.stringify(x))'
-  - 'JSON.parse(JSON.stringify(obj, null, 2))'

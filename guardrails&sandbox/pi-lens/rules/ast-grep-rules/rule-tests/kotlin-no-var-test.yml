@@ -1,7 +1,0 @@
-id: kotlin-no-var
-valid:
-  - |
-    val total = prices.sum()
-invalid:
-  - |
-    var total = 0

@@ -1,2 +1,0 @@
-🔴 STOP — 1 issue(s) must be fixed:
-  L3: syntax error, unexpected token "}"

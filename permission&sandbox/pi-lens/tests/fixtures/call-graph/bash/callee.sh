@@ -1,3 +1,0 @@
-helper() {
-  return 0
-}

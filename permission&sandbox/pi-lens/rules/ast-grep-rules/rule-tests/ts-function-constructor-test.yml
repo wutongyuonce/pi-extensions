@@ -1,8 +1,0 @@
-id: ts-function-constructor
-valid:
-  - 'function f() {}'
-  - 'const f = () => {}'
-  - 'Function.prototype'
-invalid:
-  - 'new Function("x", "return x")'
-  - 'new Function("return 1")'

@@ -1,9 +1,0 @@
-id: prefer-string-trim-start-end-js
-valid:
-  - 'str.trimStart()'
-  - 'str.trimEnd()'
-  - 'str.trim()'
-invalid:
-  - 'str.trimLeft()'
-  - 'str.trimRight()'
-  - 's.trimLeft()'

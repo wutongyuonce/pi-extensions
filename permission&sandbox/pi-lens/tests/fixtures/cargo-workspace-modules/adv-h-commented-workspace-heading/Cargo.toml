@@ -1,7 +1,0 @@
-# [workspace]
-# members = ["crates/x"]
-
-[package]
-name = "adv-h-standalone-crate"
-version = "0.1.0"
-edition = "2021"

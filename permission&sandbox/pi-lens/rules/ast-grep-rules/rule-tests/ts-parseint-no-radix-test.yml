@@ -1,9 +1,0 @@
-id: ts-parseint-no-radix
-valid:
-  - "parseInt(x, 10)"
-  - "parseInt(x, 2)"
-  - "Number.parseInt(x, 10)"
-invalid:
-  - "parseInt(x)"
-  - "Number.parseInt(x)"
-  - 'parseInt("123")'

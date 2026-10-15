@@ -1,9 +1,0 @@
-id: prefer-array-some-js
-valid:
-  - 'arr.some(fn)'
-  - 'arr.filter(fn).length === 0'
-  - 'arr.filter(fn).length > 5'
-invalid:
-  - 'arr.filter(fn).length > 0'
-  - 'arr.filter(fn).length !== 0'
-  - 'arr.filter(fn).length >= 1'

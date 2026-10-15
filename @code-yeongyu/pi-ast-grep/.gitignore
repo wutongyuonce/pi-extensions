@@ -1,7 +1,0 @@
-node_modules/
-dist/
-coverage/
-.pi/
-.sisyphus/
-*.log
-.DS_Store
