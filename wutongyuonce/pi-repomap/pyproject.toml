@@ -1,0 +1,27 @@
+[project]
+name = "scope"
+version = "3.0.0"
+description = "Codebase awareness CLI — ranked symbols by cross-file importance"
+requires-python = ">=3.11"
+dependencies = [
+    "tree-sitter>=0.23",
+    "tree-sitter-language-pack>=0.13",
+]
+
+[project.scripts]
+scope = "scope:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv]
+package = true
+
+[tool.ruff]
+line-length = 100
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+]

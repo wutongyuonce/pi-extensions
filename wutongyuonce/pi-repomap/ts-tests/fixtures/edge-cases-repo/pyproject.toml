@@ -1,0 +1,6 @@
+[project]
+name = "edge-cases-repo"
+version = "0.1.0"
+dependencies = [
+  "pytest",
+]
