@@ -26,6 +26,8 @@
 * Subagent+Tasks
   * @tintinweb/pi-subagents：https://github.com/tintinweb/pi-subagents
   * @tintinweb/pi-tasks：https://github.com/tintinweb/pi-tasks
+* visualize context usage
+  * @dimk90/pi-context-view: https://github.com/dimk90/pi-context-view
 
 ## Extensions Written By myself
 
